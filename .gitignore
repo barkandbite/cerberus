@@ -1,0 +1,4 @@
+/target
+**/*.rs.bk
+# Local render artifacts produced by `cerberus-app render`.
+*.ppm

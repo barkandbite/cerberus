@@ -1,0 +1,11 @@
+[package]
+name = "cerberus-dom"
+description = "DOM node types and a minimal placeholder HTML parser (real tokenizer at M2)."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[lints]
+workspace = true

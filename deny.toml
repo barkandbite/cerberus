@@ -1,0 +1,39 @@
+# cargo-deny configuration — the enforcement arm of the dependency policy
+# (ADR-0003). It is committed now as the documented intent; wiring `cargo deny`
+# into CI happens once the tool is approved (it adds no crates to the browser's
+# own dependency tree). Until then it can be run locally:
+#
+#     cargo install cargo-deny && cargo deny check
+#
+# The scaffold has zero third-party dependencies, so this is forward-looking.
+
+[advisories]
+# Fail on any security advisory affecting a dependency.
+yanked = "deny"
+ignore = []
+
+[licenses]
+# Allow-list only. A new license appearing in the tree fails the build and must
+# be reviewed in an ADR (it usually rides in with a new dependency, which needs
+# an ADR anyway).
+allow = [
+    "Apache-2.0",
+    "MIT",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "ISC",
+    "Unicode-3.0",
+    "Zlib",
+]
+confidence-threshold = 0.9
+
+[bans]
+# Surface accidental dependency bloat and duplicate versions — relevant to the
+# memory-and-minimalism posture even though it is a build-tree concern.
+multiple-versions = "warn"
+wildcards = "deny"
+
+[sources]
+# Only crates.io for now; any other source must be justified in an ADR.
+unknown-registry = "deny"
+unknown-git = "deny"

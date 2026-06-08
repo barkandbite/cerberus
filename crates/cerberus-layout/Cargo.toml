@@ -1,0 +1,16 @@
+[package]
+name = "cerberus-layout"
+description = "The LayoutEngine seam plus a minimal block layout (DOM -> display list)."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+cerberus-types = { path = "../cerberus-types" }
+cerberus-dom = { path = "../cerberus-dom" }
+cerberus-paint = { path = "../cerberus-paint" }

@@ -1,0 +1,42 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+  RUSTFLAGS: "-D warnings"
+
+jobs:
+  check:
+    name: build · test · lint · mem-gate
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # Installs the toolchain pinned in rust-toolchain.toml (incl. clippy,
+      # rustfmt). The scaffold has no third-party crates, so no registry fetch
+      # is needed.
+      - name: Install pinned toolchain
+        run: rustup show
+
+      - name: Format
+        run: cargo fmt --all --check
+
+      - name: Clippy (warnings = errors)
+        run: cargo clippy --workspace --all-targets --locked -- -D warnings
+
+      - name: Build
+        run: cargo build --workspace --locked
+
+      - name: Test
+        run: cargo test --workspace --locked
+
+      # Memory regression gate (see PLAN.md "Memory budget"). The budget is
+      # intentionally generous for the dependency-free scaffold and tightens as
+      # subsystems land; it steps up to the "JS isolate live" budget once the
+      # engine adapter is wired.
+      - name: Memory gate (idle RSS)
+        run: cargo run -q -p cerberus-app --release --locked -- mem-gate --budget-mb 64

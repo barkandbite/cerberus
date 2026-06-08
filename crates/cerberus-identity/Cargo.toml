@@ -1,0 +1,16 @@
+[package]
+name = "cerberus-identity"
+description = "The head manager: three switchable identities, one JS engine live at a time."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+cerberus-types = { path = "../cerberus-types" }
+cerberus-js = { path = "../cerberus-js" }
+cerberus-farbling = { path = "../cerberus-farbling" }
