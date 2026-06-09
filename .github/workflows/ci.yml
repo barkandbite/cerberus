@@ -1,9 +1,10 @@
 name: CI
 
+# Manual-only: auto-runs on push/PR are disabled to respect the GitHub Actions
+# budget. Trigger from the Actions tab ("Run workflow") for a full check, or run
+# the same gate locally (see CONTRIBUTING.md): fmt, clippy, build, test, mem-gate.
 on:
-  push:
-    branches: [main]
-  pull_request:
+  workflow_dispatch:
 
 env:
   CARGO_TERM_COLOR: always
