@@ -7,7 +7,7 @@
 //! The real, arena-allocated layout (see PLAN.md memory budget) is M2.
 
 use cerberus_dom::{Document, Element, Node};
-use cerberus_paint::{DisplayItem, DisplayList, TextShaper};
+use cerberus_paint::{DisplayItem, DisplayList, GlyphBox, TextShaper};
 use cerberus_types::{Color, Point, Size};
 
 /// Produces a `DisplayList` from a `Document` for a given viewport.
@@ -42,10 +42,21 @@ impl Default for BlockLayout {
 }
 
 impl LayoutEngine for BlockLayout {
-    fn layout(&mut self, doc: &Document, _viewport: Size, shaper: &dyn TextShaper) -> DisplayList {
+    fn layout(&mut self, doc: &Document, viewport: Size, shaper: &dyn TextShaper) -> DisplayList {
         let mut list = DisplayList::new();
         let mut cursor_y = self.margin;
-        self.lay_element(&doc.root, self.body_px, shaper, &mut list, &mut cursor_y);
+        let max_width = viewport
+            .w
+            .saturating_sub(2 * self.margin.max(0) as u32)
+            .max(16);
+        self.lay_element(
+            &doc.root,
+            self.body_px,
+            max_width,
+            shaper,
+            &mut list,
+            &mut cursor_y,
+        );
         list
     }
 }
@@ -55,6 +66,7 @@ impl BlockLayout {
         &self,
         element: &Element,
         inherited_px: u32,
+        max_width: u32,
         shaper: &dyn TextShaper,
         list: &mut DisplayList,
         cursor_y: &mut i32,
@@ -66,20 +78,67 @@ impl BlockLayout {
 
         for child in &element.children {
             match child {
-                Node::Text(text) => {
-                    let glyphs = shaper.shape(text, px);
-                    list.push(DisplayItem::Glyphs {
-                        origin: Point::new(self.margin, *cursor_y),
-                        glyphs,
-                        color: self.color,
-                    });
-                    *cursor_y += px as i32 + px as i32 / 2; // line + leading
-                }
+                Node::Text(text) => self.lay_text(text, px, max_width, shaper, list, cursor_y),
                 Node::Element(child_el) => {
-                    self.lay_element(child_el, px, shaper, list, cursor_y);
+                    self.lay_element(child_el, px, max_width, shaper, list, cursor_y);
                 }
             }
         }
+    }
+
+    /// Word-wrap `text` to `max_width`, emitting one glyph run per line.
+    fn lay_text(
+        &self,
+        text: &str,
+        px: u32,
+        max_width: u32,
+        shaper: &dyn TextShaper,
+        list: &mut DisplayList,
+        cursor_y: &mut i32,
+    ) {
+        let line_height = px as i32 + px as i32 / 2;
+        let space = shaper.shape(" ", px);
+        let space_w: u32 = space.iter().map(|g| g.advance).sum();
+
+        let mut line: Vec<GlyphBox> = Vec::new();
+        let mut line_w: u32 = 0;
+
+        for word in text.split_whitespace() {
+            let word_glyphs = shaper.shape(word, px);
+            let word_w: u32 = word_glyphs.iter().map(|g| g.advance).sum();
+
+            // Wrap before this word if it would overflow the current line.
+            if !line.is_empty() && line_w + space_w + word_w > max_width {
+                self.emit_line(std::mem::take(&mut line), line_height, list, cursor_y);
+                line_w = 0;
+            }
+            if line.is_empty() {
+                line.extend(word_glyphs);
+                line_w = word_w;
+            } else {
+                line.extend(space.iter().copied());
+                line.extend(word_glyphs);
+                line_w += space_w + word_w;
+            }
+        }
+        if !line.is_empty() {
+            self.emit_line(line, line_height, list, cursor_y);
+        }
+    }
+
+    fn emit_line(
+        &self,
+        glyphs: Vec<GlyphBox>,
+        line_height: i32,
+        list: &mut DisplayList,
+        cursor_y: &mut i32,
+    ) {
+        list.push(DisplayItem::Glyphs {
+            origin: Point::new(self.margin, *cursor_y),
+            glyphs,
+            color: self.color,
+        });
+        *cursor_y += line_height;
     }
 }
 
@@ -115,5 +174,29 @@ mod tests {
             })
             .collect();
         assert!(ys[1] > ys[0]);
+    }
+
+    #[test]
+    fn wraps_long_text_into_multiple_lines() {
+        let words = "word ".repeat(60);
+        let doc = parse_trivial(&format!("<p>{words}</p>"));
+        let list = BlockLayout::default().layout(&doc, Size::new(200, 600), &MonoShaper);
+
+        let runs = list
+            .items
+            .iter()
+            .filter(|i| matches!(i, DisplayItem::Glyphs { .. }))
+            .count();
+        assert!(
+            runs > 1,
+            "expected wrapping into multiple lines, got {runs}"
+        );
+
+        // Every line starts at the left margin.
+        for item in &list.items {
+            if let DisplayItem::Glyphs { origin, .. } = item {
+                assert_eq!(origin.x, BlockLayout::default().margin);
+            }
+        }
     }
 }

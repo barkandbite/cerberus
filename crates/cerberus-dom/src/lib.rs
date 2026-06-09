@@ -52,18 +52,19 @@ pub struct Document {
 /// Void elements that never have a close tag.
 const VOID: &[&str] = &["br", "hr", "img", "meta", "link", "input"];
 
-/// Parse a minimal subset of HTML. Attributes are discarded; comments and
-/// entities are not handled. Placeholder until the M2 parser.
+/// Parse a minimal subset of HTML: tags (attributes discarded), text with
+/// entity decoding + whitespace collapsing, comment skipping, and `<script>`/
+/// `<style>` rawtext dropping. Not standards-compliant — placeholder until M2.
 pub fn parse_trivial(input: &str) -> Document {
     let mut stack: Vec<Element> = vec![Element::new("#root")];
 
     for token in tokenize(input) {
         match token {
             Token::Text(text) => {
-                let trimmed = text.trim();
-                if !trimmed.is_empty() {
+                let cleaned = clean_text(&text);
+                if !cleaned.is_empty() {
                     if let Some(top) = stack.last_mut() {
-                        top.children.push(Node::Text(trimmed.to_string()));
+                        top.children.push(Node::Text(cleaned));
                     }
                 }
             }
@@ -139,7 +140,16 @@ fn tokenize(input: &str) -> Vec<Token> {
             }
         }
 
-        // `rest` now starts at '<'.
+        // `rest` now starts at '<'. Skip HTML comments wholesale (their body may
+        // contain '>' and is never page text).
+        if let Some(after) = rest.strip_prefix("<!--") {
+            rest = match after.find("-->") {
+                Some(end) => &after[end + 3..],
+                None => "",
+            };
+            continue;
+        }
+
         let Some(gt) = rest.find('>') else {
             tokens.push(Token::Text(rest.to_string()));
             break;
@@ -152,11 +162,104 @@ fn tokenize(input: &str) -> Vec<Token> {
         } else if let Some(name) = inner.strip_suffix('/') {
             tokens.push(Token::SelfClose(tag_name(name)));
         } else {
-            tokens.push(Token::Open(tag_name(inner)));
+            let name = tag_name(inner);
+            // Rawtext elements: their content is not markup and must not be shown
+            // as page text. Skip to the matching close tag and drop the body.
+            if name == "script" || name == "style" {
+                let close = format!("</{name}");
+                match find_ci(rest, &close) {
+                    Some(pos) => {
+                        let after = &rest[pos..];
+                        rest = match after.find('>') {
+                            Some(gt2) => &after[gt2 + 1..],
+                            None => "",
+                        };
+                    }
+                    None => rest = "",
+                }
+                tokens.push(Token::Open(name.clone()));
+                tokens.push(Token::Close(name));
+            } else {
+                tokens.push(Token::Open(name));
+            }
         }
     }
 
     tokens
+}
+
+/// Case-insensitive byte-offset search (ASCII-fold). `needle` must be lowercase.
+fn find_ci(haystack: &str, needle: &str) -> Option<usize> {
+    haystack.to_ascii_lowercase().find(needle)
+}
+
+/// Decode HTML entities, collapse runs of whitespace to single spaces, and trim.
+fn clean_text(raw: &str) -> String {
+    let decoded = decode_entities(raw);
+    let mut out = String::with_capacity(decoded.len());
+    let mut prev_space = false;
+    for ch in decoded.chars() {
+        if ch.is_whitespace() {
+            if !prev_space {
+                out.push(' ');
+                prev_space = true;
+            }
+        } else {
+            out.push(ch);
+            prev_space = false;
+        }
+    }
+    out.trim().to_string()
+}
+
+fn decode_entities(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut rest = s;
+    while let Some(amp) = rest.find('&') {
+        out.push_str(&rest[..amp]);
+        rest = &rest[amp..];
+        match rest.find(';') {
+            Some(semi) if semi <= 10 => match decode_one(&rest[1..semi]) {
+                Some(ch) => {
+                    out.push(ch);
+                    rest = &rest[semi + 1..];
+                }
+                None => {
+                    out.push('&');
+                    rest = &rest[1..];
+                }
+            },
+            _ => {
+                out.push('&');
+                rest = &rest[1..];
+            }
+        }
+    }
+    out.push_str(rest);
+    out
+}
+
+fn decode_one(entity: &str) -> Option<char> {
+    match entity {
+        "amp" => Some('&'),
+        "lt" => Some('<'),
+        "gt" => Some('>'),
+        "quot" => Some('"'),
+        "apos" => Some('\''),
+        "nbsp" => Some('\u{00A0}'),
+        _ => {
+            if let Some(hex) = entity
+                .strip_prefix("#x")
+                .or_else(|| entity.strip_prefix("#X"))
+            {
+                u32::from_str_radix(hex, 16).ok().and_then(char::from_u32)
+            } else if let Some(dec) = entity.strip_prefix('#') {
+                dec.parse::<u32>().ok().and_then(char::from_u32)
+            } else {
+                None
+            }
+        }
+    }
 }
 
 /// Take the tag name (first whitespace-delimited token), lowercased.
@@ -194,5 +297,30 @@ mod tests {
         };
         assert_eq!(p.tag, "p");
         assert_eq!(p.text_content(), "ab");
+    }
+
+    #[test]
+    fn skips_script_and_style_and_decodes_entities() {
+        let doc = parse_trivial(
+            "<body><style>p{color:red}</style>\
+             <!-- hidden > comment -->\
+             <p>a &amp; b &lt;c&gt; &#65;</p>\
+             <script>if (x<1){ y }</script>done</body>",
+        );
+        let text = doc.root.text_content();
+        assert!(
+            text.contains("a & b <c> A"),
+            "entities decoded; got {text:?}"
+        );
+        assert!(!text.contains("color:red"), "style content dropped");
+        assert!(!text.contains("if ("), "script content dropped");
+        assert!(!text.contains("hidden"), "comment dropped");
+        assert!(text.contains("done"));
+    }
+
+    #[test]
+    fn collapses_whitespace() {
+        let doc = parse_trivial("<p>one\n\n   two\t three</p>");
+        assert_eq!(doc.root.text_content(), "one two three");
     }
 }
