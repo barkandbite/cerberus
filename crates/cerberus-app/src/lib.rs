@@ -8,7 +8,6 @@
 //! identities → sealed storage → (built-in) fetch → parse → layout → paint →
 //! present, with the consent and farbling seams exercised along the way.
 
-use cerberus_chrome::Chrome;
 use cerberus_consent::{ConsentPolicy, Decision, DefaultDenyPolicy};
 use cerberus_dom::parse_trivial;
 use cerberus_headless::render_document;
@@ -20,6 +19,7 @@ use cerberus_paint::{BoxRasterizer, Framebuffer, MonoShaper, Rasterizer};
 use cerberus_shell::{HeadlessSurface, PlatformSurface};
 use cerberus_storage::{Cookie, Group, StorageEnvironment};
 use cerberus_types::{Color, HeadId, InstanceId, Origin, RealmId, Size};
+use cerberus_ui::Toolbar;
 use cerberus_url::parse as parse_url;
 
 /// What to render and how.
@@ -154,10 +154,10 @@ pub fn render(config: &RenderConfig) -> Result<RenderOutcome, AppError> {
     let body = String::from_utf8_lossy(&response.body);
     let document = parse_trivial(&body);
 
-    // --- Chrome (minimal toolbar) over the page content. ---
-    let mut chrome = Chrome::new(active_label.clone());
-    chrome.url_text = config.url.clone();
-    let content = chrome.content_size(config.viewport);
+    // --- Toolbar (minimal UI) over the page content. ---
+    let mut toolbar = Toolbar::new(active_label.clone());
+    toolbar.url_text = config.url.clone();
+    let content = toolbar.content_size(config.viewport);
 
     // Lay out + paint the page into the content area only.
     let mut layout = BlockLayout::default();
@@ -170,12 +170,12 @@ pub fn render(config: &RenderConfig) -> Result<RenderOutcome, AppError> {
         &BoxRasterizer,
     );
 
-    // Compose: page under the toolbar, chrome painted on top.
+    // Compose: page under the toolbar, toolbar painted on top.
     let mut framebuffer = Framebuffer::new(config.viewport);
     framebuffer.clear(config.background);
-    framebuffer.blit(chrome.content_origin(), &page);
+    framebuffer.blit(toolbar.content_origin(), &page);
     BoxRasterizer.rasterize(
-        &chrome.paint(config.viewport, &MonoShaper),
+        &toolbar.paint(config.viewport, &MonoShaper),
         &mut framebuffer,
     );
 

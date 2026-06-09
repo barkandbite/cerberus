@@ -1,11 +1,11 @@
-//! The minimal browser chrome.
+//! The minimal browser UI: a single toolbar.
 //!
 //! Exactly one fixed toolbar containing, left to right: Back, Forward, Refresh,
 //! Stop, a URL box, a tiny head switcher, and a Settings button. No bookmarks,
 //! no tab strip — the browser shows one page at a time.
 //!
-//! This crate is pure: it models the chrome, lays it out for a window size,
-//! paints it into a `DisplayList`, and maps a click to a [`ChromeAction`]. It
+//! This crate is pure: it models the toolbar, lays it out for a window size,
+//! paints it into a `DisplayList`, and maps a click to a [`ToolbarAction`]. It
 //! knows nothing about windowing (that's a `PlatformSurface` adapter) or
 //! networking (that's the session). Button glyphs are shaped via the injected
 //! `TextShaper`, so they read correctly once a real font adapter lands.
@@ -21,9 +21,9 @@ const BTN: u32 = 28;
 const HEAD_W: u32 = 44;
 const LABEL_PX: u32 = 16;
 
-/// An action produced by clicking or typing in the chrome.
+/// An action produced by clicking or typing in the toolbar.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub enum ChromeAction {
+pub enum ToolbarAction {
     /// Go back in history.
     Back,
     /// Go forward in history.
@@ -56,9 +56,9 @@ enum Control {
     Settings,
 }
 
-/// The chrome's current state.
+/// The toolbar's current state.
 #[derive(Clone, Debug)]
-pub struct Chrome {
+pub struct Toolbar {
     /// Text shown/edited in the URL box.
     pub url_text: String,
     /// Whether the URL box has keyboard focus.
@@ -73,8 +73,8 @@ pub struct Chrome {
     pub head_label: String,
 }
 
-impl Chrome {
-    /// A new chrome for the given active-head label.
+impl Toolbar {
+    /// A new toolbar for the given active-head label.
     pub fn new(head_label: impl Into<String>) -> Self {
         Self {
             url_text: String::new(),
@@ -125,30 +125,30 @@ impl Chrome {
     }
 
     /// Map a click at `(x, y)` to an action. Clicks below the toolbar (in the
-    /// page) return [`ChromeAction::None`].
-    pub fn hit_test(&self, window: Size, x: i32, y: i32) -> ChromeAction {
+    /// page) return [`ToolbarAction::None`].
+    pub fn hit_test(&self, window: Size, x: i32, y: i32) -> ToolbarAction {
         if y < 0 || (y as u32) >= TOOLBAR_HEIGHT {
-            return ChromeAction::None;
+            return ToolbarAction::None;
         }
         for (control, rect) in self.layout(window) {
             if point_in(rect, x, y) {
                 return self.action_for(control);
             }
         }
-        ChromeAction::None
+        ToolbarAction::None
     }
 
-    fn action_for(&self, control: Control) -> ChromeAction {
+    fn action_for(&self, control: Control) -> ToolbarAction {
         match control {
-            Control::Back if self.can_back => ChromeAction::Back,
-            Control::Forward if self.can_forward => ChromeAction::Forward,
-            Control::Reload => ChromeAction::Reload,
-            Control::Stop if self.loading => ChromeAction::Stop,
-            Control::UrlBox => ChromeAction::FocusUrl,
-            Control::Head => ChromeAction::SwitchHead,
-            Control::Settings => ChromeAction::OpenSettings,
+            Control::Back if self.can_back => ToolbarAction::Back,
+            Control::Forward if self.can_forward => ToolbarAction::Forward,
+            Control::Reload => ToolbarAction::Reload,
+            Control::Stop if self.loading => ToolbarAction::Stop,
+            Control::UrlBox => ToolbarAction::FocusUrl,
+            Control::Head => ToolbarAction::SwitchHead,
+            Control::Settings => ToolbarAction::OpenSettings,
             // Disabled controls swallow the click.
-            Control::Back | Control::Forward | Control::Stop => ChromeAction::None,
+            Control::Back | Control::Forward | Control::Stop => ToolbarAction::None,
         }
     }
 
@@ -166,10 +166,10 @@ impl Chrome {
         }
     }
 
-    /// Submit the URL box, producing a [`ChromeAction::Navigate`].
-    pub fn submit_url(&mut self) -> ChromeAction {
+    /// Submit the URL box, producing a [`ToolbarAction::Navigate`].
+    pub fn submit_url(&mut self) -> ToolbarAction {
         self.url_focused = false;
-        ChromeAction::Navigate(self.url_text.clone())
+        ToolbarAction::Navigate(self.url_text.clone())
     }
 
     /// Paint the toolbar into a display list. The page is painted separately
@@ -250,80 +250,76 @@ mod tests {
 
     #[test]
     fn content_area_sits_below_the_toolbar() {
-        let c = Chrome::new("work");
-        assert_eq!(c.content_origin(), Point::new(0, TOOLBAR_HEIGHT as i32));
+        let t = Toolbar::new("work");
+        assert_eq!(t.content_origin(), Point::new(0, TOOLBAR_HEIGHT as i32));
         assert_eq!(
-            c.content_size(window()),
+            t.content_size(window()),
             Size::new(800, 600 - TOOLBAR_HEIGHT)
         );
     }
 
     #[test]
     fn back_is_disabled_until_there_is_history() {
-        let mut c = Chrome::new("work");
-        // Back button center.
+        let mut t = Toolbar::new("work");
         let (bx, by) = (PAD + (BTN as i32) / 2, PAD + (BTN as i32) / 2);
-        assert_eq!(c.hit_test(window(), bx, by), ChromeAction::None);
-        c.can_back = true;
-        assert_eq!(c.hit_test(window(), bx, by), ChromeAction::Back);
+        assert_eq!(t.hit_test(window(), bx, by), ToolbarAction::None);
+        t.can_back = true;
+        assert_eq!(t.hit_test(window(), bx, by), ToolbarAction::Back);
     }
 
     #[test]
     fn settings_and_head_are_right_anchored() {
-        let c = Chrome::new("work");
+        let t = Toolbar::new("work");
         let w = window();
-        // Far-right button is Settings.
         let settings_x = w.w as i32 - PAD - (BTN as i32) / 2;
         assert_eq!(
-            c.hit_test(w, settings_x, PAD + 2),
-            ChromeAction::OpenSettings
+            t.hit_test(w, settings_x, PAD + 2),
+            ToolbarAction::OpenSettings
         );
-        // Just left of it is the head switcher.
         let head_x = w.w as i32 - PAD - BTN as i32 - PAD - (HEAD_W as i32) / 2;
-        assert_eq!(c.hit_test(w, head_x, PAD + 2), ChromeAction::SwitchHead);
+        assert_eq!(t.hit_test(w, head_x, PAD + 2), ToolbarAction::SwitchHead);
     }
 
     #[test]
     fn clicking_the_middle_focuses_the_url_box() {
-        let c = Chrome::new("work");
-        assert_eq!(c.hit_test(window(), 400, PAD + 2), ChromeAction::FocusUrl);
+        let t = Toolbar::new("work");
+        assert_eq!(t.hit_test(window(), 400, PAD + 2), ToolbarAction::FocusUrl);
     }
 
     #[test]
-    fn clicks_in_the_page_area_are_not_chrome() {
-        let c = Chrome::new("work");
+    fn clicks_in_the_page_area_are_not_toolbar() {
+        let t = Toolbar::new("work");
         assert_eq!(
-            c.hit_test(window(), 400, TOOLBAR_HEIGHT as i32 + 10),
-            ChromeAction::None
+            t.hit_test(window(), 400, TOOLBAR_HEIGHT as i32 + 10),
+            ToolbarAction::None
         );
     }
 
     #[test]
     fn url_editing_and_submit() {
-        let mut c = Chrome::new("work");
-        c.url_focused = true;
+        let mut t = Toolbar::new("work");
+        t.url_focused = true;
         for ch in "cerberus:home".chars() {
-            c.type_char(ch);
+            t.type_char(ch);
         }
-        c.backspace();
-        assert_eq!(c.url_text, "cerberus:hom");
+        t.backspace();
+        assert_eq!(t.url_text, "cerberus:hom");
         assert_eq!(
-            c.submit_url(),
-            ChromeAction::Navigate("cerberus:hom".to_string())
+            t.submit_url(),
+            ToolbarAction::Navigate("cerberus:hom".to_string())
         );
-        assert!(!c.url_focused);
+        assert!(!t.url_focused);
     }
 
     #[test]
     fn paint_produces_toolbar_and_controls() {
-        let c = Chrome::new("work");
-        let list = c.paint(window(), &MonoShaper);
+        let t = Toolbar::new("work");
+        let list = t.paint(window(), &MonoShaper);
         let rects = list
             .items
             .iter()
             .filter(|i| matches!(i, DisplayItem::Rect { .. }))
             .count();
-        // toolbar bg + separator + 7 control backgrounds.
         assert!(rects >= 9, "got {rects} rects");
     }
 }

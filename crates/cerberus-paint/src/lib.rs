@@ -113,7 +113,7 @@ impl Framebuffer {
     }
 
     /// Copy `src` into this framebuffer with its top-left at `dest` (opaque
-    /// copy, clipped to bounds). Used to composite the page under the chrome.
+    /// copy, clipped to bounds). Used to composite the page under the toolbar.
     pub fn blit(&mut self, dest: Point, src: &Framebuffer) {
         for sy in 0..src.size.h {
             let dy = dest.y + sy as i32;

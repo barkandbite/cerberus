@@ -61,6 +61,32 @@ impl PlatformSurface for HeadlessSurface {
     }
 }
 
+/// An interactive application the platform layer drives.
+///
+/// It renders a frame for a given size and reacts to input. The browser
+/// implements this; the windowing adapter (`cerberus-shell-winit`) calls it from
+/// the event loop, and tests can drive it headlessly. Each input method returns
+/// whether a redraw is needed. No windowing type ever appears here.
+pub trait FrameApp {
+    /// Window title.
+    fn title(&self) -> String;
+
+    /// Render a frame at the given size.
+    fn render_frame(&mut self, size: Size) -> Framebuffer;
+
+    /// Pointer press at device coordinates.
+    fn pointer_down(&mut self, x: i32, y: i32) -> bool;
+
+    /// A typed character.
+    fn text_input(&mut self, c: char) -> bool;
+
+    /// Enter / confirm (e.g. submit the URL box).
+    fn submit(&mut self) -> bool;
+
+    /// Backspace.
+    fn backspace(&mut self) -> bool;
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

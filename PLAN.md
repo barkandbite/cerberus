@@ -66,7 +66,7 @@ that names concrete adapters and wires them together via dependency injection.
 | `cerberus-consent` | Third-party detection, default-deny, rules | `ConsentPolicy` | none |
 | `cerberus-farbling` | Per-head seeded noise + JS prologue | `FarblingProvider` | none |
 | `cerberus-identity` | The three heads; engine swap on switch | — | none |
-| `cerberus-chrome` | Minimal toolbar (back/fwd/reload/stop/URL/head/settings) | — | none |
+| `cerberus-ui` | Minimal toolbar (back/fwd/reload/stop/URL/head/settings) | — | none |
 | `cerberus-shell` | Platform surface (windowing) seam | `PlatformSurface` | none; `cerberus-shell-winit` adapter (winit+softbuffer, ADR-0004) |
 | `cerberus-headless` | Render-to-PPM/PNG, automation | — | none (PNG at M2) |
 | `cerberus-app` | Composition root + CLI + memory gate | — | none |
@@ -232,10 +232,10 @@ green.
 - **Rendering stack** → full text shaping + font rasterization + image decoding,
   with fonts **bundled** (system fonts never enumerated — anti-fingerprinting)
   (ADR-0005).
-- **UI / chrome** → one minimal toolbar: Back, Forward, Refresh, Stop, a URL box,
+- **UI** → one minimal toolbar: Back, Forward, Refresh, Stop, a URL box,
   a tiny head switcher, and a Settings button. **No bookmarks. No tabs**
   (single-page; Back/Forward walk history). Identity switching and vault unlock
-  live behind the head switcher / Settings. Implemented in `cerberus-chrome`.
+  live behind the head switcher / Settings. Implemented in `cerberus-ui`.
 
 ### Still open (needs your sign-off)
 

@@ -1,6 +1,6 @@
 [package]
-name = "cerberus-chrome"
-description = "The minimal browser chrome: one toolbar (back/forward/refresh/stop/URL/head/settings)."
+name = "cerberus-ui"
+description = "The minimal browser UI: one toolbar (back/forward/refresh/stop/URL/head/settings)."
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true

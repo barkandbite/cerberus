@@ -20,12 +20,12 @@ the window) behind `PlatformSurface`, in a new adapter crate
 **`cerberus-shell-winit`**.
 
 - winit drives the event loop and yields input that we translate into our own
-  event/`ChromeAction` types; **no winit type crosses** into the chrome/browser
+  event/`ToolbarAction` types; **no winit type crosses** into the UI/browser
   layers.
 - softbuffer presents our `Framebuffer` directly — no GPU device/queue, minimal
   memory.
 - Fullscreen via winit borderless fullscreen (toggle, e.g. F11); windowed is the
-  default; resizing re-lays out the chrome + page.
+  default; resizing re-lays out the toolbar + page.
 - `HeadlessSurface` stays the surface for tests, CI, and the headless render mode
   — the *same* render→present path, no display required.
 
@@ -47,5 +47,5 @@ the window) behind `PlatformSurface`, in a new adapter crate
 - **winit + wgpu (GPU):** heavier RAM/binary; unnecessary for a CPU rasterizer.
 - **SDL2:** a single C dependency for window+input+present; less idiomatic, a
   foreign build dependency.
-- **egui / iced (full GUI toolkits):** we paint our own minimal chrome, so a
+- **egui / iced (full GUI toolkits):** we paint our own minimal toolbar, so a
   toolkit is redundant weight and would constrain the look.
