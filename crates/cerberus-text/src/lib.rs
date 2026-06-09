@@ -11,8 +11,10 @@
 //! caller changes. ab_glyph is chosen over swash as a leaner first rasterizer.
 
 use ab_glyph::{point, Font, FontRef, GlyphId, PxScale, ScaleFont};
-use cerberus_paint::{DisplayItem, DisplayList, Framebuffer, GlyphBox, Rasterizer, TextShaper};
-use cerberus_types::{Color, FontStyle, Point};
+use cerberus_paint::{
+    DecodedImage, DisplayItem, DisplayList, Framebuffer, GlyphBox, Rasterizer, TextShaper,
+};
+use cerberus_types::{Color, FontStyle, Point, Rect};
 
 /// The bundled font (Roboto Regular, Apache-2.0). See `assets/Roboto-LICENSE.txt`.
 const FONT_BYTES: &[u8] = include_bytes!("../assets/Roboto-Regular.ttf");
@@ -60,6 +62,27 @@ impl TextEngine {
             pen_x += g.advance as f32;
         }
     }
+
+    /// Draw a decoded image scaled (nearest-neighbor) into `rect`, alpha-blended.
+    fn draw_image(&self, rect: Rect, image: &DecodedImage, target: &mut Framebuffer) {
+        if rect.w == 0 || rect.h == 0 || image.size.w == 0 || image.size.h == 0 {
+            return;
+        }
+        for dy in 0..rect.h {
+            let sy = (dy * image.size.h / rect.h).min(image.size.h - 1);
+            for dx in 0..rect.w {
+                let sx = (dx * image.size.w / rect.w).min(image.size.w - 1);
+                let si = ((sy * image.size.w + sx) * 4) as usize;
+                let a = image.rgba[si + 3] as f32 / 255.0;
+                target.blend_pixel(
+                    rect.x + dx as i32,
+                    rect.y + dy as i32,
+                    Color::rgb(image.rgba[si], image.rgba[si + 1], image.rgba[si + 2]),
+                    a,
+                );
+            }
+        }
+    }
 }
 
 impl Default for TextEngine {
@@ -93,9 +116,7 @@ impl Rasterizer for TextEngine {
         for item in &list.items {
             match item {
                 DisplayItem::Rect { rect, color } => target.fill_rect(*rect, *color),
-                DisplayItem::Image { rect, .. } => {
-                    target.fill_rect(*rect, Color::rgb(192, 192, 192))
-                }
+                DisplayItem::Image { rect, image } => self.draw_image(*rect, image, target),
                 DisplayItem::Glyphs {
                     origin,
                     glyphs,

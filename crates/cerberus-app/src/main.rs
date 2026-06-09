@@ -102,6 +102,10 @@ fn cmd_render(args: &[String]) -> ExitCode {
         outcome.engine_name, outcome.engines_live, outcome.realms_live
     );
     println!("  active cookies  : {}", outcome.active_cookies);
+    println!(
+        "  images          : {}/{} decoded",
+        outcome.images_decoded, outcome.images_requested
+    );
     println!("  3rd-party access : {:?}", outcome.third_party_decision);
     println!("  wrote           : {out}");
     if let Some(kb) = resident_set_kb() {

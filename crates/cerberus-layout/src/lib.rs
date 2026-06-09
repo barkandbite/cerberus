@@ -7,9 +7,10 @@
 //! `display:none` is skipped. `<a href>` text also emits clickable link boxes.
 //! Real box widths, floats, and positioning are still ahead.
 
-use cerberus_paint::{DisplayItem, DisplayList, GlyphBox, TextShaper};
+use cerberus_paint::{DecodedImage, DisplayItem, DisplayList, GlyphBox, TextShaper};
 use cerberus_style::{ComputedStyle, Display, StyledChild, StyledDom, StyledNode, TextAlign};
 use cerberus_types::{Color, FontStyle, Point, Rect, Size};
+use std::sync::Arc;
 
 /// A clickable link region produced by layout (in layout-local coordinates).
 #[derive(Clone, Debug, PartialEq)]
@@ -25,10 +26,32 @@ pub struct LaidOut {
     pub links: Vec<LinkBox>,
 }
 
+/// Supplies decoded images to layout, keyed by an element's `src`/`data-src`.
+/// Resolution/fetching/decoding all happen inside the implementation.
+pub trait ImageProvider {
+    /// The decoded image for `src`, if available.
+    fn get(&self, src: &str) -> Option<Arc<DecodedImage>>;
+}
+
+/// An image provider with nothing (placeholders / alt text only).
+pub struct NoImages;
+
+impl ImageProvider for NoImages {
+    fn get(&self, _src: &str) -> Option<Arc<DecodedImage>> {
+        None
+    }
+}
+
 /// Produces a `LaidOut` from a styled document for a given viewport.
 pub trait LayoutEngine: Send {
-    /// Lay out `styled` into `viewport`, shaping text with `shaper`.
-    fn layout(&mut self, styled: &StyledDom, viewport: Size, shaper: &dyn TextShaper) -> LaidOut;
+    /// Lay out `styled` into `viewport`, shaping with `shaper`, images via `images`.
+    fn layout(
+        &mut self,
+        styled: &StyledDom,
+        viewport: Size,
+        shaper: &dyn TextShaper,
+        images: &dyn ImageProvider,
+    ) -> LaidOut;
 }
 
 /// Block/inline flow layout. The only knob is the page margin; everything else
@@ -46,12 +69,18 @@ impl Default for BlockLayout {
 }
 
 impl LayoutEngine for BlockLayout {
-    fn layout(&mut self, styled: &StyledDom, viewport: Size, shaper: &dyn TextShaper) -> LaidOut {
+    fn layout(
+        &mut self,
+        styled: &StyledDom,
+        viewport: Size,
+        shaper: &dyn TextShaper,
+        images: &dyn ImageProvider,
+    ) -> LaidOut {
         let max_width = viewport
             .w
             .saturating_sub(2 * self.margin.max(0) as u32)
             .max(16) as i32;
-        let mut ctx = Ctx::new(self.margin, max_width, shaper);
+        let mut ctx = Ctx::new(self.margin, max_width, shaper, images);
         ctx.walk(&styled.root, None);
         ctx.flush_line();
         LaidOut {
@@ -77,6 +106,7 @@ struct LinePiece {
 /// Flow state.
 struct Ctx<'a> {
     shaper: &'a dyn TextShaper,
+    images: &'a dyn ImageProvider,
     display: DisplayList,
     links: Vec<LinkBox>,
     left0: i32,
@@ -84,15 +114,22 @@ struct Ctx<'a> {
     left: i32,
     x: i32,
     y: i32,
-    line_px: u32,
+    /// Tallest content on the current line (text or image), in pixels.
+    line_h: i32,
     line: Vec<LinePiece>,
     line_align: TextAlign,
 }
 
 impl<'a> Ctx<'a> {
-    fn new(margin: i32, max_width: i32, shaper: &'a dyn TextShaper) -> Self {
+    fn new(
+        margin: i32,
+        max_width: i32,
+        shaper: &'a dyn TextShaper,
+        images: &'a dyn ImageProvider,
+    ) -> Self {
         Self {
             shaper,
+            images,
             display: DisplayList::new(),
             links: Vec::new(),
             left0: margin,
@@ -100,7 +137,7 @@ impl<'a> Ctx<'a> {
             left: margin,
             x: margin,
             y: margin,
-            line_px: 0,
+            line_h: 0,
             line: Vec::new(),
             line_align: TextAlign::Left,
         }
@@ -122,13 +159,7 @@ impl<'a> Ctx<'a> {
                 return;
             }
             "img" => {
-                // Replaced element: show the alt text (real decoding is a later
-                // slice; lazy-loading is ignored — speed-first, raw render).
-                if let Some(alt) = node.attr("alt").map(str::trim) {
-                    if !alt.is_empty() {
-                        self.add_text(&format!("[{alt}]"), style, in_link);
-                    }
-                }
+                self.image(node, in_link);
                 return;
             }
             _ => {}
@@ -251,7 +282,65 @@ impl<'a> Ctx<'a> {
             href: href.map(str::to_string),
         });
         self.x += w as i32;
-        self.line_px = self.line_px.max(px);
+        self.line_h = self.line_h.max(line_height(px));
+    }
+
+    /// Lay out an `<img>`: draw the decoded image if ready, else a sized
+    /// placeholder, else the alt text. Lazy-loading is ignored (raw render).
+    fn image(&mut self, node: &StyledNode, in_link: Option<&str>) {
+        // Prefer data-src (the real URL behind lazy-loaders) over a placeholder src.
+        let Some(src) = node.attr("data-src").or_else(|| node.attr("src")) else {
+            self.image_alt(node, in_link);
+            return;
+        };
+        let attr_w = node.attr("width").and_then(parse_dim);
+        let attr_h = node.attr("height").and_then(parse_dim);
+
+        if let Some(image) = self.images.get(src) {
+            let (mut w, mut h) = (
+                attr_w.filter(|v| *v > 0).unwrap_or(image.size.w),
+                attr_h.filter(|v| *v > 0).unwrap_or(image.size.h),
+            );
+            let max_w = (self.right - self.left).max(1) as u32;
+            if w > max_w {
+                h = (h as f32 * max_w as f32 / w as f32).round() as u32;
+                w = max_w;
+            }
+            self.place_box(w, h.max(1));
+            let rect = Rect::new(self.x, self.y, w, h.max(1));
+            self.display.push(DisplayItem::Image { rect, image });
+            self.advance_box(w, h);
+        } else if let (Some(w), Some(h)) = (attr_w, attr_h) {
+            // Not decoded yet: reserve the declared box so layout doesn't reflow.
+            self.place_box(w, h.max(1));
+            self.display.push(DisplayItem::Rect {
+                rect: Rect::new(self.x, self.y, w, h.max(1)),
+                color: Color::rgb(0xDD, 0xDD, 0xDD),
+            });
+            self.advance_box(w, h);
+        } else {
+            self.image_alt(node, in_link);
+        }
+    }
+
+    fn image_alt(&mut self, node: &StyledNode, in_link: Option<&str>) {
+        if let Some(alt) = node.attr("alt").map(str::trim) {
+            if !alt.is_empty() {
+                self.add_text(&format!("[{alt}]"), &node.style, in_link);
+            }
+        }
+    }
+
+    /// Wrap to a new line if a `w`-wide box wouldn't fit on the current one.
+    fn place_box(&mut self, w: u32, _h: u32) {
+        if self.x != self.left && self.x + w as i32 > self.right {
+            self.newline();
+        }
+    }
+
+    fn advance_box(&mut self, w: u32, h: u32) {
+        self.x += w as i32;
+        self.line_h = self.line_h.max(h as i32);
     }
 
     fn flush_line(&mut self) {
@@ -261,15 +350,15 @@ impl<'a> Ctx<'a> {
     }
 
     fn line_break(&mut self, px: u32) {
-        self.line_px = self.line_px.max(px);
+        self.line_h = self.line_h.max(line_height(px));
         self.newline();
     }
 
     fn newline(&mut self) {
         self.commit_line();
-        self.y += line_height(self.line_px.max(1));
+        self.y += self.line_h.max(1);
         self.x = self.left;
-        self.line_px = 0;
+        self.line_h = 0;
     }
 
     /// Apply text-align to the buffered line, then emit it.
@@ -325,6 +414,11 @@ fn space_width(shaper: &dyn TextShaper, px: u32) -> u32 {
     shaper.shape(" ", px).iter().map(|g| g.advance).sum()
 }
 
+/// Parse an `<img width/height>` attribute (a bare number or `Npx`).
+fn parse_dim(v: &str) -> Option<u32> {
+    v.trim().trim_end_matches("px").trim().parse().ok()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -335,7 +429,14 @@ mod tests {
 
     fn lay(html: &str, width: u32) -> LaidOut {
         let styled = CssEngine::new().style(&parse_trivial(html));
-        BlockLayout::default().layout(&styled, Size::new(width, 2000), &MonoShaper)
+        BlockLayout::default().layout(&styled, Size::new(width, 2000), &MonoShaper, &NoImages)
+    }
+
+    struct OneImage(Arc<DecodedImage>);
+    impl ImageProvider for OneImage {
+        fn get(&self, _src: &str) -> Option<Arc<DecodedImage>> {
+            Some(self.0.clone())
+        }
     }
 
     fn glyph_ys(laid: &LaidOut) -> Vec<i32> {
@@ -400,5 +501,38 @@ mod tests {
             _ => panic!(),
         };
         assert!(cx > lx, "centered line starts further right");
+    }
+
+    #[test]
+    fn img_with_provider_emits_image_item() {
+        let styled = CssEngine::new().style(&parse_trivial("<img src='pic.png' alt='x'>"));
+        let img = Arc::new(DecodedImage {
+            size: Size::new(20, 10),
+            rgba: vec![255; 20 * 10 * 4],
+        });
+        let laid = BlockLayout::default().layout(
+            &styled,
+            Size::new(400, 2000),
+            &MonoShaper,
+            &OneImage(img),
+        );
+        assert!(
+            laid.display
+                .items
+                .iter()
+                .any(|i| matches!(i, DisplayItem::Image { .. })),
+            "decoded image emitted"
+        );
+    }
+
+    #[test]
+    fn img_without_provider_shows_alt() {
+        let laid = lay("<img src='pic.png' alt='a cat'>", 400);
+        assert!(!glyph_ys(&laid).is_empty(), "alt text laid out");
+        assert!(!laid
+            .display
+            .items
+            .iter()
+            .any(|i| matches!(i, DisplayItem::Image { .. })));
     }
 }

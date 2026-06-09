@@ -27,6 +27,7 @@ cerberus-tls-rustls = { path = "../cerberus-tls-rustls" }
 cerberus-dns-doh = { path = "../cerberus-dns-doh" }
 cerberus-dom = { path = "../cerberus-dom" }
 cerberus-paint = { path = "../cerberus-paint" }
+cerberus-image = { path = "../cerberus-image" }
 cerberus-style = { path = "../cerberus-style" }
 cerberus-css = { path = "../cerberus-css" }
 cerberus-layout = { path = "../cerberus-layout" }
@@ -37,3 +38,8 @@ cerberus-js = { path = "../cerberus-js" }
 cerberus-identity = { path = "../cerberus-identity" }
 cerberus-shell = { path = "../cerberus-shell" }
 cerberus-headless = { path = "../cerberus-headless" }
+
+[dev-dependencies]
+# Dev-only: generates PNG fixtures for the image-pipeline tests. Production
+# decoding goes through the cerberus-image adapter, never this crate directly.
+image = { version = "0.25", default-features = false, features = ["png"] }

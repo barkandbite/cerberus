@@ -14,10 +14,13 @@ use cerberus_dns_doh::DohResolver;
 use cerberus_dom::{parse_trivial, Document, Element, Node};
 use cerberus_headless::render_document;
 use cerberus_identity::{Head, HeadManager};
+use cerberus_image::ImageCodec;
 use cerberus_js::NullJsEngineFactory;
-use cerberus_layout::{BlockLayout, LayoutEngine, LinkBox};
+use cerberus_layout::{BlockLayout, ImageProvider, LayoutEngine, LinkBox};
 use cerberus_net::{BuiltinHttpClient, HttpCache, HttpClient, HttpResponse, Router};
-use cerberus_paint::{DisplayItem, DisplayList, Framebuffer, Rasterizer, TextShaper};
+use cerberus_paint::{
+    DecodedImage, DisplayItem, DisplayList, Framebuffer, ImageDecoder, Rasterizer, TextShaper,
+};
 use cerberus_shell::{FrameApp, HeadlessSurface, PlatformSurface, Waker};
 use cerberus_storage::{Cookie, Group, StorageEnvironment};
 use cerberus_style::{StyleEngine, StyledDom};
@@ -26,6 +29,7 @@ use cerberus_tls_rustls::RustlsProvider;
 use cerberus_types::{Color, FontStyle, HeadId, InstanceId, Origin, Point, RealmId, Rect, Size};
 use cerberus_ui::{Toolbar, ToolbarAction};
 use cerberus_url::{join as join_url, parse as parse_url, Url};
+use std::collections::HashMap;
 use std::sync::mpsc::{Receiver, Sender};
 use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
@@ -67,6 +71,9 @@ pub struct RenderOutcome {
     pub engines_live: usize,
     pub realms_live: usize,
     pub active_cookies: usize,
+    /// `<img>` sub-resources fetched, and how many decoded successfully.
+    pub images_requested: usize,
+    pub images_decoded: usize,
     /// Decision for a representative third-party access (demonstrates consent).
     pub third_party_decision: Decision,
     pub framebuffer: Framebuffer,
@@ -186,6 +193,20 @@ pub fn render(config: &RenderConfig) -> Result<RenderOutcome, AppError> {
     let document = parse_trivial(&body);
     let styled = CssEngine::new().style(&document);
 
+    // Fetch + decode this page's images up front (the one-shot path is
+    // synchronous; the interactive browser fetches them on its worker). No
+    // network client is built when the page has no http(s) images.
+    let images = fetch_images_sync(&document, &url, config.system_roots);
+    let images_requested = images.len();
+    let images_decoded = images
+        .values()
+        .filter(|s| matches!(s, ImageState::Ready(_)))
+        .count();
+    let provider = StoreImages {
+        base: Some(&url),
+        images: &images,
+    };
+
     // --- Toolbar (minimal UI) over the page content, with real fonts. ---
     let text = TextEngine::new();
     let mut toolbar = Toolbar::new(active_label.clone());
@@ -201,6 +222,7 @@ pub fn render(config: &RenderConfig) -> Result<RenderOutcome, AppError> {
         &mut layout,
         &text,
         &text,
+        &provider,
     );
 
     // Compose: page under the toolbar, toolbar painted on top.
@@ -236,6 +258,8 @@ pub fn render(config: &RenderConfig) -> Result<RenderOutcome, AppError> {
         engines_live,
         realms_live,
         active_cookies,
+        images_requested,
+        images_decoded,
         third_party_decision,
         framebuffer: surface.last_frame().cloned().unwrap_or(framebuffer),
     })
@@ -256,13 +280,6 @@ struct FetchedPage {
     body: Vec<u8>,
 }
 
-/// The result of one load, tagged with the request id it answers.
-struct LoadOutcome {
-    id: u64,
-    requested_url: String,
-    result: Result<FetchedPage, String>,
-}
-
 /// In-flight navigation bookkeeping.
 struct Pending {
     id: u64,
@@ -271,45 +288,72 @@ struct Pending {
     http_fallback: Option<String>,
 }
 
-/// Performs page loads off the UI thread. Abstracted so the browser's load
+/// A job for the network worker.
+enum Job {
+    Page { id: u64, url: String },
+    Sub { url: String },
+}
+
+/// A completed job (page navigation, or an image sub-resource).
+enum Done {
+    Page {
+        id: u64,
+        requested_url: String,
+        result: Result<FetchedPage, String>,
+    },
+    Sub {
+        url: String,
+        bytes: Result<Vec<u8>, String>,
+    },
+}
+
+/// Performs page + sub-resource loads off the UI thread. Abstracted so the load
 /// state machine is testable without the network (see `FakeLoader` in tests).
 trait PageLoader {
-    /// Queue a load; the result surfaces later via [`PageLoader::try_recv`].
+    /// Queue a page navigation.
     fn request(&self, id: u64, url: String);
-    /// Non-blocking poll for a completed load.
-    fn try_recv(&mut self) -> Option<LoadOutcome>;
+    /// Queue an image sub-resource fetch (absolute URL).
+    fn request_subresource(&self, url: String);
+    /// Non-blocking poll for a completed job.
+    fn try_recv(&mut self) -> Option<Done>;
     /// Receive a waker to notify the UI when a result is ready.
     fn set_waker(&mut self, waker: Arc<dyn Waker>);
 }
 
 /// The production loader: a worker thread owning the network client.
 struct NetLoader {
-    tx: Sender<(u64, String)>,
-    rx: Receiver<LoadOutcome>,
+    tx: Sender<Job>,
+    rx: Receiver<Done>,
     waker: Arc<Mutex<Option<Arc<dyn Waker>>>>,
     _worker: JoinHandle<()>,
 }
 
 impl NetLoader {
     fn new(system_roots: bool) -> Self {
-        let (req_tx, req_rx) = std::sync::mpsc::channel::<(u64, String)>();
-        let (out_tx, out_rx) = std::sync::mpsc::channel::<LoadOutcome>();
+        let (req_tx, req_rx) = std::sync::mpsc::channel::<Job>();
+        let (out_tx, out_rx) = std::sync::mpsc::channel::<Done>();
         let waker: Arc<Mutex<Option<Arc<dyn Waker>>>> = Arc::new(Mutex::new(None));
         let worker_waker = waker.clone();
 
         let worker = std::thread::spawn(move || {
             // Build the network client (rustls config) once, on the worker.
             let client = network_client(system_roots);
-            while let Ok((id, url)) = req_rx.recv() {
-                let result = fetch_page(&client, &url);
-                if out_tx
-                    .send(LoadOutcome {
-                        id,
-                        requested_url: url,
-                        result,
-                    })
-                    .is_err()
-                {
+            while let Ok(job) = req_rx.recv() {
+                let done = match job {
+                    Job::Page { id, url } => {
+                        let result = fetch_page(&client, &url);
+                        Done::Page {
+                            id,
+                            requested_url: url,
+                            result,
+                        }
+                    }
+                    Job::Sub { url } => {
+                        let bytes = fetch_bytes(&client, &url);
+                        Done::Sub { url, bytes }
+                    }
+                };
+                if out_tx.send(done).is_err() {
                     break;
                 }
                 if let Some(w) = worker_waker.lock().unwrap().clone() {
@@ -329,9 +373,12 @@ impl NetLoader {
 
 impl PageLoader for NetLoader {
     fn request(&self, id: u64, url: String) {
-        let _ = self.tx.send((id, url));
+        let _ = self.tx.send(Job::Page { id, url });
     }
-    fn try_recv(&mut self) -> Option<LoadOutcome> {
+    fn request_subresource(&self, url: String) {
+        let _ = self.tx.send(Job::Sub { url });
+    }
+    fn try_recv(&mut self) -> Option<Done> {
         self.rx.try_recv().ok()
     }
     fn set_waker(&mut self, waker: Arc<dyn Waker>) {
@@ -350,6 +397,53 @@ fn fetch_page(client: &Router, url: &str) -> Result<FetchedPage, String> {
     })
 }
 
+fn fetch_bytes(client: &Router, url: &str) -> Result<Vec<u8>, String> {
+    let parsed = parse_url(url).map_err(|e| e.to_string())?;
+    let resp = client.get(&parsed).map_err(|e| format!("{e:?}"))?;
+    if !(200..300).contains(&resp.status) {
+        return Err(format!("HTTP {}", resp.status));
+    }
+    Ok(resp.body)
+}
+
+/// Synchronously fetch + decode every `<img>` in `document`, keyed by absolute
+/// URL. Used by the one-shot [`render`]; the interactive browser fetches images
+/// on its worker instead. Returns an empty map — and builds no network client —
+/// when the page has no http(s) images.
+fn fetch_images_sync(
+    document: &Document,
+    base: &Url,
+    system_roots: bool,
+) -> HashMap<String, ImageState> {
+    let mut srcs = Vec::new();
+    collect_image_urls(&document.root, &mut srcs);
+
+    let mut urls: Vec<String> = Vec::new();
+    for src in srcs {
+        let abs = resolve_subresource(Some(base), &src);
+        if (abs.starts_with("http://") || abs.starts_with("https://")) && !urls.contains(&abs) {
+            urls.push(abs);
+        }
+    }
+    if urls.is_empty() {
+        return HashMap::new();
+    }
+
+    let codec = ImageCodec::new();
+    let client = network_client(system_roots);
+    urls.into_iter()
+        .map(|url| {
+            let state = match fetch_bytes(&client, &url)
+                .and_then(|b| codec.decode(&b).map_err(|e| format!("{e:?}")))
+            {
+                Ok(img) => ImageState::Ready(Arc::new(img)),
+                Err(_) => ImageState::Failed,
+            };
+            (url, state)
+        })
+        .collect()
+}
+
 /// Normalize a URL-bar entry: keep `cerberus:`/explicit-scheme inputs, otherwise
 /// assume `https://`.
 fn normalize_url(input: &str) -> String {
@@ -358,6 +452,53 @@ fn normalize_url(input: &str) -> String {
         t.to_string()
     } else {
         format!("https://{t}")
+    }
+}
+
+/// State of an image sub-resource in the per-page store.
+enum ImageState {
+    Pending,
+    Ready(Arc<DecodedImage>),
+    Failed,
+}
+
+/// Image provider over the browser's per-page store. Resolves an element's
+/// `src` against the current page URL (which is how the store is keyed).
+struct StoreImages<'a> {
+    base: Option<&'a Url>,
+    images: &'a HashMap<String, ImageState>,
+}
+
+impl ImageProvider for StoreImages<'_> {
+    fn get(&self, src: &str) -> Option<Arc<DecodedImage>> {
+        match self.images.get(&resolve_subresource(self.base, src)) {
+            Some(ImageState::Ready(img)) => Some(img.clone()),
+            _ => None,
+        }
+    }
+}
+
+fn resolve_subresource(base: Option<&Url>, src: &str) -> String {
+    match base {
+        Some(b) => join_url(b, src)
+            .map(|u| u.to_string())
+            .unwrap_or_else(|_| src.to_string()),
+        None => src.to_string(),
+    }
+}
+
+/// Collect `<img>` sources from an element subtree, preferring `data-src` (the
+/// real URL behind lazy-loaders) over `src`.
+fn collect_image_urls(el: &Element, out: &mut Vec<String>) {
+    if el.tag == "img" {
+        if let Some(src) = el.attr("data-src").or_else(|| el.attr("src")) {
+            out.push(src.to_string());
+        }
+    }
+    for child in &el.children {
+        if let Node::Element(e) = child {
+            collect_image_urls(e, out);
+        }
     }
 }
 
@@ -371,6 +512,8 @@ pub struct BrowserApp {
     toolbar: Toolbar,
     text: TextEngine,
     style_engine: CssEngine,
+    image_codec: ImageCodec,
+    images: HashMap<String, ImageState>,
     history: Vec<String>,
     index: usize,
     document: Document,
@@ -418,6 +561,8 @@ impl BrowserApp {
             toolbar: Toolbar::new(label),
             text: TextEngine::new(),
             style_engine,
+            image_codec: ImageCodec::new(),
+            images: HashMap::new(),
             history: Vec::new(),
             index: 0,
             document: empty_document(),
@@ -459,6 +604,9 @@ impl BrowserApp {
         self.insecure_prompt = None;
         self.insecure_button = None;
         self.toolbar.url_focused = false;
+        // Drop the previous page's images: the store only ever holds the
+        // current page's sub-resources (memory is priority #1).
+        self.images.clear();
 
         if url.starts_with("cerberus:") {
             self.load_builtin(url);
@@ -541,6 +689,7 @@ impl BrowserApp {
         if let Some(origin) = origin {
             self.set_session_cookie(&origin);
         }
+        self.request_page_images();
         self.update_nav();
     }
 
@@ -554,16 +703,22 @@ impl BrowserApp {
     }
 
     /// Apply a completed load. Testable entry point — no network or threads.
-    fn handle_outcome(&mut self, outcome: LoadOutcome) -> bool {
+    /// Apply a completed page load. Testable entry point — no network or threads.
+    fn handle_page(
+        &mut self,
+        id: u64,
+        requested_url: String,
+        result: Result<FetchedPage, String>,
+    ) -> bool {
         let Some(pending) = &self.pending else {
             return false;
         };
-        if outcome.id != pending.id {
+        if id != pending.id {
             return false; // stale: superseded by Stop or a newer navigation
         }
         let http_fallback = pending.http_fallback.clone();
         self.pending = None;
-        match outcome.result {
+        match result {
             Ok(page) => {
                 self.commit_response(&page.url, page.status, &page.headers, &page.body, true)
             }
@@ -571,13 +726,45 @@ impl BrowserApp {
                 Some(http_url) => {
                     // The https upgrade failed; offer the plaintext risk prompt.
                     self.toolbar.loading = false;
-                    self.document = insecure_prompt_document(&http_url, &err);
+                    self.set_document(insecure_prompt_document(&http_url, &err));
                     self.insecure_prompt = Some(http_url);
                 }
-                None => self.show_error(&outcome.requested_url, &err),
+                None => self.show_error(&requested_url, &err),
             },
         }
         true
+    }
+
+    /// Apply a decoded image sub-resource (or its failure) to the store.
+    fn handle_subresource(&mut self, url: String, bytes: Result<Vec<u8>, String>) -> bool {
+        let state =
+            match bytes.and_then(|b| self.image_codec.decode(&b).map_err(|e| format!("{e:?}"))) {
+                Ok(img) => ImageState::Ready(Arc::new(img)),
+                Err(_) => ImageState::Failed,
+            };
+        self.images.insert(url, state);
+        true // a newly-decoded image changes layout — redraw
+    }
+
+    /// Scan the current document for `<img>` sources and queue a background
+    /// fetch for each new http(s) image. Lazy-loading hints are ignored — every
+    /// image is fetched immediately (speed-first; see the layout `img` path).
+    fn request_page_images(&mut self) {
+        let mut srcs = Vec::new();
+        collect_image_urls(&self.document.root, &mut srcs);
+        for src in srcs {
+            let abs = resolve_subresource(self.current_url.as_ref(), &src);
+            // Only http(s) sub-resources go to the network worker.
+            if !(abs.starts_with("http://") || abs.starts_with("https://")) {
+                continue;
+            }
+            // One fetch per distinct URL per page.
+            if self.images.contains_key(&abs) {
+                continue;
+            }
+            self.images.insert(abs.clone(), ImageState::Pending);
+            self.loader.request_subresource(abs);
+        }
     }
 
     /// Confirm the risk prompt: load the original `http` URL in plaintext.
@@ -721,8 +908,15 @@ impl FrameApp for BrowserApp {
 
     fn poll(&mut self) -> bool {
         let mut redraw = false;
-        while let Some(outcome) = self.loader.try_recv() {
-            redraw |= self.handle_outcome(outcome);
+        while let Some(done) = self.loader.try_recv() {
+            redraw |= match done {
+                Done::Page {
+                    id,
+                    requested_url,
+                    result,
+                } => self.handle_page(id, requested_url, result),
+                Done::Sub { url, bytes } => self.handle_subresource(url, bytes),
+            };
         }
         redraw
     }
@@ -732,8 +926,12 @@ impl FrameApp for BrowserApp {
         let content = self.toolbar.content_size(size);
         let origin = self.toolbar.content_origin();
 
+        let provider = StoreImages {
+            base: self.current_url.as_ref(),
+            images: &self.images,
+        };
         let mut layout = BlockLayout::default();
-        let laid = layout.layout(&self.styled, content, &self.text);
+        let laid = layout.layout(&self.styled, content, &self.text, &provider);
 
         let mut page = Framebuffer::new(content);
         page.clear(self.background);
@@ -980,7 +1178,8 @@ mod tests {
 
     struct FakeLoader {
         responses: HashMap<String, Result<FetchedPage, String>>,
-        queue: RefCell<VecDeque<LoadOutcome>>,
+        images: HashMap<String, Result<Vec<u8>, String>>,
+        queue: RefCell<VecDeque<Done>>,
     }
 
     impl FakeLoader {
@@ -990,8 +1189,17 @@ mod tests {
                     .into_iter()
                     .map(|(u, r)| (u.to_string(), r))
                     .collect(),
+                images: HashMap::new(),
                 queue: RefCell::new(VecDeque::new()),
             }
+        }
+
+        fn with_images(mut self, images: Vec<(&str, Result<Vec<u8>, String>)>) -> Self {
+            self.images = images
+                .into_iter()
+                .map(|(u, r)| (u.to_string(), r))
+                .collect();
+            self
         }
     }
 
@@ -1002,13 +1210,21 @@ mod tests {
                 .get(&url)
                 .cloned()
                 .unwrap_or_else(|| Err(format!("no canned response for {url}")));
-            self.queue.borrow_mut().push_back(LoadOutcome {
+            self.queue.borrow_mut().push_back(Done::Page {
                 id,
                 requested_url: url,
                 result,
             });
         }
-        fn try_recv(&mut self) -> Option<LoadOutcome> {
+        fn request_subresource(&self, url: String) {
+            let bytes = self
+                .images
+                .get(&url)
+                .cloned()
+                .unwrap_or_else(|| Err(format!("no canned image for {url}")));
+            self.queue.borrow_mut().push_back(Done::Sub { url, bytes });
+        }
+        fn try_recv(&mut self) -> Option<Done> {
             self.queue.get_mut().pop_front()
         }
         fn set_waker(&mut self, _waker: Arc<dyn Waker>) {}
@@ -1028,6 +1244,25 @@ mod tests {
 
     fn fake_app(responses: Vec<(&str, Result<FetchedPage, String>)>) -> BrowserApp {
         BrowserApp::with_loader(Box::new(FakeLoader::new(responses)))
+    }
+
+    fn fake_app_img(
+        responses: Vec<(&str, Result<FetchedPage, String>)>,
+        images: Vec<(&str, Result<Vec<u8>, String>)>,
+    ) -> BrowserApp {
+        BrowserApp::with_loader(Box::new(FakeLoader::new(responses).with_images(images)))
+    }
+
+    /// A small valid PNG, for the image-pipeline tests. Uses the `image` crate
+    /// directly — this is dev-only fixture generation; production decoding goes
+    /// through the `cerberus-image` adapter behind the `ImageDecoder` seam.
+    fn test_png(w: u32, h: u32) -> Vec<u8> {
+        use image::{ImageFormat, RgbaImage};
+        use std::io::Cursor;
+        let img = RgbaImage::from_pixel(w, h, image::Rgba([10, 200, 30, 255]));
+        let mut out = Cursor::new(Vec::new());
+        img.write_to(&mut out, ImageFormat::Png).unwrap();
+        out.into_inner()
     }
 
     #[test]
@@ -1193,5 +1428,97 @@ mod tests {
         assert!(b.poll());
         assert!(b.document.root.text_content().contains("Next"));
         assert_eq!(b.toolbar.url_text, "https://site.test/next");
+    }
+
+    #[test]
+    fn browser_fetches_decodes_and_serves_page_images() {
+        let png = test_png(6, 4);
+        let mut b = fake_app_img(
+            vec![(
+                "https://img.test/",
+                Ok(page(
+                    "https://img.test/",
+                    200,
+                    None,
+                    // Same src twice: must dedup to a single fetch.
+                    "<img src=\"/pic.png\"><img src=\"/pic.png\">",
+                )),
+            )],
+            vec![("https://img.test/pic.png", Ok(png))],
+        );
+        b.navigate("https://img.test/");
+        // One poll drains the page *and* the image sub-resource it queued.
+        assert!(b.poll());
+
+        // Deduped to a single fetch, decoded and stored Ready.
+        assert_eq!(b.images.len(), 1);
+        assert!(matches!(
+            b.images.get("https://img.test/pic.png"),
+            Some(ImageState::Ready(_))
+        ));
+
+        // The provider the renderer builds resolves the element's `src` against
+        // the page URL and hands layout the decoded image.
+        let provider = StoreImages {
+            base: b.current_url.as_ref(),
+            images: &b.images,
+        };
+        assert!(
+            provider.get("/pic.png").is_some(),
+            "provider supplies the decoded image to layout"
+        );
+        // A frame renders without panicking now that an Image item is present.
+        b.render_frame(Size::new(800, 600));
+    }
+
+    #[test]
+    fn browser_skips_non_http_images_and_records_decode_failures() {
+        let mut b = fake_app_img(
+            vec![(
+                "https://img.test/",
+                Ok(page(
+                    "https://img.test/",
+                    200,
+                    None,
+                    "<img src=\"data:image/png;base64,AAAA\"><img src=\"/broken.png\">",
+                )),
+            )],
+            vec![("https://img.test/broken.png", Ok(b"not a png".to_vec()))],
+        );
+        b.navigate("https://img.test/");
+        assert!(b.poll());
+        // The `data:` URL is never fetched; only the http(s) image is, and its
+        // garbage bytes are recorded as a decode failure (not left Pending).
+        assert_eq!(b.images.len(), 1);
+        assert!(matches!(
+            b.images.get("https://img.test/broken.png"),
+            Some(ImageState::Failed)
+        ));
+    }
+
+    #[test]
+    fn navigation_clears_the_previous_pages_images() {
+        let png = test_png(2, 2);
+        let mut b = fake_app_img(
+            vec![
+                (
+                    "https://a.test/",
+                    Ok(page("https://a.test/", 200, None, "<img src=\"/x.png\">")),
+                ),
+                (
+                    "https://b.test/",
+                    Ok(page("https://b.test/", 200, None, "<h1>no images</h1>")),
+                ),
+            ],
+            vec![("https://a.test/x.png", Ok(png))],
+        );
+        b.navigate("https://a.test/");
+        assert!(b.poll());
+        assert_eq!(b.images.len(), 1);
+
+        // Leaving the page drops its images (memory is bounded to one page).
+        b.navigate("https://b.test/");
+        assert!(b.poll());
+        assert!(b.images.is_empty(), "previous page's images were cleared");
     }
 }

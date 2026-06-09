@@ -6,7 +6,7 @@
 //! is just the pixel pipeline. Output is PPM today; PNG/PDF arrive with the
 //! approved image-encoder crate (M2/M8).
 
-use cerberus_layout::LayoutEngine;
+use cerberus_layout::{ImageProvider, LayoutEngine};
 use cerberus_paint::{Framebuffer, Rasterizer, TextShaper};
 use cerberus_style::StyledDom;
 use cerberus_types::{Color, Size};
@@ -21,8 +21,9 @@ pub fn render_document(
     layout: &mut dyn LayoutEngine,
     shaper: &dyn TextShaper,
     rasterizer: &dyn Rasterizer,
+    images: &dyn ImageProvider,
 ) -> Framebuffer {
-    let laid = layout.layout(styled, viewport, shaper);
+    let laid = layout.layout(styled, viewport, shaper, images);
     let mut fb = Framebuffer::new(viewport);
     fb.clear(background);
     rasterizer.rasterize(&laid.display, &mut fb);
@@ -51,7 +52,7 @@ mod tests {
     use super::*;
     use cerberus_css::CssEngine;
     use cerberus_dom::parse_trivial;
-    use cerberus_layout::BlockLayout;
+    use cerberus_layout::{BlockLayout, NoImages};
     use cerberus_paint::{BoxRasterizer, MonoShaper};
     use cerberus_style::StyleEngine;
 
@@ -66,6 +67,7 @@ mod tests {
             &mut BlockLayout::default(),
             &MonoShaper,
             &BoxRasterizer,
+            &NoImages,
         );
         assert_eq!(fb.size, viewport);
         // Background present...

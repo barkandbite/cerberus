@@ -1,0 +1,16 @@
+[package]
+name = "cerberus-image"
+description = "ImageDecoder adapter over the `image` crate (web formats), with a memory downscale cap (ADR-0005)."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+cerberus-types = { path = "../cerberus-types" }
+cerberus-paint = { path = "../cerberus-paint" }
+image = { version = "0.25", default-features = false, features = ["png", "jpeg", "gif", "webp", "bmp"] }

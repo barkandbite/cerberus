@@ -58,3 +58,19 @@ ab_glyph_rasterizer, ttf-parser, owned_ttf_parser) — and sufficient for Latin
 text. It implements both `TextShaper` and `Rasterizer` over the fixed font.
 `rustybuzz` (complex-script shaping) and `image` (decoding) remain to wire
 behind the same traits when needed. Verified: anti-aliased output, ~6 MB RSS.
+
+## Update — 2026-06-09: image decoder wired
+
+Shipped `cerberus-image`: the `image` crate (default features off; `png`, `jpeg`,
+`gif`, `webp`, `bmp`) behind `ImageDecoder`. No `image` type crosses the seam —
+`decode` returns `cerberus_paint::DecodedImage`. A **1600px long-edge cap**
+downscales oversized images at decode time so a single asset can't blow the RSS
+budget (memory is priority #1). The composition root fetches `<img>`
+sub-resources (on the network worker for the interactive browser, synchronously
+for the one-shot `render`) into a **per-page** store cleared on every
+navigation, and `cerberus-text`'s `Rasterizer` paints them with a
+nearest-neighbor alpha blend. Live-verified end-to-end (kernel.org 7/8,
+Wikipedia 8–11/N decoded); RSS 15–32 MB on image-heavy pages, within the 64 MB
+gate. SVG is vector, not a raster format `image` decodes, so SVG `<img>` are
+skipped (a resvg-based vector path is a later, separately-approved adapter).
+`rustybuzz` (complex-script shaping) is still the remaining piece.

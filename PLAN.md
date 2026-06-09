@@ -65,6 +65,7 @@ that names concrete adapters and wires them together via dependency injection.
 | `cerberus-layout` | Block/inline flow over the styled tree | `LayoutEngine` | none |
 | `cerberus-paint` | Display list, framebuffer, paint | `Rasterizer`, `TextShaper`, `ImageDecoder` | none |
 | `cerberus-text` | Software shaper + rasterizer (bundled Roboto) | impls `TextShaper`, `Rasterizer` | ab_glyph (ADR-0005) |
+| `cerberus-image` | Image-decoder adapter (web formats, 1600px cap) | impls `ImageDecoder` | image (ADR-0005) |
 | `cerberus-js` | JS engine seam | `JsEngine`, `JsEngineFactory` | none (V8 at M3) |
 | `cerberus-crypto` | Crypto seam + key material | `Aead`, `Kdf` | none (RustCrypto at M4) |
 | `cerberus-storage` | One storage env, sealed cookies, vault | `CookieStore`* , `Vault` | none |
@@ -252,9 +253,19 @@ green.
   `cerberus-css` (parser, selectors, specificity cascade, UA stylesheet — no
   deps) drive a styled block/inline layout: color, backgrounds, font
   size/weight, text-align, margins, lists, links (ADR-0007).
+- **Images (M2)** → `cerberus-image` wraps the `image` crate behind
+  `ImageDecoder` (PNG/JPEG/GIF/WebP/BMP), decoding capped at 1600px on the long
+  edge so one image can't blow the RSS budget. `<img>` sub-resources are fetched
+  on the network worker (interactive) or up front (one-shot `render`), keyed by
+  absolute URL in a **per-page** store that is cleared on every navigation;
+  layout sizes them from intrinsic or `width`/`height` and clamps to the content
+  box, with a gray placeholder while a sized image is in flight and `[alt]` text
+  otherwise. **Live-verified** end-to-end (kernel.org, Wikipedia); SVG isn't a
+  raster format and is skipped (ADR-0005).
 - **Speed-first / raw render** → Cerberus **ignores programmed delays**: CSS
   `opacity`/`animation`/`transition`/`transform`/`visibility` are not honored;
-  lazy-loading is ignored (images next slice); at M3 `setTimeout`/
+  lazy-loading is ignored — `data-src` is preferred over a placeholder `src` and
+  every image is fetched immediately, never on scroll; at M3 `setTimeout`/
   `IntersectionObserver` will be neutralized. Content renders immediately
   (ADR-0007).
 

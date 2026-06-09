@@ -7,6 +7,7 @@
 //! trivial built-in stubs so the M0 render path is end-to-end.
 
 use cerberus_types::{Color, FontStyle, Point, Rect, Size};
+use std::sync::Arc;
 
 /// One drawing primitive in a resolution-independent display list.
 #[derive(Clone, Debug)]
@@ -20,9 +21,11 @@ pub enum DisplayItem {
         color: Color,
         style: FontStyle,
     },
-    /// A decoded image placed into `rect` (referenced by id; decoding is the
-    /// `ImageDecoder`'s job).
-    Image { rect: Rect, image_id: u32 },
+    /// A decoded image (shared) to draw into `rect`.
+    Image {
+        rect: Rect,
+        image: Arc<DecodedImage>,
+    },
 }
 
 /// A flat, ordered list of paint primitives produced by layout.
