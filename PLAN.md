@@ -67,7 +67,8 @@ that names concrete adapters and wires them together via dependency injection.
 | `cerberus-farbling` | Per-head seeded noise + JS prologue | `FarblingProvider` | none |
 | `cerberus-identity` | The three heads; engine swap on switch | — | none |
 | `cerberus-ui` | Minimal toolbar (back/fwd/reload/stop/URL/head/settings) | — | none |
-| `cerberus-shell` | Platform surface (windowing) seam | `PlatformSurface` | none; `cerberus-shell-winit` adapter (winit+softbuffer, ADR-0004) |
+| `cerberus-shell` | Platform surface + `FrameApp` seam | `PlatformSurface`, `FrameApp` | none |
+| `cerberus-shell-winit` | Windowing adapter (windowed/fullscreen) | drives `FrameApp` | winit, softbuffer (ADR-0004) |
 | `cerberus-headless` | Render-to-PPM/PNG, automation | — | none (PNG at M2) |
 | `cerberus-app` | Composition root + CLI + memory gate | — | none |
 

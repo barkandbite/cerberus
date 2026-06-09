@@ -10,7 +10,14 @@ repository.workspace = true
 [lints]
 workspace = true
 
+[features]
+# Windowing is on by default. Build with --no-default-features for a pure
+# headless binary that pulls none of the winit/softbuffer tree.
+default = ["windowing"]
+windowing = ["dep:cerberus-shell-winit"]
+
 [dependencies]
+cerberus-shell-winit = { path = "../cerberus-shell-winit", optional = true }
 cerberus-types = { path = "../cerberus-types" }
 cerberus-url = { path = "../cerberus-url" }
 cerberus-ui = { path = "../cerberus-ui" }

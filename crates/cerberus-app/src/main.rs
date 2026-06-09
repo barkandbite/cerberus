@@ -18,6 +18,7 @@ fn main() -> ExitCode {
     };
 
     match command {
+        "run" => cmd_run(rest),
         "render" => cmd_render(rest),
         "mem-gate" => cmd_mem_gate(rest),
         "version" | "--version" | "-V" => {
@@ -34,6 +35,26 @@ fn main() -> ExitCode {
             ExitCode::FAILURE
         }
     }
+}
+
+#[cfg(feature = "windowing")]
+fn cmd_run(args: &[String]) -> ExitCode {
+    let fullscreen = has_flag(args, "--fullscreen");
+    let app = cerberus_app::BrowserApp::new();
+    match cerberus_shell_winit::run(app, fullscreen) {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(e) => {
+            eprintln!("could not open a window: {e}");
+            eprintln!("(a display server is required; use `render` for headless output)");
+            ExitCode::FAILURE
+        }
+    }
+}
+
+#[cfg(not(feature = "windowing"))]
+fn cmd_run(_args: &[String]) -> ExitCode {
+    eprintln!("this build has no windowing support; rebuild with --features windowing");
+    ExitCode::FAILURE
 }
 
 fn cmd_render(args: &[String]) -> ExitCode {
@@ -120,10 +141,13 @@ fn print_usage() {
          USAGE:\n\
          \x20 cerberus <command> [options]\n\n\
          COMMANDS:\n\
-         \x20 render     Render a page to PPM and print a summary\n\
+         \x20 run        Open the browser in a window (needs a display)\n\
+         \x20 render     Render a page to PPM and print a summary (headless)\n\
          \x20 mem-gate   Render and assert resident memory within budget\n\
          \x20 version    Print the version\n\
          \x20 help       Print this help\n\n\
+         RUN OPTIONS:\n\
+         \x20 --fullscreen        start borderless-fullscreen (F11 toggles)\n\n\
          RENDER OPTIONS:\n\
          \x20 --url <URL>          default: cerberus:home\n\
          \x20 --out <FILE>         default: cerberus-home.ppm\n\

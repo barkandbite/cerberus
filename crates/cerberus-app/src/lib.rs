@@ -9,17 +9,19 @@
 //! present, with the consent and farbling seams exercised along the way.
 
 use cerberus_consent::{ConsentPolicy, Decision, DefaultDenyPolicy};
-use cerberus_dom::parse_trivial;
+use cerberus_dom::{parse_trivial, Document, Element, Node};
 use cerberus_headless::render_document;
 use cerberus_identity::{Head, HeadManager};
 use cerberus_js::NullJsEngineFactory;
 use cerberus_layout::BlockLayout;
 use cerberus_net::{BuiltinHttpClient, HttpClient};
-use cerberus_paint::{BoxRasterizer, Framebuffer, MonoShaper, Rasterizer};
-use cerberus_shell::{HeadlessSurface, PlatformSurface};
+use cerberus_paint::{
+    BoxRasterizer, DisplayItem, DisplayList, Framebuffer, MonoShaper, Rasterizer, TextShaper,
+};
+use cerberus_shell::{FrameApp, HeadlessSurface, PlatformSurface};
 use cerberus_storage::{Cookie, Group, StorageEnvironment};
-use cerberus_types::{Color, HeadId, InstanceId, Origin, RealmId, Size};
-use cerberus_ui::Toolbar;
+use cerberus_types::{Color, HeadId, InstanceId, Origin, Point, RealmId, Rect, Size};
+use cerberus_ui::{Toolbar, ToolbarAction};
 use cerberus_url::parse as parse_url;
 
 /// What to render and how.
@@ -211,6 +213,313 @@ pub fn render(config: &RenderConfig) -> Result<RenderOutcome, AppError> {
     })
 }
 
+/// An interactive, single-page browser: one toolbar over one page, with a
+/// linear history (Back/Forward), driven by the platform layer via [`FrameApp`].
+///
+/// Until the network stack lands (M1) it serves the built-in `cerberus:` pages
+/// and shows a graceful error page for anything else, so the UI and navigation
+/// are fully exercisable now.
+pub struct BrowserApp {
+    heads: HeadManager,
+    storage: StorageEnvironment,
+    toolbar: Toolbar,
+    history: Vec<String>,
+    index: usize,
+    document: Document,
+    status: u16,
+    settings_open: bool,
+    background: Color,
+    last_size: Size,
+}
+
+impl BrowserApp {
+    /// Create a browser on the default heads, showing `cerberus:home`.
+    pub fn new() -> Self {
+        let heads = HeadManager::new(default_heads(), Box::new(NullJsEngineFactory));
+        let label = heads.active().label.clone();
+        let mut app = Self {
+            heads,
+            storage: StorageEnvironment::with_no_vault(),
+            toolbar: Toolbar::new(label),
+            history: Vec::new(),
+            index: 0,
+            document: empty_document(),
+            status: 0,
+            settings_open: false,
+            background: Color::WHITE,
+            last_size: Size::new(800, 600),
+        };
+        app.navigate("cerberus:home");
+        app
+    }
+
+    /// The active head's label (e.g. "work").
+    pub fn active_head(&self) -> &str {
+        self.heads.active().label.as_str()
+    }
+
+    /// Live JS engines (always 0 or 1 — the memory-first invariant).
+    pub fn engines_live(&self) -> usize {
+        self.heads.engines_live()
+    }
+
+    /// The current page's HTTP status (0 if the load failed locally).
+    pub fn status(&self) -> u16 {
+        self.status
+    }
+
+    fn load(&mut self, input: &str) {
+        self.toolbar.url_text = input.to_string();
+        self.toolbar.url_focused = false;
+        self.toolbar.loading = true;
+
+        self.document = match parse_url(input) {
+            Ok(url) => match BuiltinHttpClient.get(&url) {
+                Ok(resp) => {
+                    self.status = resp.status;
+                    if let Some(origin) = first_party_of(&url) {
+                        self.set_session_cookie(&origin);
+                    }
+                    parse_trivial(&String::from_utf8_lossy(&resp.body))
+                }
+                Err(e) => {
+                    self.status = 0;
+                    error_document(input, &format!("{e:?}"))
+                }
+            },
+            Err(e) => {
+                self.status = 0;
+                error_document(input, &e.to_string())
+            }
+        };
+
+        self.toolbar.loading = false;
+        self.update_nav();
+    }
+
+    fn set_session_cookie(&mut self, first_party: &Origin) {
+        let instance = self.heads.active().instance;
+        let _ = self.storage.instance(instance).set_cookie(
+            first_party,
+            Cookie::host("session", "demo", first_party.host.clone()),
+            Group::Active,
+        );
+    }
+
+    fn navigate(&mut self, input: &str) {
+        if !self.history.is_empty() {
+            self.history.truncate(self.index + 1);
+        }
+        self.history.push(input.to_string());
+        self.index = self.history.len() - 1;
+        self.load(input);
+    }
+
+    fn back(&mut self) -> bool {
+        if self.index == 0 {
+            return false;
+        }
+        self.index -= 1;
+        let url = self.history[self.index].clone();
+        self.load(&url);
+        true
+    }
+
+    fn forward(&mut self) -> bool {
+        if self.index + 1 >= self.history.len() {
+            return false;
+        }
+        self.index += 1;
+        let url = self.history[self.index].clone();
+        self.load(&url);
+        true
+    }
+
+    fn reload(&mut self) {
+        if let Some(url) = self.history.get(self.index).cloned() {
+            self.load(&url);
+        }
+    }
+
+    fn update_nav(&mut self) {
+        self.toolbar.can_back = self.index > 0;
+        self.toolbar.can_forward = self.index + 1 < self.history.len();
+    }
+
+    /// Switch to the next head: tears down the current JS engine and lazily
+    /// instantiates the new head's (keeps at most one engine live).
+    fn switch_head(&mut self) {
+        let next = (self.heads.active_index() + 1) % self.heads.heads().len();
+        let _ = self.heads.switch_to(next);
+        self.toolbar.head_label = self.heads.active().label.clone();
+        let _ = self.heads.engine();
+    }
+
+    fn handle(&mut self, action: ToolbarAction) -> bool {
+        match action {
+            ToolbarAction::Back => self.back(),
+            ToolbarAction::Forward => self.forward(),
+            ToolbarAction::Reload => {
+                self.reload();
+                true
+            }
+            ToolbarAction::Stop => {
+                self.toolbar.loading = false;
+                true
+            }
+            ToolbarAction::FocusUrl => {
+                self.toolbar.url_focused = true;
+                true
+            }
+            ToolbarAction::Navigate(url) => {
+                self.navigate(&url);
+                true
+            }
+            ToolbarAction::SwitchHead => {
+                self.switch_head();
+                true
+            }
+            ToolbarAction::OpenSettings => {
+                self.settings_open = !self.settings_open;
+                true
+            }
+            ToolbarAction::None => false,
+        }
+    }
+}
+
+impl Default for BrowserApp {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl FrameApp for BrowserApp {
+    fn title(&self) -> String {
+        format!("Cerberus — {}", self.toolbar.head_label)
+    }
+
+    fn render_frame(&mut self, size: Size) -> Framebuffer {
+        self.last_size = size;
+        let content = self.toolbar.content_size(size);
+
+        let mut layout = BlockLayout::default();
+        let page = render_document(
+            &self.document,
+            content,
+            self.background,
+            &mut layout,
+            &MonoShaper,
+            &BoxRasterizer,
+        );
+
+        let mut fb = Framebuffer::new(size);
+        fb.clear(self.background);
+        fb.blit(self.toolbar.content_origin(), &page);
+        BoxRasterizer.rasterize(&self.toolbar.paint(size, &MonoShaper), &mut fb);
+        if self.settings_open {
+            paint_settings_overlay(&mut fb, size);
+        }
+        fb
+    }
+
+    fn pointer_down(&mut self, x: i32, y: i32) -> bool {
+        if self.settings_open {
+            self.settings_open = false;
+            return true;
+        }
+        let action = self.toolbar.hit_test(self.last_size, x, y);
+        if action == ToolbarAction::None && self.toolbar.url_focused {
+            self.toolbar.url_focused = false;
+            return true;
+        }
+        self.handle(action)
+    }
+
+    fn text_input(&mut self, c: char) -> bool {
+        if self.toolbar.url_focused {
+            self.toolbar.type_char(c);
+            return true;
+        }
+        false
+    }
+
+    fn submit(&mut self) -> bool {
+        if self.toolbar.url_focused {
+            let action = self.toolbar.submit_url();
+            return self.handle(action);
+        }
+        false
+    }
+
+    fn backspace(&mut self) -> bool {
+        if self.toolbar.url_focused {
+            self.toolbar.backspace();
+            return true;
+        }
+        false
+    }
+}
+
+fn empty_document() -> Document {
+    Document {
+        root: Element::new("#root"),
+    }
+}
+
+fn first_party_of(url: &cerberus_url::Url) -> Option<Origin> {
+    url.origin().or_else(|| {
+        url.opaque
+            .as_ref()
+            .map(|o| Origin::new(url.scheme.clone(), o.clone(), None))
+    })
+}
+
+fn error_document(url: &str, message: &str) -> Document {
+    let mut body = Element::new("body");
+    for (tag, text) in [
+        ("h1", "Cannot load page".to_string()),
+        ("p", url.to_string()),
+        ("p", message.to_string()),
+    ] {
+        let mut el = Element::new(tag);
+        el.children.push(Node::Text(text));
+        body.children.push(Node::Element(el));
+    }
+    let mut root = Element::new("#root");
+    root.children.push(Node::Element(body));
+    Document { root }
+}
+
+/// Paint a simple centered settings panel (placeholder; real settings at M5+).
+fn paint_settings_overlay(fb: &mut Framebuffer, size: Size) {
+    let pw = size.w * 3 / 5;
+    let ph = size.h * 3 / 5;
+    let px = (size.w.saturating_sub(pw) / 2) as i32;
+    let py = (size.h.saturating_sub(ph) / 2) as i32;
+
+    let mut list = DisplayList::new();
+    list.push(DisplayItem::Rect {
+        rect: Rect::new(px - 1, py - 1, pw + 2, ph + 2),
+        color: Color::rgb(0x40, 0x40, 0x40),
+    });
+    list.push(DisplayItem::Rect {
+        rect: Rect::new(px, py, pw, ph),
+        color: Color::rgb(0xFA, 0xFA, 0xFA),
+    });
+    list.push(DisplayItem::Glyphs {
+        origin: Point::new(px + 12, py + 12),
+        glyphs: MonoShaper.shape("Settings", 20),
+        color: Color::BLACK,
+    });
+    list.push(DisplayItem::Glyphs {
+        origin: Point::new(px + 12, py + 44),
+        glyphs: MonoShaper.shape("identities | vault | consent | farbling (coming soon)", 14),
+        color: Color::rgb(0x50, 0x50, 0x50),
+    });
+    BoxRasterizer.rasterize(&list, fb);
+}
+
 /// Resident set size in kilobytes, read from `/proc/self/status` (Linux only).
 /// Returns `None` on platforms without procfs.
 pub fn resident_set_kb() -> Option<u64> {
@@ -244,5 +553,68 @@ mod tests {
         assert_eq!(outcome.third_party_decision, Decision::Deny);
         // A frame was produced at the requested size.
         assert_eq!(outcome.framebuffer.size, RenderConfig::default().viewport);
+    }
+
+    #[test]
+    fn browser_opens_on_home_with_lazy_engine() {
+        let b = BrowserApp::new();
+        assert_eq!(b.status(), 200);
+        assert_eq!(b.active_head(), "work");
+        assert_eq!(b.engines_live(), 0, "engine must be lazy until used");
+        assert!(!b.toolbar.can_back, "no history yet");
+    }
+
+    #[test]
+    fn browser_navigation_walks_history() {
+        let mut b = BrowserApp::new();
+        b.navigate("cerberus:about");
+        assert!(b.toolbar.can_back);
+        assert!(!b.toolbar.can_forward);
+
+        assert!(b.back());
+        assert_eq!(b.history[b.index], "cerberus:home");
+        assert!(b.toolbar.can_forward);
+
+        assert!(b.forward());
+        assert_eq!(b.history[b.index], "cerberus:about");
+        assert!(!b.forward(), "already at the front");
+    }
+
+    #[test]
+    fn browser_unknown_url_shows_error_page_not_crash() {
+        let mut b = BrowserApp::new();
+        b.navigate("https://example.com/");
+        assert_eq!(b.status(), 0);
+        assert!(b.document.root.text_content().contains("Cannot load page"));
+    }
+
+    #[test]
+    fn browser_switch_head_keeps_at_most_one_engine() {
+        let mut b = BrowserApp::new();
+        b.switch_head();
+        assert_eq!(b.active_head(), "personal");
+        assert_eq!(b.engines_live(), 1);
+        b.switch_head();
+        assert_eq!(b.active_head(), "throwaway");
+        assert_eq!(b.engines_live(), 1, "never more than one engine");
+    }
+
+    #[test]
+    fn browser_renders_toolbar_over_page() {
+        let mut b = BrowserApp::new();
+        let fb = b.render_frame(Size::new(400, 300));
+        assert_eq!(fb.size, Size::new(400, 300));
+        // Toolbar background near the top.
+        assert_eq!(fb.pixel(200, 1), Some(Color::rgb(0xEC, 0xEC, 0xEC)));
+        // Page background below the toolbar.
+        assert_eq!(fb.pixel(380, 200), Some(Color::WHITE));
+    }
+
+    #[test]
+    fn browser_url_typing_requires_focus() {
+        let mut b = BrowserApp::new();
+        assert!(!b.text_input('z'), "ignored until the URL box is focused");
+        assert!(b.pointer_down(200, 10), "click focuses the URL box");
+        assert!(b.text_input('z'));
     }
 }

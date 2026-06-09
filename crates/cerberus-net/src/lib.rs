@@ -77,21 +77,31 @@ pub enum NetError {
 pub const HOME_HTML: &str =
     "<html><body><h1>Cerberus</h1><p>three heads, one process</p></body></html>";
 
+/// The HTML served at `cerberus:about`. A second built-in page so navigation
+/// and history have somewhere to go before the network stack (M1).
+pub const ABOUT_HTML: &str =
+    "<html><body><h1>About Cerberus</h1><p>privacy-first, memory-lean</p></body></html>";
+
 /// Serves the internal `cerberus:` pages. Real network fetch is M1.
 #[derive(Debug, Default)]
 pub struct BuiltinHttpClient;
 
+fn builtin_html(html: &str) -> HttpResponse {
+    HttpResponse {
+        status: 200,
+        headers: vec![(
+            "content-type".to_string(),
+            "text/html; charset=utf-8".to_string(),
+        )],
+        body: html.as_bytes().to_vec(),
+    }
+}
+
 impl HttpClient for BuiltinHttpClient {
     fn get(&self, url: &Url) -> Result<HttpResponse, NetError> {
         match (url.is_builtin(), url.opaque.as_deref()) {
-            (true, Some("home")) => Ok(HttpResponse {
-                status: 200,
-                headers: vec![(
-                    "content-type".to_string(),
-                    "text/html; charset=utf-8".to_string(),
-                )],
-                body: HOME_HTML.as_bytes().to_vec(),
-            }),
+            (true, Some("home")) => Ok(builtin_html(HOME_HTML)),
+            (true, Some("about")) => Ok(builtin_html(ABOUT_HTML)),
             (true, Some(other)) => Err(NetError::Unsupported(format!(
                 "cerberus:{other} is unknown"
             ))),
