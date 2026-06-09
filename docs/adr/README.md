@@ -13,6 +13,7 @@ with the code so the reasoning travels with the repo.
 | [0003](0003-dependency-policy.md) | Dependency policy & initial approved list | Proposed |
 | [0004](0004-windowing.md) | Windowing & presentation (winit + softbuffer) | Accepted |
 | [0005](0005-rendering-stack.md) | Rendering stack (shaping, raster, image decode) | Accepted |
+| [0006](0006-networking.md) | M1 networking — HTTP/1.1, TLS (rustls), DoH (Quad9) | Accepted |
 
 ## When to write one
 

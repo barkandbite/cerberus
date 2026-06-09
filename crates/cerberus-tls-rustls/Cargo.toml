@@ -1,0 +1,16 @@
+[package]
+name = "cerberus-tls-rustls"
+description = "TlsProvider adapter: rustls (ring backend) + bundled webpki roots (ADR-0006)."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+cerberus-net = { path = "../cerberus-net" }
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
+webpki-roots = "1"

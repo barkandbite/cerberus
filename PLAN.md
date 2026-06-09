@@ -56,7 +56,9 @@ that names concrete adapters and wires them together via dependency injection.
 | --- | --- | --- | --- |
 | `cerberus-types` | Shared value types (ids, geometry, color, origin) | — | none |
 | `cerberus-url` | URL parsing (ours) | — | none |
-| `cerberus-net` | Networking | `TlsProvider`, `DnsResolver`, `HttpClient` | none (rustls at M1) |
+| `cerberus-net` | Networking: http1 codec, engine, router | `TlsProvider`, `DnsResolver`, `HttpClient` | none (bootstrapped) |
+| `cerberus-tls-rustls` | TLS adapter | impls `TlsProvider` | rustls + ring + webpki-roots (ADR-0006) |
+| `cerberus-dns-doh` | DNS-over-HTTPS adapter (Quad9) | impls `DnsResolver` | none (bootstrapped) |
 | `cerberus-dom` | DOM + HTML parser (ours) | — | none |
 | `cerberus-layout` | Layout | `LayoutEngine` | none |
 | `cerberus-paint` | Display list, framebuffer, paint | `Rasterizer`, `TextShaper`, `ImageDecoder` | none |
@@ -238,6 +240,11 @@ green.
   a tiny head switcher, and a Settings button. **No bookmarks. No tabs**
   (single-page; Back/Forward walk history). Identity switching and vault unlock
   live behind the head switcher / Settings. Implemented in `cerberus-ui`.
+- **Networking (M1)** → rustls + `ring` + bundled `webpki-roots`
+  (`TlsProvider`); **Quad9** DoH, DoH-only (`DnsResolver`); https-first →
+  user-risk-prompt → block for plaintext `http`; background-thread loads;
+  per-instance HTTP cache (ADR-0006). Fetch path **live-verified**; the cache,
+  http-consent prompt, and threading are the next commit.
 
 ### Still open (needs your sign-off)
 

@@ -70,6 +70,7 @@ fn cmd_render(args: &[String]) -> ExitCode {
         config.viewport = Size::new(w, h);
     }
     config.headed = has_flag(args, "--headed");
+    config.system_roots = has_flag(args, "--system-roots");
     config.background = Color::WHITE;
 
     let outcome = match render(&config) {
@@ -153,7 +154,8 @@ fn print_usage() {
          \x20 --out <FILE>         default: cerberus-home.ppm\n\
          \x20 --width <PX>         viewport width\n\
          \x20 --height <PX>        viewport height\n\
-         \x20 --headed            enable consent prompts\n\n\
+         \x20 --headed            enable consent prompts\n\
+         \x20 --system-roots      trust the OS cert store (TLS-inspecting proxies)\n\n\
          MEM-GATE OPTIONS:\n\
          \x20 --budget-mb <MB>     default: 64"
     );

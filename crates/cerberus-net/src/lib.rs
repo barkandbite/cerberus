@@ -13,6 +13,11 @@ use cerberus_url::Url;
 use std::io::{Read, Write};
 use std::net::IpAddr;
 
+pub mod http1;
+
+mod engine;
+pub use engine::{HttpEngine, Router, DEFAULT_USER_AGENT};
+
 /// A bidirectional byte stream (TCP, or TLS over TCP). Blanket-implemented so
 /// adapters can hand back any `Read + Write + Send` without naming a foreign
 /// type to callers.
@@ -70,6 +75,8 @@ pub enum NetError {
     Io(String),
     /// TLS handshake failure.
     Tls(String),
+    /// A malformed HTTP response (or too many redirects).
+    Protocol(String),
 }
 
 /// The HTML served at `cerberus:home`. Small on purpose — it exercises the

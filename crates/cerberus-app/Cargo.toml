@@ -23,6 +23,8 @@ cerberus-url = { path = "../cerberus-url" }
 cerberus-ui = { path = "../cerberus-ui" }
 cerberus-text = { path = "../cerberus-text" }
 cerberus-net = { path = "../cerberus-net" }
+cerberus-tls-rustls = { path = "../cerberus-tls-rustls" }
+cerberus-dns-doh = { path = "../cerberus-dns-doh" }
 cerberus-dom = { path = "../cerberus-dom" }
 cerberus-paint = { path = "../cerberus-paint" }
 cerberus-layout = { path = "../cerberus-layout" }

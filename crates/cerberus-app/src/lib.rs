@@ -9,16 +9,18 @@
 //! present, with the consent and farbling seams exercised along the way.
 
 use cerberus_consent::{ConsentPolicy, Decision, DefaultDenyPolicy};
+use cerberus_dns_doh::DohResolver;
 use cerberus_dom::{parse_trivial, Document, Element, Node};
 use cerberus_headless::render_document;
 use cerberus_identity::{Head, HeadManager};
 use cerberus_js::NullJsEngineFactory;
 use cerberus_layout::BlockLayout;
-use cerberus_net::{BuiltinHttpClient, HttpClient};
+use cerberus_net::{BuiltinHttpClient, HttpClient, Router};
 use cerberus_paint::{DisplayItem, DisplayList, Framebuffer, Rasterizer, TextShaper};
 use cerberus_shell::{FrameApp, HeadlessSurface, PlatformSurface};
 use cerberus_storage::{Cookie, Group, StorageEnvironment};
 use cerberus_text::TextEngine;
+use cerberus_tls_rustls::RustlsProvider;
 use cerberus_types::{Color, HeadId, InstanceId, Origin, Point, RealmId, Rect, Size};
 use cerberus_ui::{Toolbar, ToolbarAction};
 use cerberus_url::parse as parse_url;
@@ -31,6 +33,9 @@ pub struct RenderConfig {
     pub background: Color,
     /// Headed mode raises consent prompts; headless denies third-party silently.
     pub headed: bool,
+    /// Trust the OS root store instead of the bundled roots (for TLS-inspecting
+    /// proxies). Off by default.
+    pub system_roots: bool,
 }
 
 impl Default for RenderConfig {
@@ -40,6 +45,7 @@ impl Default for RenderConfig {
             viewport: Size::new(800, 600),
             background: Color::WHITE,
             headed: false,
+            system_roots: false,
         }
     }
 }
@@ -108,7 +114,23 @@ pub fn default_heads() -> Vec<Head> {
     ]
 }
 
-/// Run the full M0 render pipeline and return a summary plus the frame.
+/// Build the network client: built-in `cerberus:` pages are served locally;
+/// `http(s)` goes through our HTTP engine over rustls TLS + Quad9 DoH.
+pub fn network_client(system_roots: bool) -> Router {
+    let provider = || {
+        if system_roots {
+            RustlsProvider::with_system_roots().unwrap_or_default()
+        } else {
+            RustlsProvider::new()
+        }
+    };
+    Router::new(
+        Box::new(provider()),
+        Box::new(DohResolver::quad9(Box::new(provider()))),
+    )
+}
+
+/// Run the full render pipeline and return a summary plus the frame.
 pub fn render(config: &RenderConfig) -> Result<RenderOutcome, AppError> {
     let url = parse_url(&config.url).map_err(|e| AppError::Url(e.to_string()))?;
 
@@ -148,10 +170,13 @@ pub fn render(config: &RenderConfig) -> Result<RenderOutcome, AppError> {
         .evaluate(active_instance, &third_party, &first_party)
         .decision;
 
-    // --- Fetch (built-in client until M1) and parse. ---
-    let response = BuiltinHttpClient
-        .get(&url)
-        .map_err(|e| AppError::Net(format!("{e:?}")))?;
+    // --- Fetch: built-in pages locally, http(s) over the real network stack. ---
+    let response = if url.is_builtin() {
+        BuiltinHttpClient.get(&url)
+    } else {
+        network_client(config.system_roots).get(&url)
+    }
+    .map_err(|e| AppError::Net(format!("{e:?}")))?;
     let body = String::from_utf8_lossy(&response.body);
     let document = parse_trivial(&body);
 
