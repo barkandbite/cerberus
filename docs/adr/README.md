@@ -11,6 +11,8 @@ with the code so the reasoning travels with the repo.
 | [0001](0001-architecture-and-trait-boundaries.md) | Architecture & module/trait boundaries | Proposed |
 | [0002](0002-js-engine.md) | JavaScript engine choice (V8 vs SpiderMonkey vs QuickJS) | Proposed |
 | [0003](0003-dependency-policy.md) | Dependency policy & initial approved list | Proposed |
+| [0004](0004-windowing.md) | Windowing & presentation (winit + softbuffer) | Accepted |
+| [0005](0005-rendering-stack.md) | Rendering stack (shaping, raster, image decode) | Accepted |
 
 ## When to write one
 

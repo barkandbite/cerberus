@@ -1,0 +1,50 @@
+# ADR-0005: Rendering stack — text shaping, font rasterization, image decoding
+
+- Status: Accepted
+- Date: 2026-06-09
+- Deciders: bbarker@barkbite.org (approved "full stack"), engineering
+
+## Context
+
+"Properly" rendering real pages means turning text into shaped, rasterized
+glyphs and decoding images — all historically large CVE surfaces. Per ADR-0003
+these are exactly the places we lean on audited crates, each behind one of our
+paint traits (`TextShaper`, `Rasterizer`, `ImageDecoder` in `cerberus-paint`).
+
+## Decision
+
+Approve the full visual stack, each wrapped in an adapter crate behind its trait:
+
+- **Text shaping:** `rustybuzz` (pure-Rust HarfBuzz port) + `ttf-parser` for font
+  parsing → `TextShaper`.
+- **Glyph rasterization:** `swash` (scaling, hinting, rasterization, incl. color/
+  emoji) → the glyph path of `Rasterizer`. `ab_glyph`/`fontdue` are the lighter
+  fallbacks if swash proves heavy.
+- **Image decoding:** the `image` crate facade for breadth now; revisit the
+  leaner `zune-*` decoders if footprint/RSS demands → `ImageDecoder`.
+
+### Bundle fonts; do NOT enumerate system fonts
+
+We ship a fixed, **bundled** libre font set and do not read or enumerate the
+user's installed fonts. Two reasons:
+
+1. **Anti-fingerprinting.** Installed-font lists and metrics are a major
+   fingerprinting vector; enumerating system fonts would directly undercut the
+   farbling/anti-tracking goal. Font-metric farbling (M6) perturbs measurements
+   *on top of* the fixed bundle.
+2. **Reproducible rendering** across machines (and for headless PNG output).
+
+## Consequences
+
+- **Easier:** legible real text and images; complex-script shaping; deterministic
+  output.
+- **Costs:** a meaningfully larger dependency tree and higher RSS — **recalibrate
+  the memory budget** when these land (M2). Each adapter confines its `unsafe`
+  and is individually swappable (e.g. swash → ab_glyph) with no caller changes.
+
+## Alternatives considered
+
+- **`cosmic-text`:** bundles shaping + layout + rasterization, but overlaps our
+  own `LayoutEngine` and would blur that boundary. Rejected for now.
+- **System font discovery (`font-kit`/`fontdb` over installed fonts):** rejected
+  for the fingerprinting reason above — a curated bundle is a feature, not a gap.

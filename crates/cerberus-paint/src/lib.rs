@@ -111,6 +111,26 @@ impl Framebuffer {
             self.rgba[idx + 3],
         ))
     }
+
+    /// Copy `src` into this framebuffer with its top-left at `dest` (opaque
+    /// copy, clipped to bounds). Used to composite the page under the chrome.
+    pub fn blit(&mut self, dest: Point, src: &Framebuffer) {
+        for sy in 0..src.size.h {
+            let dy = dest.y + sy as i32;
+            if dy < 0 || dy as u32 >= self.size.h {
+                continue;
+            }
+            for sx in 0..src.size.w {
+                let dx = dest.x + sx as i32;
+                if dx < 0 || dx as u32 >= self.size.w {
+                    continue;
+                }
+                let si = ((sy * src.size.w + sx) * 4) as usize;
+                let di = ((dy as u32 * self.size.w + dx as u32) * 4) as usize;
+                self.rgba[di..di + 4].copy_from_slice(&src.rgba[si..si + 4]);
+            }
+        }
+    }
 }
 
 /// A decoded raster image.

@@ -6,6 +6,7 @@ version = 4
 name = "cerberus-app"
 version = "0.0.0"
 dependencies = [
+ "cerberus-chrome",
  "cerberus-consent",
  "cerberus-dom",
  "cerberus-farbling",
@@ -19,6 +20,14 @@ dependencies = [
  "cerberus-storage",
  "cerberus-types",
  "cerberus-url",
+]
+
+[[package]]
+name = "cerberus-chrome"
+version = "0.0.0"
+dependencies = [
+ "cerberus-paint",
+ "cerberus-types",
 ]
 
 [[package]]

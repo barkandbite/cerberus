@@ -69,6 +69,10 @@ fn cmd_render(args: &[String]) -> ExitCode {
         outcome.url, outcome.viewport.w, outcome.viewport.h
     );
     println!("  http status     : {}", outcome.status);
+    println!(
+        "  chrome + page   : 36px toolbar + {}x{} content",
+        outcome.content_size.w, outcome.content_size.h
+    );
     println!("  active head     : {}", outcome.active_head);
     println!(
         "  js engine       : {} (engines live: {}, realms: {})",

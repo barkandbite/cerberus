@@ -8,6 +8,7 @@
 //! identities → sealed storage → (built-in) fetch → parse → layout → paint →
 //! present, with the consent and farbling seams exercised along the way.
 
+use cerberus_chrome::Chrome;
 use cerberus_consent::{ConsentPolicy, Decision, DefaultDenyPolicy};
 use cerberus_dom::parse_trivial;
 use cerberus_headless::render_document;
@@ -15,7 +16,7 @@ use cerberus_identity::{Head, HeadManager};
 use cerberus_js::NullJsEngineFactory;
 use cerberus_layout::BlockLayout;
 use cerberus_net::{BuiltinHttpClient, HttpClient};
-use cerberus_paint::{BoxRasterizer, Framebuffer, MonoShaper};
+use cerberus_paint::{BoxRasterizer, Framebuffer, MonoShaper, Rasterizer};
 use cerberus_shell::{HeadlessSurface, PlatformSurface};
 use cerberus_storage::{Cookie, Group, StorageEnvironment};
 use cerberus_types::{Color, HeadId, InstanceId, Origin, RealmId, Size};
@@ -48,6 +49,7 @@ pub struct RenderOutcome {
     pub url: String,
     pub status: u16,
     pub viewport: Size,
+    pub content_size: Size,
     pub active_head: String,
     pub engine_name: String,
     pub engines_live: usize,
@@ -152,15 +154,29 @@ pub fn render(config: &RenderConfig) -> Result<RenderOutcome, AppError> {
     let body = String::from_utf8_lossy(&response.body);
     let document = parse_trivial(&body);
 
-    // --- Layout + paint into a framebuffer. ---
+    // --- Chrome (minimal toolbar) over the page content. ---
+    let mut chrome = Chrome::new(active_label.clone());
+    chrome.url_text = config.url.clone();
+    let content = chrome.content_size(config.viewport);
+
+    // Lay out + paint the page into the content area only.
     let mut layout = BlockLayout::default();
-    let framebuffer = render_document(
+    let page = render_document(
         &document,
-        config.viewport,
+        content,
         config.background,
         &mut layout,
         &MonoShaper,
         &BoxRasterizer,
+    );
+
+    // Compose: page under the toolbar, chrome painted on top.
+    let mut framebuffer = Framebuffer::new(config.viewport);
+    framebuffer.clear(config.background);
+    framebuffer.blit(chrome.content_origin(), &page);
+    BoxRasterizer.rasterize(
+        &chrome.paint(config.viewport, &MonoShaper),
+        &mut framebuffer,
     );
 
     // --- Present via the platform surface seam (headless capture). ---
@@ -184,6 +200,7 @@ pub fn render(config: &RenderConfig) -> Result<RenderOutcome, AppError> {
         url: config.url.clone(),
         status: response.status,
         viewport: config.viewport,
+        content_size: content,
         active_head: active_label,
         engine_name,
         engines_live,

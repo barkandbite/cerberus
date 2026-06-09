@@ -66,7 +66,8 @@ that names concrete adapters and wires them together via dependency injection.
 | `cerberus-consent` | Third-party detection, default-deny, rules | `ConsentPolicy` | none |
 | `cerberus-farbling` | Per-head seeded noise + JS prologue | `FarblingProvider` | none |
 | `cerberus-identity` | The three heads; engine swap on switch | — | none |
-| `cerberus-shell` | Platform surface (windowing) seam | `PlatformSurface` | none (windowing TBD) |
+| `cerberus-chrome` | Minimal toolbar (back/fwd/reload/stop/URL/head/settings) | — | none |
+| `cerberus-shell` | Platform surface (windowing) seam | `PlatformSurface` | none; `cerberus-shell-winit` adapter (winit+softbuffer, ADR-0004) |
 | `cerberus-headless` | Render-to-PPM/PNG, automation | — | none (PNG at M2) |
 | `cerberus-app` | Composition root + CLI + memory gate | — | none |
 
@@ -222,21 +223,32 @@ green.
 
 ---
 
-## 10. Open decisions (needs your sign-off)
+## 10. Decisions
 
-1. **Memory budget numbers** (§5) — ratify or adjust the proposed RSS budgets.
+### Resolved (owner sign-off, 2026-06-09)
+
+- **Windowing** → `winit` + `softbuffer` behind `PlatformSurface`, CPU-only
+  (ADR-0004). Windowed, fullscreen, and headless share one render→present path.
+- **Rendering stack** → full text shaping + font rasterization + image decoding,
+  with fonts **bundled** (system fonts never enumerated — anti-fingerprinting)
+  (ADR-0005).
+- **UI / chrome** → one minimal toolbar: Back, Forward, Refresh, Stop, a URL box,
+  a tiny head switcher, and a Settings button. **No bookmarks. No tabs**
+  (single-page; Back/Forward walk history). Identity switching and vault unlock
+  live behind the head switcher / Settings. Implemented in `cerberus-chrome`.
+
+### Still open (needs your sign-off)
+
+1. **Memory budget numbers** (§5) — ratify or adjust; recalibrates once winit +
+   the font/image stack land.
 2. **JS engine** — ratify V8-now/QuickJS-later (ADR-0002).
 3. **Vault crates** — approve the specific AEAD + Argon2id + zeroize crates
-   proposed in ADR-0003.
-4. **License** — `Cargo.toml`/`LICENSE` currently set to **Apache-2.0**
-   (recommended, permissive, patent grant) on the assumption of the V8 path.
-   Confirm, or choose MIT/Apache dual or (if SpiderMonkey) revisit for MPL.
-5. **Windowing dependency** — not yet chosen; headless surface ships today.
-   Approve an ADR for `winit`+`softbuffer` (or alternative) before the windowed
-   surface is built.
-6. **`CookieStore` as a named trait** — keep the structural `StorageEnvironment`
+   (ADR-0003).
+4. **License** — `Cargo.toml`/`LICENSE` set to **Apache-2.0** (provisional).
+   Confirm, or choose a MIT/Apache dual license.
+5. **`CookieStore` as a named trait** — keep the structural `StorageEnvironment`
    API, or lift it into an explicit `CookieStore` trait for uniformity (§2).
-7. **Edition** — pinned to Rust 2021 for conservatism; open to 2024.
+6. **Edition** — pinned to Rust 2021 for conservatism; open to 2024.
 
 ---
 

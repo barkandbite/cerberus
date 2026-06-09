@@ -13,6 +13,7 @@ workspace = true
 [dependencies]
 cerberus-types = { path = "../cerberus-types" }
 cerberus-url = { path = "../cerberus-url" }
+cerberus-chrome = { path = "../cerberus-chrome" }
 cerberus-net = { path = "../cerberus-net" }
 cerberus-dom = { path = "../cerberus-dom" }
 cerberus-paint = { path = "../cerberus-paint" }
