@@ -168,6 +168,30 @@ impl Color {
     pub const BLACK: Color = Color::rgb(0, 0, 0);
 }
 
+/// Font style for a run of text. Bold renders today (faux-bold); italic is
+/// tracked for the cascade and a future bold/italic font swap.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default, Hash)]
+pub struct FontStyle {
+    pub bold: bool,
+    pub italic: bool,
+}
+
+impl FontStyle {
+    /// Regular (non-bold, non-italic).
+    pub const REGULAR: FontStyle = FontStyle {
+        bold: false,
+        italic: false,
+    };
+
+    /// A bold style.
+    pub const fn bold() -> Self {
+        Self {
+            bold: true,
+            italic: false,
+        }
+    }
+}
+
 /// A web origin (scheme, host, optional port) used for site-boundary checks.
 #[derive(Clone, PartialEq, Eq, Hash, Debug)]
 pub struct Origin {

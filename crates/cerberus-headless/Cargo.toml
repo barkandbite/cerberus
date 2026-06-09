@@ -12,6 +12,10 @@ workspace = true
 
 [dependencies]
 cerberus-types = { path = "../cerberus-types" }
-cerberus-dom = { path = "../cerberus-dom" }
+cerberus-style = { path = "../cerberus-style" }
 cerberus-paint = { path = "../cerberus-paint" }
 cerberus-layout = { path = "../cerberus-layout" }
+
+[dev-dependencies]
+cerberus-dom = { path = "../cerberus-dom" }
+cerberus-css = { path = "../cerberus-css" }

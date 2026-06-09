@@ -9,6 +9,7 @@
 //! present, with the consent and farbling seams exercised along the way.
 
 use cerberus_consent::{ConsentPolicy, Decision, DefaultDenyPolicy};
+use cerberus_css::CssEngine;
 use cerberus_dns_doh::DohResolver;
 use cerberus_dom::{parse_trivial, Document, Element, Node};
 use cerberus_headless::render_document;
@@ -19,9 +20,10 @@ use cerberus_net::{BuiltinHttpClient, HttpCache, HttpClient, HttpResponse, Route
 use cerberus_paint::{DisplayItem, DisplayList, Framebuffer, Rasterizer, TextShaper};
 use cerberus_shell::{FrameApp, HeadlessSurface, PlatformSurface, Waker};
 use cerberus_storage::{Cookie, Group, StorageEnvironment};
+use cerberus_style::{StyleEngine, StyledDom};
 use cerberus_text::TextEngine;
 use cerberus_tls_rustls::RustlsProvider;
-use cerberus_types::{Color, HeadId, InstanceId, Origin, Point, RealmId, Rect, Size};
+use cerberus_types::{Color, FontStyle, HeadId, InstanceId, Origin, Point, RealmId, Rect, Size};
 use cerberus_ui::{Toolbar, ToolbarAction};
 use cerberus_url::{join as join_url, parse as parse_url, Url};
 use std::sync::mpsc::{Receiver, Sender};
@@ -182,6 +184,7 @@ pub fn render(config: &RenderConfig) -> Result<RenderOutcome, AppError> {
     .map_err(|e| AppError::Net(format!("{e:?}")))?;
     let body = String::from_utf8_lossy(&response.body);
     let document = parse_trivial(&body);
+    let styled = CssEngine::new().style(&document);
 
     // --- Toolbar (minimal UI) over the page content, with real fonts. ---
     let text = TextEngine::new();
@@ -192,7 +195,7 @@ pub fn render(config: &RenderConfig) -> Result<RenderOutcome, AppError> {
     // Lay out + paint the page into the content area only.
     let mut layout = BlockLayout::default();
     let page = render_document(
-        &document,
+        &styled,
         content,
         config.background,
         &mut layout,
@@ -367,9 +370,11 @@ pub struct BrowserApp {
     loader: Box<dyn PageLoader>,
     toolbar: Toolbar,
     text: TextEngine,
+    style_engine: CssEngine,
     history: Vec<String>,
     index: usize,
     document: Document,
+    styled: StyledDom,
     status: u16,
     /// The committed URL of the current page (base for resolving links).
     current_url: Option<Url>,
@@ -403,6 +408,8 @@ impl BrowserApp {
     fn with_loader(loader: Box<dyn PageLoader>) -> Self {
         let heads = HeadManager::new(default_heads(), Box::new(NullJsEngineFactory));
         let label = heads.active().label.clone();
+        let style_engine = CssEngine::new();
+        let styled = style_engine.style(&empty_document());
         let mut app = Self {
             heads,
             storage: StorageEnvironment::with_no_vault(),
@@ -410,9 +417,11 @@ impl BrowserApp {
             loader,
             toolbar: Toolbar::new(label),
             text: TextEngine::new(),
+            style_engine,
             history: Vec::new(),
             index: 0,
             document: empty_document(),
+            styled,
             status: 0,
             current_url: None,
             page_title: None,
@@ -475,7 +484,7 @@ impl BrowserApp {
         }
         self.toolbar.url_text = target.clone();
         self.toolbar.loading = true;
-        self.document = loading_document(&target);
+        self.set_document(loading_document(&target));
         let id = self.next_id;
         self.next_id += 1;
         self.pending = Some(Pending { id, http_fallback });
@@ -492,6 +501,13 @@ impl BrowserApp {
             },
             Err(e) => self.show_error(url, &e.to_string()),
         }
+    }
+
+    /// Set + style the current document (one cascade per page load).
+    fn set_document(&mut self, doc: Document) {
+        self.page_title = doc.title();
+        self.styled = self.style_engine.style(&doc);
+        self.document = doc;
     }
 
     fn commit_response(
@@ -515,8 +531,7 @@ impl BrowserApp {
             );
         }
         self.status = status;
-        self.document = parse_trivial(&String::from_utf8_lossy(body));
-        self.page_title = self.document.title();
+        self.set_document(parse_trivial(&String::from_utf8_lossy(body)));
         self.toolbar.url_text = url.to_string();
         self.toolbar.loading = false;
         self.insecure_prompt = None;
@@ -531,8 +546,7 @@ impl BrowserApp {
 
     fn show_error(&mut self, url: &str, message: &str) {
         self.status = 0;
-        self.document = error_document(url, message);
-        self.page_title = None;
+        self.set_document(error_document(url, message));
         self.current_url = parse_url(url).ok();
         self.toolbar.url_text = url.to_string();
         self.toolbar.loading = false;
@@ -719,7 +733,7 @@ impl FrameApp for BrowserApp {
         let origin = self.toolbar.content_origin();
 
         let mut layout = BlockLayout::default();
-        let laid = layout.layout(&self.document, content, &self.text);
+        let laid = layout.layout(&self.styled, content, &self.text);
 
         let mut page = Framebuffer::new(content);
         page.clear(self.background);
@@ -882,6 +896,7 @@ fn paint_insecure_button(fb: &mut Framebuffer, text: &TextEngine) -> Rect {
         origin: Point::new(rect.x + 8, rect.y + 8),
         glyphs: text.shape("Load anyway (insecure)", 16),
         color: Color::WHITE,
+        style: FontStyle::REGULAR,
     });
     text.rasterize(&list, fb);
     rect
@@ -912,11 +927,13 @@ fn paint_settings_overlay(
         origin: Point::new(px + 12, py + 20),
         glyphs: shaper.shape("Settings", 22),
         color: Color::BLACK,
+        style: FontStyle::REGULAR,
     });
     list.push(DisplayItem::Glyphs {
         origin: Point::new(px + 12, py + 52),
         glyphs: shaper.shape("identities | vault | consent | farbling (coming soon)", 14),
         color: Color::rgb(0x50, 0x50, 0x50),
+        style: FontStyle::REGULAR,
     });
     raster.rasterize(&list, fb);
 }

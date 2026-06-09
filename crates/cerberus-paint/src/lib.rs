@@ -6,7 +6,7 @@
 //! approved crates land at M2; this crate ships only the traits plus deliberately
 //! trivial built-in stubs so the M0 render path is end-to-end.
 
-use cerberus_types::{Color, Point, Rect, Size};
+use cerberus_types::{Color, FontStyle, Point, Rect, Size};
 
 /// One drawing primitive in a resolution-independent display list.
 #[derive(Clone, Debug)]
@@ -18,6 +18,7 @@ pub enum DisplayItem {
         origin: Point,
         glyphs: Vec<GlyphBox>,
         color: Color,
+        style: FontStyle,
     },
     /// A decoded image placed into `rect` (referenced by id; decoding is the
     /// `ImageDecoder`'s job).
@@ -232,6 +233,7 @@ impl Rasterizer for BoxRasterizer {
                     origin,
                     glyphs,
                     color,
+                    ..
                 } => {
                     let mut pen_x = origin.x;
                     for g in glyphs {
@@ -271,6 +273,7 @@ mod tests {
             origin: Point::new(0, 0),
             glyphs,
             color: Color::BLACK,
+            style: FontStyle::REGULAR,
         });
         let mut fb = Framebuffer::new(Size::new(16, 16));
         fb.clear(Color::WHITE);

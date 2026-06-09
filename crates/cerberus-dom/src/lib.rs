@@ -99,10 +99,15 @@ pub fn parse_trivial(input: &str) -> Document {
     for token in tokenize(input) {
         match token {
             Token::Text(text) => {
-                let cleaned = clean_text(&text);
-                if !cleaned.is_empty() {
-                    if let Some(top) = stack.last_mut() {
-                        top.children.push(Node::Text(cleaned));
+                if let Some(top) = stack.last_mut() {
+                    if top.tag == "style" {
+                        // Keep CSS verbatim for the style engine.
+                        top.children.push(Node::Text(text));
+                    } else {
+                        let cleaned = clean_text(&text);
+                        if !cleaned.is_empty() {
+                            top.children.push(Node::Text(cleaned));
+                        }
                     }
                 }
             }
@@ -208,17 +213,26 @@ fn tokenize(input: &str) -> Vec<Token> {
             // as page text. Skip to the matching close tag and drop the body.
             if name == "script" || name == "style" {
                 let close = format!("</{name}");
+                let content: &str;
                 match find_ci(rest, &close) {
                     Some(pos) => {
+                        content = &rest[..pos];
                         let after = &rest[pos..];
                         rest = match after.find('>') {
                             Some(gt2) => &after[gt2 + 1..],
                             None => "",
                         };
                     }
-                    None => rest = "",
+                    None => {
+                        content = rest;
+                        rest = "";
+                    }
                 }
                 tokens.push(Token::Open(name.clone(), attrs));
+                // Keep <style> text (the CSS engine reads it); drop <script>.
+                if name == "style" {
+                    tokens.push(Token::Text(content.to_string()));
+                }
                 tokens.push(Token::Close(name));
             } else {
                 tokens.push(Token::Open(name, attrs));
@@ -407,7 +421,10 @@ mod tests {
             text.contains("a & b <c> A"),
             "entities decoded; got {text:?}"
         );
-        assert!(!text.contains("color:red"), "style content dropped");
+        assert!(
+            text.contains("color:red"),
+            "style text kept for the CSS engine"
+        );
         assert!(!text.contains("if ("), "script content dropped");
         assert!(!text.contains("hidden"), "comment dropped");
         assert!(text.contains("done"));

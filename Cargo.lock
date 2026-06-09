@@ -176,6 +176,7 @@ name = "cerberus-app"
 version = "0.0.0"
 dependencies = [
  "cerberus-consent",
+ "cerberus-css",
  "cerberus-dns-doh",
  "cerberus-dom",
  "cerberus-farbling",
@@ -188,6 +189,7 @@ dependencies = [
  "cerberus-shell",
  "cerberus-shell-winit",
  "cerberus-storage",
+ "cerberus-style",
  "cerberus-text",
  "cerberus-tls-rustls",
  "cerberus-types",
@@ -205,6 +207,15 @@ dependencies = [
 [[package]]
 name = "cerberus-crypto"
 version = "0.0.0"
+
+[[package]]
+name = "cerberus-css"
+version = "0.0.0"
+dependencies = [
+ "cerberus-dom",
+ "cerberus-style",
+ "cerberus-types",
+]
 
 [[package]]
 name = "cerberus-dns-doh"
@@ -225,9 +236,11 @@ version = "0.0.0"
 name = "cerberus-headless"
 version = "0.0.0"
 dependencies = [
+ "cerberus-css",
  "cerberus-dom",
  "cerberus-layout",
  "cerberus-paint",
+ "cerberus-style",
  "cerberus-types",
 ]
 
@@ -251,8 +264,10 @@ dependencies = [
 name = "cerberus-layout"
 version = "0.0.0"
 dependencies = [
+ "cerberus-css",
  "cerberus-dom",
  "cerberus-paint",
+ "cerberus-style",
  "cerberus-types",
 ]
 
@@ -295,6 +310,14 @@ name = "cerberus-storage"
 version = "0.0.0"
 dependencies = [
  "cerberus-crypto",
+ "cerberus-types",
+]
+
+[[package]]
+name = "cerberus-style"
+version = "0.0.0"
+dependencies = [
+ "cerberus-dom",
  "cerberus-types",
 ]
 

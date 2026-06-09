@@ -6,23 +6,23 @@
 //! is just the pixel pipeline. Output is PPM today; PNG/PDF arrive with the
 //! approved image-encoder crate (M2/M8).
 
-use cerberus_dom::Document;
 use cerberus_layout::LayoutEngine;
 use cerberus_paint::{Framebuffer, Rasterizer, TextShaper};
+use cerberus_style::StyledDom;
 use cerberus_types::{Color, Size};
 use std::io::{self, Write};
 use std::path::Path;
 
-/// Render a document to a framebuffer: lay out, clear to `background`, paint.
+/// Render a styled document to a framebuffer: lay out, clear, paint.
 pub fn render_document(
-    doc: &Document,
+    styled: &StyledDom,
     viewport: Size,
     background: Color,
     layout: &mut dyn LayoutEngine,
     shaper: &dyn TextShaper,
     rasterizer: &dyn Rasterizer,
 ) -> Framebuffer {
-    let laid = layout.layout(doc, viewport, shaper);
+    let laid = layout.layout(styled, viewport, shaper);
     let mut fb = Framebuffer::new(viewport);
     fb.clear(background);
     rasterizer.rasterize(&laid.display, &mut fb);
@@ -49,16 +49,18 @@ pub fn write_ppm_to(out: &mut impl Write, fb: &Framebuffer) -> io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use cerberus_css::CssEngine;
     use cerberus_dom::parse_trivial;
     use cerberus_layout::BlockLayout;
     use cerberus_paint::{BoxRasterizer, MonoShaper};
+    use cerberus_style::StyleEngine;
 
     #[test]
     fn renders_a_nonempty_frame_with_background() {
-        let doc = parse_trivial("<h1>Cerberus</h1>");
+        let styled = CssEngine::new().style(&parse_trivial("<h1>Cerberus</h1>"));
         let viewport = Size::new(200, 80);
         let fb = render_document(
-            &doc,
+            &styled,
             viewport,
             Color::WHITE,
             &mut BlockLayout::default(),

@@ -12,7 +12,7 @@
 
 use ab_glyph::{point, Font, FontRef, GlyphId, PxScale, ScaleFont};
 use cerberus_paint::{DisplayItem, DisplayList, Framebuffer, GlyphBox, Rasterizer, TextShaper};
-use cerberus_types::{Color, Point};
+use cerberus_types::{Color, FontStyle, Point};
 
 /// The bundled font (Roboto Regular, Apache-2.0). See `assets/Roboto-LICENSE.txt`.
 const FONT_BYTES: &[u8] = include_bytes!("../assets/Roboto-Regular.ttf");
@@ -29,7 +29,14 @@ impl TextEngine {
         Self { font }
     }
 
-    fn draw_run(&self, origin: Point, glyphs: &[GlyphBox], color: Color, target: &mut Framebuffer) {
+    fn draw_run(
+        &self,
+        origin: Point,
+        glyphs: &[GlyphBox],
+        color: Color,
+        style: FontStyle,
+        target: &mut Framebuffer,
+    ) {
         let mut pen_x = origin.x as f32;
         for g in glyphs {
             let scale = PxScale::from(g.px.max(1) as f32);
@@ -43,6 +50,11 @@ impl TextEngine {
                     let x = bounds.min.x as i32 + gx as i32;
                     let y = bounds.min.y as i32 + gy as i32;
                     target.blend_pixel(x, y, color, coverage);
+                    // Faux-bold: smear one pixel to the right. (Real bold/italic
+                    // fonts are a later asset swap behind this same path.)
+                    if style.bold {
+                        target.blend_pixel(x + 1, y, color, coverage);
+                    }
                 });
             }
             pen_x += g.advance as f32;
@@ -88,7 +100,8 @@ impl Rasterizer for TextEngine {
                     origin,
                     glyphs,
                     color,
-                } => self.draw_run(*origin, glyphs, *color, target),
+                    style,
+                } => self.draw_run(*origin, glyphs, *color, *style, target),
             }
         }
     }
@@ -117,6 +130,7 @@ mod tests {
             origin: Point::new(2, 2),
             glyphs: engine.shape("A", 40),
             color: Color::BLACK,
+            style: FontStyle::REGULAR,
         });
         let mut fb = Framebuffer::new(Size::new(48, 48));
         fb.clear(Color::WHITE);

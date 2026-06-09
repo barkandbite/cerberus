@@ -11,7 +11,7 @@
 //! `TextShaper`, so they read correctly once a real font adapter lands.
 
 use cerberus_paint::{DisplayItem, DisplayList, TextShaper};
-use cerberus_types::{Color, Point, Rect, Size};
+use cerberus_types::{Color, FontStyle, Point, Rect, Size};
 
 /// Height of the single toolbar, in device pixels.
 pub const TOOLBAR_HEIGHT: u32 = 36;
@@ -201,6 +201,7 @@ impl Toolbar {
                     origin: Point::new(rect.x + 6, rect.y + 6),
                     glyphs,
                     color,
+                    style: FontStyle::REGULAR,
                 });
             }
         }

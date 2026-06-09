@@ -60,7 +60,9 @@ that names concrete adapters and wires them together via dependency injection.
 | `cerberus-tls-rustls` | TLS adapter | impls `TlsProvider` | rustls + ring + webpki-roots (ADR-0006) |
 | `cerberus-dns-doh` | DNS-over-HTTPS adapter (Quad9) | impls `DnsResolver` | none (bootstrapped) |
 | `cerberus-dom` | DOM + HTML parser (ours) | — | none |
-| `cerberus-layout` | Layout | `LayoutEngine` | none |
+| `cerberus-style` | Computed-style types + `StyleEngine` seam | `StyleEngine` | none |
+| `cerberus-css` | Our CSS engine (parser, cascade, UA sheet) | impls `StyleEngine` | none |
+| `cerberus-layout` | Block/inline flow over the styled tree | `LayoutEngine` | none |
 | `cerberus-paint` | Display list, framebuffer, paint | `Rasterizer`, `TextShaper`, `ImageDecoder` | none |
 | `cerberus-text` | Software shaper + rasterizer (bundled Roboto) | impls `TextShaper`, `Rasterizer` | ab_glyph (ADR-0005) |
 | `cerberus-js` | JS engine seam | `JsEngine`, `JsEngineFactory` | none (V8 at M3) |
@@ -246,6 +248,15 @@ green.
   loads (worker + event-loop `Waker`); per-instance HTTP cache (ADR-0006). Fetch
   path **live-verified**; the load state machine (upgrade/prompt/cache/Stop) is
   covered by hermetic tests.
+- **CSS / rendering (M2)** → our own `cerberus-style` (types + `StyleEngine`) +
+  `cerberus-css` (parser, selectors, specificity cascade, UA stylesheet — no
+  deps) drive a styled block/inline layout: color, backgrounds, font
+  size/weight, text-align, margins, lists, links (ADR-0007).
+- **Speed-first / raw render** → Cerberus **ignores programmed delays**: CSS
+  `opacity`/`animation`/`transition`/`transform`/`visibility` are not honored;
+  lazy-loading is ignored (images next slice); at M3 `setTimeout`/
+  `IntersectionObserver` will be neutralized. Content renders immediately
+  (ADR-0007).
 
 ### Still open (needs your sign-off)
 
