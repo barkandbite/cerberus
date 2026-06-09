@@ -22,10 +22,10 @@ pub fn render_document(
     shaper: &dyn TextShaper,
     rasterizer: &dyn Rasterizer,
 ) -> Framebuffer {
-    let list = layout.layout(doc, viewport, shaper);
+    let laid = layout.layout(doc, viewport, shaper);
     let mut fb = Framebuffer::new(viewport);
     fb.clear(background);
-    rasterizer.rasterize(&list, &mut fb);
+    rasterizer.rasterize(&laid.display, &mut fb);
     fb
 }
 

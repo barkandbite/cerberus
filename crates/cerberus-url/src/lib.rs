@@ -63,6 +63,28 @@ impl Url {
     }
 }
 
+impl fmt::Display for Url {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match &self.opaque {
+            Some(opaque) => write!(f, "{}:{}", self.scheme, opaque)?,
+            None => {
+                write!(f, "{}://{}", self.scheme, self.host)?;
+                if let Some(port) = self.port {
+                    write!(f, ":{port}")?;
+                }
+                write!(f, "{}", self.path)?;
+            }
+        }
+        if let Some(query) = &self.query {
+            write!(f, "?{query}")?;
+        }
+        if let Some(fragment) = &self.fragment {
+            write!(f, "#{fragment}")?;
+        }
+        Ok(())
+    }
+}
+
 /// Parse a URL string.
 pub fn parse(input: &str) -> Result<Url, UrlError> {
     let input = input.trim();
@@ -91,6 +113,51 @@ pub fn parse(input: &str) -> Result<Url, UrlError> {
             query: query.map(str::to_string),
             fragment: fragment.map(str::to_string),
         })
+    }
+}
+
+/// Resolve a possibly-relative reference (a link `href` or redirect `Location`)
+/// against `base`. Handles absolute, protocol-relative, root-relative,
+/// fragment-only, and path-relative references.
+pub fn join(base: &Url, reference: &str) -> Result<Url, UrlError> {
+    let r = reference.trim();
+    if r.is_empty() {
+        return Ok(base.clone());
+    }
+    if let Some(frag) = r.strip_prefix('#') {
+        let mut u = base.clone();
+        u.fragment = Some(frag.to_string());
+        return Ok(u);
+    }
+
+    let absolute = if has_scheme(r) {
+        r.to_string()
+    } else if let Some(rest) = r.strip_prefix("//") {
+        format!("{}://{}", base.scheme, rest)
+    } else if r.starts_with('/') {
+        format!("{}://{}{}", base.scheme, authority_of(base), r)
+    } else {
+        let dir = match base.path.rfind('/') {
+            Some(i) => &base.path[..=i],
+            None => "/",
+        };
+        format!("{}://{}{}{}", base.scheme, authority_of(base), dir, r)
+    };
+    parse(&absolute)
+}
+
+/// Whether `s` begins with a URL scheme (e.g. `https:`, `mailto:`).
+fn has_scheme(s: &str) -> bool {
+    match s.find(|c: char| !(c.is_ascii_alphanumeric() || c == '+' || c == '-' || c == '.')) {
+        Some(i) => i > 0 && s.as_bytes()[i] == b':' && s.as_bytes()[0].is_ascii_alphabetic(),
+        None => false,
+    }
+}
+
+fn authority_of(url: &Url) -> String {
+    match url.port {
+        Some(p) => format!("{}:{}", url.host, p),
+        None => url.host.clone(),
     }
 }
 
@@ -162,5 +229,21 @@ mod tests {
         assert_eq!(parse(""), Err(UrlError::Empty));
         assert_eq!(parse("no-scheme"), Err(UrlError::MissingScheme));
         assert_eq!(parse("http://h:notaport/"), Err(UrlError::BadPort));
+    }
+
+    #[test]
+    fn joins_relative_references() {
+        let base = parse("https://example.com/dir/page?q=1").unwrap();
+        assert_eq!(
+            join(&base, "https://other.test/x").unwrap().host,
+            "other.test"
+        );
+        assert_eq!(join(&base, "//cdn.test/a").unwrap().host, "cdn.test");
+        assert_eq!(join(&base, "/root").unwrap().path, "/root");
+        assert_eq!(join(&base, "sibling").unwrap().path, "/dir/sibling");
+        // Fragment-only stays on the same resource.
+        let f = join(&base, "#sec").unwrap();
+        assert_eq!(f.path, "/dir/page");
+        assert_eq!(f.fragment.as_deref(), Some("sec"));
     }
 }

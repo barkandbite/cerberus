@@ -14,7 +14,7 @@ use cerberus_dom::{parse_trivial, Document, Element, Node};
 use cerberus_headless::render_document;
 use cerberus_identity::{Head, HeadManager};
 use cerberus_js::NullJsEngineFactory;
-use cerberus_layout::BlockLayout;
+use cerberus_layout::{BlockLayout, LayoutEngine, LinkBox};
 use cerberus_net::{BuiltinHttpClient, HttpCache, HttpClient, HttpResponse, Router};
 use cerberus_paint::{DisplayItem, DisplayList, Framebuffer, Rasterizer, TextShaper};
 use cerberus_shell::{FrameApp, HeadlessSurface, PlatformSurface, Waker};
@@ -23,7 +23,7 @@ use cerberus_text::TextEngine;
 use cerberus_tls_rustls::RustlsProvider;
 use cerberus_types::{Color, HeadId, InstanceId, Origin, Point, RealmId, Rect, Size};
 use cerberus_ui::{Toolbar, ToolbarAction};
-use cerberus_url::parse as parse_url;
+use cerberus_url::{join as join_url, parse as parse_url, Url};
 use std::sync::mpsc::{Receiver, Sender};
 use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
@@ -371,6 +371,12 @@ pub struct BrowserApp {
     index: usize,
     document: Document,
     status: u16,
+    /// The committed URL of the current page (base for resolving links).
+    current_url: Option<Url>,
+    /// The `<title>` of the current page, if any.
+    page_title: Option<String>,
+    /// Clickable link boxes from the last rendered frame (window coordinates).
+    links: Vec<LinkBox>,
     pending: Option<Pending>,
     next_id: u64,
     /// When `Some`, an `http` URL is awaiting the user's risk confirmation.
@@ -408,6 +414,9 @@ impl BrowserApp {
             index: 0,
             document: empty_document(),
             status: 0,
+            current_url: None,
+            page_title: None,
+            links: Vec::new(),
             pending: None,
             next_id: 1,
             insecure_prompt: None,
@@ -507,13 +516,15 @@ impl BrowserApp {
         }
         self.status = status;
         self.document = parse_trivial(&String::from_utf8_lossy(body));
+        self.page_title = self.document.title();
         self.toolbar.url_text = url.to_string();
         self.toolbar.loading = false;
         self.insecure_prompt = None;
-        if let Ok(parsed) = parse_url(url) {
-            if let Some(origin) = first_party_of(&parsed) {
-                self.set_session_cookie(&origin);
-            }
+        self.current_url = parse_url(url).ok();
+
+        let origin = self.current_url.as_ref().and_then(first_party_of);
+        if let Some(origin) = origin {
+            self.set_session_cookie(&origin);
         }
         self.update_nav();
     }
@@ -521,6 +532,8 @@ impl BrowserApp {
     fn show_error(&mut self, url: &str, message: &str) {
         self.status = 0;
         self.document = error_document(url, message);
+        self.page_title = None;
+        self.current_url = parse_url(url).ok();
         self.toolbar.url_text = url.to_string();
         self.toolbar.loading = false;
         self.update_nav();
@@ -558,6 +571,25 @@ impl BrowserApp {
         if let Some(http_url) = self.insecure_prompt.take() {
             self.dispatch(http_url, None);
         }
+    }
+
+    /// The href of the link under `(x, y)`, if any (window coordinates).
+    fn link_at(&self, x: i32, y: i32) -> Option<String> {
+        self.links
+            .iter()
+            .find(|l| point_in_rect(l.rect, x, y))
+            .map(|l| l.href.clone())
+    }
+
+    /// Follow a link, resolving `href` against the current page URL.
+    fn open_link(&mut self, href: &str) {
+        let target = match &self.current_url {
+            Some(base) => join_url(base, href)
+                .map(|u| u.to_string())
+                .unwrap_or_else(|_| href.to_string()),
+            None => href.to_string(),
+        };
+        self.navigate(&target);
     }
 
     fn set_session_cookie(&mut self, first_party: &Origin) {
@@ -663,7 +695,10 @@ impl Default for BrowserApp {
 
 impl FrameApp for BrowserApp {
     fn title(&self) -> String {
-        format!("Cerberus — {}", self.toolbar.head_label)
+        match &self.page_title {
+            Some(t) => format!("{t} — Cerberus ({})", self.toolbar.head_label),
+            None => format!("Cerberus — {}", self.toolbar.head_label),
+        }
     }
 
     fn set_waker(&mut self, waker: Arc<dyn Waker>) {
@@ -681,20 +716,29 @@ impl FrameApp for BrowserApp {
     fn render_frame(&mut self, size: Size) -> Framebuffer {
         self.last_size = size;
         let content = self.toolbar.content_size(size);
+        let origin = self.toolbar.content_origin();
 
         let mut layout = BlockLayout::default();
-        let page = render_document(
-            &self.document,
-            content,
-            self.background,
-            &mut layout,
-            &self.text,
-            &self.text,
-        );
+        let laid = layout.layout(&self.document, content, &self.text);
+
+        let mut page = Framebuffer::new(content);
+        page.clear(self.background);
+        self.text.rasterize(&laid.display, &mut page);
+
+        // Record link hit-boxes in window coordinates for click handling.
+        self.links = laid
+            .links
+            .into_iter()
+            .map(|mut l| {
+                l.rect.x += origin.x;
+                l.rect.y += origin.y;
+                l
+            })
+            .collect();
 
         let mut fb = Framebuffer::new(size);
         fb.clear(self.background);
-        fb.blit(self.toolbar.content_origin(), &page);
+        fb.blit(origin, &page);
         self.text
             .rasterize(&self.toolbar.paint(size, &self.text), &mut fb);
         if self.insecure_prompt.is_some() {
@@ -718,6 +762,13 @@ impl FrameApp for BrowserApp {
         if self.settings_open {
             self.settings_open = false;
             return true;
+        }
+        // Page-area click: follow a link if one is under the cursor.
+        if y >= cerberus_ui::TOOLBAR_HEIGHT as i32 {
+            if let Some(href) = self.link_at(x, y) {
+                self.open_link(&href);
+                return true;
+            }
         }
         let action = self.toolbar.hit_test(self.last_size, x, y);
         if action == ToolbarAction::None && self.toolbar.url_focused {
@@ -1093,5 +1144,37 @@ mod tests {
         assert!(!b.text_input('z'), "ignored until the URL box is focused");
         assert!(b.pointer_down(200, 10), "click focuses the URL box");
         assert!(b.text_input('z'));
+    }
+
+    #[test]
+    fn browser_follows_a_link() {
+        let mut b = fake_app(vec![
+            (
+                "https://site.test/",
+                Ok(page(
+                    "https://site.test/",
+                    200,
+                    None,
+                    "<p><a href=\"/next\">go</a></p>",
+                )),
+            ),
+            (
+                "https://site.test/next",
+                Ok(page("https://site.test/next", 200, None, "<h1>Next</h1>")),
+            ),
+        ]);
+        b.navigate("https://site.test/");
+        assert!(b.poll());
+
+        // Render to populate link hit-boxes, then click the first link.
+        b.render_frame(Size::new(800, 600));
+        assert!(!b.links.is_empty(), "link box present");
+        let r = b.links[0].rect;
+        assert!(b.pointer_down(r.x + 1, r.y + 1), "click hits the link");
+        assert!(b.pending.is_some(), "navigation started");
+
+        assert!(b.poll());
+        assert!(b.document.root.text_content().contains("Next"));
+        assert_eq!(b.toolbar.url_text, "https://site.test/next");
     }
 }

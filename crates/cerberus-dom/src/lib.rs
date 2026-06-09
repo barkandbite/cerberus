@@ -30,6 +30,23 @@ impl Element {
         }
     }
 
+    /// A new childless element with attributes.
+    pub fn with_attrs(tag: impl Into<String>, attrs: Vec<(String, String)>) -> Self {
+        Self {
+            tag: tag.into(),
+            attrs,
+            children: Vec::new(),
+        }
+    }
+
+    /// The value of attribute `name` (lowercased keys), if present.
+    pub fn attr(&self, name: &str) -> Option<&str> {
+        self.attrs
+            .iter()
+            .find(|(k, _)| k == name)
+            .map(|(_, v)| v.as_str())
+    }
+
     /// Concatenate the text of this element and its descendants.
     pub fn text_content(&self) -> String {
         let mut out = String::new();
@@ -49,12 +66,33 @@ pub struct Document {
     pub root: Element,
 }
 
+impl Document {
+    /// The page `<title>` text, if any.
+    pub fn title(&self) -> Option<String> {
+        find_title(&self.root)
+    }
+}
+
+fn find_title(el: &Element) -> Option<String> {
+    if el.tag == "title" {
+        let text = el.text_content();
+        let text = text.trim();
+        if !text.is_empty() {
+            return Some(text.to_string());
+        }
+    }
+    el.children.iter().find_map(|child| match child {
+        Node::Element(e) => find_title(e),
+        Node::Text(_) => None,
+    })
+}
+
 /// Void elements that never have a close tag.
 const VOID: &[&str] = &["br", "hr", "img", "meta", "link", "input"];
 
-/// Parse a minimal subset of HTML: tags (attributes discarded), text with
-/// entity decoding + whitespace collapsing, comment skipping, and `<script>`/
-/// `<style>` rawtext dropping. Not standards-compliant — placeholder until M2.
+/// Parse a minimal subset of HTML: tags with attributes, text with entity
+/// decoding + whitespace collapsing, comment skipping, and `<script>`/`<style>`
+/// rawtext dropping. Not standards-compliant — placeholder until M2.
 pub fn parse_trivial(input: &str) -> Document {
     let mut stack: Vec<Element> = vec![Element::new("#root")];
 
@@ -68,18 +106,20 @@ pub fn parse_trivial(input: &str) -> Document {
                     }
                 }
             }
-            Token::Open(name) => {
-                if VOID.contains(&name.as_str()) {
+            Token::Open(name, attrs) => {
+                let el = Element::with_attrs(name, attrs);
+                if VOID.contains(&el.tag.as_str()) {
                     if let Some(top) = stack.last_mut() {
-                        top.children.push(Node::Element(Element::new(name)));
+                        top.children.push(Node::Element(el));
                     }
                 } else {
-                    stack.push(Element::new(name));
+                    stack.push(el);
                 }
             }
-            Token::SelfClose(name) => {
+            Token::SelfClose(name, attrs) => {
                 if let Some(top) = stack.last_mut() {
-                    top.children.push(Node::Element(Element::new(name)));
+                    top.children
+                        .push(Node::Element(Element::with_attrs(name, attrs)));
                 }
             }
             Token::Close(name) => {
@@ -118,9 +158,9 @@ pub fn parse_trivial(input: &str) -> Document {
 
 enum Token {
     Text(String),
-    Open(String),
+    Open(String, Vec<(String, String)>),
     Close(String),
-    SelfClose(String),
+    SelfClose(String, Vec<(String, String)>),
 }
 
 fn tokenize(input: &str) -> Vec<Token> {
@@ -159,10 +199,11 @@ fn tokenize(input: &str) -> Vec<Token> {
 
         if let Some(name) = inner.strip_prefix('/') {
             tokens.push(Token::Close(tag_name(name)));
-        } else if let Some(name) = inner.strip_suffix('/') {
-            tokens.push(Token::SelfClose(tag_name(name)));
+        } else if let Some(stripped) = inner.strip_suffix('/') {
+            let (name, attrs) = parse_tag(stripped);
+            tokens.push(Token::SelfClose(name, attrs));
         } else {
-            let name = tag_name(inner);
+            let (name, attrs) = parse_tag(inner);
             // Rawtext elements: their content is not markup and must not be shown
             // as page text. Skip to the matching close tag and drop the body.
             if name == "script" || name == "style" {
@@ -177,15 +218,69 @@ fn tokenize(input: &str) -> Vec<Token> {
                     }
                     None => rest = "",
                 }
-                tokens.push(Token::Open(name.clone()));
+                tokens.push(Token::Open(name.clone(), attrs));
                 tokens.push(Token::Close(name));
             } else {
-                tokens.push(Token::Open(name));
+                tokens.push(Token::Open(name, attrs));
             }
         }
     }
 
     tokens
+}
+
+/// Split a tag's inner text into a lowercased name and its attributes.
+fn parse_tag(inner: &str) -> (String, Vec<(String, String)>) {
+    let inner = inner.trim();
+    let (name, rest) = match inner.find(char::is_whitespace) {
+        Some(i) => (&inner[..i], &inner[i..]),
+        None => (inner, ""),
+    };
+    (name.to_ascii_lowercase(), parse_attrs(rest))
+}
+
+/// Parse `name="value"` / `name='value'` / `name=value` / `name` attributes.
+fn parse_attrs(mut rest: &str) -> Vec<(String, String)> {
+    let mut attrs = Vec::new();
+    rest = rest.trim_start();
+    while !rest.is_empty() {
+        let before = rest.len();
+        let name_end = rest
+            .find(|c: char| c == '=' || c.is_whitespace())
+            .unwrap_or(rest.len());
+        let name = rest[..name_end].to_ascii_lowercase();
+        rest = rest[name_end..].trim_start();
+
+        let mut value = String::new();
+        if let Some(after_eq) = rest.strip_prefix('=') {
+            rest = after_eq.trim_start();
+            match rest.chars().next() {
+                Some(q @ ('"' | '\'')) => {
+                    rest = &rest[1..];
+                    if let Some(end) = rest.find(q) {
+                        value = rest[..end].to_string();
+                        rest = &rest[end + 1..];
+                    } else {
+                        value = std::mem::take(&mut value) + rest;
+                        rest = "";
+                    }
+                }
+                _ => {
+                    let v_end = rest.find(char::is_whitespace).unwrap_or(rest.len());
+                    value = rest[..v_end].to_string();
+                    rest = &rest[v_end..];
+                }
+            }
+        }
+        if !name.is_empty() {
+            attrs.push((name, value));
+        }
+        rest = rest.trim_start();
+        if rest.len() == before {
+            break; // guarantee progress
+        }
+    }
+    attrs
 }
 
 /// Case-insensitive byte-offset search (ASCII-fold). `needle` must be lowercase.
@@ -322,5 +417,28 @@ mod tests {
     fn collapses_whitespace() {
         let doc = parse_trivial("<p>one\n\n   two\t three</p>");
         assert_eq!(doc.root.text_content(), "one two three");
+    }
+
+    fn find_tag<'a>(el: &'a Element, tag: &str) -> Option<&'a Element> {
+        if el.tag == tag {
+            return Some(el);
+        }
+        el.children.iter().find_map(|c| match c {
+            Node::Element(e) => find_tag(e, tag),
+            Node::Text(_) => None,
+        })
+    }
+
+    #[test]
+    fn parses_attributes_and_title() {
+        let doc = parse_trivial(
+            "<head><title>Hi &amp; Bye</title></head>\
+             <body><a href=\"/x\" class='c' download>link</a></body>",
+        );
+        assert_eq!(doc.title().as_deref(), Some("Hi & Bye"));
+        let a = find_tag(&doc.root, "a").expect("a element");
+        assert_eq!(a.attr("href"), Some("/x"));
+        assert_eq!(a.attr("class"), Some("c"));
+        assert_eq!(a.attr("download"), Some(""), "boolean attribute");
     }
 }

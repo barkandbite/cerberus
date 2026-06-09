@@ -1,23 +1,36 @@
-//! Layout: turn a `Document` into a `DisplayList`.
+//! Layout: turn a `Document` into a `LaidOut` (a display list plus link boxes).
 //!
-//! `LayoutEngine` is the seam so we can recode layout freely (the brief treats
-//! rendering as undifferentiated heavy lifting). `BlockLayout` is a deliberately
-//! minimal vertical block stacker — enough to place the built-in page's text —
-//! and uses the injected `TextShaper` so it never depends on a concrete shaper.
-//! The real, arena-allocated layout (see PLAN.md memory budget) is M2.
+//! `LayoutEngine` is the seam so we can recode layout freely. `BlockLayout` is a
+//! small **block/inline flow** engine: block elements (`p`, `div`, `h1`-`h6`,
+//! `li`, …) stack vertically; inline content (text, `<a>`, `<b>`, …) flows and
+//! word-wraps within a block. `<head>`/metadata is skipped, links are styled and
+//! emitted as clickable boxes. Real CSS + a real box model are still ahead (M2).
 
 use cerberus_dom::{Document, Element, Node};
-use cerberus_paint::{DisplayItem, DisplayList, GlyphBox, TextShaper};
-use cerberus_types::{Color, Point, Size};
+use cerberus_paint::{DisplayItem, DisplayList, TextShaper};
+use cerberus_types::{Color, Point, Rect, Size};
 
-/// Produces a `DisplayList` from a `Document` for a given viewport.
-pub trait LayoutEngine: Send {
-    /// Lay out `doc` into `viewport`, shaping text with `shaper`.
-    fn layout(&mut self, doc: &Document, viewport: Size, shaper: &dyn TextShaper) -> DisplayList;
+/// A clickable link region produced by layout (in layout-local coordinates).
+#[derive(Clone, Debug, PartialEq)]
+pub struct LinkBox {
+    pub rect: Rect,
+    pub href: String,
 }
 
-/// Minimal block layout: walk the DOM, stack text runs top-to-bottom, sizing
-/// headings larger than body text.
+/// The result of laying out a document: what to paint, and where the links are.
+#[derive(Clone, Debug, Default)]
+pub struct LaidOut {
+    pub display: DisplayList,
+    pub links: Vec<LinkBox>,
+}
+
+/// Produces a `LaidOut` from a `Document` for a given viewport.
+pub trait LayoutEngine: Send {
+    /// Lay out `doc` into `viewport`, shaping text with `shaper`.
+    fn layout(&mut self, doc: &Document, viewport: Size, shaper: &dyn TextShaper) -> LaidOut;
+}
+
+/// Minimal block/inline flow layout.
 #[derive(Clone, Copy, Debug)]
 pub struct BlockLayout {
     /// Left margin in pixels.
@@ -26,8 +39,10 @@ pub struct BlockLayout {
     pub body_px: u32,
     /// Heading text size in pixels.
     pub heading_px: u32,
-    /// Text color.
+    /// Body text color.
     pub color: Color,
+    /// Link text/underline color.
+    pub link_color: Color,
 }
 
 impl Default for BlockLayout {
@@ -37,109 +52,229 @@ impl Default for BlockLayout {
             body_px: 16,
             heading_px: 28,
             color: Color::BLACK,
+            link_color: Color::rgb(0x15, 0x4f, 0xd2),
         }
     }
 }
 
+const HEADINGS: &[&str] = &["h1", "h2", "h3", "h4", "h5", "h6"];
+const SKIP: &[&str] = &[
+    "head", "title", "meta", "link", "base", "script", "style", "noscript",
+];
+const INLINE: &[&str] = &[
+    "a", "b", "i", "span", "em", "strong", "code", "small", "sub", "sup", "u", "label", "abbr",
+    "mark", "time", "cite", "q", "s", "big", "tt", "kbd", "samp", "var",
+];
+
+fn is_inline(tag: &str) -> bool {
+    INLINE.contains(&tag)
+}
+
 impl LayoutEngine for BlockLayout {
-    fn layout(&mut self, doc: &Document, viewport: Size, shaper: &dyn TextShaper) -> DisplayList {
-        let mut list = DisplayList::new();
-        let mut cursor_y = self.margin;
+    fn layout(&mut self, doc: &Document, viewport: Size, shaper: &dyn TextShaper) -> LaidOut {
         let max_width = viewport
             .w
             .saturating_sub(2 * self.margin.max(0) as u32)
             .max(16);
-        self.lay_element(
-            &doc.root,
-            self.body_px,
-            max_width,
-            shaper,
-            &mut list,
-            &mut cursor_y,
-        );
-        list
+        let mut ctx = Ctx::new(self.margin, max_width);
+        self.walk(&doc.root, self.body_px, None, &mut ctx, shaper);
+        ctx.flush_line();
+        LaidOut {
+            display: ctx.display,
+            links: ctx.links,
+        }
     }
 }
 
 impl BlockLayout {
-    fn lay_element(
+    fn walk(
         &self,
         element: &Element,
         inherited_px: u32,
-        max_width: u32,
+        in_link: Option<String>,
+        ctx: &mut Ctx,
         shaper: &dyn TextShaper,
-        list: &mut DisplayList,
-        cursor_y: &mut i32,
     ) {
-        let px = match element.tag.as_str() {
-            "h1" | "h2" | "h3" => self.heading_px,
-            _ => inherited_px,
+        let tag = element.tag.as_str();
+        if SKIP.contains(&tag) {
+            return;
+        }
+        if tag == "br" {
+            ctx.line_break(inherited_px);
+            return;
+        }
+        if tag == "hr" {
+            ctx.flush_line();
+            ctx.rule();
+            return;
+        }
+
+        let px = if HEADINGS.contains(&tag) {
+            self.heading_px
+        } else {
+            inherited_px
         };
+        let block = !is_inline(tag) && tag != "#root";
+
+        // `<a href>` opens a link span; nested inline keeps the enclosing href.
+        let link = if tag == "a" {
+            element.attr("href").map(str::to_string).or(in_link)
+        } else {
+            in_link
+        };
+
+        if block {
+            ctx.flush_line();
+            if tag == "li" {
+                ctx.bullet(px, self, shaper);
+            }
+        }
 
         for child in &element.children {
             match child {
-                Node::Text(text) => self.lay_text(text, px, max_width, shaper, list, cursor_y),
-                Node::Element(child_el) => {
-                    self.lay_element(child_el, px, max_width, shaper, list, cursor_y);
-                }
+                Node::Text(text) => ctx.add_text(text, px, link.as_deref(), self, shaper),
+                Node::Element(child_el) => self.walk(child_el, px, link.clone(), ctx, shaper),
             }
+        }
+
+        if block {
+            ctx.flush_line();
+            ctx.block_gap(px);
+        }
+    }
+}
+
+/// Flow state: a pen position plus the line's tallest text size.
+struct Ctx {
+    display: DisplayList,
+    links: Vec<LinkBox>,
+    margin: i32,
+    max_width: u32,
+    x: i32,
+    y: i32,
+    line_px: u32,
+}
+
+impl Ctx {
+    fn new(margin: i32, max_width: u32) -> Self {
+        Self {
+            display: DisplayList::new(),
+            links: Vec::new(),
+            margin,
+            max_width,
+            x: margin,
+            y: margin,
+            line_px: 0,
         }
     }
 
-    /// Word-wrap `text` to `max_width`, emitting one glyph run per line.
-    fn lay_text(
-        &self,
+    fn newline(&mut self) {
+        self.y += line_height(self.line_px.max(1));
+        self.x = self.margin;
+        self.line_px = 0;
+    }
+
+    /// End the current line if it has content.
+    fn flush_line(&mut self) {
+        if self.x != self.margin {
+            self.newline();
+        }
+    }
+
+    /// Force a line break (e.g. `<br>`), even on an empty line.
+    fn line_break(&mut self, px: u32) {
+        self.line_px = self.line_px.max(px);
+        self.newline();
+    }
+
+    fn block_gap(&mut self, px: u32) {
+        self.y += (px / 2) as i32;
+    }
+
+    fn rule(&mut self) {
+        self.display.push(DisplayItem::Rect {
+            rect: Rect::new(self.margin, self.y, self.max_width, 1),
+            color: Color::rgb(0xCC, 0xCC, 0xCC),
+        });
+        self.y += 8;
+    }
+
+    fn bullet(&mut self, px: u32, layout: &BlockLayout, shaper: &dyn TextShaper) {
+        self.add_word("\u{2022}", px, None, layout, shaper);
+        self.x += space_width(shaper, px) as i32;
+    }
+
+    fn add_text(
+        &mut self,
         text: &str,
         px: u32,
-        max_width: u32,
+        link: Option<&str>,
+        layout: &BlockLayout,
         shaper: &dyn TextShaper,
-        list: &mut DisplayList,
-        cursor_y: &mut i32,
     ) {
-        let line_height = px as i32 + px as i32 / 2;
-        let space = shaper.shape(" ", px);
-        let space_w: u32 = space.iter().map(|g| g.advance).sum();
-
-        let mut line: Vec<GlyphBox> = Vec::new();
-        let mut line_w: u32 = 0;
-
         for word in text.split_whitespace() {
-            let word_glyphs = shaper.shape(word, px);
-            let word_w: u32 = word_glyphs.iter().map(|g| g.advance).sum();
-
-            // Wrap before this word if it would overflow the current line.
-            if !line.is_empty() && line_w + space_w + word_w > max_width {
-                self.emit_line(std::mem::take(&mut line), line_height, list, cursor_y);
-                line_w = 0;
-            }
-            if line.is_empty() {
-                line.extend(word_glyphs);
-                line_w = word_w;
-            } else {
-                line.extend(space.iter().copied());
-                line.extend(word_glyphs);
-                line_w += space_w + word_w;
-            }
-        }
-        if !line.is_empty() {
-            self.emit_line(line, line_height, list, cursor_y);
+            self.add_word(word, px, link, layout, shaper);
         }
     }
 
-    fn emit_line(
-        &self,
-        glyphs: Vec<GlyphBox>,
-        line_height: i32,
-        list: &mut DisplayList,
-        cursor_y: &mut i32,
+    fn add_word(
+        &mut self,
+        word: &str,
+        px: u32,
+        link: Option<&str>,
+        layout: &BlockLayout,
+        shaper: &dyn TextShaper,
     ) {
-        list.push(DisplayItem::Glyphs {
-            origin: Point::new(self.margin, *cursor_y),
+        let glyphs = shaper.shape(word, px);
+        let word_w: u32 = glyphs.iter().map(|g| g.advance).sum();
+        let gap = if self.x == self.margin {
+            0
+        } else {
+            space_width(shaper, px) as i32
+        };
+
+        // Wrap before this word if it would overflow the current line.
+        if self.x != self.margin
+            && (self.x - self.margin) as u32 + gap as u32 + word_w > self.max_width
+        {
+            self.newline();
+        } else {
+            self.x += gap;
+        }
+
+        let color = if link.is_some() {
+            layout.link_color
+        } else {
+            layout.color
+        };
+        self.display.push(DisplayItem::Glyphs {
+            origin: Point::new(self.x, self.y),
             glyphs,
-            color: self.color,
+            color,
         });
-        *cursor_y += line_height;
+        if let Some(href) = link {
+            let h = px as i32;
+            self.display.push(DisplayItem::Rect {
+                rect: Rect::new(self.x, self.y + h, word_w, 1),
+                color: layout.link_color,
+            });
+            self.links.push(LinkBox {
+                rect: Rect::new(self.x, self.y, word_w, (h + h / 3).max(1) as u32),
+                href: href.to_string(),
+            });
+        }
+
+        self.x += word_w as i32;
+        self.line_px = self.line_px.max(px);
     }
+}
+
+fn line_height(px: u32) -> i32 {
+    px as i32 + px as i32 / 2
+}
+
+fn space_width(shaper: &dyn TextShaper, px: u32) -> u32 {
+    shaper.shape(" ", px).iter().map(|g| g.advance).sum()
 }
 
 #[cfg(test)]
@@ -148,55 +283,57 @@ mod tests {
     use cerberus_dom::parse_trivial;
     use cerberus_paint::MonoShaper;
 
-    #[test]
-    fn lays_out_text_runs_top_to_bottom() {
-        let doc = parse_trivial("<h1>Title</h1><p>body</p>");
-        let list = BlockLayout::default().layout(&doc, Size::new(320, 240), &MonoShaper);
-
-        let glyph_runs: Vec<&DisplayItem> = list
-            .items
-            .iter()
-            .filter(|i| matches!(i, DisplayItem::Glyphs { .. }))
-            .collect();
-        assert_eq!(
-            glyph_runs.len(),
-            2,
-            "one run for the heading, one for the body"
-        );
-
-        // Runs are stacked: the second starts below the first.
-        let ys: Vec<i32> = list
+    fn glyph_ys(laid: &LaidOut) -> Vec<i32> {
+        laid.display
             .items
             .iter()
             .filter_map(|i| match i {
                 DisplayItem::Glyphs { origin, .. } => Some(origin.y),
                 _ => None,
             })
-            .collect();
-        assert!(ys[1] > ys[0]);
+            .collect()
+    }
+
+    #[test]
+    fn inline_content_flows_on_one_line() {
+        let doc = parse_trivial("<p>Hello <b>brave</b> world</p>");
+        let laid = BlockLayout::default().layout(&doc, Size::new(400, 200), &MonoShaper);
+        let ys = glyph_ys(&laid);
+        assert_eq!(ys.len(), 3, "three words");
+        assert!(ys.iter().all(|&y| y == ys[0]), "inline flows on one line");
+    }
+
+    #[test]
+    fn blocks_stack_vertically() {
+        let doc = parse_trivial("<h1>Title</h1><p>body</p>");
+        let laid = BlockLayout::default().layout(&doc, Size::new(400, 200), &MonoShaper);
+        let ys = glyph_ys(&laid);
+        assert_eq!(ys.len(), 2);
+        assert!(ys[1] > ys[0], "second block is below the first");
+    }
+
+    #[test]
+    fn links_are_collected_with_href() {
+        let doc = parse_trivial("<p><a href=\"/page\">click me</a></p>");
+        let laid = BlockLayout::default().layout(&doc, Size::new(400, 200), &MonoShaper);
+        assert!(!laid.links.is_empty(), "link boxes emitted");
+        assert!(laid.links.iter().all(|l| l.href == "/page"));
+    }
+
+    #[test]
+    fn skips_head_metadata() {
+        let doc = parse_trivial("<head><title>Hidden</title><meta></head>");
+        let laid = BlockLayout::default().layout(&doc, Size::new(400, 200), &MonoShaper);
+        let runs = glyph_ys(&laid).len();
+        assert_eq!(runs, 0, "head content is not rendered");
     }
 
     #[test]
     fn wraps_long_text_into_multiple_lines() {
         let words = "word ".repeat(60);
         let doc = parse_trivial(&format!("<p>{words}</p>"));
-        let list = BlockLayout::default().layout(&doc, Size::new(200, 600), &MonoShaper);
-
-        let runs = list
-            .items
-            .iter()
-            .filter(|i| matches!(i, DisplayItem::Glyphs { .. }))
-            .count();
-        assert!(
-            runs > 1,
-            "expected wrapping into multiple lines, got {runs}"
-        );
-
-        // Every line starts at the left margin.
-        for item in &list.items {
-            if let DisplayItem::Glyphs { origin, .. } = item {
-                assert_eq!(origin.x, BlockLayout::default().margin);
-            }
-        }
+        let laid = BlockLayout::default().layout(&doc, Size::new(200, 800), &MonoShaper);
+        let distinct: std::collections::BTreeSet<i32> = glyph_ys(&laid).into_iter().collect();
+        assert!(distinct.len() > 1, "wrapped into multiple lines");
     }
 }
