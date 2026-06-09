@@ -106,6 +106,22 @@ impl StyledNode {
             .find(|(k, _)| k == name)
             .map(|(_, v)| v.as_str())
     }
+
+    /// Concatenate the text of this node and its descendants.
+    pub fn text(&self) -> String {
+        let mut out = String::new();
+        self.collect_text(&mut out);
+        out
+    }
+
+    fn collect_text(&self, out: &mut String) {
+        for child in &self.children {
+            match child {
+                StyledChild::Text(t) => out.push_str(t),
+                StyledChild::Element(e) => e.collect_text(out),
+            }
+        }
+    }
 }
 
 /// A styled document.

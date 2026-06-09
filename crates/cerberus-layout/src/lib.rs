@@ -4,8 +4,10 @@
 //! `ComputedStyle` on each node (from `cerberus-css`): blocks stack with their
 //! margins and optional background, inline content flows and word-wraps, text
 //! uses the cascaded color/size/weight/underline, `text-align` shifts lines, and
-//! `display:none` is skipped. `<a href>` text also emits clickable link boxes.
-//! Real box widths, floats, and positioning are still ahead.
+//! `display:none` is skipped. `<a href>` text also emits clickable link boxes,
+//! `<img>` emits decoded images (or a sized placeholder / `[alt]`), and form
+//! controls (`<input>`, `<button>`, `<textarea>`, `<select>`) render as bordered
+//! inline-block boxes. Real box widths, floats, and positioning are still ahead.
 
 use cerberus_paint::{DecodedImage, DisplayItem, DisplayList, GlyphBox, TextShaper};
 use cerberus_style::{ComputedStyle, Display, StyledChild, StyledDom, StyledNode, TextAlign};
@@ -162,6 +164,24 @@ impl<'a> Ctx<'a> {
                 self.image(node, in_link);
                 return;
             }
+            "input" => {
+                self.form_input(node);
+                return;
+            }
+            "button" => {
+                self.form_button(node);
+                return;
+            }
+            "textarea" => {
+                self.form_textarea(node);
+                return;
+            }
+            "select" => {
+                self.form_select(node);
+                return;
+            }
+            // Options are rendered by their <select>; loose ones never flow.
+            "option" | "optgroup" => return,
             _ => {}
         }
 
@@ -331,6 +351,187 @@ impl<'a> Ctx<'a> {
         }
     }
 
+    /// Lay out an `<input>` as the right inline-block control for its `type`.
+    fn form_input(&mut self, node: &StyledNode) {
+        let kind = node
+            .attr("type")
+            .map(|t| t.trim().to_ascii_lowercase())
+            .unwrap_or_else(|| "text".to_string());
+        match kind.as_str() {
+            "hidden" => {}
+            "checkbox" | "radio" => self.toggle_control(node, kind == "radio"),
+            "submit" | "reset" | "button" | "image" => {
+                let label =
+                    node.attr("value")
+                        .map(str::to_string)
+                        .unwrap_or_else(|| match kind.as_str() {
+                            "reset" => "Reset".to_string(),
+                            _ => "Submit".to_string(),
+                        });
+                self.push_button(&node.style, &label);
+            }
+            // text, search, email, url, tel, password, number, date, … all render
+            // as a single-line text field.
+            _ => self.text_field(node, kind == "password"),
+        }
+    }
+
+    /// A `<button>`: a button box labelled with its text (or `value`).
+    fn form_button(&mut self, node: &StyledNode) {
+        let text = node.text();
+        let label = if text.trim().is_empty() {
+            node.attr("value").unwrap_or("Button")
+        } else {
+            text.trim()
+        };
+        self.push_button(&node.style, label);
+    }
+
+    /// A `<textarea>`: a multi-row bordered box showing its text content.
+    fn form_textarea(&mut self, node: &StyledNode) {
+        let px = node.style.font_size.max(1);
+        let rows = node
+            .attr("rows")
+            .and_then(parse_dim)
+            .unwrap_or(2)
+            .clamp(1, 20);
+        let cols = node.attr("cols").and_then(parse_dim).unwrap_or(30).max(1);
+        let w = self.fit_width(cols as i32 * self.char_w(px) + 2 * FIELD_PAD);
+        let h = rows * line_height(px) as u32 + 6;
+        self.control_box(w, h, FIELD_BG);
+        let value = node.text();
+        let value = value.trim_end_matches('\n');
+        if !value.is_empty() {
+            self.box_label(px, value, node.style.color, FIELD_PAD, FIELD_PAD);
+        }
+        self.advance_box(w, h);
+    }
+
+    /// A `<select>`: a bordered box showing the chosen option plus a caret.
+    fn form_select(&mut self, node: &StyledNode) {
+        let px = node.style.font_size.max(1);
+        let label = selected_option(node).unwrap_or_default();
+        let text_w = self.text_width(&label, px);
+        let w = self.fit_width(text_w + self.char_w(px) + 3 * FIELD_PAD);
+        let h = px as i32 + 2 * FIELD_PAD;
+        self.control_box(w, h as u32, FIELD_BG);
+        if !label.is_empty() {
+            self.box_label(px, &label, node.style.color, FIELD_PAD, FIELD_PAD);
+        }
+        // A down caret at the right edge marks it as a dropdown.
+        self.box_label(
+            px,
+            "\u{25BE}",
+            Color::rgb(0x55, 0x55, 0x55),
+            w as i32 - self.char_w(px) - FIELD_PAD,
+            FIELD_PAD,
+        );
+        self.advance_box(w, h as u32);
+    }
+
+    /// A single-line text field of width from the `size` attr (or a default),
+    /// showing the `value`, else the `placeholder` (greyed).
+    fn text_field(&mut self, node: &StyledNode, password: bool) {
+        let px = node.style.font_size.max(1);
+        let cols = node.attr("size").and_then(parse_dim).unwrap_or(20).max(1);
+        let w = self.fit_width(cols as i32 * self.char_w(px) + 2 * FIELD_PAD);
+        let h = px as i32 + 2 * FIELD_PAD;
+        self.control_box(w, h as u32, FIELD_BG);
+
+        let (text, color) = match node.attr("value").filter(|v| !v.is_empty()) {
+            Some(v) if password => ("\u{2022}".repeat(v.chars().count()), node.style.color),
+            Some(v) => (v.to_string(), node.style.color),
+            None => (
+                node.attr("placeholder").unwrap_or("").to_string(),
+                Color::rgb(0x75, 0x75, 0x75),
+            ),
+        };
+        if !text.is_empty() {
+            self.box_label(px, &text, color, FIELD_PAD, FIELD_PAD);
+        }
+        self.advance_box(w, h as u32);
+    }
+
+    /// A checkbox/radio: a small box, filled when `checked`.
+    fn toggle_control(&mut self, node: &StyledNode, _radio: bool) {
+        let px = node.style.font_size.max(1);
+        let s = px + 2;
+        self.control_box(s, s, Color::WHITE);
+        if node.attr("checked").is_some() {
+            let inset = (s / 4).max(1) as i32;
+            self.display.push(DisplayItem::Rect {
+                rect: Rect::new(
+                    self.x + inset,
+                    self.y + inset,
+                    s - 2 * inset as u32,
+                    s - 2 * inset as u32,
+                ),
+                color: Color::rgb(0x33, 0x33, 0x33),
+            });
+        }
+        self.advance_box(s, s);
+    }
+
+    /// A button-styled box (grey fill) labelled `label`, centred horizontally.
+    fn push_button(&mut self, style: &ComputedStyle, label: &str) {
+        let px = style.font_size.max(1);
+        let text_w = self.text_width(label, px);
+        let w = self.fit_width(text_w + 4 * FIELD_PAD);
+        let h = px as i32 + 2 * FIELD_PAD;
+        self.control_box(w, h as u32, BUTTON_BG);
+        let pad_x = ((w as i32 - text_w) / 2).max(FIELD_PAD);
+        self.box_label(px, label, style.color, pad_x, FIELD_PAD);
+        self.advance_box(w, h as u32);
+    }
+
+    /// Emit a bordered, filled control box at the current pen, wrapping first if
+    /// it wouldn't fit. Does **not** advance the pen (the caller does, after
+    /// drawing any label, so the label sits on top of the box).
+    fn control_box(&mut self, w: u32, h: u32, fill: Color) {
+        self.place_box(w, h);
+        self.display.push(DisplayItem::Rect {
+            rect: Rect::new(self.x, self.y, w, h),
+            color: CONTROL_BORDER,
+        });
+        if w > 2 && h > 2 {
+            self.display.push(DisplayItem::Rect {
+                rect: Rect::new(self.x + 1, self.y + 1, w - 2, h - 2),
+                color: fill,
+            });
+        }
+    }
+
+    /// Draw one line of label text inside the current control box at the given
+    /// padding offsets from the box's top-left.
+    fn box_label(&mut self, px: u32, text: &str, color: Color, pad_x: i32, pad_y: i32) {
+        let glyphs = self.shaper.shape(text, px);
+        self.display.push(DisplayItem::Glyphs {
+            origin: Point::new(self.x + pad_x, self.y + pad_y),
+            glyphs,
+            color,
+            style: FontStyle::REGULAR,
+        });
+    }
+
+    /// Total advance width of `text` at size `px`.
+    fn text_width(&self, text: &str, px: u32) -> i32 {
+        self.shaper
+            .shape(text, px)
+            .iter()
+            .map(|g| g.advance)
+            .sum::<u32>() as i32
+    }
+
+    /// Approximate width of one character at size `px`.
+    fn char_w(&self, px: u32) -> i32 {
+        self.text_width("n", px).max(1)
+    }
+
+    /// Clamp a desired control width to the content box.
+    fn fit_width(&self, w: i32) -> u32 {
+        w.clamp(1, (self.right - self.left).max(1)) as u32
+    }
+
     /// Wrap to a new line if a `w`-wide box wouldn't fit on the current one.
     fn place_box(&mut self, w: u32, _h: u32) {
         if self.x != self.left && self.x + w as i32 > self.right {
@@ -419,6 +620,39 @@ fn parse_dim(v: &str) -> Option<u32> {
     v.trim().trim_end_matches("px").trim().parse().ok()
 }
 
+// --- Form-control styling (UA defaults; CSS overrides are a later slice). ---
+/// Inner padding for form controls, in pixels.
+const FIELD_PAD: i32 = 4;
+/// Form-control border colour (≈ `#767676`, the typical UA control border).
+const CONTROL_BORDER: Color = Color::rgb(0x76, 0x76, 0x76);
+/// Fill for text fields, selects, and textareas.
+const FIELD_BG: Color = Color::WHITE;
+/// Fill for buttons.
+const BUTTON_BG: Color = Color::rgb(0xE9, 0xE9, 0xED);
+
+/// The label of a `<select>`'s selected option, falling back to its first.
+fn selected_option(node: &StyledNode) -> Option<String> {
+    let mut options: Vec<(String, bool)> = Vec::new();
+    collect_options(node, &mut options);
+    options
+        .iter()
+        .find(|(_, selected)| *selected)
+        .or_else(|| options.first())
+        .map(|(label, _)| label.clone())
+}
+
+fn collect_options(node: &StyledNode, out: &mut Vec<(String, bool)>) {
+    for child in &node.children {
+        if let StyledChild::Element(e) = child {
+            match e.tag.as_str() {
+                "option" => out.push((e.text().trim().to_string(), e.attr("selected").is_some())),
+                "optgroup" => collect_options(e, out),
+                _ => {}
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -448,6 +682,32 @@ mod tests {
                 _ => None,
             })
             .collect()
+    }
+
+    fn rect_count(laid: &LaidOut) -> usize {
+        laid.display
+            .items
+            .iter()
+            .filter(|i| matches!(i, DisplayItem::Rect { .. }))
+            .count()
+    }
+
+    fn total_glyphs(laid: &LaidOut) -> usize {
+        laid.display
+            .items
+            .iter()
+            .filter_map(|i| match i {
+                DisplayItem::Glyphs { glyphs, .. } => Some(glyphs.len()),
+                _ => None,
+            })
+            .sum()
+    }
+
+    fn has_rect_color(laid: &LaidOut, c: Color) -> bool {
+        laid.display
+            .items
+            .iter()
+            .any(|i| matches!(i, DisplayItem::Rect { color, .. } if *color == c))
     }
 
     #[test]
@@ -534,5 +794,67 @@ mod tests {
             .items
             .iter()
             .any(|i| matches!(i, DisplayItem::Image { .. })));
+    }
+
+    #[test]
+    fn text_input_renders_a_bordered_box_with_placeholder() {
+        let laid = lay("<input placeholder='Search'>", 400);
+        // A border rect and an inset fill rect.
+        assert!(rect_count(&laid) >= 2);
+        assert!(
+            has_rect_color(&laid, CONTROL_BORDER),
+            "control border drawn"
+        );
+        assert!(has_rect_color(&laid, FIELD_BG), "field fill drawn");
+        // The placeholder text is laid out.
+        assert!(total_glyphs(&laid) > 0, "placeholder shown");
+    }
+
+    #[test]
+    fn button_renders_a_filled_box_and_label() {
+        let laid = lay("<button>Go</button>", 400);
+        assert!(has_rect_color(&laid, BUTTON_BG), "button fill drawn");
+        assert_eq!(total_glyphs(&laid), 2, "two-glyph label 'Go'");
+    }
+
+    #[test]
+    fn submit_input_uses_its_value_as_label() {
+        let laid = lay("<input type='submit' value='Send'>", 400);
+        assert!(has_rect_color(&laid, BUTTON_BG));
+        assert_eq!(total_glyphs(&laid), 4, "'Send' label");
+    }
+
+    #[test]
+    fn checkbox_fills_when_checked() {
+        let off = lay("<input type='checkbox'>", 400);
+        let on = lay("<input type='checkbox' checked>", 400);
+        // The checked mark is an extra rect over the empty box.
+        assert!(rect_count(&on) > rect_count(&off), "checked mark drawn");
+    }
+
+    #[test]
+    fn select_shows_only_the_selected_option_plus_a_caret() {
+        let laid = lay(
+            "<select><option>AAAA</option><option selected>BBBB</option></select>",
+            400,
+        );
+        // Only "BBBB" (4) is shown, plus the dropdown caret (1) — "AAAA" is not.
+        assert_eq!(total_glyphs(&laid), 5);
+    }
+
+    #[test]
+    fn textarea_renders_a_box_with_its_text() {
+        let laid = lay("<textarea>hello</textarea>", 400);
+        assert!(has_rect_color(&laid, CONTROL_BORDER));
+        assert_eq!(total_glyphs(&laid), 5, "'hello' shown inside the box");
+    }
+
+    #[test]
+    fn hidden_input_renders_nothing() {
+        let laid = lay("<input type='hidden' value='secret'>", 400);
+        assert!(
+            laid.display.items.is_empty(),
+            "type=hidden produces no paint"
+        );
     }
 }

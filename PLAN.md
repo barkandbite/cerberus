@@ -262,6 +262,13 @@ green.
   box, with a gray placeholder while a sized image is in flight and `[alt]` text
   otherwise. **Live-verified** end-to-end (kernel.org, Wikipedia); SVG isn't a
   raster format and is skipped (ADR-0005).
+- **Form controls (M2)** → layout renders `<input>` (text/search/password/…,
+  checkbox, radio, submit/reset/button), `<button>`, `<textarea>`, and
+  `<select>` as bordered inline-block boxes from their DOM state (value,
+  placeholder, `checked`, selected `<option>`, `size`/`rows`/`cols`), clamped to
+  the content box; `type=hidden` paints nothing. **Live-verified** (Wikipedia's
+  search field + button + checkboxes). Interactivity (focus/typing/submit) ties
+  into the event model and lands with JS at M3.
 - **Speed-first / raw render** → Cerberus **ignores programmed delays**: CSS
   `opacity`/`animation`/`transition`/`transform`/`visibility` are not honored;
   lazy-loading is ignored — `data-src` is preferred over a placeholder `src` and
