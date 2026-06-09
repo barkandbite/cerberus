@@ -1,0 +1,16 @@
+[package]
+name = "cerberus-text"
+description = "Software text adapter: TextShaper + Rasterizer via ab_glyph and a bundled Roboto font (ADR-0005)."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+cerberus-types = { path = "../cerberus-types" }
+cerberus-paint = { path = "../cerberus-paint" }
+ab_glyph = "0.2"

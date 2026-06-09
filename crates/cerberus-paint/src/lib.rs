@@ -42,16 +42,21 @@ impl DisplayList {
     }
 }
 
-/// A shaped glyph reduced to its metrics. Real glyph ids/outlines arrive with
-/// the M2 shaping adapter; the box is enough to lay out and paint placeholders.
+/// A shaped glyph: enough for both the placeholder box rasterizer (uses `w`/`h`)
+/// and a real outline rasterizer (uses `id` + `px` to fetch the outline from the
+/// run's font). `id` is `0` for the placeholder shaper.
 #[derive(Clone, Copy, Debug)]
 pub struct GlyphBox {
     /// Horizontal advance after this glyph.
     pub advance: u32,
-    /// Inked width.
+    /// Inked width (placeholder rasterizer).
     pub w: u32,
-    /// Inked height.
+    /// Inked height (placeholder rasterizer).
     pub h: u32,
+    /// Glyph id within the font that shaped this run (`0` for the placeholder).
+    pub id: u16,
+    /// Pixel size this glyph was shaped at (so the rasterizer can scale it).
+    pub px: u32,
 }
 
 /// An RGBA8 framebuffer (row-major, top-left origin).
@@ -131,6 +136,21 @@ impl Framebuffer {
             }
         }
     }
+
+    /// Alpha-blend `color` over the pixel at `(x, y)` with coverage `alpha`
+    /// (0.0..=1.0). Used by the glyph rasterizer for anti-aliased text.
+    pub fn blend_pixel(&mut self, x: i32, y: i32, color: Color, alpha: f32) {
+        if x < 0 || y < 0 || x as u32 >= self.size.w || y as u32 >= self.size.h {
+            return;
+        }
+        let a = alpha.clamp(0.0, 1.0);
+        let idx = ((y as u32 * self.size.w + x as u32) * 4) as usize;
+        for (i, channel) in [color.r, color.g, color.b].into_iter().enumerate() {
+            let bg = self.rgba[idx + i] as f32;
+            self.rgba[idx + i] = (bg * (1.0 - a) + channel as f32 * a).round() as u8;
+        }
+        self.rgba[idx + 3] = 255;
+    }
 }
 
 /// A decoded raster image.
@@ -181,12 +201,16 @@ impl TextShaper for MonoShaper {
                         advance: cell / 2,
                         w: 0,
                         h: 0,
+                        id: 0,
+                        px: cell,
                     }
                 } else {
                     GlyphBox {
                         advance: cell / 2,
                         w: cell / 2 - 1,
                         h: cell,
+                        id: 0,
+                        px: cell,
                     }
                 }
             })

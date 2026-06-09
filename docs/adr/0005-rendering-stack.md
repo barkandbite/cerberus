@@ -48,3 +48,13 @@ user's installed fonts. Two reasons:
   own `LayoutEngine` and would blur that boundary. Rejected for now.
 - **System font discovery (`font-kit`/`fontdb` over installed fonts):** rejected
   for the fingerprinting reason above — a curated bundle is a feature, not a gap.
+
+## Update — 2026-06-09: first adapter wired
+
+Shipped `cerberus-text`: `ab_glyph` + a **bundled Roboto Regular** (Apache-2.0,
+in `crates/cerberus-text/assets/`, license preserved alongside). Chosen over
+swash as the leaner first rasterizer — only 4 transitive crates (ab_glyph,
+ab_glyph_rasterizer, ttf-parser, owned_ttf_parser) — and sufficient for Latin
+text. It implements both `TextShaper` and `Rasterizer` over the fixed font.
+`rustybuzz` (complex-script shaping) and `image` (decoding) remain to wire
+behind the same traits when needed. Verified: anti-aliased output, ~6 MB RSS.

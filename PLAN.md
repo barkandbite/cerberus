@@ -59,7 +59,8 @@ that names concrete adapters and wires them together via dependency injection.
 | `cerberus-net` | Networking | `TlsProvider`, `DnsResolver`, `HttpClient` | none (rustls at M1) |
 | `cerberus-dom` | DOM + HTML parser (ours) | — | none |
 | `cerberus-layout` | Layout | `LayoutEngine` | none |
-| `cerberus-paint` | Display list, framebuffer, paint | `Rasterizer`, `TextShaper`, `ImageDecoder` | none (font/image at M2) |
+| `cerberus-paint` | Display list, framebuffer, paint | `Rasterizer`, `TextShaper`, `ImageDecoder` | none |
+| `cerberus-text` | Software shaper + rasterizer (bundled Roboto) | impls `TextShaper`, `Rasterizer` | ab_glyph (ADR-0005) |
 | `cerberus-js` | JS engine seam | `JsEngine`, `JsEngineFactory` | none (V8 at M3) |
 | `cerberus-crypto` | Crypto seam + key material | `Aead`, `Kdf` | none (RustCrypto at M4) |
 | `cerberus-storage` | One storage env, sealed cookies, vault | `CookieStore`* , `Vault` | none |

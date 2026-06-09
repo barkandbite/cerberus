@@ -21,6 +21,7 @@ cerberus-shell-winit = { path = "../cerberus-shell-winit", optional = true }
 cerberus-types = { path = "../cerberus-types" }
 cerberus-url = { path = "../cerberus-url" }
 cerberus-ui = { path = "../cerberus-ui" }
+cerberus-text = { path = "../cerberus-text" }
 cerberus-net = { path = "../cerberus-net" }
 cerberus-dom = { path = "../cerberus-dom" }
 cerberus-paint = { path = "../cerberus-paint" }

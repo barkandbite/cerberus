@@ -15,11 +15,10 @@ use cerberus_identity::{Head, HeadManager};
 use cerberus_js::NullJsEngineFactory;
 use cerberus_layout::BlockLayout;
 use cerberus_net::{BuiltinHttpClient, HttpClient};
-use cerberus_paint::{
-    BoxRasterizer, DisplayItem, DisplayList, Framebuffer, MonoShaper, Rasterizer, TextShaper,
-};
+use cerberus_paint::{DisplayItem, DisplayList, Framebuffer, Rasterizer, TextShaper};
 use cerberus_shell::{FrameApp, HeadlessSurface, PlatformSurface};
 use cerberus_storage::{Cookie, Group, StorageEnvironment};
+use cerberus_text::TextEngine;
 use cerberus_types::{Color, HeadId, InstanceId, Origin, Point, RealmId, Rect, Size};
 use cerberus_ui::{Toolbar, ToolbarAction};
 use cerberus_url::parse as parse_url;
@@ -156,7 +155,8 @@ pub fn render(config: &RenderConfig) -> Result<RenderOutcome, AppError> {
     let body = String::from_utf8_lossy(&response.body);
     let document = parse_trivial(&body);
 
-    // --- Toolbar (minimal UI) over the page content. ---
+    // --- Toolbar (minimal UI) over the page content, with real fonts. ---
+    let text = TextEngine::new();
     let mut toolbar = Toolbar::new(active_label.clone());
     toolbar.url_text = config.url.clone();
     let content = toolbar.content_size(config.viewport);
@@ -168,18 +168,15 @@ pub fn render(config: &RenderConfig) -> Result<RenderOutcome, AppError> {
         content,
         config.background,
         &mut layout,
-        &MonoShaper,
-        &BoxRasterizer,
+        &text,
+        &text,
     );
 
     // Compose: page under the toolbar, toolbar painted on top.
     let mut framebuffer = Framebuffer::new(config.viewport);
     framebuffer.clear(config.background);
     framebuffer.blit(toolbar.content_origin(), &page);
-    BoxRasterizer.rasterize(
-        &toolbar.paint(config.viewport, &MonoShaper),
-        &mut framebuffer,
-    );
+    text.rasterize(&toolbar.paint(config.viewport, &text), &mut framebuffer);
 
     // --- Present via the platform surface seam (headless capture). ---
     let mut surface = HeadlessSurface::new(config.viewport);
@@ -223,6 +220,7 @@ pub struct BrowserApp {
     heads: HeadManager,
     storage: StorageEnvironment,
     toolbar: Toolbar,
+    text: TextEngine,
     history: Vec<String>,
     index: usize,
     document: Document,
@@ -241,6 +239,7 @@ impl BrowserApp {
             heads,
             storage: StorageEnvironment::with_no_vault(),
             toolbar: Toolbar::new(label),
+            text: TextEngine::new(),
             history: Vec::new(),
             index: 0,
             document: empty_document(),
@@ -409,16 +408,17 @@ impl FrameApp for BrowserApp {
             content,
             self.background,
             &mut layout,
-            &MonoShaper,
-            &BoxRasterizer,
+            &self.text,
+            &self.text,
         );
 
         let mut fb = Framebuffer::new(size);
         fb.clear(self.background);
         fb.blit(self.toolbar.content_origin(), &page);
-        BoxRasterizer.rasterize(&self.toolbar.paint(size, &MonoShaper), &mut fb);
+        self.text
+            .rasterize(&self.toolbar.paint(size, &self.text), &mut fb);
         if self.settings_open {
-            paint_settings_overlay(&mut fb, size);
+            paint_settings_overlay(&mut fb, size, &self.text, &self.text);
         }
         fb
     }
@@ -492,7 +492,12 @@ fn error_document(url: &str, message: &str) -> Document {
 }
 
 /// Paint a simple centered settings panel (placeholder; real settings at M5+).
-fn paint_settings_overlay(fb: &mut Framebuffer, size: Size) {
+fn paint_settings_overlay(
+    fb: &mut Framebuffer,
+    size: Size,
+    shaper: &dyn TextShaper,
+    raster: &dyn Rasterizer,
+) {
     let pw = size.w * 3 / 5;
     let ph = size.h * 3 / 5;
     let px = (size.w.saturating_sub(pw) / 2) as i32;
@@ -508,16 +513,16 @@ fn paint_settings_overlay(fb: &mut Framebuffer, size: Size) {
         color: Color::rgb(0xFA, 0xFA, 0xFA),
     });
     list.push(DisplayItem::Glyphs {
-        origin: Point::new(px + 12, py + 12),
-        glyphs: MonoShaper.shape("Settings", 20),
+        origin: Point::new(px + 12, py + 20),
+        glyphs: shaper.shape("Settings", 22),
         color: Color::BLACK,
     });
     list.push(DisplayItem::Glyphs {
-        origin: Point::new(px + 12, py + 44),
-        glyphs: MonoShaper.shape("identities | vault | consent | farbling (coming soon)", 14),
+        origin: Point::new(px + 12, py + 52),
+        glyphs: shaper.shape("identities | vault | consent | farbling (coming soon)", 14),
         color: Color::rgb(0x50, 0x50, 0x50),
     });
-    BoxRasterizer.rasterize(&list, fb);
+    raster.rasterize(&list, fb);
 }
 
 /// Resident set size in kilobytes, read from `/proc/self/status` (Linux only).
