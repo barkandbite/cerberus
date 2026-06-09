@@ -61,6 +61,13 @@ impl PlatformSurface for HeadlessSurface {
     }
 }
 
+/// Wakes the platform event loop from another thread (e.g. a network worker) so
+/// the app's [`FrameApp::poll`] runs promptly, without busy-waiting.
+pub trait Waker: Send + Sync {
+    /// Request that the event loop wake and poll the app.
+    fn wake(&self);
+}
+
 /// An interactive application the platform layer drives.
 ///
 /// It renders a frame for a given size and reacts to input. The browser
@@ -70,6 +77,15 @@ impl PlatformSurface for HeadlessSurface {
 pub trait FrameApp {
     /// Window title.
     fn title(&self) -> String;
+
+    /// Receive a waker the app can hand to background workers. Default: ignored.
+    fn set_waker(&mut self, _waker: std::sync::Arc<dyn Waker>) {}
+
+    /// Advance background work (e.g. drain a network worker) when the loop is
+    /// woken; return true if a redraw is needed. Default: nothing to do.
+    fn poll(&mut self) -> bool {
+        false
+    }
 
     /// Render a frame at the given size.
     fn render_frame(&mut self, size: Size) -> Framebuffer;

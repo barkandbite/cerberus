@@ -67,8 +67,11 @@ keep-alive/pooling.
   MITM sandbox).
 - Hermetic unit tests cover the `http1` parser (Content-Length + chunked) and the
   DoH query/response codec; the network itself is not exercised by `cargo test`.
-- **Pending (next commit):** the per-instance cache, the https→prompt→block
-  policy, and background-thread loading wired into the windowed `BrowserApp`.
+- **Wired (windowed):** the per-instance `HttpCache`, the https→prompt→block
+  policy, and background-thread loading (a worker thread + an event-loop `Waker`)
+  are in `BrowserApp`. The load state machine (https upgrade, risk prompt, cache
+  hit, Stop-cancels) is covered by hermetic tests via a `FakeLoader`; the window
+  itself needs a display to run.
 
 ## Consequences
 

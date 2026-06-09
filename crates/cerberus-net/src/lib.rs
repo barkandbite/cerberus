@@ -15,7 +15,9 @@ use std::net::IpAddr;
 
 pub mod http1;
 
+mod cache;
 mod engine;
+pub use cache::HttpCache;
 pub use engine::{HttpEngine, Router, DEFAULT_USER_AGENT};
 
 /// A bidirectional byte stream (TCP, or TLS over TCP). Blanket-implemented so

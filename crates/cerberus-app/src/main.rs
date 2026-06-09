@@ -40,7 +40,8 @@ fn main() -> ExitCode {
 #[cfg(feature = "windowing")]
 fn cmd_run(args: &[String]) -> ExitCode {
     let fullscreen = has_flag(args, "--fullscreen");
-    let app = cerberus_app::BrowserApp::new();
+    let system_roots = has_flag(args, "--system-roots");
+    let app = cerberus_app::BrowserApp::with_options(system_roots);
     match cerberus_shell_winit::run(app, fullscreen) {
         Ok(()) => ExitCode::SUCCESS,
         Err(e) => {
@@ -148,7 +149,8 @@ fn print_usage() {
          \x20 version    Print the version\n\
          \x20 help       Print this help\n\n\
          RUN OPTIONS:\n\
-         \x20 --fullscreen        start borderless-fullscreen (F11 toggles)\n\n\
+         \x20 --fullscreen        start borderless-fullscreen (F11 toggles)\n\
+         \x20 --system-roots      trust the OS cert store (TLS-inspecting proxies)\n\n\
          RENDER OPTIONS:\n\
          \x20 --url <URL>          default: cerberus:home\n\
          \x20 --out <FILE>         default: cerberus-home.ppm\n\

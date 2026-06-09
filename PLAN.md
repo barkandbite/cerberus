@@ -240,11 +240,12 @@ green.
   a tiny head switcher, and a Settings button. **No bookmarks. No tabs**
   (single-page; Back/Forward walk history). Identity switching and vault unlock
   live behind the head switcher / Settings. Implemented in `cerberus-ui`.
-- **Networking (M1)** → rustls + `ring` + bundled `webpki-roots`
+- **Networking (M1, complete)** → rustls + `ring` + bundled `webpki-roots`
   (`TlsProvider`); **Quad9** DoH, DoH-only (`DnsResolver`); https-first →
-  user-risk-prompt → block for plaintext `http`; background-thread loads;
-  per-instance HTTP cache (ADR-0006). Fetch path **live-verified**; the cache,
-  http-consent prompt, and threading are the next commit.
+  user-risk-prompt → block for plaintext `http`; background-thread windowed
+  loads (worker + event-loop `Waker`); per-instance HTTP cache (ADR-0006). Fetch
+  path **live-verified**; the load state machine (upgrade/prompt/cache/Stop) is
+  covered by hermetic tests.
 
 ### Still open (needs your sign-off)
 

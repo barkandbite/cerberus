@@ -15,15 +15,18 @@ use cerberus_headless::render_document;
 use cerberus_identity::{Head, HeadManager};
 use cerberus_js::NullJsEngineFactory;
 use cerberus_layout::BlockLayout;
-use cerberus_net::{BuiltinHttpClient, HttpClient, Router};
+use cerberus_net::{BuiltinHttpClient, HttpCache, HttpClient, HttpResponse, Router};
 use cerberus_paint::{DisplayItem, DisplayList, Framebuffer, Rasterizer, TextShaper};
-use cerberus_shell::{FrameApp, HeadlessSurface, PlatformSurface};
+use cerberus_shell::{FrameApp, HeadlessSurface, PlatformSurface, Waker};
 use cerberus_storage::{Cookie, Group, StorageEnvironment};
 use cerberus_text::TextEngine;
 use cerberus_tls_rustls::RustlsProvider;
 use cerberus_types::{Color, HeadId, InstanceId, Origin, Point, RealmId, Rect, Size};
 use cerberus_ui::{Toolbar, ToolbarAction};
 use cerberus_url::parse as parse_url;
+use std::sync::mpsc::{Receiver, Sender};
+use std::sync::{Arc, Mutex};
+use std::thread::JoinHandle;
 
 /// What to render and how.
 #[derive(Clone, Debug)]
@@ -241,15 +244,139 @@ pub fn render(config: &RenderConfig) -> Result<RenderOutcome, AppError> {
 /// Until the network stack lands (M1) it serves the built-in `cerberus:` pages
 /// and shows a graceful error page for anything else, so the UI and navigation
 /// are fully exercisable now.
+/// A fetched page handed back from the loader.
+#[derive(Clone)]
+struct FetchedPage {
+    url: String,
+    status: u16,
+    headers: Vec<(String, String)>,
+    body: Vec<u8>,
+}
+
+/// The result of one load, tagged with the request id it answers.
+struct LoadOutcome {
+    id: u64,
+    requested_url: String,
+    result: Result<FetchedPage, String>,
+}
+
+/// In-flight navigation bookkeeping.
+struct Pending {
+    id: u64,
+    /// If this load is an https upgrade of an `http` URL, the original URL — so a
+    /// failure can offer the risk prompt.
+    http_fallback: Option<String>,
+}
+
+/// Performs page loads off the UI thread. Abstracted so the browser's load
+/// state machine is testable without the network (see `FakeLoader` in tests).
+trait PageLoader {
+    /// Queue a load; the result surfaces later via [`PageLoader::try_recv`].
+    fn request(&self, id: u64, url: String);
+    /// Non-blocking poll for a completed load.
+    fn try_recv(&mut self) -> Option<LoadOutcome>;
+    /// Receive a waker to notify the UI when a result is ready.
+    fn set_waker(&mut self, waker: Arc<dyn Waker>);
+}
+
+/// The production loader: a worker thread owning the network client.
+struct NetLoader {
+    tx: Sender<(u64, String)>,
+    rx: Receiver<LoadOutcome>,
+    waker: Arc<Mutex<Option<Arc<dyn Waker>>>>,
+    _worker: JoinHandle<()>,
+}
+
+impl NetLoader {
+    fn new(system_roots: bool) -> Self {
+        let (req_tx, req_rx) = std::sync::mpsc::channel::<(u64, String)>();
+        let (out_tx, out_rx) = std::sync::mpsc::channel::<LoadOutcome>();
+        let waker: Arc<Mutex<Option<Arc<dyn Waker>>>> = Arc::new(Mutex::new(None));
+        let worker_waker = waker.clone();
+
+        let worker = std::thread::spawn(move || {
+            // Build the network client (rustls config) once, on the worker.
+            let client = network_client(system_roots);
+            while let Ok((id, url)) = req_rx.recv() {
+                let result = fetch_page(&client, &url);
+                if out_tx
+                    .send(LoadOutcome {
+                        id,
+                        requested_url: url,
+                        result,
+                    })
+                    .is_err()
+                {
+                    break;
+                }
+                if let Some(w) = worker_waker.lock().unwrap().clone() {
+                    w.wake();
+                }
+            }
+        });
+
+        Self {
+            tx: req_tx,
+            rx: out_rx,
+            waker,
+            _worker: worker,
+        }
+    }
+}
+
+impl PageLoader for NetLoader {
+    fn request(&self, id: u64, url: String) {
+        let _ = self.tx.send((id, url));
+    }
+    fn try_recv(&mut self) -> Option<LoadOutcome> {
+        self.rx.try_recv().ok()
+    }
+    fn set_waker(&mut self, waker: Arc<dyn Waker>) {
+        *self.waker.lock().unwrap() = Some(waker);
+    }
+}
+
+fn fetch_page(client: &Router, url: &str) -> Result<FetchedPage, String> {
+    let parsed = parse_url(url).map_err(|e| e.to_string())?;
+    let resp = client.get(&parsed).map_err(|e| format!("{e:?}"))?;
+    Ok(FetchedPage {
+        url: url.to_string(),
+        status: resp.status,
+        headers: resp.headers,
+        body: resp.body,
+    })
+}
+
+/// Normalize a URL-bar entry: keep `cerberus:`/explicit-scheme inputs, otherwise
+/// assume `https://`.
+fn normalize_url(input: &str) -> String {
+    let t = input.trim();
+    if t.starts_with("cerberus:") || t.contains("://") {
+        t.to_string()
+    } else {
+        format!("https://{t}")
+    }
+}
+
+/// The interactive single-page browser: one toolbar over one page, linear
+/// history, background loads, and the https→prompt→block policy.
 pub struct BrowserApp {
     heads: HeadManager,
     storage: StorageEnvironment,
+    cache: HttpCache,
+    loader: Box<dyn PageLoader>,
     toolbar: Toolbar,
     text: TextEngine,
     history: Vec<String>,
     index: usize,
     document: Document,
     status: u16,
+    pending: Option<Pending>,
+    next_id: u64,
+    /// When `Some`, an `http` URL is awaiting the user's risk confirmation.
+    insecure_prompt: Option<String>,
+    /// Hit region of the "Load anyway" button while the prompt is shown.
+    insecure_button: Option<Rect>,
     settings_open: bool,
     background: Color,
     last_size: Size,
@@ -258,17 +385,33 @@ pub struct BrowserApp {
 impl BrowserApp {
     /// Create a browser on the default heads, showing `cerberus:home`.
     pub fn new() -> Self {
+        Self::with_loader(Box::new(NetLoader::new(false)))
+    }
+
+    /// Like [`new`](Self::new) but trusting the OS root store (for TLS-inspecting
+    /// proxies); see `RustlsProvider::with_system_roots`.
+    pub fn with_options(system_roots: bool) -> Self {
+        Self::with_loader(Box::new(NetLoader::new(system_roots)))
+    }
+
+    fn with_loader(loader: Box<dyn PageLoader>) -> Self {
         let heads = HeadManager::new(default_heads(), Box::new(NullJsEngineFactory));
         let label = heads.active().label.clone();
         let mut app = Self {
             heads,
             storage: StorageEnvironment::with_no_vault(),
+            cache: HttpCache::new(),
+            loader,
             toolbar: Toolbar::new(label),
             text: TextEngine::new(),
             history: Vec::new(),
             index: 0,
             document: empty_document(),
             status: 0,
+            pending: None,
+            next_id: 1,
+            insecure_prompt: None,
+            insecure_button: None,
             settings_open: false,
             background: Color::WHITE,
             last_size: Size::new(800, 600),
@@ -292,33 +435,129 @@ impl BrowserApp {
         self.status
     }
 
-    fn load(&mut self, input: &str) {
-        self.toolbar.url_text = input.to_string();
+    /// Begin loading `url`: built-in pages synchronously; http(s) on the worker,
+    /// upgrading `http`→`https` first.
+    fn start_load(&mut self, url: &str) {
+        self.insecure_prompt = None;
+        self.insecure_button = None;
         self.toolbar.url_focused = false;
-        self.toolbar.loading = true;
 
-        self.document = match parse_url(input) {
-            Ok(url) => match BuiltinHttpClient.get(&url) {
-                Ok(resp) => {
-                    self.status = resp.status;
-                    if let Some(origin) = first_party_of(&url) {
-                        self.set_session_cookie(&origin);
-                    }
-                    parse_trivial(&String::from_utf8_lossy(&resp.body))
-                }
-                Err(e) => {
-                    self.status = 0;
-                    error_document(input, &format!("{e:?}"))
-                }
-            },
-            Err(e) => {
-                self.status = 0;
-                error_document(input, &e.to_string())
-            }
+        if url.starts_with("cerberus:") {
+            self.load_builtin(url);
+            return;
+        }
+        let (target, http_fallback) = if url.starts_with("http://") {
+            (
+                url.replacen("http://", "https://", 1),
+                Some(url.to_string()),
+            )
+        } else {
+            (url.to_string(), None)
         };
+        self.dispatch(target, http_fallback);
+    }
 
+    /// Serve from cache if fresh, else queue a background fetch.
+    fn dispatch(&mut self, target: String, http_fallback: Option<String>) {
+        let instance = self.heads.active().instance;
+        if let Some(resp) = self.cache.get(instance, &target) {
+            self.commit_response(&target, resp.status, &resp.headers, &resp.body, false);
+            return;
+        }
+        self.toolbar.url_text = target.clone();
+        self.toolbar.loading = true;
+        self.document = loading_document(&target);
+        let id = self.next_id;
+        self.next_id += 1;
+        self.pending = Some(Pending { id, http_fallback });
+        self.loader.request(id, target);
+    }
+
+    fn load_builtin(&mut self, url: &str) {
+        match parse_url(url) {
+            Ok(u) => match BuiltinHttpClient.get(&u) {
+                Ok(resp) => {
+                    self.commit_response(url, resp.status, &resp.headers, &resp.body, false)
+                }
+                Err(e) => self.show_error(url, &format!("{e:?}")),
+            },
+            Err(e) => self.show_error(url, &e.to_string()),
+        }
+    }
+
+    fn commit_response(
+        &mut self,
+        url: &str,
+        status: u16,
+        headers: &[(String, String)],
+        body: &[u8],
+        store_in_cache: bool,
+    ) {
+        let instance = self.heads.active().instance;
+        if store_in_cache {
+            self.cache.store(
+                instance,
+                url,
+                &HttpResponse {
+                    status,
+                    headers: headers.to_vec(),
+                    body: body.to_vec(),
+                },
+            );
+        }
+        self.status = status;
+        self.document = parse_trivial(&String::from_utf8_lossy(body));
+        self.toolbar.url_text = url.to_string();
+        self.toolbar.loading = false;
+        self.insecure_prompt = None;
+        if let Ok(parsed) = parse_url(url) {
+            if let Some(origin) = first_party_of(&parsed) {
+                self.set_session_cookie(&origin);
+            }
+        }
+        self.update_nav();
+    }
+
+    fn show_error(&mut self, url: &str, message: &str) {
+        self.status = 0;
+        self.document = error_document(url, message);
+        self.toolbar.url_text = url.to_string();
         self.toolbar.loading = false;
         self.update_nav();
+    }
+
+    /// Apply a completed load. Testable entry point — no network or threads.
+    fn handle_outcome(&mut self, outcome: LoadOutcome) -> bool {
+        let Some(pending) = &self.pending else {
+            return false;
+        };
+        if outcome.id != pending.id {
+            return false; // stale: superseded by Stop or a newer navigation
+        }
+        let http_fallback = pending.http_fallback.clone();
+        self.pending = None;
+        match outcome.result {
+            Ok(page) => {
+                self.commit_response(&page.url, page.status, &page.headers, &page.body, true)
+            }
+            Err(err) => match http_fallback {
+                Some(http_url) => {
+                    // The https upgrade failed; offer the plaintext risk prompt.
+                    self.toolbar.loading = false;
+                    self.document = insecure_prompt_document(&http_url, &err);
+                    self.insecure_prompt = Some(http_url);
+                }
+                None => self.show_error(&outcome.requested_url, &err),
+            },
+        }
+        true
+    }
+
+    /// Confirm the risk prompt: load the original `http` URL in plaintext.
+    fn confirm_insecure(&mut self) {
+        if let Some(http_url) = self.insecure_prompt.take() {
+            self.dispatch(http_url, None);
+        }
     }
 
     fn set_session_cookie(&mut self, first_party: &Origin) {
@@ -331,12 +570,13 @@ impl BrowserApp {
     }
 
     fn navigate(&mut self, input: &str) {
+        let url = normalize_url(input);
         if !self.history.is_empty() {
             self.history.truncate(self.index + 1);
         }
-        self.history.push(input.to_string());
+        self.history.push(url.clone());
         self.index = self.history.len() - 1;
-        self.load(input);
+        self.start_load(&url);
     }
 
     fn back(&mut self) -> bool {
@@ -345,7 +585,7 @@ impl BrowserApp {
         }
         self.index -= 1;
         let url = self.history[self.index].clone();
-        self.load(&url);
+        self.start_load(&url);
         true
     }
 
@@ -355,13 +595,13 @@ impl BrowserApp {
         }
         self.index += 1;
         let url = self.history[self.index].clone();
-        self.load(&url);
+        self.start_load(&url);
         true
     }
 
     fn reload(&mut self) {
         if let Some(url) = self.history.get(self.index).cloned() {
-            self.load(&url);
+            self.start_load(&url);
         }
     }
 
@@ -388,6 +628,9 @@ impl BrowserApp {
                 true
             }
             ToolbarAction::Stop => {
+                // Cancel the in-flight load: drop the pending id so its result
+                // is ignored when it arrives.
+                self.pending = None;
                 self.toolbar.loading = false;
                 true
             }
@@ -423,6 +666,18 @@ impl FrameApp for BrowserApp {
         format!("Cerberus — {}", self.toolbar.head_label)
     }
 
+    fn set_waker(&mut self, waker: Arc<dyn Waker>) {
+        self.loader.set_waker(waker);
+    }
+
+    fn poll(&mut self) -> bool {
+        let mut redraw = false;
+        while let Some(outcome) = self.loader.try_recv() {
+            redraw |= self.handle_outcome(outcome);
+        }
+        redraw
+    }
+
     fn render_frame(&mut self, size: Size) -> Framebuffer {
         self.last_size = size;
         let content = self.toolbar.content_size(size);
@@ -442,6 +697,9 @@ impl FrameApp for BrowserApp {
         fb.blit(self.toolbar.content_origin(), &page);
         self.text
             .rasterize(&self.toolbar.paint(size, &self.text), &mut fb);
+        if self.insecure_prompt.is_some() {
+            self.insecure_button = Some(paint_insecure_button(&mut fb, &self.text));
+        }
         if self.settings_open {
             paint_settings_overlay(&mut fb, size, &self.text, &self.text);
         }
@@ -449,6 +707,14 @@ impl FrameApp for BrowserApp {
     }
 
     fn pointer_down(&mut self, x: i32, y: i32) -> bool {
+        if self.insecure_prompt.is_some() {
+            if let Some(button) = self.insecure_button {
+                if point_in_rect(button, x, y) {
+                    self.confirm_insecure();
+                    return true;
+                }
+            }
+        }
         if self.settings_open {
             self.settings_open = false;
             return true;
@@ -514,6 +780,60 @@ fn error_document(url: &str, message: &str) -> Document {
     let mut root = Element::new("#root");
     root.children.push(Node::Element(body));
     Document { root }
+}
+
+fn loading_document(url: &str) -> Document {
+    simple_document("Loading…", url, None)
+}
+
+fn insecure_prompt_document(http_url: &str, error: &str) -> Document {
+    simple_document(
+        "This site doesn't support HTTPS",
+        http_url,
+        Some(&format!(
+            "HTTPS failed ({error}). Loading over plaintext http is not private. \
+             Click \"Load anyway (insecure)\" below to proceed, or enter a different address."
+        )),
+    )
+}
+
+fn simple_document(heading: &str, line: &str, note: Option<&str>) -> Document {
+    let mut body = Element::new("body");
+    for (tag, text) in [("h1", heading.to_string()), ("p", line.to_string())] {
+        let mut el = Element::new(tag);
+        el.children.push(Node::Text(text));
+        body.children.push(Node::Element(el));
+    }
+    if let Some(n) = note {
+        let mut el = Element::new("p");
+        el.children.push(Node::Text(n.to_string()));
+        body.children.push(Node::Element(el));
+    }
+    let mut root = Element::new("#root");
+    root.children.push(Node::Element(body));
+    Document { root }
+}
+
+fn point_in_rect(r: Rect, x: i32, y: i32) -> bool {
+    x >= r.x && y >= r.y && x < r.x + r.w as i32 && y < r.y + r.h as i32
+}
+
+/// Paint the "Load anyway (insecure)" button into the content area; return its
+/// hit rect.
+fn paint_insecure_button(fb: &mut Framebuffer, text: &TextEngine) -> Rect {
+    let rect = Rect::new(12, cerberus_ui::TOOLBAR_HEIGHT as i32 + 96, 240, 32);
+    let mut list = DisplayList::new();
+    list.push(DisplayItem::Rect {
+        rect,
+        color: Color::rgb(0xC0, 0x39, 0x2B),
+    });
+    list.push(DisplayItem::Glyphs {
+        origin: Point::new(rect.x + 8, rect.y + 8),
+        glyphs: text.shape("Load anyway (insecure)", 16),
+        color: Color::WHITE,
+    });
+    text.rasterize(&list, fb);
+    rect
 }
 
 /// Paint a simple centered settings panel (placeholder; real settings at M5+).
@@ -585,9 +905,66 @@ mod tests {
         assert_eq!(outcome.framebuffer.size, RenderConfig::default().viewport);
     }
 
+    // ---- Hermetic test harness: a fake loader, no network or threads. ----
+
+    use std::cell::RefCell;
+    use std::collections::{HashMap, VecDeque};
+
+    struct FakeLoader {
+        responses: HashMap<String, Result<FetchedPage, String>>,
+        queue: RefCell<VecDeque<LoadOutcome>>,
+    }
+
+    impl FakeLoader {
+        fn new(responses: Vec<(&str, Result<FetchedPage, String>)>) -> Self {
+            Self {
+                responses: responses
+                    .into_iter()
+                    .map(|(u, r)| (u.to_string(), r))
+                    .collect(),
+                queue: RefCell::new(VecDeque::new()),
+            }
+        }
+    }
+
+    impl PageLoader for FakeLoader {
+        fn request(&self, id: u64, url: String) {
+            let result = self
+                .responses
+                .get(&url)
+                .cloned()
+                .unwrap_or_else(|| Err(format!("no canned response for {url}")));
+            self.queue.borrow_mut().push_back(LoadOutcome {
+                id,
+                requested_url: url,
+                result,
+            });
+        }
+        fn try_recv(&mut self) -> Option<LoadOutcome> {
+            self.queue.get_mut().pop_front()
+        }
+        fn set_waker(&mut self, _waker: Arc<dyn Waker>) {}
+    }
+
+    fn page(url: &str, status: u16, cache_control: Option<&str>, body: &str) -> FetchedPage {
+        let headers = cache_control
+            .map(|cc| vec![("Cache-Control".to_string(), cc.to_string())])
+            .unwrap_or_default();
+        FetchedPage {
+            url: url.to_string(),
+            status,
+            headers,
+            body: body.as_bytes().to_vec(),
+        }
+    }
+
+    fn fake_app(responses: Vec<(&str, Result<FetchedPage, String>)>) -> BrowserApp {
+        BrowserApp::with_loader(Box::new(FakeLoader::new(responses)))
+    }
+
     #[test]
     fn browser_opens_on_home_with_lazy_engine() {
-        let b = BrowserApp::new();
+        let b = fake_app(vec![]);
         assert_eq!(b.status(), 200);
         assert_eq!(b.active_head(), "work");
         assert_eq!(b.engines_live(), 0, "engine must be lazy until used");
@@ -596,7 +973,7 @@ mod tests {
 
     #[test]
     fn browser_navigation_walks_history() {
-        let mut b = BrowserApp::new();
+        let mut b = fake_app(vec![]);
         b.navigate("cerberus:about");
         assert!(b.toolbar.can_back);
         assert!(!b.toolbar.can_forward);
@@ -611,16 +988,88 @@ mod tests {
     }
 
     #[test]
-    fn browser_unknown_url_shows_error_page_not_crash() {
-        let mut b = BrowserApp::new();
-        b.navigate("https://example.com/");
-        assert_eq!(b.status(), 0);
-        assert!(b.document.root.text_content().contains("Cannot load page"));
+    fn browser_loads_real_page_on_a_background_request() {
+        let mut b = fake_app(vec![(
+            "https://site.test/",
+            Ok(page("https://site.test/", 200, None, "<h1>Hello</h1>")),
+        )]);
+        b.navigate("https://site.test/");
+        // The fetch is in flight: loading, with a pending request.
+        assert!(b.toolbar.loading);
+        assert!(b.pending.is_some());
+
+        assert!(b.poll(), "result drained on poll");
+        assert_eq!(b.status(), 200);
+        assert!(b.document.root.text_content().contains("Hello"));
+        assert!(!b.toolbar.loading);
+    }
+
+    #[test]
+    fn browser_https_upgrade_then_insecure_prompt_then_proceed() {
+        let mut b = fake_app(vec![
+            ("https://insecure.test/", Err("UnknownIssuer".to_string())),
+            (
+                "http://insecure.test/",
+                Ok(page("http://insecure.test/", 200, None, "<h1>Plain</h1>")),
+            ),
+        ]);
+        // Entering an http URL upgrades to https first.
+        b.navigate("http://insecure.test/");
+        assert!(b.poll());
+        // https failed -> risk prompt for the original http URL.
+        assert_eq!(b.insecure_prompt.as_deref(), Some("http://insecure.test/"));
+        assert!(b.document.root.text_content().contains("HTTPS"));
+
+        // Confirming loads the plaintext http page.
+        b.confirm_insecure();
+        assert!(b.pending.is_some());
+        assert!(b.poll());
+        assert_eq!(b.status(), 200);
+        assert!(b.document.root.text_content().contains("Plain"));
+        assert!(b.insecure_prompt.is_none());
+    }
+
+    #[test]
+    fn browser_cache_serves_repeat_without_a_new_request() {
+        let mut b = fake_app(vec![(
+            "https://c.test/",
+            Ok(page(
+                "https://c.test/",
+                200,
+                Some("max-age=60"),
+                "<h1>Cached</h1>",
+            )),
+        )]);
+        b.navigate("https://c.test/");
+        assert!(b.poll());
+        assert_eq!(b.status(), 200);
+
+        // Second visit is served from the per-instance cache: no pending request.
+        b.navigate("https://c.test/");
+        assert!(b.pending.is_none(), "served from cache");
+        assert!(!b.toolbar.loading);
+        assert!(b.document.root.text_content().contains("Cached"));
+    }
+
+    #[test]
+    fn browser_stop_cancels_the_in_flight_load() {
+        let mut b = fake_app(vec![(
+            "https://s.test/",
+            Ok(page("https://s.test/", 200, None, "x")),
+        )]);
+        b.navigate("https://s.test/");
+        assert!(b.pending.is_some());
+
+        assert!(b.handle(ToolbarAction::Stop));
+        assert!(b.pending.is_none());
+        assert!(!b.toolbar.loading);
+        // The late result is ignored.
+        assert!(!b.poll(), "stale outcome dropped after Stop");
     }
 
     #[test]
     fn browser_switch_head_keeps_at_most_one_engine() {
-        let mut b = BrowserApp::new();
+        let mut b = fake_app(vec![]);
         b.switch_head();
         assert_eq!(b.active_head(), "personal");
         assert_eq!(b.engines_live(), 1);
@@ -631,18 +1080,16 @@ mod tests {
 
     #[test]
     fn browser_renders_toolbar_over_page() {
-        let mut b = BrowserApp::new();
+        let mut b = fake_app(vec![]);
         let fb = b.render_frame(Size::new(400, 300));
         assert_eq!(fb.size, Size::new(400, 300));
-        // Toolbar background near the top.
         assert_eq!(fb.pixel(200, 1), Some(Color::rgb(0xEC, 0xEC, 0xEC)));
-        // Page background below the toolbar.
         assert_eq!(fb.pixel(380, 200), Some(Color::WHITE));
     }
 
     #[test]
     fn browser_url_typing_requires_focus() {
-        let mut b = BrowserApp::new();
+        let mut b = fake_app(vec![]);
         assert!(!b.text_input('z'), "ignored until the URL box is focused");
         assert!(b.pointer_down(200, 10), "click focuses the URL box");
         assert!(b.text_input('z'));

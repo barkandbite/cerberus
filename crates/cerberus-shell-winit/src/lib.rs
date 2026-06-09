@@ -12,14 +12,24 @@
 
 use std::num::NonZeroU32;
 use std::rc::Rc;
+use std::sync::Arc;
 
-use cerberus_shell::FrameApp;
+use cerberus_shell::{FrameApp, Waker};
 use cerberus_types::Size;
 use winit::application::ApplicationHandler;
 use winit::event::{ElementState, KeyEvent, MouseButton, WindowEvent};
-use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop};
+use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop, EventLoopProxy};
 use winit::keyboard::{Key, NamedKey};
 use winit::window::{Fullscreen, Window, WindowId};
+
+/// Wraps a winit proxy so a worker thread can wake the event loop.
+struct ProxyWaker(EventLoopProxy<()>);
+
+impl Waker for ProxyWaker {
+    fn wake(&self) {
+        let _ = self.0.send_event(());
+    }
+}
 
 /// Errors from running the windowed event loop.
 #[derive(Debug)]
@@ -179,13 +189,22 @@ impl<A: FrameApp> ApplicationHandler for State<A> {
             _ => {}
         }
     }
+
+    fn user_event(&mut self, _event_loop: &ActiveEventLoop, _event: ()) {
+        // A worker woke us; let the app drain its results and redraw if needed.
+        if self.app.poll() {
+            self.request_redraw();
+        }
+    }
 }
 
 /// Run `app` in a window until the user closes it. `fullscreen` starts the
 /// window borderless-fullscreen (toggle later with F11). Requires a display
 /// server; the headless path is used in CI/tests instead.
 pub fn run(app: impl FrameApp + 'static, fullscreen: bool) -> Result<(), WinitError> {
-    let event_loop = EventLoop::new().map_err(|e| WinitError::EventLoop(e.to_string()))?;
+    let event_loop = EventLoop::<()>::with_user_event()
+        .build()
+        .map_err(|e| WinitError::EventLoop(e.to_string()))?;
     event_loop.set_control_flow(ControlFlow::Wait);
 
     let mut state = State {
@@ -197,6 +216,11 @@ pub fn run(app: impl FrameApp + 'static, fullscreen: bool) -> Result<(), WinitEr
         start_fullscreen: fullscreen,
         error: None,
     };
+    // Hand the app a waker so its network worker can wake the loop.
+    state
+        .app
+        .set_waker(Arc::new(ProxyWaker(event_loop.create_proxy())));
+
     event_loop
         .run_app(&mut state)
         .map_err(|e| WinitError::EventLoop(e.to_string()))?;
