@@ -37,8 +37,11 @@ committed.
 
 | Dependency | Trait / crate | Status | License | Why not bootstrap |
 | --- | --- | --- | --- | --- |
-| `rustls` (+ `rustls-pki-types`, a verifier) | `TlsProvider` / `cerberus-tls-rustls` | **Approved**, wire at M1 | Apache-2.0 / MIT / ISC | TLS is a top CVE surface; memory-safe, audited |
-| V8 via `v8` (rusty_v8) | `JsEngine` / `cerberus-js-v8` | **Approved** (ADR-0002), wire at M3 | BSD-3-Clause | Engine is infeasible & dangerous to write |
+| `rustls` (+ `rustls-pki-types`, a verifier) | `TlsProvider` / `cerberus-tls-rustls` | **Approved**, wired at M1 | Apache-2.0 / MIT / ISC | TLS is a top CVE surface; memory-safe, audited |
+| `ab_glyph` (+ bundled Roboto) | `TextShaper`/`Rasterizer` / `cerberus-text` | **Approved** (ADR-0005), wired at M2 | Apache-2.0 | Font rasterization is a CVE surface; lean pure-Rust |
+| `image` (png/jpeg/gif/webp/bmp) | `ImageDecoder` / `cerberus-image` | **Approved** (ADR-0005), wired at M2 | MIT/Apache-2.0 | Image decoding is a top CVE surface |
+| `rquickjs` 0.9 (bundled QuickJS) | `JsEngine` / `cerberus-js-quickjs` | **Approved** (ADR-0002), wiring at M3 | MIT (QuickJS) / MIT (binding) | Engine is infeasible & dangerous to write; QuickJS chosen over V8 for memory |
+| ~~V8 via `v8` (rusty_v8)~~ | ~~`cerberus-js-v8`~~ | **Superseded** by QuickJS (ADR-0002, 2026-06-10); kept as a documented swap-in if compat demands | BSD-3-Clause | — |
 
 ### Proposed for the vault (needs your approval — M4)
 

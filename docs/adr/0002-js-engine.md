@@ -1,7 +1,7 @@
 # ADR-0002: JavaScript engine choice
 
-- Status: Proposed
-- Date: 2026-06-08
+- Status: Accepted (owner ratified **QuickJS-first**, 2026-06-10 — see Update)
+- Date: 2026-06-08 (updated 2026-06-10)
 - Deciders: bbarker@barkbite.org (owner), engineering
 
 ## Context
@@ -70,3 +70,39 @@ ratified here / in PLAN §10.
   considerations; no decisive advantage for us.
 - **No JS / our own engine.** Out of scope and a security non-starter,
   respectively.
+
+## Update — 2026-06-10: owner ratified QuickJS-first (reverses the V8 default)
+
+The owner chose **QuickJS now**, not V8. Memory is priority #1 and the
+anti-bloat stance is explicit; V8's RAM/build cost lost to QuickJS's tiny
+footprint. The original "V8-first, QuickJS-as-escape-hatch" framing above is
+inverted: we ship QuickJS first and keep V8 as the documented swap-in *if*
+real-world compatibility later demands it (still a pure adapter swap behind the
+`JsEngine` seam — the modularity test holds either way).
+
+Decision, as implemented at M3:
+
+1. The first engine adapter is **`cerberus-js-quickjs`** over **`rquickjs` 0.9**
+   (bundled QuickJS; compiles its vendored C — no system lib). Added to the
+   ADR-0003 approved-dependency list.
+2. **`JsEngine` is no longer `: Send`.** QuickJS (like a V8 isolate) is a
+   single-threaded VM bound to its creating thread, and `rquickjs`'s handles are
+   `!Send`. Nothing required the engine to be `Send` — it lives on the UI thread
+   with the active head, and the network worker never touches it (verified). If
+   JS ever moves off-thread it will be a channel-based *handle* (itself `Send`),
+   not a `Send` engine.
+3. **One realm = one `rquickjs::Context`** within the engine's single
+   `Runtime`; created/destroyed on tab lifecycle, sharing the one GC heap. The
+   "at most one engine live per active head" invariant (ADR-0001 /
+   `cerberus-identity`) is unchanged.
+4. **Speed-first delay neutralization** (product directive: "pure speed, ignore
+   programmed delays") is installed as a JS prelude in every realm before any
+   page script: `setTimeout`/`setInterval`/`requestAnimationFrame`/
+   `requestIdleCallback`/`queueMicrotask` fire **immediately** (delays ignored;
+   `setInterval` fires once, not forever), and `IntersectionObserver.observe`
+   reports the target as intersecting **immediately** (so lazy/scroll-in content
+   loads at once). `ResizeObserver`/`MutationObserver` exist as safe no-ops.
+
+`unsafe`: the adapter needs none — `rquickjs`'s safe API suffices, so the crate
+keeps the workspace `unsafe_code = "deny"` (unlike the V8 path, which would have
+opted out for FFI).

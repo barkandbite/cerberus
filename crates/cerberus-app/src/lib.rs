@@ -15,7 +15,7 @@ use cerberus_dom::{parse_html, Document, DocumentBuilder, NodeRef};
 use cerberus_headless::render_document;
 use cerberus_identity::{Head, HeadManager};
 use cerberus_image::ImageCodec;
-use cerberus_js::NullJsEngineFactory;
+use cerberus_js_quickjs::QuickJsEngineFactory;
 use cerberus_layout::{
     BlockLayout, FieldKind, FormFieldBox, FormState, ImageProvider, LayoutEngine, LinkBox, NoForms,
 };
@@ -149,7 +149,7 @@ pub fn render(config: &RenderConfig) -> Result<RenderOutcome, AppError> {
     let url = parse_url(&config.url).map_err(|e| AppError::Url(e.to_string()))?;
 
     // --- Identities: one engine live at a time, instantiated lazily. ---
-    let mut heads = HeadManager::new(default_heads(), Box::new(NullJsEngineFactory));
+    let mut heads = HeadManager::new(default_heads(), Box::new(QuickJsEngineFactory));
     let active_instance = heads.active().instance;
     let active_label = heads.active().label.clone();
 
@@ -593,7 +593,7 @@ impl BrowserApp {
     }
 
     fn with_loader(loader: Box<dyn PageLoader>) -> Self {
-        let heads = HeadManager::new(default_heads(), Box::new(NullJsEngineFactory));
+        let heads = HeadManager::new(default_heads(), Box::new(QuickJsEngineFactory));
         let label = heads.active().label.clone();
         let style_engine = CssEngine::new();
         let styled = style_engine.style(&empty_document());
@@ -1640,7 +1640,7 @@ mod tests {
     fn renders_builtin_home_end_to_end() {
         let outcome = render(&RenderConfig::default()).expect("render should succeed");
         assert_eq!(outcome.status, 200);
-        assert_eq!(outcome.engine_name, "null");
+        assert_eq!(outcome.engine_name, "quickjs");
         // Memory-first invariant: never more than one engine live.
         assert_eq!(outcome.engines_live, 1);
         assert_eq!(outcome.realms_live, 1);

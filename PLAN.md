@@ -307,12 +307,25 @@ green.
   behavior is unchanged; the css + app consumers were migrated to the cursor.
   Verified output-identical (a deterministic page renders byte-for-byte the same
   as before the swap) with the full suite green.
+- **JS engine (M3, started)** → `cerberus-js-quickjs` wraps **QuickJS** (via
+  `rquickjs` 0.9, bundled) behind the `JsEngine` seam — the owner chose QuickJS
+  over V8 for memory (ADR-0002). One `Runtime` (one GC heap) per active head,
+  one `Context` per realm; the engine is instantiated lazily and torn down on
+  head switch (still ≤1 live). `JsEngine` is no longer `Send` (single-threaded
+  VM, lives on the UI thread). Wired into the composition root: home renders with
+  a live `quickjs` engine + the per-head farbling prologue, at **~10 MB RSS**
+  (QuickJS adds ≈1.4 MB — well within the 64 MB gate). *Executing a page's own
+  `<script>`s needs DOM bindings (`document`/`window`) and is the next M3 step;
+  today the engine runs the farbling prologue and the speed-first prelude.*
 - **Speed-first / raw render** → Cerberus **ignores programmed delays**: CSS
   `opacity`/`animation`/`transition`/`transform`/`visibility` are not honored;
   lazy-loading is ignored — `data-src` is preferred over a placeholder `src` and
-  every image is fetched immediately, never on scroll; at M3 `setTimeout`/
-  `IntersectionObserver` will be neutralized. Content renders immediately
-  (ADR-0007).
+  every image is fetched immediately, never on scroll. On the JS side (M3) a
+  prelude installed into every realm makes `setTimeout`/`setInterval`/
+  `requestAnimationFrame`/`requestIdleCallback`/`queueMicrotask` fire
+  **immediately** and `IntersectionObserver.observe` report the target visible
+  **at once** (so scroll-/timer-gated content appears without waiting);
+  `setInterval` fires once, not forever. Content renders immediately (ADR-0007).
 
 ### Still open (needs your sign-off)
 

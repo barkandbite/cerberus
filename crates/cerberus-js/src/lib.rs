@@ -48,7 +48,12 @@ impl fmt::Display for JsError {
 impl std::error::Error for JsError {}
 
 /// A live JS engine instance. One instance corresponds to one active head.
-pub trait JsEngine: Send {
+///
+/// Not `Send`: an engine (QuickJS today, V8 later) is bound to the thread that
+/// created it — both are single-threaded VMs. The memory-first design keeps it
+/// on the UI thread with the active head; moving JS off-thread would be a
+/// channel-based handle (itself `Send`), not a `Send` engine.
+pub trait JsEngine {
     /// A short engine name (e.g. `"v8"`, `"null"`).
     fn name(&self) -> &'static str;
 

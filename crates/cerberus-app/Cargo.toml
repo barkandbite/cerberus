@@ -35,6 +35,7 @@ cerberus-storage = { path = "../cerberus-storage" }
 cerberus-consent = { path = "../cerberus-consent" }
 cerberus-farbling = { path = "../cerberus-farbling" }
 cerberus-js = { path = "../cerberus-js" }
+cerberus-js-quickjs = { path = "../cerberus-js-quickjs" }
 cerberus-identity = { path = "../cerberus-identity" }
 cerberus-shell = { path = "../cerberus-shell" }
 cerberus-headless = { path = "../cerberus-headless" }
