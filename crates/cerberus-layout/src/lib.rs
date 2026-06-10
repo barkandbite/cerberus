@@ -5,9 +5,11 @@
 //! margins and optional background, inline content flows and word-wraps, text
 //! uses the cascaded color/size/weight/underline, `text-align` shifts lines, and
 //! `display:none` is skipped. `<a href>` text also emits clickable link boxes,
-//! `<img>` emits decoded images (or a sized placeholder / `[alt]`), and form
+//! `<img>` emits decoded images (or a sized placeholder / `[alt]`), form
 //! controls (`<input>`, `<button>`, `<textarea>`, `<select>`) render as bordered
-//! inline-block boxes. Real box widths, floats, and positioning are still ahead.
+//! inline-block boxes, and `<table>` lays out as an equal-width bordered grid
+//! (each cell's content flowed into its own box). Real box widths, floats, and
+//! positioning are still ahead.
 
 use cerberus_paint::{DecodedImage, DisplayItem, DisplayList, GlyphBox, TextShaper};
 use cerberus_style::{ComputedStyle, Display, StyledChild, StyledDom, StyledNode, TextAlign};
@@ -145,6 +147,32 @@ impl<'a> Ctx<'a> {
         }
     }
 
+    /// A fresh flow context bounded to `left..right` and starting at `y`, used to
+    /// lay a table cell's content into its own rectangle. It shares the parent's
+    /// shaper/images and produces absolute-coordinate items (no offset needed).
+    fn sub(
+        left: i32,
+        right: i32,
+        y: i32,
+        shaper: &'a dyn TextShaper,
+        images: &'a dyn ImageProvider,
+    ) -> Self {
+        Self {
+            shaper,
+            images,
+            display: DisplayList::new(),
+            links: Vec::new(),
+            left0: left,
+            right: right.max(left + 1),
+            left,
+            x: left,
+            y,
+            line_h: 0,
+            line: Vec::new(),
+            line_align: TextAlign::Left,
+        }
+    }
+
     fn walk(&mut self, node: &StyledNode, in_link: Option<&str>) {
         let style = &node.style;
         if style.display == Display::None {
@@ -180,8 +208,15 @@ impl<'a> Ctx<'a> {
                 self.form_select(node);
                 return;
             }
+            "table" => {
+                self.table(node);
+                return;
+            }
             // Options are rendered by their <select>; loose ones never flow.
             "option" | "optgroup" => return,
+            // Table-internal tags only flow inside a <table> (see `table`); a
+            // stray one in normal flow renders nothing.
+            "tr" | "td" | "th" | "thead" | "tbody" | "tfoot" | "caption" => return,
             _ => {}
         }
 
@@ -605,6 +640,188 @@ impl<'a> Ctx<'a> {
         });
         self.y += 8;
     }
+
+    /// Lay out a `<table>` as an equal-width grid.
+    ///
+    /// Rows are the `<tr>`s directly under the table plus those inside
+    /// `<thead>/<tbody>/<tfoot>` (flattened in source order); a row's cells are
+    /// its `<td>`/`<th>` children. Columns are equal width across the content box
+    /// (`col_w = (right - left) / cols`, last column takes the remainder). Each
+    /// cell's content is flowed into its own rectangle by a sub-`Ctx`, the row
+    /// height is the tallest cell, and a 1px border (plus optional fill) is drawn
+    /// around every cell. `<th>` text is bold and centred; `<td>` is left-aligned.
+    ///
+    /// Pragmatic, not spec-perfect: equal columns only (no content-based sizing),
+    /// and colspan/rowspan are ignored — every cell is one column by one row.
+    // TODO: honour colspan/rowspan and content-based column widths.
+    fn table(&mut self, node: &StyledNode) {
+        self.flush_line();
+        let left = self.left;
+        let right = self.right.max(left + 1);
+        self.line_align = node.style.text_align;
+
+        // A caption (if any) renders as a single line above the grid.
+        if let Some(caption) = find_child(node, "caption") {
+            let text = caption.text();
+            let text = text.trim();
+            if !text.is_empty() {
+                self.x = left;
+                self.add_run(text, &node.style, None);
+                self.flush_line();
+            }
+        }
+
+        let rows = collect_rows(node);
+        let num_cols = rows
+            .iter()
+            .map(|r| cell_children(r).count())
+            .max()
+            .unwrap_or(0);
+
+        // Nothing to lay out: leave a small margin and bail (never panic).
+        if num_cols == 0 || right - left < num_cols as i32 {
+            self.y += TABLE_MARGIN;
+            self.x = self.left;
+            return;
+        }
+
+        let col_w = ((right - left) / num_cols as i32).max(1);
+        let mut row_y = self.y;
+
+        for row in rows {
+            let cells: Vec<&StyledNode> = cell_children(row).collect();
+            if cells.is_empty() {
+                continue;
+            }
+
+            // Sub-lay every cell, capturing its items/links and content height.
+            let mut laid: Vec<(Vec<DisplayItem>, Vec<LinkBox>, i32)> =
+                Vec::with_capacity(cells.len());
+            let mut row_h = line_height(node.style.font_size.max(1));
+            for (col, cell) in cells.iter().enumerate() {
+                let cell_x = left + col as i32 * col_w;
+                let cell_w = if col + 1 == num_cols {
+                    right - cell_x
+                } else {
+                    col_w
+                }
+                .max(1);
+                let (items, links, h) = self.flow_cell(cell, cell_x, cell_x + cell_w, row_y);
+                row_h = row_h.max(h);
+                laid.push((items, links, h));
+            }
+            row_h = (row_h + 2 * CELL_PAD).max(1);
+
+            // Emit each cell's box (fill + border) under its content.
+            for (col, cell) in cells.iter().enumerate() {
+                let cell_x = left + col as i32 * col_w;
+                let cell_w = if col + 1 == num_cols {
+                    right - cell_x
+                } else {
+                    col_w
+                }
+                .max(1) as u32;
+                let is_header = cell.tag == "th";
+                let fill = cell
+                    .style
+                    .background
+                    .or(if is_header { Some(TH_BG) } else { None });
+                self.cell_box(cell_x, row_y, cell_w, row_h as u32, fill);
+            }
+
+            // Then the captured cell content, on top of the boxes.
+            for (items, links, _) in laid {
+                self.display.items.extend(items);
+                self.links.extend(links);
+            }
+
+            row_y += row_h;
+        }
+
+        self.y = row_y + TABLE_MARGIN;
+        self.x = self.left;
+    }
+
+    /// Flow one table cell's children into its own rectangle and read back the
+    /// produced items, links, and content height. The sub-context is positioned
+    /// at the cell's absolute padded bounds, so its output needs no offset.
+    fn flow_cell(
+        &self,
+        cell: &StyledNode,
+        cell_x: i32,
+        cell_right: i32,
+        cell_y: i32,
+    ) -> (Vec<DisplayItem>, Vec<LinkBox>, i32) {
+        let content_left = cell_x + CELL_PAD;
+        let content_right = (cell_right - CELL_PAD).max(content_left + 1);
+        let content_top = cell_y + CELL_PAD;
+        let mut sub = Ctx::sub(
+            content_left,
+            content_right,
+            content_top,
+            self.shaper,
+            self.images,
+        );
+
+        let is_header = cell.tag == "th";
+        // Headers centre their text; cells inherit the cell's own alignment.
+        sub.line_align = if is_header {
+            TextAlign::Center
+        } else {
+            cell.style.text_align
+        };
+        // Direct text in a <th> is bold (nested elements keep their own style).
+        let text_style = if is_header {
+            let mut s = cell.style.clone();
+            s.font.bold = true;
+            s
+        } else {
+            cell.style.clone()
+        };
+
+        for child in &cell.children {
+            match child {
+                StyledChild::Text(t) => sub.add_text(t, &text_style, None),
+                StyledChild::Element(e) => sub.walk(e, None),
+            }
+        }
+        sub.flush_line();
+
+        // After flush, `sub.y` already includes the last line; floor at one line.
+        let height = (sub.y - content_top).max(line_height(cell.style.font_size.max(1)));
+        (sub.display.items, sub.links, height)
+    }
+
+    /// Draw a cell's optional background fill and its 1px border outline.
+    fn cell_box(&mut self, x: i32, y: i32, w: u32, h: u32, fill: Option<Color>) {
+        if w == 0 || h == 0 {
+            return;
+        }
+        if let Some(color) = fill {
+            self.display.push(DisplayItem::Rect {
+                rect: Rect::new(x, y, w, h),
+                color,
+            });
+        }
+        // Four thin rects form a hollow border (so a fill stays visible inside).
+        let b = TABLE_BORDER;
+        self.display.push(DisplayItem::Rect {
+            rect: Rect::new(x, y, w, 1),
+            color: b,
+        });
+        self.display.push(DisplayItem::Rect {
+            rect: Rect::new(x, y + h as i32 - 1, w, 1),
+            color: b,
+        });
+        self.display.push(DisplayItem::Rect {
+            rect: Rect::new(x, y, 1, h),
+            color: b,
+        });
+        self.display.push(DisplayItem::Rect {
+            rect: Rect::new(x + w as i32 - 1, y, 1, h),
+            color: b,
+        });
+    }
 }
 
 fn line_height(px: u32) -> i32 {
@@ -629,6 +846,56 @@ const CONTROL_BORDER: Color = Color::rgb(0x76, 0x76, 0x76);
 const FIELD_BG: Color = Color::WHITE;
 /// Fill for buttons.
 const BUTTON_BG: Color = Color::rgb(0xE9, 0xE9, 0xED);
+
+// --- Table styling (UA defaults; CSS overrides are a later slice). ---
+/// Inner padding inside every table cell, in pixels.
+const CELL_PAD: i32 = 4;
+/// Space left below a table before the next block.
+const TABLE_MARGIN: i32 = 8;
+/// Table cell border colour.
+const TABLE_BORDER: Color = Color::rgb(0xCC, 0xCC, 0xCC);
+/// Default `<th>` header-cell fill (light grey) when none is set by the cascade.
+const TH_BG: Color = Color::rgb(0xF0, 0xF0, 0xF0);
+
+/// Rows of a table in source order: each `<tr>` directly under the table, and
+/// each `<tr>` inside a `<thead>`/`<tbody>`/`<tfoot>` section (flattened).
+fn collect_rows(table: &StyledNode) -> Vec<&StyledNode> {
+    let mut rows = Vec::new();
+    for child in &table.children {
+        if let StyledChild::Element(e) = child {
+            match e.tag.as_str() {
+                "tr" => rows.push(e),
+                "thead" | "tbody" | "tfoot" => {
+                    for inner in &e.children {
+                        if let StyledChild::Element(r) = inner {
+                            if r.tag == "tr" {
+                                rows.push(r);
+                            }
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+    rows
+}
+
+/// The `<td>`/`<th>` element children of a row, in order.
+fn cell_children(row: &StyledNode) -> impl Iterator<Item = &StyledNode> {
+    row.children.iter().filter_map(|c| match c {
+        StyledChild::Element(e) if e.tag == "td" || e.tag == "th" => Some(e),
+        _ => None,
+    })
+}
+
+/// The first direct element child of `node` whose tag is `tag`.
+fn find_child<'a>(node: &'a StyledNode, tag: &str) -> Option<&'a StyledNode> {
+    node.children.iter().find_map(|c| match c {
+        StyledChild::Element(e) if e.tag == tag => Some(e),
+        _ => None,
+    })
+}
 
 /// The label of a `<select>`'s selected option, falling back to its first.
 fn selected_option(node: &StyledNode) -> Option<String> {
@@ -682,6 +949,25 @@ mod tests {
                 _ => None,
             })
             .collect()
+    }
+
+    fn glyph_xs(laid: &LaidOut) -> Vec<i32> {
+        laid.display
+            .items
+            .iter()
+            .filter_map(|i| match i {
+                DisplayItem::Glyphs { origin, .. } => Some(origin.x),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// Count of distinct values in a slice of coordinates.
+    fn distinct(values: &[i32]) -> usize {
+        let mut v = values.to_vec();
+        v.sort_unstable();
+        v.dedup();
+        v.len()
     }
 
     fn rect_count(laid: &LaidOut) -> usize {
@@ -856,5 +1142,88 @@ mod tests {
             laid.display.items.is_empty(),
             "type=hidden produces no paint"
         );
+    }
+
+    #[test]
+    fn table_draws_cell_borders_and_grids_text() {
+        // A 2x2 grid of <td> cells. Each cell draws a hollow 1px border made of
+        // four rects, so a table emits many more rects than the plain-text
+        // baseline (which emits none).
+        let baseline = lay("<p>aa bb cc dd</p>", 400);
+        let laid = lay(
+            "<table><tr><td>aa</td><td>bb</td></tr>\
+             <tr><td>cc</td><td>dd</td></tr></table>",
+            400,
+        );
+        assert_eq!(rect_count(&baseline), 0, "plain text draws no rects");
+        assert!(
+            rect_count(&laid) >= 4 * 4,
+            "four cells each add a four-rect border: {}",
+            rect_count(&laid)
+        );
+
+        // All four cell texts are laid out across two columns and two rows.
+        assert_eq!(total_glyphs(&laid), 8, "aa bb cc dd, two glyphs each");
+        let xs = glyph_xs(&laid);
+        let ys = glyph_ys(&laid);
+        assert_eq!(distinct(&xs), 2, "two distinct cell columns: {xs:?}");
+        assert_eq!(distinct(&ys), 2, "two distinct cell rows: {ys:?}");
+    }
+
+    #[test]
+    fn table_header_cells_render_bold() {
+        let laid = lay(
+            "<table><thead><tr><th>Name</th><th>Age</th></tr></thead>\
+             <tbody><tr><td>Alice</td><td>30</td></tr></tbody></table>",
+            400,
+        );
+        // The header row's two cells are laid out (4 + 3 glyphs).
+        assert!(total_glyphs(&laid) >= 7, "header + body text laid out");
+        // <th> text is shaped bold; <td> text is not, so both weights appear.
+        let has_bold = laid
+            .display
+            .items
+            .iter()
+            .any(|i| matches!(i, DisplayItem::Glyphs { style, .. } if style.bold));
+        let has_regular = laid
+            .display
+            .items
+            .iter()
+            .any(|i| matches!(i, DisplayItem::Glyphs { style, .. } if !style.bold));
+        assert!(has_bold, "header text rendered bold");
+        assert!(has_regular, "body text rendered regular");
+        // The light-grey header fill is drawn behind the <th> cells.
+        assert!(has_rect_color(&laid, TH_BG), "header cell fill drawn");
+    }
+
+    #[test]
+    fn table_cell_link_emits_a_link_box() {
+        let laid = lay(
+            "<table><tr><td><a href=\"/dest\">go</a></td></tr></table>",
+            400,
+        );
+        assert!(!laid.links.is_empty(), "link inside a cell is preserved");
+        assert!(laid.links.iter().all(|l| l.href == "/dest"));
+    }
+
+    #[test]
+    fn empty_table_does_not_panic() {
+        let laid = lay("<table></table>", 400);
+        // No rows means no cells: nothing painted, no links, no crash.
+        assert!(laid.display.items.is_empty(), "empty table paints nothing");
+        assert!(laid.links.is_empty());
+    }
+
+    #[test]
+    fn malformed_table_does_not_panic() {
+        // A stray <td> directly under <table> (no <tr>) must not panic and must
+        // not produce absurd output.
+        let laid = lay("<table><td>x</table>", 400);
+        // Sane result: the loose cell is dropped (no row), so nothing is painted.
+        assert!(rect_count(&laid) == 0);
+        // A row of one bare cell is also tolerated and produces a real grid.
+        let one = lay("<table><tr><td>x</td></tr></table>", 400);
+        assert_eq!(total_glyphs(&one), 1, "single-cell table lays out its text");
+        assert!(rect_count(&one) >= 4, "single cell has a four-rect border");
     }
 }

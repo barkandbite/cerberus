@@ -269,6 +269,13 @@ green.
   the content box; `type=hidden` paints nothing. **Live-verified** (Wikipedia's
   search field + button + checkboxes). Interactivity (focus/typing/submit) ties
   into the event model and lands with JS at M3.
+- **Tables (M2)** → `<table>` (with `<thead>`/`<tbody>`/`<tfoot>`, `<tr>`,
+  `<td>`/`<th>`, `<caption>`) lays out as a bordered grid: equal-width columns,
+  each cell's content flowed into its own box (so nested links/images/tables
+  work), `<th>` bold + centred with a grey fill, and a `<caption>` line above.
+  **Live-verified** (kernel.org's release tables render as real grids with the
+  in-cell links preserved). Content-based column sizing and colspan/rowspan are
+  noted follow-ups.
 - **HTML parser (M2)** → `parse_html` replaces the M0 placeholder: a quote-aware
   tokenizer (so `>` inside an attribute value can't end a tag early),
   rawtext/RCDATA for `<script>`/`<style>`/`<title>`/`<textarea>`, comment +
