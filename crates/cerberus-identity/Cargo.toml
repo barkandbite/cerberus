@@ -1,4 +1,5 @@
 [package]
+publish = false
 name = "cerberus-identity"
 description = "The head manager: three switchable identities, one JS engine live at a time."
 version.workspace = true

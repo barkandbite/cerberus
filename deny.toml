@@ -1,11 +1,22 @@
 # cargo-deny configuration — the enforcement arm of the dependency policy
-# (ADR-0003). It is committed now as the documented intent; wiring `cargo deny`
-# into CI happens once the tool is approved (it adds no crates to the browser's
-# own dependency tree). Until then it can be run locally:
+# (ADR-0003). Run it locally before adding/upgrading any dependency (CI does not
+# run it automatically in this environment):
 #
 #     cargo install cargo-deny && cargo deny check
 #
-# The scaffold has zero third-party dependencies, so this is forward-looking.
+# Every crate in the tree must pass licenses + bans + advisories + sources.
+
+[graph]
+# Evaluate only the desktop platforms Cerberus actually builds/ships for. This
+# keeps target-specific stubs we never link (e.g. the UEFI `r-efi`, LGPL) out of
+# the license/ban evaluation — we don't ship a UEFI target.
+targets = [
+    "x86_64-unknown-linux-gnu",
+    "aarch64-unknown-linux-gnu",
+    "x86_64-apple-darwin",
+    "aarch64-apple-darwin",
+    "x86_64-pc-windows-msvc",
+]
 
 [advisories]
 # Fail on any security advisory affecting a dependency.
@@ -24,6 +35,10 @@ allow = [
     "ISC",
     "Unicode-3.0",
     "Zlib",
+    # Permissive, non-copyleft licenses that ride in with already-approved deps
+    # (reviewed per ADR-0003, 2026-06-10):
+    "CDLA-Permissive-2.0", # webpki-roots (Mozilla CA list) — via rustls (ADR-0003)
+    "0BSD",                # adler2 (Adler-32) — via the image PNG path (ADR-0005)
 ]
 confidence-threshold = 0.9
 
@@ -32,6 +47,9 @@ confidence-threshold = 0.9
 # memory-and-minimalism posture even though it is a build-tree concern.
 multiple-versions = "warn"
 wildcards = "deny"
+# Our own workspace crates are path deps declared without a version, which reads
+# as a `*` requirement. They are first-party, so exempt them from the wildcard ban.
+allow-wildcard-paths = true
 
 [sources]
 # Only crates.io for now; any other source must be justified in an ADR.

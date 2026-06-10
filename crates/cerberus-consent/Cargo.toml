@@ -1,4 +1,5 @@
 [package]
+publish = false
 name = "cerberus-consent"
 description = "Third-party detection, default-deny policy, consent events, and a rule store."
 version.workspace = true

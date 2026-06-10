@@ -98,3 +98,22 @@ etc. without their own ADR.)
   whole premise. Rejected.
 - **Hand-roll crypto/TLS.** Rejected outright — the canonical way to ship a
   catastrophic CVE.
+
+## Update — 2026-06-10: deny gate actually enforced (run locally)
+
+CI does not run automatically in the current environment, so `cargo deny check`
+is run **locally before any dependency change** rather than relied on in CI. Its
+first real run against the post-M0 tree (M1–M3 deps) surfaced three things, now
+resolved so all four checks pass (`advisories/bans/licenses/sources ok`):
+
+- **License allow-list extended** (this ADR is the required review). Two
+  permissive, non-copyleft licenses ride in with already-approved deps:
+  `CDLA-Permissive-2.0` (`webpki-roots`, the Mozilla CA list, via rustls) and
+  `0BSD` (`adler2`, the Adler-32 checksum, via the `image` PNG path). Both added.
+- **Targets scoped** to the desktop triples we build/ship (`[graph].targets`).
+  This drops target-specific stubs we never link — notably `r-efi` (LGPL, UEFI),
+  which is not in any platform graph we ship.
+- **Workspace crates marked `publish = false`.** They are first-party path deps
+  (no version → a `*` requirement); `allow-wildcard-paths` only exempts private
+  crates, so marking them unpublished (which they are — this is an application,
+  not crates.io libraries) clears the wildcard ban without inventing versions.

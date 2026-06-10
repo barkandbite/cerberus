@@ -1,4 +1,5 @@
 [package]
+publish = false
 name = "cerberus-tls-rustls"
 description = "TlsProvider adapter: rustls (ring backend) + bundled webpki roots (ADR-0006)."
 version.workspace = true

@@ -1,4 +1,5 @@
 [package]
+publish = false
 name = "cerberus-shell"
 description = "Platform surface seam (windowing abstraction) with a headless surface."
 version.workspace = true

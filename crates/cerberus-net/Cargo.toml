@@ -1,4 +1,5 @@
 [package]
+publish = false
 name = "cerberus-net"
 description = "Networking traits (TlsProvider, DnsResolver, HttpClient) plus a built-in page client."
 version.workspace = true

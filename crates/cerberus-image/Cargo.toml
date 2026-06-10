@@ -1,4 +1,5 @@
 [package]
+publish = false
 name = "cerberus-image"
 description = "ImageDecoder adapter over the `image` crate (web formats), with a memory downscale cap (ADR-0005)."
 version.workspace = true

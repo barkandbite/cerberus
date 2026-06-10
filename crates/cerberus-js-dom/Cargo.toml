@@ -1,4 +1,5 @@
 [package]
+publish = false
 name = "cerberus-js-dom"
 description = "Engine-agnostic DOM bridge: run page scripts against a JS document model and reconcile mutations back into the Rust DOM via a snapshot/replay round-trip (ADR-0008)."
 version.workspace = true

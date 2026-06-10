@@ -1,4 +1,5 @@
 [package]
+publish = false
 name = "cerberus-style"
 description = "Neutral computed-style types, a styled tree, and the StyleEngine seam."
 version.workspace = true

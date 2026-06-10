@@ -1,4 +1,5 @@
 [package]
+publish = false
 name = "cerberus-dns-doh"
 description = "DnsResolver adapter: DNS-over-HTTPS (RFC 8484 wire format), Quad9 default (ADR-0006)."
 version.workspace = true

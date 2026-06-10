@@ -1,4 +1,5 @@
 [package]
+publish = false
 name = "cerberus-shell-winit"
 description = "Windowing adapter: drives a FrameApp in a real window via winit + softbuffer (ADR-0004)."
 version.workspace = true

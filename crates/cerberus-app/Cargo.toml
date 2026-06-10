@@ -1,4 +1,5 @@
 [package]
+publish = false
 name = "cerberus-app"
 description = "Composition root: wires the subsystem seams, runs the trivial render and the memory gate."
 version.workspace = true

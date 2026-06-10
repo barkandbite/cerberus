@@ -1,4 +1,5 @@
 [package]
+publish = false
 name = "cerberus-layout"
 description = "The LayoutEngine seam plus a block/inline flow over a styled tree."
 version.workspace = true

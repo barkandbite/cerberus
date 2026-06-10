@@ -1,4 +1,5 @@
 [package]
+publish = false
 name = "cerberus-css"
 description = "Our CSS engine (CssEngine: StyleEngine): parser, selectors, cascade, UA stylesheet. No deps."
 version.workspace = true

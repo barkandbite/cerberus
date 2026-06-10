@@ -1,4 +1,5 @@
 [package]
+publish = false
 name = "cerberus-js-quickjs"
 description = "QuickJS adapter: implements the JsEngine seam over rquickjs (bundled), with speed-first delay neutralization (ADR-0002)."
 version.workspace = true

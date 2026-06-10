@@ -1,4 +1,5 @@
 [package]
+publish = false
 name = "cerberus-farbling"
 description = "Per-head deterministic noise (Brave-style farbling) and the JS prologue seam."
 version.workspace = true

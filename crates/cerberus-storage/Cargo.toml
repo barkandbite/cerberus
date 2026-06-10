@@ -1,4 +1,5 @@
 [package]
+publish = false
 name = "cerberus-storage"
 description = "One storage environment: instance-sealed cookies, cookie groups, quarantine state machine, vault."
 version.workspace = true

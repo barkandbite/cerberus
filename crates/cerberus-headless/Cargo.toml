@@ -1,4 +1,5 @@
 [package]
+publish = false
 name = "cerberus-headless"
 description = "Headless rendering: orchestrate layout+paint into a framebuffer and serialize (PPM now)."
 version.workspace = true

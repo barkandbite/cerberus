@@ -1,4 +1,5 @@
 [package]
+publish = false
 name = "cerberus-ui"
 description = "The minimal browser UI: one toolbar (back/forward/refresh/stop/URL/head/settings)."
 version.workspace = true

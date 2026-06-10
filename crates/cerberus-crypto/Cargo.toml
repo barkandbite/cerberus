@@ -1,4 +1,5 @@
 [package]
+publish = false
 name = "cerberus-crypto"
 description = "Crypto seams: Aead and Kdf traits plus zeroizing key material. No primitives implemented here."
 version.workspace = true

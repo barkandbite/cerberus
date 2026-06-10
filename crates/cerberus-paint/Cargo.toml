@@ -1,4 +1,5 @@
 [package]
+publish = false
 name = "cerberus-paint"
 description = "Paint traits (Rasterizer, TextShaper, ImageDecoder), display list, and framebuffer."
 version.workspace = true

@@ -1,4 +1,5 @@
 [package]
+publish = false
 name = "cerberus-text"
 description = "Software text adapter: TextShaper + Rasterizer via ab_glyph and a bundled Roboto font (ADR-0005)."
 version.workspace = true

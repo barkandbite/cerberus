@@ -1,4 +1,5 @@
 [package]
+publish = false
 name = "cerberus-types"
 description = "Shared, dependency-free domain types for the Cerberus workspace."
 version.workspace = true
