@@ -263,8 +263,10 @@ green.
   absolute URL in a **per-page** store that is cleared on every navigation;
   layout sizes them from intrinsic or `width`/`height` and clamps to the content
   box, with a gray placeholder while a sized image is in flight and `[alt]` text
-  otherwise. **Live-verified** end-to-end (kernel.org, Wikipedia); SVG isn't a
-  raster format and is skipped (ADR-0005).
+  otherwise. **SVG** is rasterized via `resvg`/`usvg`/`tiny-skia` (text feature
+  off) behind the same `ImageDecoder`, under the same 1600px cap (ADR-0009).
+  **Live-verified** end-to-end: rust-lang 9/9, Wikipedia 9/12, HN 2/2 decoded,
+  all within the 64 MB gate.
 - **Form controls (M2)** → layout renders `<input>` (text/search/password/…,
   checkbox, radio, submit/reset/button), `<button>`, `<textarea>`, and
   `<select>` as bordered inline-block boxes from their DOM state (value,
@@ -336,9 +338,7 @@ green.
   **85 MB on a Wikipedia article**; with it the same page renders at **~38 MB**
   (validated on live sites: HN/cnn/rust-lang/Wikipedia all well under the 64 MB
   gate, zero crashes across redirects/404/forms). Next: external `<script src>`,
-  a live-binding swap if profiling demands, broader event/DOM coverage. Known
-  gap: SVG images don't decode (raster-only `image` crate; graceful no-op —
-  vector rasterization is a future dep decision).
+  a live-binding swap if profiling demands, broader event/DOM coverage.
 - **Speed-first / raw render** → Cerberus **ignores programmed delays**: CSS
   `opacity`/`animation`/`transition`/`transform`/`visibility` are not honored;
   lazy-loading is ignored — `data-src` is preferred over a placeholder `src` and

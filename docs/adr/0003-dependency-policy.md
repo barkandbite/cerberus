@@ -40,6 +40,7 @@ committed.
 | `rustls` (+ `rustls-pki-types`, a verifier) | `TlsProvider` / `cerberus-tls-rustls` | **Approved**, wired at M1 | Apache-2.0 / MIT / ISC | TLS is a top CVE surface; memory-safe, audited |
 | `ab_glyph` (+ bundled Roboto) | `TextShaper`/`Rasterizer` / `cerberus-text` | **Approved** (ADR-0005), wired at M2 | Apache-2.0 | Font rasterization is a CVE surface; lean pure-Rust |
 | `image` (png/jpeg/gif/webp/bmp) | `ImageDecoder` / `cerberus-image` | **Approved** (ADR-0005), wired at M2 | MIT/Apache-2.0 | Image decoding is a top CVE surface |
+| `resvg`/`usvg`/`tiny-skia` (SVG, text feature off) | `ImageDecoder` / `cerberus-image` | **Approved** (ADR-0009), wired post-M3 | Apache-2.0 OR MIT / BSD-3-Clause | SVG is a large spec + CVE surface; logos/icons are SVG on real pages |
 | `rquickjs` 0.9 (bundled QuickJS) | `JsEngine` / `cerberus-js-quickjs` | **Approved** (ADR-0002), wiring at M3 | MIT (QuickJS) / MIT (binding) | Engine is infeasible & dangerous to write; QuickJS chosen over V8 for memory |
 | ~~V8 via `v8` (rusty_v8)~~ | ~~`cerberus-js-v8`~~ | **Superseded** by QuickJS (ADR-0002, 2026-06-10); kept as a documented swap-in if compat demands | BSD-3-Clause | — |
 

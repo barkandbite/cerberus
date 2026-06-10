@@ -74,3 +74,11 @@ Wikipedia 8–11/N decoded); RSS 15–32 MB on image-heavy pages, within the 64 
 gate. SVG is vector, not a raster format `image` decodes, so SVG `<img>` are
 skipped (a resvg-based vector path is a later, separately-approved adapter).
 `rustybuzz` (complex-script shaping) is still the remaining piece.
+
+## Update — 2026-06-10: SVG wired (see ADR-0009)
+
+The deferred vector path landed: `resvg`/`usvg`/`tiny-skia` (text feature off)
+behind the same `ImageDecoder`, sniffed in `ImageCodec::decode` and rasterized
+under the same 1600px cap. Real-site decode jumped (rust-lang 0/9 → 9/9,
+Wikipedia 6/12 → 9/12). Details and the anti-fingerprinting rationale for
+disabling SVG text are in ADR-0009.
