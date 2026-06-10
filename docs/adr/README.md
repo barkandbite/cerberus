@@ -15,6 +15,7 @@ with the code so the reasoning travels with the repo.
 | [0005](0005-rendering-stack.md) | Rendering stack (shaping, raster, image decode) | Accepted |
 | [0006](0006-networking.md) | M1 networking — HTTP/1.1, TLS (rustls), DoH (Quad9) | Accepted |
 | [0007](0007-css-engine.md) | CSS engine + speed-first "raw render" (ignore delays) | Accepted |
+| [0008](0008-page-scripts-dom-bridge.md) | Page-script execution via a snapshot/replay DOM bridge | Accepted |
 
 ## When to write one
 
