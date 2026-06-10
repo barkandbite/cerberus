@@ -7,90 +7,222 @@
 //! new `<li>`/`<tr>`/`<td>`/`<option>` closes the previous one; block elements
 //! close an open `<p>`). It is deliberately not the full HTML5 tree-construction
 //! algorithm — no foster parenting, adoption agency, or implicit html/head/body —
-//! but it parses real-world pages without mis-nesting. Swapping the recursive
-//! node tree for an arena (PLAN.md memory budget) is a later, behind-the-API
-//! change.
+//! but it parses real-world pages without mis-nesting.
+//!
+//! Storage is an **arena** (PLAN.md memory budget): a [`Document`] owns one flat
+//! `Vec<NodeData>` and children are referenced by [`NodeId`] index, never by
+//! owned subtrees. Reads go through [`NodeRef`], a `Copy` cursor borrowing the
+//! document; programmatic construction goes through [`DocumentBuilder`]. The
+//! tokenizer and tree-construction *behavior* are unchanged — only the backing
+//! store and the read/write API differ.
 
-/// A DOM node: either an element or a text run.
+/// Index of a node within a [`Document`]'s arena.
+pub type NodeId = u32;
+
+/// A node stored in the arena: either an element or a text run. Children are
+/// referenced by [`NodeId`], so the structure is flat rather than recursive.
 #[derive(Clone, Debug, PartialEq)]
-pub enum Node {
-    Element(Element),
+enum NodeData {
+    Element {
+        tag: String,
+        attrs: Vec<(String, String)>,
+        children: Vec<NodeId>,
+    },
     Text(String),
 }
 
-/// An element with a tag name, attributes, and children.
-#[derive(Clone, Debug, PartialEq)]
-pub struct Element {
-    pub tag: String,
-    pub attrs: Vec<(String, String)>,
-    pub children: Vec<Node>,
-}
-
-impl Element {
-    /// A new childless, attribute-less element.
-    pub fn new(tag: impl Into<String>) -> Self {
-        Self {
-            tag: tag.into(),
-            attrs: Vec::new(),
-            children: Vec::new(),
-        }
-    }
-
-    /// A new childless element with attributes.
-    pub fn with_attrs(tag: impl Into<String>, attrs: Vec<(String, String)>) -> Self {
-        Self {
-            tag: tag.into(),
-            attrs,
-            children: Vec::new(),
-        }
-    }
-
-    /// The value of attribute `name` (lowercased keys), if present.
-    pub fn attr(&self, name: &str) -> Option<&str> {
-        self.attrs
-            .iter()
-            .find(|(k, _)| k == name)
-            .map(|(_, v)| v.as_str())
-    }
-
-    /// Concatenate the text of this element and its descendants.
-    pub fn text_content(&self) -> String {
-        let mut out = String::new();
-        for child in &self.children {
-            match child {
-                Node::Text(t) => out.push_str(t),
-                Node::Element(e) => out.push_str(&e.text_content()),
-            }
-        }
-        out
-    }
-}
-
-/// A parsed document, rooted at a synthetic `#root` element.
-#[derive(Clone, Debug, PartialEq)]
+/// A parsed document, rooted at a synthetic `#root` element. Owns the arena of
+/// every node; navigate it with [`Document::root`] and [`NodeRef`].
+#[derive(Clone, Debug)]
 pub struct Document {
-    pub root: Element,
+    nodes: Vec<NodeData>,
+    root: NodeId,
 }
 
 impl Document {
-    /// The page `<title>` text, if any.
+    /// A cursor at the synthetic `#root` element.
+    pub fn root(&self) -> NodeRef<'_> {
+        NodeRef {
+            doc: self,
+            id: self.root,
+        }
+    }
+
+    /// The page `<title>` text (trimmed), if any.
     pub fn title(&self) -> Option<String> {
-        find_title(&self.root)
+        find_title(self.root())
     }
 }
 
-fn find_title(el: &Element) -> Option<String> {
-    if el.tag == "title" {
-        let text = el.text_content();
+/// Depth-first search for the first `<title>` with non-empty trimmed text.
+fn find_title(node: NodeRef<'_>) -> Option<String> {
+    if node.tag() == "title" {
+        let text = node.text_content();
         let text = text.trim();
         if !text.is_empty() {
             return Some(text.to_string());
         }
     }
-    el.children.iter().find_map(|child| match child {
-        Node::Element(e) => find_title(e),
-        Node::Text(_) => None,
-    })
+    node.children().find_map(find_title)
+}
+
+/// A lightweight cursor into a [`Document`]'s arena. `Copy`: cheap to pass
+/// around and clone; it borrows the document and resolves nodes on demand.
+#[derive(Clone, Copy)]
+pub struct NodeRef<'a> {
+    doc: &'a Document,
+    id: NodeId,
+}
+
+impl<'a> NodeRef<'a> {
+    /// The node's arena id — its stable identity within the document, suitable
+    /// for ancestor or equality checks.
+    pub fn id(&self) -> NodeId {
+        self.id
+    }
+
+    /// The backing arena entry for this cursor.
+    fn data(&self) -> &'a NodeData {
+        &self.doc.nodes[self.id as usize]
+    }
+
+    /// Whether this node is an element.
+    pub fn is_element(&self) -> bool {
+        matches!(self.data(), NodeData::Element { .. })
+    }
+
+    /// Whether this node is a text run.
+    pub fn is_text(&self) -> bool {
+        matches!(self.data(), NodeData::Text(_))
+    }
+
+    /// The element tag (lowercased), or `""` for text nodes.
+    pub fn tag(&self) -> &'a str {
+        match self.data() {
+            NodeData::Element { tag, .. } => tag,
+            NodeData::Text(_) => "",
+        }
+    }
+
+    /// The text of a text node, or `None` for elements.
+    pub fn text(&self) -> Option<&'a str> {
+        match self.data() {
+            NodeData::Text(t) => Some(t),
+            NodeData::Element { .. } => None,
+        }
+    }
+
+    /// The value of attribute `name` (lowercased keys), if present. Always
+    /// `None` for text nodes.
+    pub fn attr(&self, name: &str) -> Option<&'a str> {
+        self.attrs()
+            .iter()
+            .find(|(k, _)| k == name)
+            .map(|(_, v)| v.as_str())
+    }
+
+    /// This element's attributes; an empty slice for text nodes.
+    pub fn attrs(&self) -> &'a [(String, String)] {
+        match self.data() {
+            NodeData::Element { attrs, .. } => attrs,
+            NodeData::Text(_) => &[],
+        }
+    }
+
+    /// The node's children, in document order. Empty for text nodes.
+    pub fn children(&self) -> impl Iterator<Item = NodeRef<'a>> + 'a {
+        let doc = self.doc;
+        let ids: &'a [NodeId] = match self.data() {
+            NodeData::Element { children, .. } => children,
+            NodeData::Text(_) => &[],
+        };
+        ids.iter().map(move |&id| NodeRef { doc, id })
+    }
+
+    /// Recursive concatenation of all descendant text (the old
+    /// `Element::text_content`).
+    pub fn text_content(&self) -> String {
+        let mut out = String::new();
+        self.collect_text(&mut out);
+        out
+    }
+
+    /// Append this node's text and that of its descendants to `out`.
+    fn collect_text(&self, out: &mut String) {
+        match self.data() {
+            NodeData::Text(t) => out.push_str(t),
+            NodeData::Element { .. } => {
+                for child in self.children() {
+                    child.collect_text(out);
+                }
+            }
+        }
+    }
+}
+
+/// Builds a [`Document`] programmatically (for app-generated pages). Children
+/// are created first (post-order), then their ids are handed to their parent;
+/// [`finish`](DocumentBuilder::finish) names the root.
+pub struct DocumentBuilder {
+    nodes: Vec<NodeData>,
+}
+
+impl DocumentBuilder {
+    /// A new, empty builder.
+    pub fn new() -> Self {
+        Self { nodes: Vec::new() }
+    }
+
+    /// Allocate a text node, returning its id.
+    pub fn text(&mut self, s: impl Into<String>) -> NodeId {
+        self.push(NodeData::Text(s.into()))
+    }
+
+    /// Allocate an attribute-less element over the given (already-created)
+    /// children, returning its id.
+    pub fn element(
+        &mut self,
+        tag: impl Into<String>,
+        children: impl IntoIterator<Item = NodeId>,
+    ) -> NodeId {
+        self.element_attrs(tag, Vec::new(), children)
+    }
+
+    /// Allocate an element with attributes over the given (already-created)
+    /// children, returning its id.
+    pub fn element_attrs(
+        &mut self,
+        tag: impl Into<String>,
+        attrs: Vec<(String, String)>,
+        children: impl IntoIterator<Item = NodeId>,
+    ) -> NodeId {
+        self.push(NodeData::Element {
+            tag: tag.into(),
+            attrs,
+            children: children.into_iter().collect(),
+        })
+    }
+
+    /// Finish, with `root` as the document root.
+    pub fn finish(self, root: NodeId) -> Document {
+        Document {
+            nodes: self.nodes,
+            root,
+        }
+    }
+
+    /// Push a node into the arena and return its freshly assigned id.
+    fn push(&mut self, node: NodeData) -> NodeId {
+        let id = self.nodes.len() as NodeId;
+        self.nodes.push(node);
+        id
+    }
+}
+
+impl Default for DocumentBuilder {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 /// Void elements: no children, no close tag.
@@ -116,10 +248,40 @@ pub fn parse_html(input: &str) -> Document {
     build_tree(tokenize(input))
 }
 
-/// Build the DOM tree from a token stream, applying void-element and
-/// optional-end-tag rules.
+/// An open element on the builder stack: its tag, attributes, and the ids of the
+/// children accumulated so far. Materialized into a [`NodeData::Element`] in the
+/// arena when the element closes.
+struct OpenElement {
+    tag: String,
+    attrs: Vec<(String, String)>,
+    children: Vec<NodeId>,
+}
+
+impl OpenElement {
+    fn new(tag: impl Into<String>) -> Self {
+        Self {
+            tag: tag.into(),
+            attrs: Vec::new(),
+            children: Vec::new(),
+        }
+    }
+
+    fn with_attrs(tag: impl Into<String>, attrs: Vec<(String, String)>) -> Self {
+        Self {
+            tag: tag.into(),
+            attrs,
+            children: Vec::new(),
+        }
+    }
+}
+
+/// Build the DOM tree from a token stream into a flat arena, applying
+/// void-element and optional-end-tag rules. The stack holds open elements; on
+/// close (or void/self-close) the element is allocated in the arena and its id
+/// pushed into its parent's child list.
 fn build_tree(tokens: Vec<Token>) -> Document {
-    let mut stack: Vec<Element> = vec![Element::new("#root")];
+    let mut nodes: Vec<NodeData> = Vec::new();
+    let mut stack: Vec<OpenElement> = vec![OpenElement::new("#root")];
 
     for token in tokens {
         match token {
@@ -127,60 +289,91 @@ fn build_tree(tokens: Vec<Token>) -> Document {
                 let top = stack.last_mut().expect("root frame is always present");
                 if top.tag == "style" {
                     // Keep CSS verbatim for the style engine.
-                    top.children.push(Node::Text(text));
+                    let id = alloc(&mut nodes, NodeData::Text(text));
+                    top.children.push(id);
                 } else {
                     let cleaned = clean_text(&text);
                     if !cleaned.is_empty() {
-                        top.children.push(Node::Text(cleaned));
+                        let id = alloc(&mut nodes, NodeData::Text(cleaned));
+                        stack
+                            .last_mut()
+                            .expect("root frame is always present")
+                            .children
+                            .push(id);
                     }
                 }
             }
             Token::Open(name, attrs) => {
-                close_implied(&mut stack, &name);
+                close_implied(&mut nodes, &mut stack, &name);
                 if VOID.contains(&name.as_str()) {
-                    push_child(&mut stack, Element::with_attrs(name, attrs));
+                    push_element(&mut nodes, &mut stack, OpenElement::with_attrs(name, attrs));
                 } else {
-                    stack.push(Element::with_attrs(name, attrs));
+                    stack.push(OpenElement::with_attrs(name, attrs));
                 }
             }
             Token::SelfClose(name, attrs) => {
-                close_implied(&mut stack, &name);
-                push_child(&mut stack, Element::with_attrs(name, attrs));
+                close_implied(&mut nodes, &mut stack, &name);
+                push_element(&mut nodes, &mut stack, OpenElement::with_attrs(name, attrs));
             }
-            Token::Close(name) => close_element(&mut stack, &name),
+            Token::Close(name) => close_element(&mut nodes, &mut stack, &name),
         }
     }
 
     // Collapse any unclosed elements into their parents.
     while stack.len() > 1 {
         let closed = stack.pop().expect("len > 1");
-        push_child(&mut stack, closed);
+        push_element(&mut nodes, &mut stack, closed);
     }
 
-    Document {
-        root: stack.pop().expect("root frame"),
-    }
+    let root_frame = stack.pop().expect("root frame");
+    let root = alloc(
+        &mut nodes,
+        NodeData::Element {
+            tag: root_frame.tag,
+            attrs: root_frame.attrs,
+            children: root_frame.children,
+        },
+    );
+
+    Document { nodes, root }
 }
 
-/// Append `child` to the current open element.
-fn push_child(stack: &mut [Element], child: Element) {
+/// Push a node into the arena and return its freshly assigned id.
+fn alloc(nodes: &mut Vec<NodeData>, node: NodeData) -> NodeId {
+    let id = nodes.len() as NodeId;
+    nodes.push(node);
+    id
+}
+
+/// Materialize `child` into the arena and append its id to the current open
+/// element.
+fn push_element(nodes: &mut Vec<NodeData>, stack: &mut [OpenElement], child: OpenElement) {
+    let id = alloc(
+        nodes,
+        NodeData::Element {
+            tag: child.tag,
+            attrs: child.attrs,
+            children: child.children,
+        },
+    );
     stack
         .last_mut()
         .expect("root frame is always present")
         .children
-        .push(Node::Element(child));
+        .push(id);
 }
 
-/// Tolerant end tag: if a matching element is open, pop down to it (attaching
-/// popped elements to their parents); otherwise ignore the stray close.
-fn close_element(stack: &mut Vec<Element>, name: &str) {
+/// Tolerant end tag: if a matching element is open, pop down to it (allocating
+/// popped elements and attaching them to their parents); otherwise ignore the
+/// stray close.
+fn close_element(nodes: &mut Vec<NodeData>, stack: &mut Vec<OpenElement>, name: &str) {
     if let Some(pos) = stack.iter().rposition(|e| e.tag == name) {
         if pos == 0 {
             return; // never pop the synthetic root
         }
         while stack.len() > pos {
             let closed = stack.pop().expect("above pos");
-            push_child(stack, closed);
+            push_element(nodes, stack, closed);
         }
     }
 }
@@ -188,7 +381,7 @@ fn close_element(stack: &mut Vec<Element>, name: &str) {
 /// Apply optional-end-tag rules before opening `opening`: a new list item /
 /// table row / cell / option closes the previous one, and a block-level element
 /// closes an open `<p>`.
-fn close_implied(stack: &mut Vec<Element>, opening: &str) {
+fn close_implied(nodes: &mut Vec<NodeData>, stack: &mut Vec<OpenElement>, opening: &str) {
     while stack.len() > 1 {
         let top = stack.last().expect("non-root frame").tag.as_str();
         let close = match opening {
@@ -207,7 +400,7 @@ fn close_implied(stack: &mut Vec<Element>, opening: &str) {
             break;
         }
         let closed = stack.pop().expect("non-root frame");
-        push_child(stack, closed);
+        push_element(nodes, stack, closed);
     }
 }
 
@@ -517,14 +710,13 @@ fn decode_one(entity: &str) -> Option<char> {
 mod tests {
     use super::*;
 
-    fn find_tag<'a>(el: &'a Element, tag: &str) -> Option<&'a Element> {
-        if el.tag == tag {
-            return Some(el);
+    /// Depth-first search for the first descendant (or `node` itself) whose tag
+    /// matches, returning a cursor at it.
+    fn find_tag<'a>(node: NodeRef<'a>, tag: &str) -> Option<NodeRef<'a>> {
+        if node.is_element() && node.tag() == tag {
+            return Some(node);
         }
-        el.children.iter().find_map(|c| match c {
-            Node::Element(e) => find_tag(e, tag),
-            Node::Text(_) => None,
-        })
+        node.children().find_map(|c| find_tag(c, tag))
     }
 
     #[test]
@@ -532,23 +724,21 @@ mod tests {
         let doc = parse_html(
             "<html><body><h1>Cerberus</h1><p>three heads, one process</p></body></html>",
         );
-        assert_eq!(doc.root.text_content(), "Cerberusthree heads, one process");
+        assert_eq!(
+            doc.root().text_content(),
+            "Cerberusthree heads, one process"
+        );
         // Structure: #root > html > body > {h1, p}
-        let html = match &doc.root.children[0] {
-            Node::Element(e) => e,
-            _ => panic!("expected html element"),
-        };
-        assert_eq!(html.tag, "html");
+        let html = doc.root().children().next().expect("html element");
+        assert!(html.is_element());
+        assert_eq!(html.tag(), "html");
     }
 
     #[test]
     fn handles_void_and_unclosed_tags() {
         let doc = parse_html("<p>a<br>b");
-        let p = match &doc.root.children[0] {
-            Node::Element(e) => e,
-            _ => panic!("expected p"),
-        };
-        assert_eq!(p.tag, "p");
+        let p = doc.root().children().next().expect("p");
+        assert_eq!(p.tag(), "p");
         assert_eq!(p.text_content(), "ab");
     }
 
@@ -560,7 +750,7 @@ mod tests {
              <p>a &amp; b &lt;c&gt; &#65;</p>\
              <script>if (x<1){ y }</script>done</body>",
         );
-        let text = doc.root.text_content();
+        let text = doc.root().text_content();
         assert!(
             text.contains("a & b <c> A"),
             "entities decoded; got {text:?}"
@@ -577,7 +767,7 @@ mod tests {
     #[test]
     fn collapses_whitespace() {
         let doc = parse_html("<p>one\n\n   two\t three</p>");
-        assert_eq!(doc.root.text_content(), "one two three");
+        assert_eq!(doc.root().text_content(), "one two three");
     }
 
     #[test]
@@ -587,7 +777,7 @@ mod tests {
              <body><a href=\"/x\" class='c' download>link</a></body>",
         );
         assert_eq!(doc.title().as_deref(), Some("Hi & Bye"));
-        let a = find_tag(&doc.root, "a").expect("a element");
+        let a = find_tag(doc.root(), "a").expect("a element");
         assert_eq!(a.attr("href"), Some("/x"));
         assert_eq!(a.attr("class"), Some("c"));
         assert_eq!(a.attr("download"), Some(""), "boolean attribute");
@@ -598,7 +788,7 @@ mod tests {
         // The quote-aware scanner must not treat the '>' in title="a>b" as the
         // tag's end (the old line-based tokenizer did).
         let doc = parse_html("<a title=\"a>b\" href='/p'>hi</a>");
-        let a = find_tag(&doc.root, "a").expect("a element");
+        let a = find_tag(doc.root(), "a").expect("a element");
         assert_eq!(a.attr("title"), Some("a>b"));
         assert_eq!(a.attr("href"), Some("/p"));
         assert_eq!(a.text_content(), "hi");
@@ -608,14 +798,10 @@ mod tests {
     fn list_items_auto_close() {
         // `<li>a<li>b` are siblings, not nested.
         let doc = parse_html("<ul><li>a<li>b</ul>");
-        let ul = find_tag(&doc.root, "ul").expect("ul");
+        let ul = find_tag(doc.root(), "ul").expect("ul");
         let lis: Vec<_> = ul
-            .children
-            .iter()
-            .filter_map(|c| match c {
-                Node::Element(e) if e.tag == "li" => Some(e),
-                _ => None,
-            })
+            .children()
+            .filter(|c| c.is_element() && c.tag() == "li")
             .collect();
         assert_eq!(lis.len(), 2, "two sibling <li> items");
         assert_eq!(lis[0].text_content(), "a");
@@ -625,20 +811,15 @@ mod tests {
     #[test]
     fn table_cells_and_rows_auto_close() {
         let doc = parse_html("<table><tr><td>a<td>b<tr><td>c</table>");
-        let rows: Vec<_> = find_tag(&doc.root, "table")
-            .expect("table")
-            .children
-            .iter()
-            .filter_map(|c| match c {
-                Node::Element(e) if e.tag == "tr" => Some(e),
-                _ => None,
-            })
+        let table = find_tag(doc.root(), "table").expect("table");
+        let rows: Vec<_> = table
+            .children()
+            .filter(|c| c.is_element() && c.tag() == "tr")
             .collect();
         assert_eq!(rows.len(), 2, "two rows");
         let first_cells = rows[0]
-            .children
-            .iter()
-            .filter(|c| matches!(c, Node::Element(e) if e.tag == "td"))
+            .children()
+            .filter(|c| c.is_element() && c.tag() == "td")
             .count();
         assert_eq!(first_cells, 2, "first row has two cells");
     }
@@ -647,31 +828,72 @@ mod tests {
     fn block_element_closes_open_paragraph() {
         // `<p>a<div>b</div>` — the div closes the p (they are siblings).
         let doc = parse_html("<p>a<div>b</div>");
-        let p = find_tag(&doc.root, "p").expect("p");
+        let p = find_tag(doc.root(), "p").expect("p");
         assert_eq!(p.text_content(), "a", "div is not inside the p");
-        assert!(find_tag(&doc.root, "div").is_some());
+        assert!(find_tag(doc.root(), "div").is_some());
     }
 
     #[test]
     fn textarea_content_is_rawtext() {
         // The '<' in the textarea body must not start a tag.
         let doc = parse_html("<textarea>1 < 2 && 3 > 0</textarea>");
-        let ta = find_tag(&doc.root, "textarea").expect("textarea");
+        let ta = find_tag(doc.root(), "textarea").expect("textarea");
         assert!(ta.text_content().contains("1 < 2"), "raw text preserved");
-        assert!(find_tag(&doc.root, "2").is_none(), "no phantom element");
+        assert!(find_tag(doc.root(), "2").is_none(), "no phantom element");
     }
 
     #[test]
     fn doctype_is_skipped() {
         let doc = parse_html("<!DOCTYPE html><html><body><h1>Hi</h1></body></html>");
-        assert!(find_tag(&doc.root, "!doctype").is_none());
-        assert!(find_tag(&doc.root, "h1").is_some());
+        assert!(find_tag(doc.root(), "!doctype").is_none());
+        assert!(find_tag(doc.root(), "h1").is_some());
     }
 
     #[test]
     fn entities_in_attribute_values_are_decoded() {
         let doc = parse_html("<a href='/s?a=1&amp;b=2'>q</a>");
-        let a = find_tag(&doc.root, "a").expect("a");
+        let a = find_tag(doc.root(), "a").expect("a");
         assert_eq!(a.attr("href"), Some("/s?a=1&b=2"));
+    }
+
+    #[test]
+    fn builder_round_trips() {
+        // Build `<a href="/x">hi <b>there</b></a>` post-order, then read back.
+        let mut b = DocumentBuilder::new();
+        let hi = b.text("hi ");
+        let there = b.text("there");
+        let bold = b.element("b", [there]);
+        let a = b.element_attrs("a", vec![("href".into(), "/x".into())], [hi, bold]);
+        let doc = b.finish(a);
+
+        let root = doc.root();
+        assert_eq!(root.tag(), "a");
+        assert_eq!(root.attr("href"), Some("/x"));
+        assert_eq!(root.text_content(), "hi there");
+
+        let kids: Vec<_> = root.children().collect();
+        assert_eq!(kids.len(), 2);
+        assert_eq!(kids[0].text(), Some("hi "));
+        assert!(kids[1].is_element());
+        assert_eq!(kids[1].tag(), "b");
+        assert_eq!(kids[1].text_content(), "there");
+    }
+
+    #[test]
+    fn node_ids_are_distinct_and_children_ordered() {
+        // Two distinct children with distinct ids, yielded in insertion order.
+        let mut b = DocumentBuilder::new();
+        let first = b.text("first");
+        let second = b.text("second");
+        let parent = b.element("p", [first, second]);
+        let doc = b.finish(parent);
+
+        let kids: Vec<_> = doc.root().children().collect();
+        assert_eq!(kids.len(), 2);
+        assert_ne!(kids[0].id(), kids[1].id(), "different nodes, different ids");
+        assert_eq!(kids[0].id(), first);
+        assert_eq!(kids[1].id(), second);
+        assert_eq!(kids[0].text(), Some("first"));
+        assert_eq!(kids[1].text(), Some("second"));
     }
 }

@@ -29,8 +29,11 @@ this in two ways:
   tests) and by the `JsEngineFactory` seam (dropping the `Box<dyn JsEngine>` is
   the teardown).
 - **Arena/bump allocation** for parse trees and short-lived render state, to
-  avoid per-node heap churn. The DOM and layout crates are structured so the M2
-  implementations slot an arena behind the existing APIs without caller changes.
+  avoid per-node heap churn. **Done for the DOM (M2):** `cerberus-dom` stores the
+  parse tree in one flat `Vec<NodeData>` with `NodeId` children, read through a
+  `NodeRef` cursor (the css + app consumers were migrated to it — the original
+  "no caller changes" hope didn't survive the public-field API, but the cutover
+  was output-identical). Short-lived render state (layout) is a later candidate.
 
 The memory budget in [§5](#5-memory-budget-proposed-for-sign-off) is gated in CI
 as a regression test.
@@ -294,8 +297,16 @@ green.
   `<option>` closes the previous one; block elements close an open `<p>`). Not
   the full HTML5 tree-construction algorithm, but it parses real pages without
   mis-nesting. Head-only elements (`<title>`, `<meta>`, …) are UA `display:none`,
-  so they no longer leak into the page. The **arena**-backed node store
-  (PLAN §1) is a later behind-the-API swap; the recursive tree ships now.
+  so they no longer leak into the page.
+- **Arena DOM (M2)** → the parse tree is now an **arena** (PLAN §1): a `Document`
+  owns one flat `Vec<NodeData>` and children are `NodeId` indices, replacing the
+  recursive `Box`/`Vec<Node>` tree (fewer scattered allocations, better
+  locality — memory is priority #1). Reads go through a `Copy` `NodeRef` cursor
+  (`tag`/`text`/`attr`/`attrs`/`children`/`text_content`/`id`); app-generated
+  pages build via `DocumentBuilder`. The parser's tokenizer/tree-construction
+  behavior is unchanged; the css + app consumers were migrated to the cursor.
+  Verified output-identical (a deterministic page renders byte-for-byte the same
+  as before the swap) with the full suite green.
 - **Speed-first / raw render** → Cerberus **ignores programmed delays**: CSS
   `opacity`/`animation`/`transition`/`transform`/`visibility` are not honored;
   lazy-loading is ignored — `data-src` is preferred over a placeholder `src` and

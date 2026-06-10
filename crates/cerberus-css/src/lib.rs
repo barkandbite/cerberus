@@ -12,7 +12,7 @@ mod parser;
 
 pub use color::parse_color;
 
-use cerberus_dom::{Document, Element, Node};
+use cerberus_dom::{Document, NodeRef};
 use cerberus_style::{
     ComputedStyle, Display, StyleEngine, StyledChild, StyledDom, StyledNode, TextAlign,
 };
@@ -60,19 +60,19 @@ impl CssEngine {
 
     fn build(
         &self,
-        element: &Element,
+        node: NodeRef<'_>,
         parent: &ComputedStyle,
         path: &mut Vec<ElemRef>,
         author: &Stylesheet,
     ) -> StyledNode {
-        let is_root = element.tag == "#root";
+        let is_root = node.tag() == "#root";
         let mut style = if is_root {
             ComputedStyle::initial()
         } else {
             parent.inherit()
         };
 
-        path.push(elem_ref(element));
+        path.push(elem_ref(node));
 
         if !is_root {
             // Collect matching declarations: (origin, specificity, source-order).
@@ -93,25 +93,24 @@ impl CssEngine {
             }
 
             // Inline `style=` has the highest priority.
-            if let Some(inline) = element.attr("style") {
+            if let Some(inline) = node.attr("style") {
                 let decls = parse_declaration_block(inline);
                 apply_declarations(&mut style, &decls, parent.font_size);
             }
         }
 
-        let children = element
-            .children
-            .iter()
-            .map(|child| match child {
-                Node::Text(t) => StyledChild::Text(t.clone()),
-                Node::Element(e) => StyledChild::Element(self.build(e, &style, path, author)),
+        let children = node
+            .children()
+            .map(|child| match child.text() {
+                Some(t) => StyledChild::Text(t.to_string()),
+                None => StyledChild::Element(self.build(child, &style, path, author)),
             })
             .collect();
 
         path.pop();
         StyledNode {
-            tag: element.tag.clone(),
-            attrs: element.attrs.clone(),
+            tag: node.tag().to_string(),
+            attrs: node.attrs().to_vec(),
             style,
             children,
         }
@@ -126,18 +125,18 @@ impl Default for CssEngine {
 
 impl StyleEngine for CssEngine {
     fn style(&self, doc: &Document) -> StyledDom {
-        let author = parse_stylesheet(&collect_author_css(&doc.root));
+        let author = parse_stylesheet(&collect_author_css(doc.root()));
         let mut path = Vec::new();
-        let root = self.build(&doc.root, &ComputedStyle::initial(), &mut path, &author);
+        let root = self.build(doc.root(), &ComputedStyle::initial(), &mut path, &author);
         StyledDom { root }
     }
 }
 
-fn elem_ref(element: &Element) -> ElemRef {
+fn elem_ref(node: NodeRef<'_>) -> ElemRef {
     ElemRef {
-        tag: element.tag.clone(),
-        id: element.attr("id").map(str::to_string),
-        classes: element
+        tag: node.tag().to_string(),
+        id: node.attr("id").map(str::to_string),
+        classes: node
             .attr("class")
             .map(|c| c.split_whitespace().map(str::to_string).collect())
             .unwrap_or_default(),
@@ -145,15 +144,15 @@ fn elem_ref(element: &Element) -> ElemRef {
 }
 
 /// Concatenate the text of every `<style>` element (the HTML parser keeps it raw).
-fn collect_author_css(element: &Element) -> String {
+fn collect_author_css(node: NodeRef<'_>) -> String {
     let mut css = String::new();
-    if element.tag == "style" {
-        css.push_str(&element.text_content());
+    if node.tag() == "style" {
+        css.push_str(&node.text_content());
         css.push('\n');
     }
-    for child in &element.children {
-        if let Node::Element(e) = child {
-            css.push_str(&collect_author_css(e));
+    for child in node.children() {
+        if child.is_element() {
+            css.push_str(&collect_author_css(child));
         }
     }
     css

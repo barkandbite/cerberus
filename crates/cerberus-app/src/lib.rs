@@ -11,7 +11,7 @@
 use cerberus_consent::{ConsentPolicy, Decision, DefaultDenyPolicy};
 use cerberus_css::CssEngine;
 use cerberus_dns_doh::DohResolver;
-use cerberus_dom::{parse_html, Document, Element, Node};
+use cerberus_dom::{parse_html, Document, DocumentBuilder, NodeRef};
 use cerberus_headless::render_document;
 use cerberus_identity::{Head, HeadManager};
 use cerberus_image::ImageCodec;
@@ -419,7 +419,7 @@ fn fetch_images_sync(
     system_roots: bool,
 ) -> HashMap<String, ImageState> {
     let mut srcs = Vec::new();
-    collect_image_urls(&document.root, &mut srcs);
+    collect_image_urls(document.root(), &mut srcs);
 
     let mut urls: Vec<String> = Vec::new();
     for src in srcs {
@@ -492,15 +492,15 @@ fn resolve_subresource(base: Option<&Url>, src: &str) -> String {
 
 /// Collect `<img>` sources from an element subtree, preferring `data-src` (the
 /// real URL behind lazy-loaders) over `src`.
-fn collect_image_urls(el: &Element, out: &mut Vec<String>) {
-    if el.tag == "img" {
-        if let Some(src) = el.attr("data-src").or_else(|| el.attr("src")) {
+fn collect_image_urls(node: NodeRef<'_>, out: &mut Vec<String>) {
+    if node.tag() == "img" {
+        if let Some(src) = node.attr("data-src").or_else(|| node.attr("src")) {
             out.push(src.to_string());
         }
     }
-    for child in &el.children {
-        if let Node::Element(e) = child {
-            collect_image_urls(e, out);
+    for child in node.children() {
+        if child.is_element() {
+            collect_image_urls(child, out);
         }
     }
 }
@@ -802,7 +802,7 @@ impl BrowserApp {
     /// image is fetched immediately (speed-first; see the layout `img` path).
     fn request_page_images(&mut self) {
         let mut srcs = Vec::new();
-        collect_image_urls(&self.document.root, &mut srcs);
+        collect_image_urls(self.document.root(), &mut srcs);
         for src in srcs {
             let abs = resolve_subresource(self.current_url.as_ref(), &src);
             // Only http(s) sub-resources go to the network worker.
@@ -884,14 +884,14 @@ impl BrowserApp {
     /// Check radio `id` and clear every other radio sharing its `name` in the
     /// same enclosing form (mutually-exclusive radio-group behaviour).
     fn check_radio(&mut self, id: u32) {
-        let controls = collect_controls(&self.document.root);
+        let controls = collect_controls(self.document.root());
         let Some(this) = controls.iter().find(|c| c.id == id) else {
             return;
         };
         let name = this.el.attr("name").unwrap_or_default().to_string();
         let group = this.form;
         for c in &controls {
-            let is_radio = c.el.tag == "input"
+            let is_radio = c.el.tag() == "input"
                 && c.el
                     .attr("type")
                     .is_some_and(|t| t.eq_ignore_ascii_case("radio"));
@@ -905,7 +905,7 @@ impl BrowserApp {
     /// Advance a `<select>` to its next option (wrapping). Reads the option count
     /// from the DOM and the current index from the store (or the DOM default).
     fn cycle_select(&mut self, id: u32) {
-        let controls = collect_controls(&self.document.root);
+        let controls = collect_controls(self.document.root());
         let Some(sel) = controls.iter().find(|c| c.id == id) else {
             return;
         };
@@ -923,7 +923,7 @@ impl BrowserApp {
     /// Submit the form enclosing control `id` (or the whole document if the
     /// control has no `<form>` ancestor), as a GET navigation.
     fn submit_from(&mut self, id: u32) {
-        let controls = collect_controls(&self.document.root);
+        let controls = collect_controls(self.document.root());
         let Some(this) = controls.iter().find(|c| c.id == id) else {
             return;
         };
@@ -1274,9 +1274,9 @@ impl FrameApp for BrowserApp {
 }
 
 fn empty_document() -> Document {
-    Document {
-        root: Element::new("#root"),
-    }
+    let mut b = DocumentBuilder::new();
+    let root = b.element("#root", []);
+    b.finish(root)
 }
 
 fn first_party_of(url: &cerberus_url::Url) -> Option<Origin> {
@@ -1288,19 +1288,19 @@ fn first_party_of(url: &cerberus_url::Url) -> Option<Origin> {
 }
 
 fn error_document(url: &str, message: &str) -> Document {
-    let mut body = Element::new("body");
+    let mut b = DocumentBuilder::new();
+    let mut kids = Vec::new();
     for (tag, text) in [
         ("h1", "Cannot load page".to_string()),
         ("p", url.to_string()),
         ("p", message.to_string()),
     ] {
-        let mut el = Element::new(tag);
-        el.children.push(Node::Text(text));
-        body.children.push(Node::Element(el));
+        let t = b.text(text);
+        kids.push(b.element(tag, [t]));
     }
-    let mut root = Element::new("#root");
-    root.children.push(Node::Element(body));
-    Document { root }
+    let body = b.element("body", kids);
+    let root = b.element("#root", [body]);
+    b.finish(root)
 }
 
 fn loading_document(url: &str) -> Document {
@@ -1319,20 +1319,19 @@ fn insecure_prompt_document(http_url: &str, error: &str) -> Document {
 }
 
 fn simple_document(heading: &str, line: &str, note: Option<&str>) -> Document {
-    let mut body = Element::new("body");
+    let mut b = DocumentBuilder::new();
+    let mut kids = Vec::new();
     for (tag, text) in [("h1", heading.to_string()), ("p", line.to_string())] {
-        let mut el = Element::new(tag);
-        el.children.push(Node::Text(text));
-        body.children.push(Node::Element(el));
+        let t = b.text(text);
+        kids.push(b.element(tag, [t]));
     }
     if let Some(n) = note {
-        let mut el = Element::new("p");
-        el.children.push(Node::Text(n.to_string()));
-        body.children.push(Node::Element(el));
+        let t = b.text(n.to_string());
+        kids.push(b.element("p", [t]));
     }
-    let mut root = Element::new("#root");
-    root.children.push(Node::Element(body));
-    Document { root }
+    let body = b.element("body", kids);
+    let root = b.element("#root", [body]);
+    b.finish(root)
 }
 
 fn point_in_rect(r: Rect, x: i32, y: i32) -> bool {
@@ -1350,8 +1349,8 @@ const FIELD_PAD: i32 = 4;
 /// `<form>` element, if any.
 struct ControlRef<'a> {
     id: u32,
-    el: &'a Element,
-    form: Option<&'a Element>,
+    el: NodeRef<'a>,
+    form: Option<NodeRef<'a>>,
 }
 
 /// Whether `tag` is a control that consumes a field id (the same set layout
@@ -1364,7 +1363,7 @@ fn is_control_tag(tag: &str) -> bool {
 /// recording its nearest enclosing `<form>`. This is the *single canonical*
 /// numbering the app shares with layout, so a clicked box maps to the right
 /// control and submission groups controls by their real form.
-fn collect_controls(root: &Element) -> Vec<ControlRef<'_>> {
+fn collect_controls(root: NodeRef<'_>) -> Vec<ControlRef<'_>> {
     let mut out = Vec::new();
     let mut next_id = 0u32;
     walk_controls(root, None, &mut next_id, &mut out);
@@ -1372,12 +1371,12 @@ fn collect_controls(root: &Element) -> Vec<ControlRef<'_>> {
 }
 
 fn walk_controls<'a>(
-    el: &'a Element,
-    form: Option<&'a Element>,
+    el: NodeRef<'a>,
+    form: Option<NodeRef<'a>>,
     next_id: &mut u32,
     out: &mut Vec<ControlRef<'a>>,
 ) {
-    if is_control_tag(&el.tag) {
+    if is_control_tag(el.tag()) {
         out.push(ControlRef {
             id: *next_id,
             el,
@@ -1386,9 +1385,9 @@ fn walk_controls<'a>(
         *next_id += 1;
     }
     // Descend; controls inside a <form> inherit it as their enclosing form.
-    let inner_form = if el.tag == "form" { Some(el) } else { form };
-    for child in &el.children {
-        if let Node::Element(child) = child {
+    let inner_form = if el.tag() == "form" { Some(el) } else { form };
+    for child in el.children() {
+        if child.is_element() {
             walk_controls(child, inner_form, next_id, out);
         }
     }
@@ -1396,27 +1395,27 @@ fn walk_controls<'a>(
 
 /// Whether two optional form refs denote the same `<form>` element (or both the
 /// implicit "no form" group).
-fn same_form(a: Option<&Element>, b: Option<&Element>) -> bool {
+fn same_form(a: Option<NodeRef<'_>>, b: Option<NodeRef<'_>>) -> bool {
     match (a, b) {
-        (Some(x), Some(y)) => std::ptr::eq(x, y),
+        (Some(x), Some(y)) => x.id() == y.id(),
         (None, None) => true,
         _ => false,
     }
 }
 
 /// Number of `<option>` descendants of a `<select>`.
-fn count_options(select: &Element) -> usize {
+fn count_options(select: NodeRef<'_>) -> usize {
     let mut n = 0;
     count_options_into(select, &mut n);
     n
 }
 
-fn count_options_into(el: &Element, n: &mut usize) {
-    for child in &el.children {
-        if let Node::Element(e) = child {
-            match e.tag.as_str() {
+fn count_options_into(el: NodeRef<'_>, n: &mut usize) {
+    for child in el.children() {
+        if child.is_element() {
+            match child.tag() {
                 "option" => *n += 1,
-                "optgroup" => count_options_into(e, n),
+                "optgroup" => count_options_into(child, n),
                 _ => {}
             }
         }
@@ -1425,7 +1424,7 @@ fn count_options_into(el: &Element, n: &mut usize) {
 
 /// The DOM-selected option index of a `<select>` (the first `selected` option,
 /// else 0).
-fn dom_selected_index(select: &Element) -> usize {
+fn dom_selected_index(select: NodeRef<'_>) -> usize {
     let mut options = Vec::new();
     collect_option_pairs(select, &mut options);
     options
@@ -1436,16 +1435,19 @@ fn dom_selected_index(select: &Element) -> usize {
 
 /// Flatten a `<select>`'s options to `(value, text, selected)` triples, where
 /// `value` is the option's `value` attr or its text when absent.
-fn collect_option_pairs(el: &Element, out: &mut Vec<(String, String, bool)>) {
-    for child in &el.children {
-        if let Node::Element(e) = child {
-            match e.tag.as_str() {
+fn collect_option_pairs(el: NodeRef<'_>, out: &mut Vec<(String, String, bool)>) {
+    for child in el.children() {
+        if child.is_element() {
+            match child.tag() {
                 "option" => {
-                    let text = e.text_content().trim().to_string();
-                    let value = e.attr("value").map(str::to_string).unwrap_or(text.clone());
-                    out.push((value, text, e.attr("selected").is_some()));
+                    let text = child.text_content().trim().to_string();
+                    let value = child
+                        .attr("value")
+                        .map(str::to_string)
+                        .unwrap_or(text.clone());
+                    out.push((value, text, child.attr("selected").is_some()));
                 }
-                "optgroup" => collect_option_pairs(e, out),
+                "optgroup" => collect_option_pairs(child, out),
                 _ => {}
             }
         }
@@ -1455,7 +1457,11 @@ fn collect_option_pairs(el: &Element, out: &mut Vec<(String, String, bool)>) {
 /// Serialize the successful controls of one form (identified by `form` — `None`
 /// means the implicit whole-document form) into a `name=value&...` query string,
 /// reading live edits from `store` and falling back to DOM defaults.
-fn build_query(controls: &[ControlRef<'_>], form: Option<&Element>, store: &FormStore) -> String {
+fn build_query(
+    controls: &[ControlRef<'_>],
+    form: Option<NodeRef<'_>>,
+    store: &FormStore,
+) -> String {
     let mut pairs: Vec<String> = Vec::new();
     for c in controls.iter().filter(|c| same_form(c.form, form)) {
         let Some(name) = c.el.attr("name").filter(|n| !n.is_empty()) else {
@@ -1475,7 +1481,7 @@ fn build_query(controls: &[ControlRef<'_>], form: Option<&Element>, store: &Form
 /// The submitted value(s) of one control (empty if it is not successful, e.g. an
 /// unchecked box or a button).
 fn control_values(c: &ControlRef<'_>, store: &FormStore) -> Vec<String> {
-    match c.el.tag.as_str() {
+    match c.el.tag() {
         "textarea" => vec![store
             .value(c.id)
             .map(str::to_string)
@@ -1778,7 +1784,7 @@ mod tests {
 
         assert!(b.poll(), "result drained on poll");
         assert_eq!(b.status(), 200);
-        assert!(b.document.root.text_content().contains("Hello"));
+        assert!(b.document.root().text_content().contains("Hello"));
         assert!(!b.toolbar.loading);
     }
 
@@ -1796,14 +1802,14 @@ mod tests {
         assert!(b.poll());
         // https failed -> risk prompt for the original http URL.
         assert_eq!(b.insecure_prompt.as_deref(), Some("http://insecure.test/"));
-        assert!(b.document.root.text_content().contains("HTTPS"));
+        assert!(b.document.root().text_content().contains("HTTPS"));
 
         // Confirming loads the plaintext http page.
         b.confirm_insecure();
         assert!(b.pending.is_some());
         assert!(b.poll());
         assert_eq!(b.status(), 200);
-        assert!(b.document.root.text_content().contains("Plain"));
+        assert!(b.document.root().text_content().contains("Plain"));
         assert!(b.insecure_prompt.is_none());
     }
 
@@ -1826,7 +1832,7 @@ mod tests {
         b.navigate("https://c.test/");
         assert!(b.pending.is_none(), "served from cache");
         assert!(!b.toolbar.loading);
-        assert!(b.document.root.text_content().contains("Cached"));
+        assert!(b.document.root().text_content().contains("Cached"));
     }
 
     #[test]
@@ -1901,7 +1907,7 @@ mod tests {
         assert!(b.pending.is_some(), "navigation started");
 
         assert!(b.poll());
-        assert!(b.document.root.text_content().contains("Next"));
+        assert!(b.document.root().text_content().contains("Next"));
         assert_eq!(b.toolbar.url_text, "https://site.test/next");
     }
 
