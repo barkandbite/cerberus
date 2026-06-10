@@ -6,7 +6,7 @@
 //! is just the pixel pipeline. Output is PPM today; PNG/PDF arrive with the
 //! approved image-encoder crate (M2/M8).
 
-use cerberus_layout::{ImageProvider, LayoutEngine};
+use cerberus_layout::{FormState, ImageProvider, LayoutEngine};
 use cerberus_paint::{Framebuffer, Rasterizer, TextShaper};
 use cerberus_style::StyledDom;
 use cerberus_types::{Color, Size};
@@ -14,6 +14,10 @@ use std::io::{self, Write};
 use std::path::Path;
 
 /// Render a styled document to a framebuffer: lay out, clear, paint.
+///
+/// This threads every render seam (shaper, rasterizer, image, form state) in one
+/// call, so the argument count is inherent rather than a smell.
+#[allow(clippy::too_many_arguments)]
 pub fn render_document(
     styled: &StyledDom,
     viewport: Size,
@@ -22,8 +26,9 @@ pub fn render_document(
     shaper: &dyn TextShaper,
     rasterizer: &dyn Rasterizer,
     images: &dyn ImageProvider,
+    forms: &dyn FormState,
 ) -> Framebuffer {
-    let laid = layout.layout(styled, viewport, shaper, images);
+    let laid = layout.layout(styled, viewport, shaper, images, forms);
     let mut fb = Framebuffer::new(viewport);
     fb.clear(background);
     rasterizer.rasterize(&laid.display, &mut fb);
@@ -52,7 +57,7 @@ mod tests {
     use super::*;
     use cerberus_css::CssEngine;
     use cerberus_dom::parse_html;
-    use cerberus_layout::{BlockLayout, NoImages};
+    use cerberus_layout::{BlockLayout, NoForms, NoImages};
     use cerberus_paint::{BoxRasterizer, MonoShaper};
     use cerberus_style::StyleEngine;
 
@@ -68,6 +73,7 @@ mod tests {
             &MonoShaper,
             &BoxRasterizer,
             &NoImages,
+            &NoForms,
         );
         assert_eq!(fb.size, viewport);
         // Background present...

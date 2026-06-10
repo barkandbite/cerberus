@@ -267,8 +267,18 @@ green.
   `<select>` as bordered inline-block boxes from their DOM state (value,
   placeholder, `checked`, selected `<option>`, `size`/`rows`/`cols`), clamped to
   the content box; `type=hidden` paints nothing. **Live-verified** (Wikipedia's
-  search field + button + checkboxes). Interactivity (focus/typing/submit) ties
-  into the event model and lands with JS at M3.
+  search field + button + checkboxes).
+- **Form interactivity (M2)** → the controls are now usable without JS: layout
+  emits a `FormFieldBox` hit region + stable field id for each control (the id is
+  the pre-order index of `<input>`/`<textarea>`/`<select>`/`<button>`, shared
+  verbatim by layout and the app so a clicked box maps to the right DOM control,
+  even inside table cells). Click a text field/textarea to focus it (blinking-
+  less caret) and type/backspace; click toggles a checkbox, keeps a radio group
+  mutually exclusive within its form, and cycles a `<select>`; a submit button or
+  Enter serializes that form's successful controls into a urlencoded `action?query`
+  (GET) and navigates. Field state is per-page (cleared on navigation). Covered by
+  hermetic app tests (typing→store, encoded submission URL, checkbox/radio/select).
+  Richer events + POST arrive with JS at M3.
 - **Tables (M2)** → `<table>` (with `<thead>`/`<tbody>`/`<tfoot>`, `<tr>`,
   `<td>`/`<th>`, `<caption>`) lays out as a bordered grid: equal-width columns,
   each cell's content flowed into its own box (so nested links/images/tables

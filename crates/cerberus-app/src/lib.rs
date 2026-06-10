@@ -16,7 +16,9 @@ use cerberus_headless::render_document;
 use cerberus_identity::{Head, HeadManager};
 use cerberus_image::ImageCodec;
 use cerberus_js::NullJsEngineFactory;
-use cerberus_layout::{BlockLayout, ImageProvider, LayoutEngine, LinkBox};
+use cerberus_layout::{
+    BlockLayout, FieldKind, FormFieldBox, FormState, ImageProvider, LayoutEngine, LinkBox, NoForms,
+};
 use cerberus_net::{BuiltinHttpClient, HttpCache, HttpClient, HttpResponse, Router};
 use cerberus_paint::{
     DecodedImage, DisplayItem, DisplayList, Framebuffer, ImageDecoder, Rasterizer, TextShaper,
@@ -223,6 +225,7 @@ pub fn render(config: &RenderConfig) -> Result<RenderOutcome, AppError> {
         &text,
         &text,
         &provider,
+        &NoForms,
     );
 
     // Compose: page under the toolbar, toolbar painted on top.
@@ -502,6 +505,41 @@ fn collect_image_urls(el: &Element, out: &mut Vec<String>) {
     }
 }
 
+/// Live, per-page state of the interactive form controls, keyed by the field id
+/// (the 0-based pre-order index over every `<input>`/`<textarea>`/`<select>`/
+/// `<button>` — the same numbering layout assigns). A control appears here only
+/// once the user touches it; layout renders untouched controls from their DOM
+/// defaults. Cleared on every page load (form state is per page).
+#[derive(Default)]
+struct FormStore {
+    /// Edited text of text fields / textareas.
+    values: HashMap<u32, String>,
+    /// Live checked state of checkboxes / radios.
+    checked: HashMap<u32, bool>,
+    /// Chosen option index of `<select>`s.
+    selected: HashMap<u32, usize>,
+}
+
+impl FormStore {
+    fn clear(&mut self) {
+        self.values.clear();
+        self.checked.clear();
+        self.selected.clear();
+    }
+}
+
+impl FormState for FormStore {
+    fn value(&self, id: u32) -> Option<&str> {
+        self.values.get(&id).map(String::as_str)
+    }
+    fn checked(&self, id: u32) -> bool {
+        self.checked.get(&id).copied().unwrap_or(false)
+    }
+    fn select_index(&self, id: u32) -> Option<usize> {
+        self.selected.get(&id).copied()
+    }
+}
+
 /// The interactive single-page browser: one toolbar over one page, linear
 /// history, background loads, and the https→prompt→block policy.
 pub struct BrowserApp {
@@ -525,6 +563,12 @@ pub struct BrowserApp {
     page_title: Option<String>,
     /// Clickable link boxes from the last rendered frame (window coordinates).
     links: Vec<LinkBox>,
+    /// Interactive form-control hit boxes from the last frame (window coords).
+    form_fields: Vec<FormFieldBox>,
+    /// Live form-control state for the current page.
+    forms: FormStore,
+    /// The currently focused text field/textarea, if any (a field id).
+    focused_field: Option<u32>,
     pending: Option<Pending>,
     next_id: u64,
     /// When `Some`, an `http` URL is awaiting the user's risk confirmation.
@@ -571,6 +615,9 @@ impl BrowserApp {
             current_url: None,
             page_title: None,
             links: Vec::new(),
+            form_fields: Vec::new(),
+            forms: FormStore::default(),
+            focused_field: None,
             pending: None,
             next_id: 1,
             insecure_prompt: None,
@@ -607,6 +654,10 @@ impl BrowserApp {
         // Drop the previous page's images: the store only ever holds the
         // current page's sub-resources (memory is priority #1).
         self.images.clear();
+        // Form state is per page: clear edited values, focus, and hit boxes.
+        self.forms.clear();
+        self.focused_field = None;
+        self.form_fields.clear();
 
         if url.starts_with("cerberus:") {
             self.load_builtin(url);
@@ -793,6 +844,170 @@ impl BrowserApp {
         self.navigate(&target);
     }
 
+    /// The form-control hit box under `(x, y)`, if any (window coordinates).
+    fn field_at(&self, x: i32, y: i32) -> Option<FormFieldBox> {
+        self.form_fields
+            .iter()
+            .find(|f| point_in_rect(f.rect, x, y))
+            .cloned()
+    }
+
+    /// Handle a click that landed on form control `field`. Returns true (the
+    /// click is always consumed once it hits a control).
+    fn click_field(&mut self, field: &FormFieldBox) -> bool {
+        match field.kind {
+            FieldKind::Text | FieldKind::Textarea => {
+                self.focused_field = Some(field.id);
+                self.toolbar.url_focused = false;
+            }
+            FieldKind::Checkbox => {
+                let now = !self.forms.checked(field.id);
+                self.forms.checked.insert(field.id, now);
+                self.focused_field = None;
+            }
+            FieldKind::Radio => {
+                self.check_radio(field.id);
+                self.focused_field = None;
+            }
+            FieldKind::Select => {
+                self.cycle_select(field.id);
+                self.focused_field = None;
+            }
+            FieldKind::Button => {
+                self.focused_field = None;
+                self.submit_from(field.id);
+            }
+        }
+        true
+    }
+
+    /// Check radio `id` and clear every other radio sharing its `name` in the
+    /// same enclosing form (mutually-exclusive radio-group behaviour).
+    fn check_radio(&mut self, id: u32) {
+        let controls = collect_controls(&self.document.root);
+        let Some(this) = controls.iter().find(|c| c.id == id) else {
+            return;
+        };
+        let name = this.el.attr("name").unwrap_or_default().to_string();
+        let group = this.form;
+        for c in &controls {
+            let is_radio = c.el.tag == "input"
+                && c.el
+                    .attr("type")
+                    .is_some_and(|t| t.eq_ignore_ascii_case("radio"));
+            if is_radio && same_form(c.form, group) && c.el.attr("name").unwrap_or_default() == name
+            {
+                self.forms.checked.insert(c.id, c.id == id);
+            }
+        }
+    }
+
+    /// Advance a `<select>` to its next option (wrapping). Reads the option count
+    /// from the DOM and the current index from the store (or the DOM default).
+    fn cycle_select(&mut self, id: u32) {
+        let controls = collect_controls(&self.document.root);
+        let Some(sel) = controls.iter().find(|c| c.id == id) else {
+            return;
+        };
+        let count = count_options(sel.el);
+        if count == 0 {
+            return;
+        }
+        let current = self
+            .forms
+            .select_index(id)
+            .unwrap_or_else(|| dom_selected_index(sel.el));
+        self.forms.selected.insert(id, (current + 1) % count);
+    }
+
+    /// Submit the form enclosing control `id` (or the whole document if the
+    /// control has no `<form>` ancestor), as a GET navigation.
+    fn submit_from(&mut self, id: u32) {
+        let controls = collect_controls(&self.document.root);
+        let Some(this) = controls.iter().find(|c| c.id == id) else {
+            return;
+        };
+        // The enclosing <form> (if any) supplies the action/method; its absence
+        // means the whole document is treated as one big form.
+        let form_el = this.form;
+        let query = build_query(&controls, form_el, &self.forms);
+        let action = form_el.and_then(|f| f.attr("action")).unwrap_or("");
+        // Method: GET today; POST falls back to a GET of the action.
+        // TODO POST: send the body instead of a query once the net layer allows.
+        let target = self.resolve_action(action, &query);
+        self.navigate(&target);
+    }
+
+    /// Resolve a form `action` against the current URL and append `?query`.
+    fn resolve_action(&self, action: &str, query: &str) -> String {
+        let base = match &self.current_url {
+            Some(base) if !action.is_empty() => join_url(base, action)
+                .map(|u| u.to_string())
+                .unwrap_or_else(|_| action.to_string()),
+            Some(base) => base.to_string(),
+            None if !action.is_empty() => action.to_string(),
+            None => String::new(),
+        };
+        // Replace any existing query with the form's serialized controls.
+        let stem = base.split('#').next().unwrap_or(&base);
+        let stem = stem.split('?').next().unwrap_or(stem);
+        if query.is_empty() {
+            stem.to_string()
+        } else {
+            format!("{stem}?{query}")
+        }
+    }
+
+    /// Paint a 1px caret at the end of the focused text field's value into the
+    /// page framebuffer. `origin` is the page's top-left in window coordinates,
+    /// used to map the (window-space) field rect back into page-local pixels.
+    ///
+    /// The caret font size is recovered from a single-line text field's box
+    /// height (`font_size + 2*FIELD_PAD`); a multi-row `<textarea>` reuses one
+    /// line of that, which is exact for the single-line editing we support today
+    /// (newlines can't be typed — Enter submits). The caret is always clamped
+    /// inside the box.
+    fn paint_caret(&self, page: &mut Framebuffer, origin: Point) {
+        let Some(id) = self.focused_field else {
+            return;
+        };
+        let Some(field) = self.form_fields.iter().find(|f| f.id == id) else {
+            return;
+        };
+        if !matches!(field.kind, FieldKind::Text | FieldKind::Textarea) {
+            return;
+        }
+        // Map the field rect back into page-local coordinates.
+        let rect = field.rect;
+        let lx = rect.x - origin.x;
+        let ly = rect.y - origin.y;
+        // A single-line field is font_size + 2*FIELD_PAD high; a textarea is
+        // taller, so cap the caret to one line height there.
+        let box_inner = (rect.h as i32 - 2 * FIELD_PAD).max(8);
+        let px = if field.kind == FieldKind::Textarea {
+            box_inner.min(20) as u32
+        } else {
+            box_inner as u32
+        };
+        // Width of the current value up to the caret (the last line for areas).
+        let value = self.forms.value(id).unwrap_or("");
+        let last_line = value.rsplit('\n').next().unwrap_or(value);
+        let text_w: u32 = self
+            .text
+            .shape(last_line, px)
+            .iter()
+            .map(|g| g.advance)
+            .sum();
+        let inner_w = (rect.w as i32 - 2 * FIELD_PAD).max(0);
+        let caret_x = lx + FIELD_PAD + (text_w as i32).min(inner_w);
+        let mut list = DisplayList::new();
+        list.push(DisplayItem::Rect {
+            rect: Rect::new(caret_x, ly + FIELD_PAD, 1, px),
+            color: Color::rgb(0x22, 0x22, 0x22),
+        });
+        self.text.rasterize(&list, page);
+    }
+
     fn set_session_cookie(&mut self, first_party: &Origin) {
         let instance = self.heads.active().instance;
         let _ = self.storage.instance(instance).set_cookie(
@@ -931,7 +1146,7 @@ impl FrameApp for BrowserApp {
             images: &self.images,
         };
         let mut layout = BlockLayout::default();
-        let laid = layout.layout(&self.styled, content, &self.text, &provider);
+        let laid = layout.layout(&self.styled, content, &self.text, &provider, &self.forms);
 
         let mut page = Framebuffer::new(content);
         page.clear(self.background);
@@ -947,6 +1162,21 @@ impl FrameApp for BrowserApp {
                 l
             })
             .collect();
+
+        // Record form-control hit-boxes in window coordinates too.
+        self.form_fields = laid
+            .fields
+            .into_iter()
+            .map(|mut f| {
+                f.rect.x += origin.x;
+                f.rect.y += origin.y;
+                f
+            })
+            .collect();
+
+        // Draw a caret at the end of the focused text field's value. The field's
+        // own value is already painted by layout into `page`; we just add the bar.
+        self.paint_caret(&mut page, origin);
 
         let mut fb = Framebuffer::new(size);
         fb.clear(self.background);
@@ -975,11 +1205,20 @@ impl FrameApp for BrowserApp {
             self.settings_open = false;
             return true;
         }
-        // Page-area click: follow a link if one is under the cursor.
+        // Page-area click: a form control wins over a link, which wins over
+        // plain content. A click anywhere in the page that misses every control
+        // also drops form focus (and is consumed if it actually had focus).
         if y >= cerberus_ui::TOOLBAR_HEIGHT as i32 {
+            if let Some(field) = self.field_at(x, y) {
+                return self.click_field(&field);
+            }
+            let had_focus = self.focused_field.take().is_some();
             if let Some(href) = self.link_at(x, y) {
                 self.open_link(&href);
                 return true;
+            }
+            if had_focus {
+                return true; // the click dismissed the focused field
             }
         }
         let action = self.toolbar.hit_test(self.last_size, x, y);
@@ -991,8 +1230,16 @@ impl FrameApp for BrowserApp {
     }
 
     fn text_input(&mut self, c: char) -> bool {
+        // The URL box takes priority while it is focused.
         if self.toolbar.url_focused {
             self.toolbar.type_char(c);
+            return true;
+        }
+        // Otherwise type into the focused text field/textarea.
+        if let Some(id) = self.focused_field {
+            if !c.is_control() {
+                self.forms.values.entry(id).or_default().push(c);
+            }
             return true;
         }
         false
@@ -1003,12 +1250,23 @@ impl FrameApp for BrowserApp {
             let action = self.toolbar.submit_url();
             return self.handle(action);
         }
+        // Enter in a focused field submits its enclosing form.
+        if let Some(id) = self.focused_field {
+            self.submit_from(id);
+            return true;
+        }
         false
     }
 
     fn backspace(&mut self) -> bool {
         if self.toolbar.url_focused {
             self.toolbar.backspace();
+            return true;
+        }
+        if let Some(id) = self.focused_field {
+            if let Some(v) = self.forms.values.get_mut(&id) {
+                v.pop();
+            }
             return true;
         }
         false
@@ -1079,6 +1337,223 @@ fn simple_document(heading: &str, line: &str, note: Option<&str>) -> Document {
 
 fn point_in_rect(r: Rect, x: i32, y: i32) -> bool {
     x >= r.x && y >= r.y && x < r.x + r.w as i32 && y < r.y + r.h as i32
+}
+
+// --- Form controls: the id convention + GET submission. ---
+
+/// Inner padding of a form control, mirroring `cerberus_layout::FIELD_PAD`. Used
+/// only to place the focus caret relative to a field's rect.
+const FIELD_PAD: i32 = 4;
+
+/// One interactive control located in the DOM, tagged with its field id (the
+/// 0-based pre-order index matching layout's numbering) and its enclosing
+/// `<form>` element, if any.
+struct ControlRef<'a> {
+    id: u32,
+    el: &'a Element,
+    form: Option<&'a Element>,
+}
+
+/// Whether `tag` is a control that consumes a field id (the same set layout
+/// counts: every `<input>`/`<textarea>`/`<select>`/`<button>`).
+fn is_control_tag(tag: &str) -> bool {
+    matches!(tag, "input" | "textarea" | "select" | "button")
+}
+
+/// Walk the document in pre-order, assigning each control its field id and
+/// recording its nearest enclosing `<form>`. This is the *single canonical*
+/// numbering the app shares with layout, so a clicked box maps to the right
+/// control and submission groups controls by their real form.
+fn collect_controls(root: &Element) -> Vec<ControlRef<'_>> {
+    let mut out = Vec::new();
+    let mut next_id = 0u32;
+    walk_controls(root, None, &mut next_id, &mut out);
+    out
+}
+
+fn walk_controls<'a>(
+    el: &'a Element,
+    form: Option<&'a Element>,
+    next_id: &mut u32,
+    out: &mut Vec<ControlRef<'a>>,
+) {
+    if is_control_tag(&el.tag) {
+        out.push(ControlRef {
+            id: *next_id,
+            el,
+            form,
+        });
+        *next_id += 1;
+    }
+    // Descend; controls inside a <form> inherit it as their enclosing form.
+    let inner_form = if el.tag == "form" { Some(el) } else { form };
+    for child in &el.children {
+        if let Node::Element(child) = child {
+            walk_controls(child, inner_form, next_id, out);
+        }
+    }
+}
+
+/// Whether two optional form refs denote the same `<form>` element (or both the
+/// implicit "no form" group).
+fn same_form(a: Option<&Element>, b: Option<&Element>) -> bool {
+    match (a, b) {
+        (Some(x), Some(y)) => std::ptr::eq(x, y),
+        (None, None) => true,
+        _ => false,
+    }
+}
+
+/// Number of `<option>` descendants of a `<select>`.
+fn count_options(select: &Element) -> usize {
+    let mut n = 0;
+    count_options_into(select, &mut n);
+    n
+}
+
+fn count_options_into(el: &Element, n: &mut usize) {
+    for child in &el.children {
+        if let Node::Element(e) = child {
+            match e.tag.as_str() {
+                "option" => *n += 1,
+                "optgroup" => count_options_into(e, n),
+                _ => {}
+            }
+        }
+    }
+}
+
+/// The DOM-selected option index of a `<select>` (the first `selected` option,
+/// else 0).
+fn dom_selected_index(select: &Element) -> usize {
+    let mut options = Vec::new();
+    collect_option_pairs(select, &mut options);
+    options
+        .iter()
+        .position(|(_, _, selected)| *selected)
+        .unwrap_or(0)
+}
+
+/// Flatten a `<select>`'s options to `(value, text, selected)` triples, where
+/// `value` is the option's `value` attr or its text when absent.
+fn collect_option_pairs(el: &Element, out: &mut Vec<(String, String, bool)>) {
+    for child in &el.children {
+        if let Node::Element(e) = child {
+            match e.tag.as_str() {
+                "option" => {
+                    let text = e.text_content().trim().to_string();
+                    let value = e.attr("value").map(str::to_string).unwrap_or(text.clone());
+                    out.push((value, text, e.attr("selected").is_some()));
+                }
+                "optgroup" => collect_option_pairs(e, out),
+                _ => {}
+            }
+        }
+    }
+}
+
+/// Serialize the successful controls of one form (identified by `form` — `None`
+/// means the implicit whole-document form) into a `name=value&...` query string,
+/// reading live edits from `store` and falling back to DOM defaults.
+fn build_query(controls: &[ControlRef<'_>], form: Option<&Element>, store: &FormStore) -> String {
+    let mut pairs: Vec<String> = Vec::new();
+    for c in controls.iter().filter(|c| same_form(c.form, form)) {
+        let Some(name) = c.el.attr("name").filter(|n| !n.is_empty()) else {
+            continue; // unnamed controls are never successful
+        };
+        for value in control_values(c, store) {
+            pairs.push(format!(
+                "{}={}",
+                encode_component(name),
+                encode_component(&value)
+            ));
+        }
+    }
+    pairs.join("&")
+}
+
+/// The submitted value(s) of one control (empty if it is not successful, e.g. an
+/// unchecked box or a button).
+fn control_values(c: &ControlRef<'_>, store: &FormStore) -> Vec<String> {
+    match c.el.tag.as_str() {
+        "textarea" => vec![store
+            .value(c.id)
+            .map(str::to_string)
+            .unwrap_or_else(|| c.el.text_content().trim_end_matches('\n').to_string())],
+        "select" => {
+            let mut options = Vec::new();
+            collect_option_pairs(c.el, &mut options);
+            if options.is_empty() {
+                return Vec::new();
+            }
+            let idx = store
+                .select_index(c.id)
+                .unwrap_or_else(|| dom_selected_index(c.el))
+                .min(options.len() - 1);
+            vec![options[idx].0.clone()]
+        }
+        "button" => Vec::new(), // a <button> is not a submitted value here
+        _ => input_values(c, store), // <input>
+    }
+}
+
+/// The submitted value(s) of an `<input>`.
+fn input_values(c: &ControlRef<'_>, store: &FormStore) -> Vec<String> {
+    let kind =
+        c.el.attr("type")
+            .map(|t| t.trim().to_ascii_lowercase())
+            .unwrap_or_else(|| "text".to_string());
+    match kind.as_str() {
+        // Buttons never contribute their own value on a generic submit.
+        "submit" | "reset" | "button" | "image" => Vec::new(),
+        "checkbox" | "radio" => {
+            // Touched? use the live state; else fall back to the DOM `checked`.
+            let on = store
+                .checked
+                .get(&c.id)
+                .copied()
+                .unwrap_or_else(|| c.el.attr("checked").is_some());
+            if on {
+                vec![c.el.attr("value").unwrap_or("on").to_string()]
+            } else {
+                Vec::new()
+            }
+        }
+        "hidden" => vec![c.el.attr("value").unwrap_or("").to_string()],
+        // text, search, email, password, … : live edit, else the DOM value.
+        _ => vec![store
+            .value(c.id)
+            .map(str::to_string)
+            .unwrap_or_else(|| c.el.attr("value").unwrap_or("").to_string())],
+    }
+}
+
+/// Percent-encode one `application/x-www-form-urlencoded` component: spaces
+/// become `+`, the unreserved set (`A–Z a–z 0–9 - _ . ~`) passes through, and
+/// every other byte is `%`-escaped (uppercase hex).
+fn encode_component(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for &b in s.as_bytes() {
+        match b {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                out.push(b as char)
+            }
+            b' ' => out.push('+'),
+            _ => {
+                out.push('%');
+                out.push(hex_digit(b >> 4));
+                out.push(hex_digit(b & 0x0F));
+            }
+        }
+    }
+    out
+}
+
+fn hex_digit(n: u8) -> char {
+    match n {
+        0..=9 => (b'0' + n) as char,
+        _ => (b'A' + (n - 10)) as char,
+    }
 }
 
 /// Paint the "Load anyway (insecure)" button into the content area; return its
@@ -1520,5 +1995,216 @@ mod tests {
         b.navigate("https://b.test/");
         assert!(b.poll());
         assert!(b.images.is_empty(), "previous page's images were cleared");
+    }
+
+    // ---- Form interactivity ----
+
+    /// Load `url` into a fresh app, draining the background fetch.
+    fn loaded(responses: Vec<(&str, Result<FetchedPage, String>)>, url: &str) -> BrowserApp {
+        let mut b = fake_app(responses);
+        b.navigate(url);
+        assert!(b.poll(), "page load drained");
+        b
+    }
+
+    #[test]
+    fn typing_into_a_focused_text_field_updates_the_store() {
+        let mut b = loaded(
+            vec![(
+                "https://site.test/",
+                Ok(page(
+                    "https://site.test/",
+                    200,
+                    None,
+                    "<form action='/s'><input name='q'></form>",
+                )),
+            )],
+            "https://site.test/",
+        );
+        // Render to populate the field hit-boxes, then focus the field.
+        b.render_frame(Size::new(800, 600));
+        assert_eq!(b.form_fields.len(), 1, "one text field laid out");
+        let id = b.form_fields[0].id;
+        let r = b.form_fields[0].rect;
+        assert!(b.pointer_down(r.x + 1, r.y + 1), "click focuses the field");
+        assert_eq!(b.focused_field, Some(id));
+        assert!(!b.toolbar.url_focused, "URL box defocused on field click");
+
+        // Typing flows into the store keyed by the field id.
+        assert!(b.text_input('h'));
+        assert!(b.text_input('i'));
+        assert_eq!(b.forms.value(id), Some("hi"));
+
+        // Backspace pops; a clicked-away pointer drops focus.
+        assert!(b.backspace());
+        assert_eq!(b.forms.value(id), Some("h"));
+        assert!(b.pointer_down(r.x + 1, r.y + 200), "click off the field");
+        assert_eq!(b.focused_field, None);
+    }
+
+    #[test]
+    fn submitting_a_text_field_navigates_with_an_encoded_query() {
+        let mut b = loaded(
+            vec![(
+                "https://site.test/",
+                Ok(page(
+                    "https://site.test/",
+                    200,
+                    None,
+                    "<form action='/s'><input name='q'></form>",
+                )),
+            )],
+            "https://site.test/",
+        );
+        b.render_frame(Size::new(800, 600));
+        let r = b.form_fields[0].rect;
+        assert!(b.pointer_down(r.x + 1, r.y + 1));
+        assert!(b.text_input('h'));
+        assert!(b.text_input('i'));
+
+        // Enter submits the enclosing form: GET to action?name=value.
+        assert!(b.submit(), "submit consumed");
+        assert!(b.pending.is_some(), "navigation started");
+        assert_eq!(b.toolbar.url_text, "https://site.test/s?q=hi");
+    }
+
+    #[test]
+    fn submit_button_click_submits_the_form() {
+        let mut b = loaded(
+            vec![(
+                "https://site.test/",
+                Ok(page(
+                    "https://site.test/",
+                    200,
+                    None,
+                    "<form action='/go'><input name='q' value='a b'>\
+                     <input type='submit' value='Send'></form>",
+                )),
+            )],
+            "https://site.test/",
+        );
+        b.render_frame(Size::new(800, 600));
+        // Two controls: the text field (id 0) and the submit button (id 1).
+        let submit = b
+            .form_fields
+            .iter()
+            .find(|f| matches!(f.kind, FieldKind::Button))
+            .expect("submit button box")
+            .rect;
+        assert!(b.pointer_down(submit.x + 1, submit.y + 1), "click submit");
+        // The DOM value "a b" round-trips through the encoder (space -> +).
+        assert_eq!(b.toolbar.url_text, "https://site.test/go?q=a+b");
+    }
+
+    /// A page with a single checkbox `name='a' value='1'` plus a submit button.
+    fn checkbox_page() -> Vec<(&'static str, Result<FetchedPage, String>)> {
+        vec![(
+            "https://site.test/",
+            Ok(page(
+                "https://site.test/",
+                200,
+                None,
+                "<form action='/s'><input type='checkbox' name='a' value='1'>\
+                 <input type='submit'></form>",
+            )),
+        )]
+    }
+
+    #[test]
+    fn checkbox_click_toggles_its_checked_state() {
+        let mut b = loaded(checkbox_page(), "https://site.test/");
+        b.render_frame(Size::new(800, 600));
+        let cb = b.form_fields[0].clone();
+        assert_eq!(cb.kind, FieldKind::Checkbox);
+        assert!(!b.forms.checked(cb.id), "unchecked by default");
+
+        assert!(b.pointer_down(cb.rect.x + 1, cb.rect.y + 1), "toggle on");
+        assert!(b.forms.checked(cb.id));
+        assert!(b.pointer_down(cb.rect.x + 1, cb.rect.y + 1), "toggle off");
+        assert!(!b.forms.checked(cb.id));
+    }
+
+    #[test]
+    fn checkbox_is_submitted_only_when_checked() {
+        // Unchecked: an empty query.
+        let mut b = loaded(checkbox_page(), "https://site.test/");
+        b.render_frame(Size::new(800, 600));
+        let submit = b.form_fields[1].rect;
+        assert!(b.pointer_down(submit.x + 1, submit.y + 1));
+        assert_eq!(b.toolbar.url_text, "https://site.test/s");
+
+        // Checked: a=1 is included.
+        let mut b = loaded(checkbox_page(), "https://site.test/");
+        b.render_frame(Size::new(800, 600));
+        let cb = b.form_fields[0].rect;
+        let submit = b.form_fields[1].rect;
+        assert!(b.pointer_down(cb.x + 1, cb.y + 1), "check it");
+        assert!(b.pointer_down(submit.x + 1, submit.y + 1));
+        assert_eq!(b.toolbar.url_text, "https://site.test/s?a=1");
+    }
+
+    #[test]
+    fn radio_group_is_mutually_exclusive_in_its_form() {
+        let mut b = loaded(
+            vec![(
+                "https://site.test/",
+                Ok(page(
+                    "https://site.test/",
+                    200,
+                    None,
+                    "<form action='/r'>\
+                     <input type='radio' name='c' value='x'>\
+                     <input type='radio' name='c' value='y'>\
+                     <input type='submit'></form>",
+                )),
+            )],
+            "https://site.test/",
+        );
+        b.render_frame(Size::new(800, 600));
+        let x = b.form_fields[0].clone();
+        let y = b.form_fields[1].clone();
+        let submit = b.form_fields[2].rect;
+
+        assert!(b.pointer_down(x.rect.x + 1, x.rect.y + 1));
+        assert!(b.pointer_down(y.rect.x + 1, y.rect.y + 1));
+        // Selecting y clears x (same name, same form).
+        assert!(!b.forms.checked(x.id));
+        assert!(b.forms.checked(y.id));
+        assert!(b.pointer_down(submit.x + 1, submit.y + 1));
+        assert_eq!(b.toolbar.url_text, "https://site.test/r?c=y");
+    }
+
+    #[test]
+    fn select_cycles_options_and_submits_the_choice() {
+        let mut b = loaded(
+            vec![(
+                "https://site.test/",
+                Ok(page(
+                    "https://site.test/",
+                    200,
+                    None,
+                    "<form action='/s'>\
+                     <select name='k'><option value='a'>A</option>\
+                     <option value='b'>B</option></select>\
+                     <input type='submit'></form>",
+                )),
+            )],
+            "https://site.test/",
+        );
+        b.render_frame(Size::new(800, 600));
+        let sel = b.form_fields[0].clone();
+        assert_eq!(sel.kind, FieldKind::Select);
+        let submit = b.form_fields[1].rect;
+
+        // Two clicks advance past B and wrap back to A (the store, not a nav).
+        assert!(b.pointer_down(sel.rect.x + 1, sel.rect.y + 1));
+        assert_eq!(b.forms.select_index(sel.id), Some(1));
+        assert!(b.pointer_down(sel.rect.x + 1, sel.rect.y + 1));
+        assert_eq!(b.forms.select_index(sel.id), Some(0), "wraps around");
+
+        // One more click selects B, and submitting sends its value.
+        assert!(b.pointer_down(sel.rect.x + 1, sel.rect.y + 1));
+        assert!(b.pointer_down(submit.x + 1, submit.y + 1));
+        assert_eq!(b.toolbar.url_text, "https://site.test/s?k=b");
     }
 }

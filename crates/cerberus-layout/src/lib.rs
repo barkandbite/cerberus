@@ -23,11 +23,66 @@ pub struct LinkBox {
     pub href: String,
 }
 
-/// The result of laying out a document: what to paint, and where the links are.
+/// The kind of an interactive form control, used to route input and rendering.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FieldKind {
+    Text,
+    Textarea,
+    Checkbox,
+    Radio,
+    Select,
+    Button,
+}
+
+/// A hit region for one interactive form control (in layout-local coordinates).
+///
+/// The `id` is the control's 0-based index in a pre-order traversal of the tree
+/// counting **every** `<input>`, `<textarea>`, `<select>`, and `<button>` —
+/// including `type=hidden`, which consumes an id but paints nothing. The app
+/// assigns the same ids while walking the DOM, so a box the user clicked maps to
+/// the right control's name/value.
+#[derive(Clone, Debug, PartialEq)]
+pub struct FormFieldBox {
+    pub rect: Rect,
+    pub id: u32,
+    pub kind: FieldKind,
+}
+
+/// The result of laying out a document: what to paint, where the links are, and
+/// the interactive form-control hit boxes.
 #[derive(Clone, Debug, Default)]
 pub struct LaidOut {
     pub display: DisplayList,
     pub links: Vec<LinkBox>,
+    pub fields: Vec<FormFieldBox>,
+}
+
+/// Supplies the live state of form controls to layout, keyed by field id (the
+/// same pre-order index layout assigns). An implementation returns `Some`/`true`
+/// only for fields the user has actually touched; layout falls back to the DOM
+/// attributes otherwise.
+pub trait FormState {
+    /// The current text of a text field/textarea, if the user has edited it.
+    fn value(&self, id: u32) -> Option<&str>;
+    /// Whether a checkbox/radio is currently checked (the live override).
+    fn checked(&self, id: u32) -> bool;
+    /// The chosen option index of a `<select>`, if the user has changed it.
+    fn select_index(&self, id: u32) -> Option<usize>;
+}
+
+/// A form state that knows nothing: every control renders from its DOM defaults.
+pub struct NoForms;
+
+impl FormState for NoForms {
+    fn value(&self, _id: u32) -> Option<&str> {
+        None
+    }
+    fn checked(&self, _id: u32) -> bool {
+        false
+    }
+    fn select_index(&self, _id: u32) -> Option<usize> {
+        None
+    }
 }
 
 /// Supplies decoded images to layout, keyed by an element's `src`/`data-src`.
@@ -48,13 +103,15 @@ impl ImageProvider for NoImages {
 
 /// Produces a `LaidOut` from a styled document for a given viewport.
 pub trait LayoutEngine: Send {
-    /// Lay out `styled` into `viewport`, shaping with `shaper`, images via `images`.
+    /// Lay out `styled` into `viewport`, shaping with `shaper`, images via
+    /// `images`, and rendering form controls from their live `forms` state.
     fn layout(
         &mut self,
         styled: &StyledDom,
         viewport: Size,
         shaper: &dyn TextShaper,
         images: &dyn ImageProvider,
+        forms: &dyn FormState,
     ) -> LaidOut;
 }
 
@@ -79,20 +136,26 @@ impl LayoutEngine for BlockLayout {
         viewport: Size,
         shaper: &dyn TextShaper,
         images: &dyn ImageProvider,
+        forms: &dyn FormState,
     ) -> LaidOut {
         let max_width = viewport
             .w
             .saturating_sub(2 * self.margin.max(0) as u32)
             .max(16) as i32;
-        let mut ctx = Ctx::new(self.margin, max_width, shaper, images);
+        let mut ctx = Ctx::new(self.margin, max_width, shaper, images, forms);
         ctx.walk(&styled.root, None);
         ctx.flush_line();
         LaidOut {
             display: ctx.display,
             links: ctx.links,
+            fields: ctx.fields,
         }
     }
 }
+
+/// The output of flowing one table cell: its display items, link boxes, form
+/// field boxes, and the content height (all in absolute coordinates).
+type CellLayout = (Vec<DisplayItem>, Vec<LinkBox>, Vec<FormFieldBox>, i32);
 
 /// One placed run of text on the current (not-yet-aligned) line.
 struct LinePiece {
@@ -111,8 +174,12 @@ struct LinePiece {
 struct Ctx<'a> {
     shaper: &'a dyn TextShaper,
     images: &'a dyn ImageProvider,
+    forms: &'a dyn FormState,
     display: DisplayList,
     links: Vec<LinkBox>,
+    fields: Vec<FormFieldBox>,
+    /// Next form-control id (0-based pre-order index across the whole document).
+    field_id: u32,
     left0: i32,
     right: i32,
     left: i32,
@@ -130,12 +197,16 @@ impl<'a> Ctx<'a> {
         max_width: i32,
         shaper: &'a dyn TextShaper,
         images: &'a dyn ImageProvider,
+        forms: &'a dyn FormState,
     ) -> Self {
         Self {
             shaper,
             images,
+            forms,
             display: DisplayList::new(),
             links: Vec::new(),
+            fields: Vec::new(),
+            field_id: 0,
             left0: margin,
             right: margin + max_width,
             left: margin,
@@ -149,19 +220,27 @@ impl<'a> Ctx<'a> {
 
     /// A fresh flow context bounded to `left..right` and starting at `y`, used to
     /// lay a table cell's content into its own rectangle. It shares the parent's
-    /// shaper/images and produces absolute-coordinate items (no offset needed).
+    /// shaper/images/forms and produces absolute-coordinate items (no offset
+    /// needed). The `field_id` is seeded from the parent so controls inside the
+    /// cell continue the document-wide pre-order numbering; the parent reads the
+    /// advanced counter back after the cell is flowed.
     fn sub(
         left: i32,
         right: i32,
         y: i32,
         shaper: &'a dyn TextShaper,
         images: &'a dyn ImageProvider,
+        forms: &'a dyn FormState,
+        field_id: u32,
     ) -> Self {
         Self {
             shaper,
             images,
+            forms,
             display: DisplayList::new(),
             links: Vec::new(),
+            fields: Vec::new(),
+            field_id,
             left0: left,
             right: right.max(left + 1),
             left,
@@ -387,14 +466,20 @@ impl<'a> Ctx<'a> {
     }
 
     /// Lay out an `<input>` as the right inline-block control for its `type`.
+    ///
+    /// Assigns this control's id first, *before* the `type=hidden` early-out, so
+    /// a hidden input still consumes an id (keeping layout's pre-order numbering
+    /// in lockstep with the app's DOM walk).
     fn form_input(&mut self, node: &StyledNode) {
+        let id = self.field_id;
+        self.field_id += 1;
         let kind = node
             .attr("type")
             .map(|t| t.trim().to_ascii_lowercase())
             .unwrap_or_else(|| "text".to_string());
         match kind.as_str() {
             "hidden" => {}
-            "checkbox" | "radio" => self.toggle_control(node, kind == "radio"),
+            "checkbox" | "radio" => self.toggle_control(node, id, kind == "radio"),
             "submit" | "reset" | "button" | "image" => {
                 let label =
                     node.attr("value")
@@ -403,27 +488,32 @@ impl<'a> Ctx<'a> {
                             "reset" => "Reset".to_string(),
                             _ => "Submit".to_string(),
                         });
-                self.push_button(&node.style, &label);
+                self.push_button(&node.style, id, &label);
             }
             // text, search, email, url, tel, password, number, date, … all render
             // as a single-line text field.
-            _ => self.text_field(node, kind == "password"),
+            _ => self.text_field(node, id, kind == "password"),
         }
     }
 
     /// A `<button>`: a button box labelled with its text (or `value`).
     fn form_button(&mut self, node: &StyledNode) {
+        let id = self.field_id;
+        self.field_id += 1;
         let text = node.text();
         let label = if text.trim().is_empty() {
             node.attr("value").unwrap_or("Button")
         } else {
             text.trim()
         };
-        self.push_button(&node.style, label);
+        self.push_button(&node.style, id, label);
     }
 
-    /// A `<textarea>`: a multi-row bordered box showing its text content.
+    /// A `<textarea>`: a multi-row bordered box showing its text content (or the
+    /// live edited value from `forms`).
     fn form_textarea(&mut self, node: &StyledNode) {
+        let id = self.field_id;
+        self.field_id += 1;
         let px = node.style.font_size.max(1);
         let rows = node
             .attr("rows")
@@ -434,22 +524,34 @@ impl<'a> Ctx<'a> {
         let w = self.fit_width(cols as i32 * self.char_w(px) + 2 * FIELD_PAD);
         let h = rows * line_height(px) as u32 + 6;
         self.control_box(w, h, FIELD_BG);
-        let value = node.text();
-        let value = value.trim_end_matches('\n');
+        self.push_field(id, FieldKind::Textarea, w, h);
+        let dom_value = node.text();
+        let value: &str = match self.forms.value(id) {
+            Some(v) => v,
+            None => dom_value.trim_end_matches('\n'),
+        };
         if !value.is_empty() {
             self.box_label(px, value, node.style.color, FIELD_PAD, FIELD_PAD);
         }
         self.advance_box(w, h);
     }
 
-    /// A `<select>`: a bordered box showing the chosen option plus a caret.
+    /// A `<select>`: a bordered box showing the chosen option plus a caret. The
+    /// chosen option is `forms.select_index(id)` if set, else the DOM-selected
+    /// option (or the first).
     fn form_select(&mut self, node: &StyledNode) {
+        let id = self.field_id;
+        self.field_id += 1;
         let px = node.style.font_size.max(1);
-        let label = selected_option(node).unwrap_or_default();
+        let label = match self.forms.select_index(id) {
+            Some(i) => option_at(node, i).unwrap_or_default(),
+            None => selected_option(node).unwrap_or_default(),
+        };
         let text_w = self.text_width(&label, px);
         let w = self.fit_width(text_w + self.char_w(px) + 3 * FIELD_PAD);
         let h = px as i32 + 2 * FIELD_PAD;
         self.control_box(w, h as u32, FIELD_BG);
+        self.push_field(id, FieldKind::Select, w, h as u32);
         if !label.is_empty() {
             self.box_label(px, &label, node.style.color, FIELD_PAD, FIELD_PAD);
         }
@@ -465,18 +567,24 @@ impl<'a> Ctx<'a> {
     }
 
     /// A single-line text field of width from the `size` attr (or a default),
-    /// showing the `value`, else the `placeholder` (greyed).
-    fn text_field(&mut self, node: &StyledNode, password: bool) {
+    /// showing the live edited value from `forms`, else the DOM `value`, else the
+    /// `placeholder` (greyed). Passwords are masked.
+    fn text_field(&mut self, node: &StyledNode, id: u32, password: bool) {
         let px = node.style.font_size.max(1);
         let cols = node.attr("size").and_then(parse_dim).unwrap_or(20).max(1);
         let w = self.fit_width(cols as i32 * self.char_w(px) + 2 * FIELD_PAD);
         let h = px as i32 + 2 * FIELD_PAD;
         self.control_box(w, h as u32, FIELD_BG);
+        self.push_field(id, FieldKind::Text, w, h as u32);
 
-        let (text, color) = match node.attr("value").filter(|v| !v.is_empty()) {
-            Some(v) if password => ("\u{2022}".repeat(v.chars().count()), node.style.color),
-            Some(v) => (v.to_string(), node.style.color),
-            None => (
+        let live = self.forms.value(id);
+        let dom = node.attr("value").filter(|v| !v.is_empty());
+        let (text, color) = match (live, dom) {
+            (Some(v), _) if password => ("\u{2022}".repeat(v.chars().count()), node.style.color),
+            (Some(v), _) => (v.to_string(), node.style.color),
+            (None, Some(v)) if password => ("\u{2022}".repeat(v.chars().count()), node.style.color),
+            (None, Some(v)) => (v.to_string(), node.style.color),
+            (None, None) => (
                 node.attr("placeholder").unwrap_or("").to_string(),
                 Color::rgb(0x75, 0x75, 0x75),
             ),
@@ -487,12 +595,25 @@ impl<'a> Ctx<'a> {
         self.advance_box(w, h as u32);
     }
 
-    /// A checkbox/radio: a small box, filled when `checked`.
-    fn toggle_control(&mut self, node: &StyledNode, _radio: bool) {
+    /// A checkbox/radio: a small box, filled when checked. It is checked when
+    /// `forms.checked(id)` is set, or — when `forms` has no opinion — when the DOM
+    /// carries the `checked` attribute.
+    fn toggle_control(&mut self, node: &StyledNode, id: u32, radio: bool) {
         let px = node.style.font_size.max(1);
         let s = px + 2;
         self.control_box(s, s, Color::WHITE);
-        if node.attr("checked").is_some() {
+        self.push_field(
+            id,
+            if radio {
+                FieldKind::Radio
+            } else {
+                FieldKind::Checkbox
+            },
+            s,
+            s,
+        );
+        let checked = self.forms.checked(id) || node.attr("checked").is_some();
+        if checked {
             let inset = (s / 4).max(1) as i32;
             self.display.push(DisplayItem::Rect {
                 rect: Rect::new(
@@ -507,16 +628,29 @@ impl<'a> Ctx<'a> {
         self.advance_box(s, s);
     }
 
-    /// A button-styled box (grey fill) labelled `label`, centred horizontally.
-    fn push_button(&mut self, style: &ComputedStyle, label: &str) {
+    /// A button-styled box (grey fill) labelled `label`, centred horizontally,
+    /// recording a `Button` hit box under `id`.
+    fn push_button(&mut self, style: &ComputedStyle, id: u32, label: &str) {
         let px = style.font_size.max(1);
         let text_w = self.text_width(label, px);
         let w = self.fit_width(text_w + 4 * FIELD_PAD);
         let h = px as i32 + 2 * FIELD_PAD;
         self.control_box(w, h as u32, BUTTON_BG);
+        self.push_field(id, FieldKind::Button, w, h as u32);
         let pad_x = ((w as i32 - text_w) / 2).max(FIELD_PAD);
         self.box_label(px, label, style.color, pad_x, FIELD_PAD);
         self.advance_box(w, h as u32);
+    }
+
+    /// Record an interactive control's hit box at the current pen position. The
+    /// rect is absolute (the pen is already in document/cell coordinates), so the
+    /// box needs no later offset — the same as link boxes inside a cell.
+    fn push_field(&mut self, id: u32, kind: FieldKind, w: u32, h: u32) {
+        self.fields.push(FormFieldBox {
+            rect: Rect::new(self.x, self.y, w, h),
+            id,
+            kind,
+        });
     }
 
     /// Emit a bordered, filled control box at the current pen, wrapping first if
@@ -694,9 +828,8 @@ impl<'a> Ctx<'a> {
                 continue;
             }
 
-            // Sub-lay every cell, capturing its items/links and content height.
-            let mut laid: Vec<(Vec<DisplayItem>, Vec<LinkBox>, i32)> =
-                Vec::with_capacity(cells.len());
+            // Sub-lay every cell, capturing its items/links/fields and height.
+            let mut laid: Vec<CellLayout> = Vec::with_capacity(cells.len());
             let mut row_h = line_height(node.style.font_size.max(1));
             for (col, cell) in cells.iter().enumerate() {
                 let cell_x = left + col as i32 * col_w;
@@ -706,9 +839,10 @@ impl<'a> Ctx<'a> {
                     col_w
                 }
                 .max(1);
-                let (items, links, h) = self.flow_cell(cell, cell_x, cell_x + cell_w, row_y);
+                let (items, links, fields, h) =
+                    self.flow_cell(cell, cell_x, cell_x + cell_w, row_y);
                 row_h = row_h.max(h);
-                laid.push((items, links, h));
+                laid.push((items, links, fields, h));
             }
             row_h = (row_h + 2 * CELL_PAD).max(1);
 
@@ -730,9 +864,10 @@ impl<'a> Ctx<'a> {
             }
 
             // Then the captured cell content, on top of the boxes.
-            for (items, links, _) in laid {
+            for (items, links, fields, _) in laid {
                 self.display.items.extend(items);
                 self.links.extend(links);
+                self.fields.extend(fields);
             }
 
             row_y += row_h;
@@ -743,15 +878,21 @@ impl<'a> Ctx<'a> {
     }
 
     /// Flow one table cell's children into its own rectangle and read back the
-    /// produced items, links, and content height. The sub-context is positioned
-    /// at the cell's absolute padded bounds, so its output needs no offset.
+    /// produced items, links, form-field boxes, and content height. The
+    /// sub-context is positioned at the cell's absolute padded bounds, so its
+    /// output (including hit rects) needs no offset.
+    ///
+    /// Field ids stay globally consistent: the sub-context starts its `field_id`
+    /// at the parent's current value, and the parent's counter is advanced to the
+    /// sub's final value here — so a control in a later cell (or after the table)
+    /// continues the same pre-order numbering.
     fn flow_cell(
-        &self,
+        &mut self,
         cell: &StyledNode,
         cell_x: i32,
         cell_right: i32,
         cell_y: i32,
-    ) -> (Vec<DisplayItem>, Vec<LinkBox>, i32) {
+    ) -> CellLayout {
         let content_left = cell_x + CELL_PAD;
         let content_right = (cell_right - CELL_PAD).max(content_left + 1);
         let content_top = cell_y + CELL_PAD;
@@ -761,6 +902,8 @@ impl<'a> Ctx<'a> {
             content_top,
             self.shaper,
             self.images,
+            self.forms,
+            self.field_id,
         );
 
         let is_header = cell.tag == "th";
@@ -787,9 +930,11 @@ impl<'a> Ctx<'a> {
         }
         sub.flush_line();
 
+        // Carry the advanced control counter back to the parent.
+        self.field_id = sub.field_id;
         // After flush, `sub.y` already includes the last line; floor at one line.
         let height = (sub.y - content_top).max(line_height(cell.style.font_size.max(1)));
-        (sub.display.items, sub.links, height)
+        (sub.display.items, sub.links, sub.fields, height)
     }
 
     /// Draw a cell's optional background fill and its 1px border outline.
@@ -908,6 +1053,13 @@ fn selected_option(node: &StyledNode) -> Option<String> {
         .map(|(label, _)| label.clone())
 }
 
+/// The label of a `<select>`'s option at index `i` (pre-order over options).
+fn option_at(node: &StyledNode, i: usize) -> Option<String> {
+    let mut options: Vec<(String, bool)> = Vec::new();
+    collect_options(node, &mut options);
+    options.get(i).map(|(label, _)| label.clone())
+}
+
 fn collect_options(node: &StyledNode, out: &mut Vec<(String, bool)>) {
     for child in &node.children {
         if let StyledChild::Element(e) = child {
@@ -930,7 +1082,13 @@ mod tests {
 
     fn lay(html: &str, width: u32) -> LaidOut {
         let styled = CssEngine::new().style(&parse_html(html));
-        BlockLayout::default().layout(&styled, Size::new(width, 2000), &MonoShaper, &NoImages)
+        BlockLayout::default().layout(
+            &styled,
+            Size::new(width, 2000),
+            &MonoShaper,
+            &NoImages,
+            &NoForms,
+        )
     }
 
     struct OneImage(Arc<DecodedImage>);
@@ -1061,6 +1219,7 @@ mod tests {
             Size::new(400, 2000),
             &MonoShaper,
             &OneImage(img),
+            &NoForms,
         );
         assert!(
             laid.display
@@ -1141,6 +1300,65 @@ mod tests {
         assert!(
             laid.display.items.is_empty(),
             "type=hidden produces no paint"
+        );
+    }
+
+    #[test]
+    fn text_input_emits_one_field_box_with_sane_rect() {
+        let laid = lay("<input name='q'>", 400);
+        assert_eq!(laid.fields.len(), 1, "one form-field box");
+        let f = &laid.fields[0];
+        assert_eq!(f.kind, FieldKind::Text);
+        assert_eq!(f.id, 0, "first control gets id 0");
+        // The hit rect is positive-sized and lives inside the content box.
+        assert!(f.rect.w > 0 && f.rect.h > 0, "field has a real size");
+        assert!(f.rect.x >= 0 && f.rect.y >= 0);
+        assert!(f.rect.x + f.rect.w as i32 <= 400, "field stays in viewport");
+    }
+
+    #[test]
+    fn field_ids_increase_in_document_order() {
+        // text(0), hidden(1, no box), checkbox(2), select(3), button(4)
+        let laid = lay(
+            "<input name='a'>\
+             <input type='hidden' name='h'>\
+             <input type='checkbox' name='c'>\
+             <select name='s'><option>x</option></select>\
+             <button>Go</button>",
+            400,
+        );
+        let kinds: Vec<(u32, FieldKind)> = laid.fields.iter().map(|f| (f.id, f.kind)).collect();
+        // Hidden consumes id 1 but emits no box, so the boxes carry ids 0,2,3,4.
+        assert_eq!(
+            kinds,
+            vec![
+                (0, FieldKind::Text),
+                (2, FieldKind::Checkbox),
+                (3, FieldKind::Select),
+                (4, FieldKind::Button),
+            ],
+            "ids ascend in pre-order; hidden still consumes id 1"
+        );
+    }
+
+    #[test]
+    fn control_inside_a_table_cell_has_an_absolute_field_box() {
+        // A control preceding the table takes id 0; the in-cell input takes id 1
+        // and must carry an absolute hit-rect offset into the cell.
+        let laid = lay(
+            "<input name='before'>\
+             <table><tr><td><input name='incell'></td></tr></table>",
+            400,
+        );
+        assert_eq!(laid.fields.len(), 2, "outer + in-cell controls");
+        let cell_field = laid.fields.iter().find(|f| f.id == 1).expect("id 1 box");
+        assert_eq!(cell_field.kind, FieldKind::Text);
+        // The cell sits below the first input, so the in-cell box is lower and
+        // inset by the cell padding — i.e. a real absolute rect, not (0,0).
+        assert!(cell_field.rect.x > 0, "inset by the cell's left padding");
+        assert!(
+            cell_field.rect.y > laid.fields[0].rect.y,
+            "the cell control is below the leading control"
         );
     }
 
