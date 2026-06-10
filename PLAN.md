@@ -314,9 +314,17 @@ green.
   head switch (still ≤1 live). `JsEngine` is no longer `Send` (single-threaded
   VM, lives on the UI thread). Wired into the composition root: home renders with
   a live `quickjs` engine + the per-head farbling prologue, at **~10 MB RSS**
-  (QuickJS adds ≈1.4 MB — well within the 64 MB gate). *Executing a page's own
-  `<script>`s needs DOM bindings (`document`/`window`) and is the next M3 step;
-  today the engine runs the farbling prologue and the speed-first prelude.*
+  (QuickJS adds ≈1.4 MB — well within the 64 MB gate).
+- **Page scripts (M3)** → a page's own inline `<script>`s now run, via an
+  engine-agnostic **snapshot/replay DOM bridge** (`cerberus-js-dom`, ADR-0008):
+  the parser retains inline scripts (`Document::scripts()`), the immutable DOM is
+  serialized to JSON, scripts run against a JS `document`/`window` model (built
+  in JS, so the `JsEngine` seam stays eval-only — no `unsafe`, no live bindings),
+  and the mutated tree is serialized back and rebuilt via `DocumentBuilder`
+  before styling/layout. Runs between `parse_html` and layout in both app paths;
+  script-built and `DOMContentLoaded`-built content appears in the render.
+  `innerHTML`-via-reparse and `navigator`/`location`/storage stubs are the next
+  increment. Cost: a transient ~2× DOM serialization, only on script-laden pages.
 - **Speed-first / raw render** → Cerberus **ignores programmed delays**: CSS
   `opacity`/`animation`/`transition`/`transform`/`visibility` are not honored;
   lazy-loading is ignored — `data-src` is preferred over a placeholder `src` and

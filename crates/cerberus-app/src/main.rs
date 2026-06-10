@@ -101,6 +101,7 @@ fn cmd_render(args: &[String]) -> ExitCode {
         "  js engine       : {} (engines live: {}, realms: {})",
         outcome.engine_name, outcome.engines_live, outcome.realms_live
     );
+    println!("  page scripts    : {} executed", outcome.scripts_ran);
     println!("  active cookies  : {}", outcome.active_cookies);
     println!(
         "  images          : {}/{} decoded",

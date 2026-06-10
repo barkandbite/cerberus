@@ -36,6 +36,7 @@ cerberus-consent = { path = "../cerberus-consent" }
 cerberus-farbling = { path = "../cerberus-farbling" }
 cerberus-js = { path = "../cerberus-js" }
 cerberus-js-quickjs = { path = "../cerberus-js-quickjs" }
+cerberus-js-dom = { path = "../cerberus-js-dom" }
 cerberus-identity = { path = "../cerberus-identity" }
 cerberus-shell = { path = "../cerberus-shell" }
 cerberus-headless = { path = "../cerberus-headless" }

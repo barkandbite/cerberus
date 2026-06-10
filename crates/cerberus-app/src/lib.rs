@@ -15,6 +15,7 @@ use cerberus_dom::{parse_html, Document, DocumentBuilder, NodeRef};
 use cerberus_headless::render_document;
 use cerberus_identity::{Head, HeadManager};
 use cerberus_image::ImageCodec;
+use cerberus_js_dom::run_page_scripts;
 use cerberus_js_quickjs::QuickJsEngineFactory;
 use cerberus_layout::{
     BlockLayout, FieldKind, FormFieldBox, FormState, ImageProvider, LayoutEngine, LinkBox, NoForms,
@@ -72,6 +73,8 @@ pub struct RenderOutcome {
     pub engine_name: String,
     pub engines_live: usize,
     pub realms_live: usize,
+    /// Inline page `<script>`s executed against the JS document model (ADR-0008).
+    pub scripts_ran: usize,
     pub active_cookies: usize,
     /// `<img>` sub-resources fetched, and how many decoded successfully.
     pub images_requested: usize,
@@ -192,7 +195,29 @@ pub fn render(config: &RenderConfig) -> Result<RenderOutcome, AppError> {
     }
     .map_err(|e| AppError::Net(format!("{e:?}")))?;
     let body = String::from_utf8_lossy(&response.body);
-    let document = parse_html(&body);
+    let mut document = parse_html(&body);
+
+    // --- JS engine seam: instantiate the active head's engine (this also injects
+    // the head's farbling prologue), then run the page's inline scripts (if any)
+    // against a JS document model and reconcile their DOM mutations back into a
+    // fresh Document — *before* styling/layout/images, so script-built content
+    // participates in the render (ADR-0008). A script-less page keeps the realm
+    // warm with a trivial eval and pays nothing for the bridge. ---
+    let base_realm = RealmId(heads.active().id.0);
+    let scripts_ran = document.scripts().len();
+    let engine = heads.engine().map_err(|e| AppError::Js(format!("{e:?}")))?;
+    if scripts_ran == 0 {
+        engine
+            .eval(base_realm, "void 0")
+            .map_err(|e| AppError::Js(format!("{e:?}")))?;
+    } else {
+        document = run_page_scripts(engine, base_realm, &document, document.scripts())
+            .map_err(|e| AppError::Js(format!("{e:?}")))?;
+    }
+    let engine_name = engine.name().to_string();
+    let realms_live = engine.realm_count();
+    let engines_live = heads.engines_live();
+
     let styled = CssEngine::new().style(&document);
 
     // Fetch + decode this page's images up front (the one-shot path is
@@ -240,17 +265,6 @@ pub fn render(config: &RenderConfig) -> Result<RenderOutcome, AppError> {
         .present(&framebuffer)
         .map_err(|e| AppError::Io(format!("{e:?}")))?;
 
-    // --- JS engine seam: instantiate the active head's engine (this also
-    // injects the head's farbling prologue) and run a trivial eval. ---
-    let base_realm = RealmId(heads.active().id.0);
-    let engine = heads.engine().map_err(|e| AppError::Js(format!("{e:?}")))?;
-    engine
-        .eval(base_realm, "void 0")
-        .map_err(|e| AppError::Js(format!("{e:?}")))?;
-    let engine_name = engine.name().to_string();
-    let realms_live = engine.realm_count();
-    let engines_live = heads.engines_live();
-
     Ok(RenderOutcome {
         url: config.url.clone(),
         status: response.status,
@@ -260,6 +274,7 @@ pub fn render(config: &RenderConfig) -> Result<RenderOutcome, AppError> {
         engine_name,
         engines_live,
         realms_live,
+        scripts_ran,
         active_cookies,
         images_requested,
         images_decoded,
@@ -702,11 +717,36 @@ impl BrowserApp {
         }
     }
 
-    /// Set + style the current document (one cascade per page load).
+    /// Set + style the current document (one cascade per page load). Inline page
+    /// scripts (if any) run first against the JS document model and their DOM
+    /// mutations are reconciled back before styling (ADR-0008).
     fn set_document(&mut self, doc: Document) {
+        let doc = self.run_scripts(doc);
         self.page_title = doc.title();
         self.styled = self.style_engine.style(&doc);
         self.document = doc;
+    }
+
+    /// Run the document's inline scripts against the active head's engine and
+    /// return the reconciled document. Script-less pages return untouched (and
+    /// keep the engine lazy); on any bridge failure we fall back to the
+    /// unscripted DOM so the page still renders.
+    fn run_scripts(&mut self, doc: Document) -> Document {
+        if doc.scripts().is_empty() {
+            return doc;
+        }
+        let realm = RealmId(self.heads.active().id.0);
+        let engine = match self.heads.engine() {
+            Ok(engine) => engine,
+            Err(_) => return doc,
+        };
+        // Bind the result before matching so `doc`'s borrows (in the call) end
+        // before the `Err` arm moves it.
+        let reconciled = run_page_scripts(engine, realm, &doc, doc.scripts());
+        match reconciled {
+            Ok(rebuilt) => rebuilt,
+            Err(_) => doc,
+        }
     }
 
     fn commit_response(
@@ -1786,6 +1826,60 @@ mod tests {
         assert_eq!(b.status(), 200);
         assert!(b.document.root().text_content().contains("Hello"));
         assert!(!b.toolbar.loading);
+    }
+
+    #[test]
+    fn browser_runs_inline_script_and_reflects_dom_mutation() {
+        let mut b = fake_app(vec![(
+            "https://script.test/",
+            Ok(page(
+                "https://script.test/",
+                200,
+                None,
+                "<div id=\"app\">old</div>\
+                 <script>document.getElementById('app').textContent = 'new-from-js'</script>",
+            )),
+        )]);
+        b.navigate("https://script.test/");
+        assert!(b.poll());
+        let text = b.document.root().text_content();
+        assert!(
+            text.contains("new-from-js"),
+            "script mutation missing; got {text:?}"
+        );
+        assert!(
+            !text.contains("old"),
+            "original text should be replaced; got {text:?}"
+        );
+    }
+
+    #[test]
+    fn browser_script_can_build_content_and_fire_domcontentloaded() {
+        let mut b = fake_app(vec![(
+            "https://build.test/",
+            Ok(page(
+                "https://build.test/",
+                200,
+                None,
+                "<body><ul id=\"list\"></ul>\
+                 <script>\
+                   document.addEventListener('DOMContentLoaded', function () {\
+                     var li = document.createElement('li');\
+                     li.textContent = 'built-by-script';\
+                     document.getElementById('list').appendChild(li);\
+                   });\
+                 </script></body>",
+            )),
+        )]);
+        b.navigate("https://build.test/");
+        assert!(b.poll());
+        // The element is created by a DOMContentLoaded handler — which the bridge
+        // fires synchronously after the scripts (speed-first), then reconciles.
+        assert!(
+            b.document.root().text_content().contains("built-by-script"),
+            "DOMContentLoaded-built content missing; got {:?}",
+            b.document.root().text_content()
+        );
     }
 
     #[test]

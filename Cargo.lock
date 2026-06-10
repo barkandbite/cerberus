@@ -202,6 +202,7 @@ dependencies = [
  "cerberus-identity",
  "cerberus-image",
  "cerberus-js",
+ "cerberus-js-dom",
  "cerberus-js-quickjs",
  "cerberus-layout",
  "cerberus-net",
@@ -287,6 +288,16 @@ dependencies = [
 name = "cerberus-js"
 version = "0.0.0"
 dependencies = [
+ "cerberus-types",
+]
+
+[[package]]
+name = "cerberus-js-dom"
+version = "0.0.0"
+dependencies = [
+ "cerberus-dom",
+ "cerberus-js",
+ "cerberus-js-quickjs",
  "cerberus-types",
 ]
 

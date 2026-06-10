@@ -1,0 +1,19 @@
+[package]
+name = "cerberus-js-dom"
+description = "Engine-agnostic DOM bridge: run page scripts against a JS document model and reconcile mutations back into the Rust DOM via a snapshot/replay round-trip (ADR-0008)."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+cerberus-dom = { path = "../cerberus-dom" }
+cerberus-js = { path = "../cerberus-js" }
+cerberus-types = { path = "../cerberus-types" }
+
+[dev-dependencies]
+cerberus-js-quickjs = { path = "../cerberus-js-quickjs" }
