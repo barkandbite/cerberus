@@ -11,7 +11,7 @@
 use cerberus_consent::{ConsentPolicy, Decision, DefaultDenyPolicy};
 use cerberus_css::CssEngine;
 use cerberus_dns_doh::DohResolver;
-use cerberus_dom::{parse_trivial, Document, Element, Node};
+use cerberus_dom::{parse_html, Document, Element, Node};
 use cerberus_headless::render_document;
 use cerberus_identity::{Head, HeadManager};
 use cerberus_image::ImageCodec;
@@ -190,7 +190,7 @@ pub fn render(config: &RenderConfig) -> Result<RenderOutcome, AppError> {
     }
     .map_err(|e| AppError::Net(format!("{e:?}")))?;
     let body = String::from_utf8_lossy(&response.body);
-    let document = parse_trivial(&body);
+    let document = parse_html(&body);
     let styled = CssEngine::new().style(&document);
 
     // Fetch + decode this page's images up front (the one-shot path is
@@ -679,7 +679,7 @@ impl BrowserApp {
             );
         }
         self.status = status;
-        self.set_document(parse_trivial(&String::from_utf8_lossy(body)));
+        self.set_document(parse_html(&String::from_utf8_lossy(body)));
         self.toolbar.url_text = url.to_string();
         self.toolbar.loading = false;
         self.insecure_prompt = None;

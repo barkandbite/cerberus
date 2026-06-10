@@ -51,14 +51,14 @@ pub fn write_ppm_to(out: &mut impl Write, fb: &Framebuffer) -> io::Result<()> {
 mod tests {
     use super::*;
     use cerberus_css::CssEngine;
-    use cerberus_dom::parse_trivial;
+    use cerberus_dom::parse_html;
     use cerberus_layout::{BlockLayout, NoImages};
     use cerberus_paint::{BoxRasterizer, MonoShaper};
     use cerberus_style::StyleEngine;
 
     #[test]
     fn renders_a_nonempty_frame_with_background() {
-        let styled = CssEngine::new().style(&parse_trivial("<h1>Cerberus</h1>"));
+        let styled = CssEngine::new().style(&parse_html("<h1>Cerberus</h1>"));
         let viewport = Size::new(200, 80);
         let fb = render_document(
             &styled,

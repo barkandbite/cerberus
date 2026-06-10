@@ -269,6 +269,16 @@ green.
   the content box; `type=hidden` paints nothing. **Live-verified** (Wikipedia's
   search field + button + checkboxes). Interactivity (focus/typing/submit) ties
   into the event model and lands with JS at M3.
+- **HTML parser (M2)** → `parse_html` replaces the M0 placeholder: a quote-aware
+  tokenizer (so `>` inside an attribute value can't end a tag early),
+  rawtext/RCDATA for `<script>`/`<style>`/`<title>`/`<textarea>`, comment +
+  doctype skipping, entity decoding (text **and** attribute values), and a tree
+  builder with the common optional-end-tag rules (a new `<li>`/`<tr>`/`<td>`/
+  `<option>` closes the previous one; block elements close an open `<p>`). Not
+  the full HTML5 tree-construction algorithm, but it parses real pages without
+  mis-nesting. Head-only elements (`<title>`, `<meta>`, …) are UA `display:none`,
+  so they no longer leak into the page. The **arena**-backed node store
+  (PLAN §1) is a later behind-the-API swap; the recursive tree ships now.
 - **Speed-first / raw render** → Cerberus **ignores programmed delays**: CSS
   `opacity`/`animation`/`transition`/`transform`/`visibility` are not honored;
   lazy-loading is ignored — `data-src` is preferred over a placeholder `src` and
@@ -299,8 +309,9 @@ green.
   CI (fmt/clippy/build/test/mem-gate); docs (this plan, ADRs, threat model,
   security, contributing).
 - **Stubbed, behind the real traits:** JS (`NullJsEngine`), networking
-  (`BuiltinHttpClient`), shaping/raster (`MonoShaper`/`BoxRasterizer`), HTML
-  parser (`parse_trivial`), platform surface (`HeadlessSurface`).
+  (`BuiltinHttpClient`), shaping/raster (`MonoShaper`/`BoxRasterizer`), the HTML
+  parser (a trivial placeholder, since replaced by the real `parse_html`),
+  platform surface (`HeadlessSurface`).
 - **Pending your approval before wiring:** V8, rustls, the vault crates,
   font/shaping/image crates, windowing — none are in the dependency tree yet
   (the scaffold is std-only and builds offline).

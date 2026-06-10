@@ -27,6 +27,7 @@ const UA_CSS: &str = r#"
 html, body, div, p, h1, h2, h3, h4, h5, h6, ul, ol, li, section, article,
 header, footer, nav, main, aside, blockquote, pre, figure, figcaption, form,
 table, tr, hr, dl, dt, dd, fieldset, address { display: block; }
+head, title, meta, link, style, script, base, template { display: none; }
 li { display: list-item; }
 h1 { font-size: 32px; font-weight: bold; margin-top: 16px; margin-bottom: 16px; }
 h2 { font-size: 24px; font-weight: bold; margin-top: 14px; margin-bottom: 14px; }
@@ -339,7 +340,7 @@ fn split_num_unit(v: &str) -> Option<(f32, String)> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use cerberus_dom::parse_trivial;
+    use cerberus_dom::parse_html;
 
     fn first<'a>(node: &'a StyledNode, tag: &str) -> Option<&'a StyledNode> {
         if node.tag == tag {
@@ -353,8 +354,7 @@ mod tests {
 
     #[test]
     fn ua_styles_headings_and_links() {
-        let dom =
-            CssEngine::new().style(&parse_trivial("<body><h1>T</h1><a href='/x'>l</a></body>"));
+        let dom = CssEngine::new().style(&parse_html("<body><h1>T</h1><a href='/x'>l</a></body>"));
         let h1 = first(&dom.root, "h1").unwrap();
         assert!(h1.style.font.bold);
         assert_eq!(h1.style.font_size, 32);
@@ -367,7 +367,7 @@ mod tests {
     fn author_and_inline_cascade() {
         let html = "<style>p{color:green} #x{color:red}</style>\
                     <p id='x' style='color:#0000ff'>hi</p>";
-        let dom = CssEngine::new().style(&parse_trivial(html));
+        let dom = CssEngine::new().style(&parse_html(html));
         let p = first(&dom.root, "p").unwrap();
         // inline beats #id beats type.
         assert_eq!(p.style.color, Color::rgb(0, 0, 255));
@@ -377,7 +377,7 @@ mod tests {
     fn display_none_and_background() {
         let html =
             "<div style='display:none'>x</div><section style='background:#ffffff'>y</section>";
-        let dom = CssEngine::new().style(&parse_trivial(html));
+        let dom = CssEngine::new().style(&parse_html(html));
         assert_eq!(
             first(&dom.root, "div").unwrap().style.display,
             Display::None
@@ -392,7 +392,7 @@ mod tests {
     fn opacity_and_animation_are_ignored_for_raw_render() {
         // Content hidden behind a fade/scroll-in still renders normally.
         let html = "<p style='opacity:0; animation: fade 3s; transition: all 2s'>visible</p>";
-        let dom = CssEngine::new().style(&parse_trivial(html));
+        let dom = CssEngine::new().style(&parse_html(html));
         let p = first(&dom.root, "p").unwrap();
         // We simply never read opacity/animation; the element is a normal block.
         assert_eq!(p.style.display, Display::Block);

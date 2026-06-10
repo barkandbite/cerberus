@@ -657,12 +657,12 @@ fn collect_options(node: &StyledNode, out: &mut Vec<(String, bool)>) {
 mod tests {
     use super::*;
     use cerberus_css::CssEngine;
-    use cerberus_dom::parse_trivial;
+    use cerberus_dom::parse_html;
     use cerberus_paint::MonoShaper;
     use cerberus_style::StyleEngine;
 
     fn lay(html: &str, width: u32) -> LaidOut {
-        let styled = CssEngine::new().style(&parse_trivial(html));
+        let styled = CssEngine::new().style(&parse_html(html));
         BlockLayout::default().layout(&styled, Size::new(width, 2000), &MonoShaper, &NoImages)
     }
 
@@ -765,7 +765,7 @@ mod tests {
 
     #[test]
     fn img_with_provider_emits_image_item() {
-        let styled = CssEngine::new().style(&parse_trivial("<img src='pic.png' alt='x'>"));
+        let styled = CssEngine::new().style(&parse_html("<img src='pic.png' alt='x'>"));
         let img = Arc::new(DecodedImage {
             size: Size::new(20, 10),
             rgba: vec![255; 20 * 10 * 4],
