@@ -33,10 +33,19 @@ enum NodeData {
 
 /// A parsed document, rooted at a synthetic `#root` element. Owns the arena of
 /// every node; navigate it with [`Document::root`] and [`NodeRef`].
+///
+/// Inline `<script>` sources are collected out-of-band in [`scripts`] (in
+/// document order) rather than as render-tree nodes, so the JS engine can run
+/// them while their text never appears as visible page content.
+///
+/// [`scripts`]: Document::scripts
 #[derive(Clone, Debug)]
 pub struct Document {
     nodes: Vec<NodeData>,
     root: NodeId,
+    /// Inline `<script>` bodies (no `src`), in document order. Kept separate
+    /// from `nodes` so script source is never rendered.
+    scripts: Vec<String>,
 }
 
 impl Document {
@@ -46,6 +55,13 @@ impl Document {
             doc: self,
             id: self.root,
         }
+    }
+
+    /// Inline `<script>` sources (elements without a `src` attribute), in
+    /// document order. The text is the raw script body, undecoded — it is *not*
+    /// part of the render tree and never appears in [`NodeRef::text_content`].
+    pub fn scripts(&self) -> &[String] {
+        &self.scripts
     }
 
     /// The page `<title>` text (trimmed), if any.
@@ -203,11 +219,13 @@ impl DocumentBuilder {
         })
     }
 
-    /// Finish, with `root` as the document root.
+    /// Finish, with `root` as the document root. App-generated documents carry
+    /// no inline scripts.
     pub fn finish(self, root: NodeId) -> Document {
         Document {
             nodes: self.nodes,
             root,
+            scripts: Vec::new(),
         }
     }
 
@@ -245,7 +263,8 @@ fn rawtext_keep(tag: &str) -> Option<bool> {
 /// Parse HTML into a [`Document`]. Tolerant of malformed and unclosed markup;
 /// see the module docs for the supported subset.
 pub fn parse_html(input: &str) -> Document {
-    build_tree(tokenize(input))
+    let (tokens, scripts) = tokenize(input);
+    build_tree(tokens, scripts)
 }
 
 /// An open element on the builder stack: its tag, attributes, and the ids of the
@@ -278,8 +297,10 @@ impl OpenElement {
 /// Build the DOM tree from a token stream into a flat arena, applying
 /// void-element and optional-end-tag rules. The stack holds open elements; on
 /// close (or void/self-close) the element is allocated in the arena and its id
-/// pushed into its parent's child list.
-fn build_tree(tokens: Vec<Token>) -> Document {
+/// pushed into its parent's child list. `scripts` holds the inline `<script>`
+/// sources already gathered (in document order) by the tokenizer; they are
+/// stored on the [`Document`] but never enter the render tree.
+fn build_tree(tokens: Vec<Token>, scripts: Vec<String>) -> Document {
     let mut nodes: Vec<NodeData> = Vec::new();
     let mut stack: Vec<OpenElement> = vec![OpenElement::new("#root")];
 
@@ -335,7 +356,11 @@ fn build_tree(tokens: Vec<Token>) -> Document {
         },
     );
 
-    Document { nodes, root }
+    Document {
+        nodes,
+        root,
+        scripts,
+    }
 }
 
 /// Push a node into the arena and return its freshly assigned id.
@@ -451,9 +476,14 @@ enum Token {
 /// Split raw HTML into tokens. The scanner is quote-aware (so `>` inside an
 /// attribute value never ends a tag early) and handles rawtext/RCDATA elements,
 /// comments, and doctype/PI declarations.
-fn tokenize(input: &str) -> Vec<Token> {
+///
+/// Returns the token stream plus the inline `<script>` sources (no `src`
+/// attribute) in document order. Script bodies are captured here so they never
+/// become render-tree text.
+fn tokenize(input: &str) -> (Vec<Token>, Vec<String>) {
     let b = input.as_bytes();
     let mut tokens = Vec::new();
+    let mut scripts: Vec<String> = Vec::new();
     let mut i = 0;
 
     while i < b.len() {
@@ -492,9 +522,17 @@ fn tokenize(input: &str) -> Vec<Token> {
             match rawtext_keep(&name) {
                 Some(keep) => {
                     // Content is raw: consume to the matching close tag.
+                    // Inline scripts (no `src`) are collected out-of-band for
+                    // the JS engine — capture before `attrs` is moved into the
+                    // Open token.
+                    let is_inline_script =
+                        name == "script" && !attrs.iter().any(|(k, _)| k == "src");
                     tokens.push(Token::Open(name.clone(), attrs));
                     let (content, after) = read_rawtext(input, i, &name);
                     i = after;
+                    if is_inline_script {
+                        scripts.push(content.to_string());
+                    }
                     if keep {
                         tokens.push(Token::Text(content.to_string()));
                     }
@@ -511,7 +549,7 @@ fn tokenize(input: &str) -> Vec<Token> {
         i += 1;
     }
 
-    tokens
+    (tokens, scripts)
 }
 
 /// Read a start tag at `start` (`b[start] == '<'`): lowercased name, decoded
@@ -759,9 +797,60 @@ mod tests {
             text.contains("color:red"),
             "style text kept for the CSS engine"
         );
-        assert!(!text.contains("if ("), "script content dropped");
+        // Script source is now *collected* for the JS engine but must still not
+        // *render*: it never appears in the page's text content.
+        assert!(!text.contains("if ("), "script content not rendered");
         assert!(!text.contains("hidden"), "comment dropped");
         assert!(text.contains("done"));
+        // The inline script body is captured separately, rawtext (undecoded).
+        assert_eq!(doc.scripts(), &["if (x<1){ y }".to_string()]);
+    }
+
+    #[test]
+    fn inline_scripts_are_collected_in_order() {
+        let doc = parse_html(
+            "<head><script>A=1</script></head><body><p>hi</p><script>B=2</script></body>",
+        );
+        assert_eq!(doc.scripts(), &["A=1".to_string(), "B=2".to_string()]);
+    }
+
+    #[test]
+    fn external_script_contributes_no_inline_source() {
+        let doc = parse_html("<script src=\"x.js\"></script>");
+        assert!(
+            doc.scripts().is_empty(),
+            "external scripts contribute no inline source; got {:?}",
+            doc.scripts()
+        );
+    }
+
+    #[test]
+    fn script_with_src_and_body_ignores_body() {
+        // A script with both `src` and a body is treated as external: its body
+        // is ignored (matches browser behavior).
+        let doc = parse_html("<script src=\"x.js\">SHOULD_BE_IGNORED</script>");
+        assert!(
+            doc.scripts().is_empty(),
+            "body of a src'd script is ignored; got {:?}",
+            doc.scripts()
+        );
+    }
+
+    #[test]
+    fn script_text_does_not_render() {
+        let doc = parse_html("<body><p>visible</p><script>document.x='SECRET'</script></body>");
+        let body = find_tag(doc.root(), "body").expect("body");
+        let text = body.text_content();
+        assert!(
+            text.contains("visible"),
+            "visible text renders; got {text:?}"
+        );
+        assert!(
+            !text.contains("SECRET"),
+            "script source must never render; got {text:?}"
+        );
+        // It is, however, available to the JS engine.
+        assert_eq!(doc.scripts(), &["document.x='SECRET'".to_string()]);
     }
 
     #[test]
@@ -870,6 +959,7 @@ mod tests {
         assert_eq!(root.tag(), "a");
         assert_eq!(root.attr("href"), Some("/x"));
         assert_eq!(root.text_content(), "hi there");
+        assert!(doc.scripts().is_empty(), "builder docs have no scripts");
 
         let kids: Vec<_> = root.children().collect();
         assert_eq!(kids.len(), 2);
