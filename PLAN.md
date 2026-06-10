@@ -330,9 +330,15 @@ green.
   `localStorage`/`sessionStorage`, `getComputedStyle`, `matchMedia` (always
   `matches:false`, speed-first), `history`, and a deliberately **low-entropy
   `navigator`** (per-head fingerprint farbling stays M6, not here). Cost: a
-  transient ~2× DOM serialization, only on script-laden pages. Next: external
-  `<script src>`, a live-binding swap if profiling demands, broader event/DOM
-  coverage.
+  transient ~2× DOM serialization, only on script-laden pages. The JS document
+  model puts all node behavior on **shared prototypes** (nodes carry data only;
+  `style`/listeners are lazy) — without this, ~40 per-node closures blew RSS to
+  **85 MB on a Wikipedia article**; with it the same page renders at **~38 MB**
+  (validated on live sites: HN/cnn/rust-lang/Wikipedia all well under the 64 MB
+  gate, zero crashes across redirects/404/forms). Next: external `<script src>`,
+  a live-binding swap if profiling demands, broader event/DOM coverage. Known
+  gap: SVG images don't decode (raster-only `image` crate; graceful no-op —
+  vector rasterization is a future dep decision).
 - **Speed-first / raw render** → Cerberus **ignores programmed delays**: CSS
   `opacity`/`animation`/`transition`/`transform`/`visibility` are not honored;
   lazy-loading is ignored — `data-src` is preferred over a placeholder `src` and

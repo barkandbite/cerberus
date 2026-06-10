@@ -953,168 +953,43 @@ pub const DOM_MODEL_PRELUDE: &str = r##"
       return out;
     }
 
-    // ---- node prototype (shared accessors via defineProperty) ----------
-    function defineNodeAccessors(node) {
-      Object.defineProperty(node, "nodeType", { get: function () { return this.__type; }, enumerable: false, configurable: true });
-
-      Object.defineProperty(node, "parentNode", { get: function () { return this.__parent; }, enumerable: false, configurable: true });
-      Object.defineProperty(node, "parentElement", {
-        get: function () { return this.__parent && this.__parent.__type === ELEMENT_NODE ? this.__parent : null; },
-        enumerable: false, configurable: true,
-      });
-      Object.defineProperty(node, "childNodes", { get: function () { return this.__kids.slice(); }, enumerable: false, configurable: true });
-      Object.defineProperty(node, "firstChild", { get: function () { return this.__kids[0] || null; }, enumerable: false, configurable: true });
-      Object.defineProperty(node, "lastChild", { get: function () { return this.__kids[this.__kids.length - 1] || null; }, enumerable: false, configurable: true });
-      Object.defineProperty(node, "nextSibling", {
-        get: function () {
-          var p = this.__parent; if (!p) return null;
-          var i = p.__kids.indexOf(this); return (i === -1) ? null : (p.__kids[i + 1] || null);
-        }, enumerable: false, configurable: true,
-      });
-      Object.defineProperty(node, "previousSibling", {
-        get: function () {
-          var p = this.__parent; if (!p) return null;
-          var i = p.__kids.indexOf(this); return (i <= 0) ? null : (p.__kids[i - 1] || null);
-        }, enumerable: false, configurable: true,
-      });
-
-      Object.defineProperty(node, "textContent", {
-        get: function () { var acc = []; collectText(this, acc); return acc.join(""); },
-        set: function (value) {
-          if (this.__type === TEXT_NODE) { this.__text = String(value); return; }
-          for (var i = 0; i < this.__kids.length; i++) this.__kids[i].__parent = null;
-          this.__kids = [];
-          if (typeof this.__rawHTML === "string") this.__rawHTML = undefined;
-          var t = makeText(String(value));
-          appendChild(this, t);
-        },
-        enumerable: false, configurable: true,
-      });
-
-      node.appendChild = function (child) { return appendChild(this, child); };
-      node.removeChild = function (child) { return removeChild(this, child); };
-      node.insertBefore = function (child, ref) { return insertBefore(this, child, ref); };
-      node.remove = function () { detach(this); };
-      node.contains = function (other) {
-        for (var n = other; n; n = n.__parent) if (n === this) return true;
-        return false;
-      };
-      node.hasChildNodes = function () { return this.__kids.length > 0; };
+    // ---- style helpers (used lazily by the element `style` accessor) ---
+    // The style object is a Proxy built ONCE PER ELEMENT, but only when `.style`
+    // is first read (cached on el.__styleObj). The thousands of nodes that never
+    // touch `.style` therefore pay nothing. Behavior is store-only: assignments
+    // are remembered and reflected back into the `style` attribute so a
+    // round-trip preserves them, but nothing is rendered from them yet.
+    function styleCssTextOf(store) {
+      var parts = [];
+      for (var k in store) parts.push(k + ": " + store[k]);
+      return parts.join("; ");
     }
-
-    function defineElementAccessors(el) {
-      Object.defineProperty(el, "tagName", { get: function () { return this.__tag.toUpperCase(); }, enumerable: false, configurable: true });
-      Object.defineProperty(el, "nodeName", { get: function () { return this.__tag.toUpperCase(); }, enumerable: false, configurable: true });
-      Object.defineProperty(el, "children", {
-        get: function () { return elementChildren(this); }, enumerable: false, configurable: true,
+    function parseCssText(text, into) {
+      text.split(";").forEach(function (decl) {
+        var c = decl.indexOf(":");
+        if (c === -1) return;
+        var prop = decl.slice(0, c).trim();
+        var val = decl.slice(c + 1).trim();
+        if (prop) into[prop] = val;
       });
-      Object.defineProperty(el, "firstElementChild", {
-        get: function () { var c = elementChildren(this); return c[0] || null; }, enumerable: false, configurable: true,
-      });
-      Object.defineProperty(el, "lastElementChild", {
-        get: function () { var c = elementChildren(this); return c[c.length - 1] || null; }, enumerable: false, configurable: true,
-      });
-      Object.defineProperty(el, "id", {
-        get: function () { return getAttr(this, "id") || ""; },
-        set: function (v) { setAttr(this, "id", v); },
-        enumerable: false, configurable: true,
-      });
-      Object.defineProperty(el, "className", {
-        get: function () { return getAttr(this, "class") || ""; },
-        set: function (v) { setAttr(this, "class", v); },
-        enumerable: false, configurable: true,
-      });
-      Object.defineProperty(el, "classList", {
-        get: function () { if (!this.__classList) this.__classList = makeClassList(this); return this.__classList; },
-        enumerable: false, configurable: true,
-      });
-      Object.defineProperty(el, "innerText", {
-        get: function () { var acc = []; collectText(this, acc); return acc.join(""); },
-        set: function (v) { this.textContent = v; },
-        enumerable: false, configurable: true,
-      });
-
-      // innerHTML — DEFERRED REPARSE. The setter does NOT parse HTML in JS: it
-      // records the raw fragment on the node (__rawHTML) and drops the node's
-      // JS children. The fragment is reparsed by the real Rust parser at
-      // reconcile (see serialize → rebuild_document). LIMITATION: the children
-      // are not available in JS after a set, so reading them back mid-script
-      // (el.children, querySelector into the fragment, …) is not supported; the
-      // getter returns the stored raw string. The getter on a non-raw node
-      // serializes its current children to HTML in JS.
-      Object.defineProperty(el, "innerHTML", {
-        get: function () { return serializeChildrenHTML(this); },
-        set: function (v) {
-          // Detach existing children and mark the node "raw".
-          for (var i = 0; i < this.__kids.length; i++) this.__kids[i].__parent = null;
-          this.__kids = [];
-          this.__rawHTML = String(v);
-        },
-        enumerable: false, configurable: true,
-      });
-      // outerHTML getter serializes this element (open tag, contents, close) to
-      // HTML in JS. The setter is not supported (it would require splicing into
-      // the parent and reparsing in place); we leave it as a silent no-op.
-      Object.defineProperty(el, "outerHTML", {
-        get: function () { return serializeNodeHTML(this); },
-        set: function () { /* unsupported: see note above */ },
-        enumerable: false, configurable: true,
-      });
-      // insertAdjacentHTML: reuses the raw-HTML mechanism. We support the two
-      // common in-element positions by merging into __rawHTML (which the Rust
-      // parser reparses); "afterbegin" prepends, "beforeend" appends. The
-      // sibling positions "beforebegin"/"afterend" would need to splice raw HTML
-      // into the PARENT and are not supported (documented no-op). Because this
-      // routes through __rawHTML, any pre-existing JS children are first
-      // serialized into the raw string (same deferred-reparse limitation).
-      el.insertAdjacentHTML = function (position, html) {
-        position = String(position).toLowerCase();
-        html = String(html);
-        var current = (typeof this.__rawHTML === "string")
-          ? this.__rawHTML
-          : serializeChildrenHTML(this);
-        if (position === "afterbegin") {
-          for (var i = 0; i < this.__kids.length; i++) this.__kids[i].__parent = null;
-          this.__kids = [];
-          this.__rawHTML = html + current;
-        } else if (position === "beforeend") {
-          for (var j = 0; j < this.__kids.length; j++) this.__kids[j].__parent = null;
-          this.__kids = [];
-          this.__rawHTML = current + html;
-        }
-        // else: beforebegin/afterend unsupported → no-op.
-      };
-
-      el.getAttribute = function (n) { return getAttr(this, String(n)); };
-      el.setAttribute = function (n, v) { setAttr(this, String(n), v); };
-      el.removeAttribute = function (n) { removeAttr(this, String(n)); };
-      el.hasAttribute = function (n) { return attrIndex(this, String(n)) !== -1; };
-      el.getAttributeNames = function () { return this.__attrs.map(function (p) { return p[0]; }); };
-
-      el.getElementsByTagName = function (t) { return queryAll(this, String(t)); };
-      el.getElementsByClassName = function (c) { return queryAll(this, "." + String(c)); };
-      el.querySelector = function (s) { return queryOne(this, s); };
-      el.querySelectorAll = function (s) { return queryAll(this, s); };
-      el.matches = function (s) { return matchesSelector(this, s); };
-      el.closest = function (s) {
-        for (var n = this; n && n.__type === ELEMENT_NODE; n = n.__parent) if (matchesSelector(n, s)) return n;
-        return null;
-      };
-
-      el.getBoundingClientRect = function () {
-        return { x: 0, y: 0, top: 0, left: 0, right: 0, bottom: 0, width: 0, height: 0 };
-      };
-
-      // style: store-only. Assignments are remembered and reflected back into
-      // the `style` attribute so a round-trip preserves them, but nothing is
-      // rendered from them yet.
+    }
+    function buildStyleObject(el) {
       var styleStore = Object.create(null);
-      var styleObj = new Proxy(styleStore, {
+      function syncStyleAttr() {
+        var text = styleCssTextOf(styleStore);
+        if (text) setAttr(el, "style", text); else removeAttr(el, "style");
+      }
+      // If the element carries a style attribute, seed the store from it. Lazy
+      // seeding is equivalent to eager seeding: the store is only observable
+      // through this proxy (getComputedStyle reads the attribute directly).
+      var initialStyle = getAttr(el, "style");
+      if (initialStyle) parseCssText(initialStyle, styleStore);
+      return new Proxy(styleStore, {
         get: function (t, k) {
           if (k === "setProperty") return function (p, v) { t[p] = String(v); syncStyleAttr(); };
           if (k === "removeProperty") return function (p) { var old = t[p]; delete t[p]; syncStyleAttr(); return old; };
           if (k === "getPropertyValue") return function (p) { return t[p] || ""; };
-          if (k === "cssText") return styleCssText();
+          if (k === "cssText") return styleCssTextOf(styleStore);
           return (k in t) ? t[k] : "";
         },
         set: function (t, k, v) {
@@ -1122,76 +997,206 @@ pub const DOM_MODEL_PRELUDE: &str = r##"
           t[k] = String(v); syncStyleAttr(); return true;
         },
       });
-      function styleCssText() {
-        var parts = [];
-        for (var k in styleStore) parts.push(k + ": " + styleStore[k]);
-        return parts.join("; ");
-      }
-      function parseCssText(text, into) {
-        text.split(";").forEach(function (decl) {
-          var c = decl.indexOf(":");
-          if (c === -1) return;
-          var prop = decl.slice(0, c).trim();
-          var val = decl.slice(c + 1).trim();
-          if (prop) into[prop] = val;
-        });
-      }
-      function syncStyleAttr() {
-        var text = styleCssText();
-        if (text) setAttr(el, "style", text); else removeAttr(el, "style");
-      }
-      Object.defineProperty(el, "style", { get: function () { return styleObj; }, enumerable: false, configurable: true });
-      // If the snapshot carried a style attribute, seed the store from it.
-      var initialStyle = getAttr(el, "style");
-      if (initialStyle) parseCssText(initialStyle, styleStore);
-
-      // Inert event listener registry on elements (dispatch not yet driven by
-      // the bridge beyond DOMContentLoaded/load on document+window).
-      el.__listeners = el.__listeners || Object.create(null);
-      el.addEventListener = function (type, fn) {
-        type = String(type); if (!this.__listeners[type]) this.__listeners[type] = [];
-        if (typeof fn === "function") this.__listeners[type].push(fn);
-      };
-      el.removeEventListener = function (type, fn) {
-        type = String(type); var arr = this.__listeners[type]; if (!arr) return;
-        var i = arr.indexOf(fn); if (i !== -1) arr.splice(i, 1);
-      };
-      el.dispatchEvent = function (ev) {
-        var arr = this.__listeners[ev && ev.type]; if (!arr) return true;
-        for (var i = 0; i < arr.slice().length; i++) { try { arr[i].call(this, ev); } catch (e) {} }
-        return true;
-      };
     }
 
+    // ---- shared node prototypes ----------------------------------------
+    // BEHAVIOR LIVES ONCE on three shared prototype objects; each node instance
+    // carries only DATA (__id/__type/__tag/__attrs/__kids/__parent/__text/…).
+    // This replaces the old per-instance defineProperty + method-assignment
+    // explosion (~40 accessors + closures per node), which ballooned resident
+    // memory on large pages. NODE_PROTO holds the accessors/methods common to
+    // every node; ELEMENT_PROTO and TEXT_PROTO inherit from it via
+    // Object.create(NODE_PROTO) and add their own. Accessors read/write `this`.
+    var NODE_PROTO = Object.create(null);
+    var ELEMENT_PROTO = Object.create(NODE_PROTO);
+    var TEXT_PROTO = Object.create(NODE_PROTO);
+
+    function defAccessor(proto, name, getter, setter) {
+      var desc = { get: getter, enumerable: false, configurable: true };
+      if (setter) desc.set = setter;
+      Object.defineProperty(proto, name, desc);
+    }
+
+    // -- common (NODE_PROTO): tree links + structural mutation --
+    defAccessor(NODE_PROTO, "nodeType", function () { return this.__type; });
+    defAccessor(NODE_PROTO, "parentNode", function () { return this.__parent; });
+    defAccessor(NODE_PROTO, "parentElement", function () {
+      return this.__parent && this.__parent.__type === ELEMENT_NODE ? this.__parent : null;
+    });
+    defAccessor(NODE_PROTO, "childNodes", function () { return this.__kids.slice(); });
+    defAccessor(NODE_PROTO, "firstChild", function () { return this.__kids[0] || null; });
+    defAccessor(NODE_PROTO, "lastChild", function () { return this.__kids[this.__kids.length - 1] || null; });
+    defAccessor(NODE_PROTO, "nextSibling", function () {
+      var p = this.__parent; if (!p) return null;
+      var i = p.__kids.indexOf(this); return (i === -1) ? null : (p.__kids[i + 1] || null);
+    });
+    defAccessor(NODE_PROTO, "previousSibling", function () {
+      var p = this.__parent; if (!p) return null;
+      var i = p.__kids.indexOf(this); return (i <= 0) ? null : (p.__kids[i - 1] || null);
+    });
+    defAccessor(NODE_PROTO, "textContent",
+      function () { var acc = []; collectText(this, acc); return acc.join(""); },
+      function (value) {
+        if (this.__type === TEXT_NODE) { this.__text = String(value); return; }
+        for (var i = 0; i < this.__kids.length; i++) this.__kids[i].__parent = null;
+        this.__kids = [];
+        if (typeof this.__rawHTML === "string") this.__rawHTML = undefined;
+        var t = makeText(String(value));
+        appendChild(this, t);
+      });
+    NODE_PROTO.appendChild = function (child) { return appendChild(this, child); };
+    NODE_PROTO.removeChild = function (child) { return removeChild(this, child); };
+    NODE_PROTO.insertBefore = function (child, ref) { return insertBefore(this, child, ref); };
+    NODE_PROTO.remove = function () { detach(this); };
+    NODE_PROTO.contains = function (other) {
+      for (var n = other; n; n = n.__parent) if (n === this) return true;
+      return false;
+    };
+    NODE_PROTO.hasChildNodes = function () { return this.__kids.length > 0; };
+
+    // -- elements (ELEMENT_PROTO) --
+    defAccessor(ELEMENT_PROTO, "tagName", function () { return this.__tag.toUpperCase(); });
+    defAccessor(ELEMENT_PROTO, "nodeName", function () { return this.__tag.toUpperCase(); });
+    defAccessor(ELEMENT_PROTO, "children", function () { return elementChildren(this); });
+    defAccessor(ELEMENT_PROTO, "firstElementChild", function () { var c = elementChildren(this); return c[0] || null; });
+    defAccessor(ELEMENT_PROTO, "lastElementChild", function () { var c = elementChildren(this); return c[c.length - 1] || null; });
+    defAccessor(ELEMENT_PROTO, "id",
+      function () { return getAttr(this, "id") || ""; },
+      function (v) { setAttr(this, "id", v); });
+    defAccessor(ELEMENT_PROTO, "className",
+      function () { return getAttr(this, "class") || ""; },
+      function (v) { setAttr(this, "class", v); });
+    defAccessor(ELEMENT_PROTO, "classList", function () {
+      if (!this.__classList) this.__classList = makeClassList(this);
+      return this.__classList;
+    });
+    defAccessor(ELEMENT_PROTO, "innerText",
+      function () { var acc = []; collectText(this, acc); return acc.join(""); },
+      function (v) { this.textContent = v; });
+
+    // innerHTML — DEFERRED REPARSE. The setter does NOT parse HTML in JS: it
+    // records the raw fragment on the node (__rawHTML) and drops the node's
+    // JS children. The fragment is reparsed by the real Rust parser at
+    // reconcile (see serialize -> rebuild_document). LIMITATION: the children
+    // are not available in JS after a set, so reading them back mid-script
+    // (el.children, querySelector into the fragment, ...) is not supported; the
+    // getter returns the stored raw string. The getter on a non-raw node
+    // serializes its current children to HTML in JS.
+    defAccessor(ELEMENT_PROTO, "innerHTML",
+      function () { return serializeChildrenHTML(this); },
+      function (v) {
+        for (var i = 0; i < this.__kids.length; i++) this.__kids[i].__parent = null;
+        this.__kids = [];
+        this.__rawHTML = String(v);
+      });
+    // outerHTML getter serializes this element (open tag, contents, close) to
+    // HTML in JS. The setter is not supported (it would require splicing into
+    // the parent and reparsing in place); we leave it as a silent no-op.
+    defAccessor(ELEMENT_PROTO, "outerHTML",
+      function () { return serializeNodeHTML(this); },
+      function () { /* unsupported: see note above */ });
+    // style: lazy per-element Proxy, built on first read and cached on
+    // __styleObj so nodes that never touch `.style` allocate nothing.
+    defAccessor(ELEMENT_PROTO, "style", function () {
+      if (!this.__styleObj) this.__styleObj = buildStyleObject(this);
+      return this.__styleObj;
+    });
+
+    // insertAdjacentHTML: reuses the raw-HTML mechanism. We support the two
+    // common in-element positions by merging into __rawHTML (which the Rust
+    // parser reparses); "afterbegin" prepends, "beforeend" appends. The
+    // sibling positions "beforebegin"/"afterend" would need to splice raw HTML
+    // into the PARENT and are not supported (documented no-op). Because this
+    // routes through __rawHTML, any pre-existing JS children are first
+    // serialized into the raw string (same deferred-reparse limitation).
+    ELEMENT_PROTO.insertAdjacentHTML = function (position, html) {
+      position = String(position).toLowerCase();
+      html = String(html);
+      var current = (typeof this.__rawHTML === "string")
+        ? this.__rawHTML
+        : serializeChildrenHTML(this);
+      if (position === "afterbegin") {
+        for (var i = 0; i < this.__kids.length; i++) this.__kids[i].__parent = null;
+        this.__kids = [];
+        this.__rawHTML = html + current;
+      } else if (position === "beforeend") {
+        for (var j = 0; j < this.__kids.length; j++) this.__kids[j].__parent = null;
+        this.__kids = [];
+        this.__rawHTML = current + html;
+      }
+      /* else: beforebegin/afterend unsupported -> no-op. */
+    };
+
+    ELEMENT_PROTO.getAttribute = function (n) { return getAttr(this, String(n)); };
+    ELEMENT_PROTO.setAttribute = function (n, v) { setAttr(this, String(n), v); };
+    ELEMENT_PROTO.removeAttribute = function (n) { removeAttr(this, String(n)); };
+    ELEMENT_PROTO.hasAttribute = function (n) { return attrIndex(this, String(n)) !== -1; };
+    ELEMENT_PROTO.getAttributeNames = function () { return this.__attrs.map(function (p) { return p[0]; }); };
+
+    ELEMENT_PROTO.getElementsByTagName = function (t) { return queryAll(this, String(t)); };
+    ELEMENT_PROTO.getElementsByClassName = function (c) { return queryAll(this, "." + String(c)); };
+    ELEMENT_PROTO.querySelector = function (s) { return queryOne(this, s); };
+    ELEMENT_PROTO.querySelectorAll = function (s) { return queryAll(this, s); };
+    ELEMENT_PROTO.matches = function (s) { return matchesSelector(this, s); };
+    ELEMENT_PROTO.closest = function (s) {
+      for (var n = this; n && n.__type === ELEMENT_NODE; n = n.__parent) if (matchesSelector(n, s)) return n;
+      return null;
+    };
+
+    ELEMENT_PROTO.getBoundingClientRect = function () {
+      return { x: 0, y: 0, top: 0, left: 0, right: 0, bottom: 0, width: 0, height: 0 };
+    };
+
+    // Inert event listener registry on elements (dispatch not yet driven by
+    // the bridge beyond DOMContentLoaded/load on document+window). __listeners
+    // is created lazily on first addEventListener so listener-free nodes pay
+    // nothing.
+    ELEMENT_PROTO.addEventListener = function (type, fn) {
+      type = String(type);
+      if (!this.__listeners) this.__listeners = Object.create(null);
+      if (!this.__listeners[type]) this.__listeners[type] = [];
+      if (typeof fn === "function") this.__listeners[type].push(fn);
+    };
+    ELEMENT_PROTO.removeEventListener = function (type, fn) {
+      type = String(type); if (!this.__listeners) return;
+      var arr = this.__listeners[type]; if (!arr) return;
+      var i = arr.indexOf(fn); if (i !== -1) arr.splice(i, 1);
+    };
+    ELEMENT_PROTO.dispatchEvent = function (ev) {
+      if (!this.__listeners) return true;
+      var arr = this.__listeners[ev && ev.type]; if (!arr) return true;
+      for (var i = 0; i < arr.slice().length; i++) { try { arr[i].call(this, ev); } catch (e) {} }
+      return true;
+    };
+
+    // -- text nodes (TEXT_PROTO) --
+    defAccessor(TEXT_PROTO, "nodeName", function () { return "#text"; });
+    defAccessor(TEXT_PROTO, "data",
+      function () { return this.__text; },
+      function (v) { this.__text = String(v); });
+
     // ---- node constructors ---------------------------------------------
+    // Nodes are created with Object.create(<proto>) and carry ONLY data fields;
+    // all behavior comes from the shared prototype. No per-node defineProperty,
+    // no per-node function assignments.
     function makeElement(tag, id) {
-      var el = {
-        __type: ELEMENT_NODE,
-        __tag: String(tag).toLowerCase(),
-        __attrs: [],
-        __kids: [],
-        __parent: null,
-        __id: (typeof id === "number") ? id : freshId(),
-      };
-      defineNodeAccessors(el);
-      defineElementAccessors(el);
+      var el = Object.create(ELEMENT_PROTO);
+      el.__type = ELEMENT_NODE;
+      el.__tag = String(tag).toLowerCase();
+      el.__attrs = [];
+      el.__kids = [];
+      el.__parent = null;
+      el.__id = (typeof id === "number") ? id : freshId();
       indexNode(el);
       return el;
     }
     function makeText(text, id) {
-      var t = {
-        __type: TEXT_NODE,
-        __text: String(text),
-        __kids: [],
-        __parent: null,
-        __id: (typeof id === "number") ? id : freshId(),
-      };
-      defineNodeAccessors(t);
-      Object.defineProperty(t, "nodeName", { get: function () { return "#text"; }, enumerable: false, configurable: true });
-      Object.defineProperty(t, "data", {
-        get: function () { return this.__text; }, set: function (v) { this.__text = String(v); },
-        enumerable: false, configurable: true,
-      });
+      var t = Object.create(TEXT_PROTO);
+      t.__type = TEXT_NODE;
+      t.__text = String(text);
+      t.__kids = [];
+      t.__parent = null;
+      t.__id = (typeof id === "number") ? id : freshId();
       indexNode(t);
       return t;
     }
