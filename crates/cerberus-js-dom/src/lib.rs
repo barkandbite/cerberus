@@ -34,16 +34,23 @@
 //! unique integers used only to express the `children`/`root` links; on rebuild
 //! they are renumbered to fresh [`cerberus_dom::NodeId`]s.
 //!
+//! An element may instead carry an `"innerHTML": <string>` field (and then *no*
+//! `children`). That is the wire encoding of a node whose `.innerHTML` was set in
+//! JS: rather than parse HTML in JavaScript, we ship the raw fragment string and
+//! reparse it in Rust with [`cerberus_dom::parse_html`] at rebuild time (see
+//! [`rebuild_document`]). This "deferred reparse" reuses the real Rust parser for
+//! the dominant "render this HTML" pattern.
+//!
 //! # Implemented vs deferred DOM surface
 //!
-//! This is "minimal but real": enough of `document`, element/text nodes,
-//! `window`, and `console` to run typical page bootstraps and reconcile their
-//! structural mutations. Selectors are a single simple selector only (`#id`,
-//! `.class`, or `tag` — no combinators). Layout APIs are stubbed
-//! (`getBoundingClientRect` is all-zero), `style` is store-only, and richer
-//! `window` surfaces (`navigator`, `location`, `localStorage`,
-//! `getComputedStyle`, `matchMedia`) are intentionally left to a follow-up. See
-//! the [`DOM_MODEL_PRELUDE`] docs for the precise list.
+//! This is "real, v2": enough of `document`, element/text nodes, `window`,
+//! `navigator`, `location`, storage, and `console` to run typical page
+//! bootstraps and reconcile their structural mutations. Selectors now support
+//! compound simple selectors plus descendant/child combinators and comma lists
+//! (see [`DOM_MODEL_PRELUDE`]); sibling combinators (`~`/`+`) and pseudo-classes
+//! are not supported. Layout APIs are stubbed (`getBoundingClientRect` is
+//! all-zero) and `style` is store-only (`getComputedStyle` reflects inline
+//! values only). See the [`DOM_MODEL_PRELUDE`] docs for the precise list.
 
 mod json;
 
@@ -184,6 +191,10 @@ enum WireNode {
         tag: String,
         attrs: Vec<(String, String)>,
         children: Vec<u64>,
+        /// Raw HTML set via `.innerHTML` in JS, to be reparsed in Rust. When
+        /// present it takes precedence over `children` (the JS setter clears the
+        /// node's children, so they are empty here anyway).
+        inner_html: Option<String>,
     },
     Text {
         text: String,
@@ -269,17 +280,25 @@ pub fn rebuild_document(json: &str) -> Result<Document, BridgeError> {
                     tag,
                     attrs,
                     children,
+                    inner_html,
                 } => {
-                    let child_ids: Vec<NodeId> = children
-                        .iter()
-                        .map(|c| {
-                            fresh.get(c).copied().ok_or_else(|| {
-                                BridgeError::Structure(format!(
-                                    "child id {c} not materialized before parent {id}"
-                                ))
+                    // A node carrying `innerHTML` is reparsed in Rust (deferred
+                    // reparse): the raw fragment is fed to the real HTML parser
+                    // and its body children are grafted in place of `children`
+                    // (which the JS setter already cleared).
+                    let child_ids: Vec<NodeId> = match inner_html {
+                        Some(html) => graft_inner_html(&mut builder, html),
+                        None => children
+                            .iter()
+                            .map(|c| {
+                                fresh.get(c).copied().ok_or_else(|| {
+                                    BridgeError::Structure(format!(
+                                        "child id {c} not materialized before parent {id}"
+                                    ))
+                                })
                             })
-                        })
-                        .collect::<Result<_, _>>()?;
+                            .collect::<Result<_, _>>()?,
+                    };
                     builder.element_attrs(tag.clone(), attrs.clone(), child_ids)
                 }
             };
@@ -291,6 +310,50 @@ pub fn rebuild_document(json: &str) -> Result<Document, BridgeError> {
         .get(&root_id)
         .expect("root materialized by post-order");
     Ok(builder.finish(root_fresh))
+}
+
+/// Reparse an `innerHTML` fragment with [`cerberus_dom::parse_html`] and copy
+/// the resulting children into `builder`, returning their fresh [`NodeId`]s (in
+/// document order) so the caller can attach them to the node that owned the
+/// `innerHTML`.
+///
+/// `parse_html` wraps its input in a synthetic `#root > html > body` scaffold, so
+/// the fragment's real top-level nodes land under `<body>`. We locate that body
+/// and graft *its* children; if no `<body>` materialized (e.g. the fragment
+/// produced only a `<head>`), we fall back to the parsed root's own children.
+fn graft_inner_html(builder: &mut DocumentBuilder, html: &str) -> Vec<NodeId> {
+    let parsed = cerberus_dom::parse_html(html);
+    let root = parsed.root();
+    let graft_parent = find_body(root).unwrap_or(root);
+    graft_parent
+        .children()
+        .map(|child| copy_subtree(builder, child))
+        .collect()
+}
+
+/// Depth-first search for the first `<body>` element at or below `node`.
+fn find_body<'a>(node: NodeRef<'a>) -> Option<NodeRef<'a>> {
+    if node.is_element() && node.tag() == "body" {
+        return Some(node);
+    }
+    node.children().find_map(find_body)
+}
+
+/// Deep-copy a parsed subtree from a foreign [`Document`] arena into `builder`,
+/// returning the new node's [`NodeId`]. Recursive in lock-step with the parsed
+/// tree's depth; HTML fragments are shallow in practice, and the parser itself
+/// already bounds nesting.
+fn copy_subtree(builder: &mut DocumentBuilder, node: NodeRef<'_>) -> NodeId {
+    if let Some(text) = node.text() {
+        return builder.text(text);
+    }
+    // Children first (post-order), then the element over their fresh ids.
+    let child_ids: Vec<NodeId> = node
+        .children()
+        .map(|child| copy_subtree(builder, child))
+        .collect();
+    let attrs: Vec<(String, String)> = node.attrs().to_vec();
+    builder.element_attrs(node.tag().to_string(), attrs, child_ids)
 }
 
 /// Decode one wire-node JSON object into a [`WireNode`] plus its wire id.
@@ -346,12 +409,21 @@ fn decode_wire_node(node: &Json) -> Result<(u64, WireNode), BridgeError> {
                 }
             }
 
+            // `innerHTML`, if present, is the raw fragment to reparse in Rust at
+            // graft time. A node carrying it should not also carry children (the
+            // JS setter clears them); we tolerate both and prefer `innerHTML`.
+            let inner_html = node
+                .get("innerHTML")
+                .and_then(Json::as_str)
+                .map(str::to_string);
+
             Ok((
                 id,
                 WireNode::Element {
                     tag,
                     attrs,
                     children,
+                    inner_html,
                 },
             ))
         }
@@ -365,12 +437,40 @@ fn decode_wire_node(node: &Json) -> Result<(u64, WireNode), BridgeError> {
 // Entry point
 // ---------------------------------------------------------------------------
 
+/// The page's ambient environment: the values `window.location`, `navigator`,
+/// `window.innerWidth`/`screen`, etc. are derived from. Supplied by the caller
+/// (the browser) because the bridge itself has no notion of "which URL" or "how
+/// big the viewport is".
+///
+/// Kept deliberately small and low-entropy — see [`DOM_MODEL_PRELUDE`]'s
+/// `navigator` notes on anti-fingerprinting. Per-head fingerprint *farbling* is a
+/// separate concern (M6 / ADR-0002's farbling prologue), not this struct.
+pub struct PageEnv {
+    /// The document's URL, parsed in JS into `location.href`/`protocol`/`host`/…
+    pub url: String,
+    /// The layout viewport as `(width, height)` in CSS pixels; feeds
+    /// `window.innerWidth`/`innerHeight` and `screen.*`.
+    pub viewport: (u32, u32),
+}
+
+/// Encode `s` as a JS/JSON string literal (quotes included) suitable for
+/// splicing into a `globalThis.__CERBERUS_ENV__ = …` eval. A valid JSON string
+/// is also a valid JS string, and [`json::write_json_string`] escapes the quote,
+/// backslash, and control characters that would otherwise break out of it.
+fn js_string(s: &str) -> String {
+    let mut out = String::with_capacity(s.len() + 2);
+    json::write_json_string(&mut out, s);
+    out
+}
+
 /// Run page `<script>`s against a JS document model snapshotted from `document`,
 /// and return a fresh Rust [`Document`] reflecting their mutations.
 ///
 /// All work goes through `engine.eval(realm, …)`:
 ///
-/// 1. Install [`DOM_MODEL_PRELUDE`] (defines `document`, `window`, helpers).
+/// 1. Inject `env` as a global, then install [`DOM_MODEL_PRELUDE`] (which reads
+///    that global to build `location`/`navigator`/`screen`/storage and defines
+///    `document`, `window`, helpers).
 /// 2. Hand the model a snapshot of `document` and call `__cerberusInstallDOM()`.
 /// 3. Evaluate each script in `scripts`, in order. **A script that throws does
 ///    not abort the run** — browsers continue to the next `<script>`, so we
@@ -387,9 +487,19 @@ pub fn run_page_scripts(
     realm: RealmId,
     document: &Document,
     scripts: &[String],
+    env: &PageEnv,
 ) -> Result<Document, BridgeError> {
-    // 1. Install the document model. The prelude is self-guarding, but a genuine
-    //    engine/compile failure still surfaces here and is fatal.
+    // 1. Inject the ambient environment, then install the document model. The
+    //    env global is read by the prelude as it builds `location`/`navigator`/
+    //    `screen`; it must land *before* the model installs. The prelude is
+    //    self-guarding, but a genuine engine/compile failure is fatal.
+    let env_install = format!(
+        "globalThis.__CERBERUS_ENV__ = {{ url: {}, width: {}, height: {} }};",
+        js_string(&env.url),
+        env.viewport.0,
+        env.viewport.1,
+    );
+    engine.eval(realm, &env_install)?;
     engine.eval(realm, DOM_MODEL_PRELUDE)?;
 
     // 2. Hand it the snapshot and build the JS tree.
@@ -441,32 +551,59 @@ pub fn run_page_scripts(
 ///
 /// # Implemented
 ///
-/// * **`document`**: `getElementById`, `querySelector`/`querySelectorAll`
-///   (single simple selector — `#id`, `.class`, or `tag`; **no combinators**),
+/// * **`document`**: `getElementById`, `querySelector`/`querySelectorAll`/
+///   `matches`/`closest` (the v2 selector grammar below),
 ///   `getElementsByTagName`, `getElementsByClassName`, `createElement`,
 ///   `createTextNode`, `body`/`head`/`documentElement`, `title` (get/set),
 ///   `addEventListener`/`removeEventListener`, `readyState`
-///   (`"loading"` → `"complete"`), `cookie` (in-memory get/set).
+///   (`"loading"` → `"complete"`), `cookie` (in-memory get/set),
+///   `location`/`URL`/`documentURI` (from [`PageEnv::url`]).
 /// * **element / text nodes**: `nodeType`, `nodeName`/`tagName`, `textContent`
 ///   (get concatenates descendant text; set replaces children with one text
-///   node), `getAttribute`/`setAttribute`/`removeAttribute`/`hasAttribute`/
+///   node), `innerHTML`/`outerHTML` (get serializes to HTML in JS; set stores a
+///   raw fragment reparsed in Rust — see below), `insertAdjacentHTML`,
+///   `getAttribute`/`setAttribute`/`removeAttribute`/`hasAttribute`/
 ///   `getAttributeNames`, `id`, `className`, `classList`
 ///   (`add`/`remove`/`toggle`/`contains`/`length`), `children`/`childNodes`,
 ///   `parentNode`/`parentElement`, `firstChild`/`lastChild`/`nextSibling`/
 ///   `previousSibling`, `appendChild`/`removeChild`/`insertBefore`/`remove`, a
 ///   store-only `style`, `getBoundingClientRect` (all-zero), scoped
-///   `querySelector`/`querySelectorAll`.
-/// * **`window`** = `globalThis`, with `window.document` and
-///   `addEventListener`/`removeEventListener` (load events fired by fire-load).
+///   `querySelector`/`querySelectorAll`/`matches`/`closest`.
+/// * **`window`** = `globalThis`, with `window.document`,
+///   `addEventListener`/`removeEventListener` (load events fired by fire-load),
+///   `location`, `navigator`, `screen`, `history`, `localStorage`/
+///   `sessionStorage`, `innerWidth`/`innerHeight`, `getComputedStyle`,
+///   `matchMedia`.
 /// * **`console`**: `log`/`warn`/`error`/`info`/`debug` push joined `String(arg)`
 ///   messages into `globalThis.__cerberusConsole`; never throw.
 ///
-/// # Deferred (follow-up)
+/// # Selector grammar
 ///
-/// `navigator`, `location`, `localStorage`/`sessionStorage`, `getComputedStyle`,
-/// `matchMedia`; CSS-aware `style` rendering; complex/compound selectors; live
-/// collection objects (we expose plain arrays). The structure is kept clean so
-/// these slot in without reshaping the model.
+/// The selector engine supports a *selector list* (comma-separated) of
+/// *complex* selectors, where a complex selector is a sequence of *compound*
+/// selectors joined by the descendant (whitespace) or child (`>`) combinator. A
+/// compound selector is a tag (or `*`) and/or any number of `.class` and/or `#id`
+/// parts, plus optional attribute selectors `[name]` / `[name="value"]`, all of
+/// which must match one element. **Not** supported (documented in the prelude):
+/// sibling combinators `~`/`+`, pseudo-classes/elements (`:hover`, `::before`),
+/// `>` at the start, and namespaces.
+///
+/// # `innerHTML` — deferred reparse
+///
+/// The `innerHTML` *setter* does not parse HTML in JS. It records the raw
+/// fragment string on the node and drops the node's JS children; the node is
+/// serialized with an `"innerHTML"` field and the fragment is reparsed by the
+/// real Rust parser at [`rebuild_document`] time. **Limitation:** because the
+/// children are not re-parsed *in JS*, reading them back (`el.children`,
+/// `el.firstChild`, a follow-up `querySelector` into the fragment) mid-script is
+/// not supported after a set; the `innerHTML` *getter* on such a node returns the
+/// stored raw string. This covers the dominant "render this HTML" pattern.
+///
+/// # Anti-fingerprinting
+///
+/// `navigator` is deliberately low-entropy and identical for every head (fixed
+/// generic `userAgent`, `en-US`, no plugins/`mediaDevices`/WebGL). Per-head
+/// fingerprint *farbling* is M6 (ADR-0002's farbling prologue), not here.
 pub const DOM_MODEL_PRELUDE: &str = r##"
 (function () {
   try {
@@ -583,8 +720,14 @@ pub const DOM_MODEL_PRELUDE: &str = r##"
       if (k !== -1) p.__kids.splice(k, 1);
       node.__parent = null;
     }
+    function clearRaw(node) {
+      // Inserting/removing real children supersedes a pending innerHTML string:
+      // a node holds EITHER a raw fragment OR live children, never both.
+      if (typeof node.__rawHTML === "string") node.__rawHTML = undefined;
+    }
     function appendChild(parent, node) {
       detach(node);
+      clearRaw(parent);
       parent.__kids.push(node);
       node.__parent = parent;
       return node;
@@ -592,6 +735,7 @@ pub const DOM_MODEL_PRELUDE: &str = r##"
     function insertBefore(parent, node, ref) {
       if (ref == null) return appendChild(parent, node);
       detach(node);
+      clearRaw(parent);
       var i = parent.__kids.indexOf(ref);
       if (i === -1) { parent.__kids.push(node); }
       else { parent.__kids.splice(i, 0, node); }
@@ -614,13 +758,6 @@ pub const DOM_MODEL_PRELUDE: &str = r##"
       for (var i = 0; i < node.__kids.length; i++) collectText(node.__kids[i], acc);
     }
 
-    // ---- selector matching (single simple selector only) ---------------
-    function matchesSimple(el, sel) {
-      if (el.__type !== ELEMENT_NODE) return false;
-      if (sel.charAt(0) === "#") return getAttr(el, "id") === sel.slice(1);
-      if (sel.charAt(0) === ".") return classTokens(el).indexOf(sel.slice(1)) !== -1;
-      return el.__tag.toLowerCase() === sel.toLowerCase();
-    }
     function walkElements(root, fn) {
       // Pre-order over elements, excluding `root` itself unless caller adds it.
       var kids = root.__kids;
@@ -629,16 +766,191 @@ pub const DOM_MODEL_PRELUDE: &str = r##"
         if (c.__type === ELEMENT_NODE) { fn(c); walkElements(c, fn); }
       }
     }
-    function queryAll(root, sel) {
-      sel = String(sel).trim();
+
+    // ---- selector engine (compound + descendant/child + comma lists) ---
+    // A selector list is parsed once into an array of "complex" selectors. A
+    // complex selector is an array of steps [{combinator, compound}, …] read
+    // left→right, where `compound` is { tag, id, classes[], attrs[] } and
+    // `combinator` is how this compound relates to the PRECEDING one:
+    //   " " descendant, ">" child, "" (only on the first step) the subject.
+    // Matching is anchored on the rightmost (subject) compound and walks back
+    // through ancestors/parents, so we never need sibling links here.
+    //
+    // Unsupported (by design, speed-first): sibling combinators `~`/`+`,
+    // pseudo-classes/elements (`:hover`, `::before`), leading `>`, namespaces.
+    // Attribute selectors are limited to `[name]` and `[name="value"]` /
+    // `[name='value']` (presence and exact-match; no `~=`, `^=`, `*=`, …).
+    function parseCompound(text) {
+      // text is one compound run with no whitespace/combinators, e.g.
+      // `div.foo#bar[data-x="1"]`. Returns null if it is empty/garbage.
+      var compound = { tag: null, id: null, classes: [], attrs: [] };
+      var i = 0, n = text.length, sawAny = false;
+      while (i < n) {
+        var ch = text.charAt(i);
+        if (ch === "#") {
+          i++; var s = i; while (i < n && !".#[".includes(text.charAt(i))) i++;
+          compound.id = text.slice(s, i); sawAny = true;
+        } else if (ch === ".") {
+          i++; var s2 = i; while (i < n && !".#[".includes(text.charAt(i))) i++;
+          if (i > s2) { compound.classes.push(text.slice(s2, i)); sawAny = true; }
+        } else if (ch === "[") {
+          var end = text.indexOf("]", i);
+          if (end === -1) return null;            // unterminated → no match
+          var body = text.slice(i + 1, end).trim();
+          i = end + 1;
+          var eq = body.indexOf("=");
+          if (eq === -1) {
+            if (body) { compound.attrs.push({ name: body, value: null }); sawAny = true; }
+          } else {
+            var an = body.slice(0, eq).trim();
+            var av = body.slice(eq + 1).trim();
+            if (av.length >= 2 && (av.charAt(0) === '"' || av.charAt(0) === "'")) av = av.slice(1, -1);
+            if (an) { compound.attrs.push({ name: an, value: av }); sawAny = true; }
+          }
+        } else {
+          // A type (tag) selector or universal `*`; runs until the next part.
+          var s3 = i; while (i < n && !".#[".includes(text.charAt(i))) i++;
+          var tag = text.slice(s3, i);
+          if (tag && tag !== "*") compound.tag = tag.toLowerCase();
+          sawAny = true;
+        }
+      }
+      return sawAny ? compound : null;
+    }
+    function parseComplex(text) {
+      // Split one complex selector into steps, honoring the `>` child combinator
+      // (with optional surrounding whitespace) and whitespace as descendant.
+      var steps = [];
+      var i = 0, n = text.length;
+      var pendingCombinator = "";   // for the first compound: subject ("")
+      while (i < n) {
+        // Skip leading whitespace; remember it as a (possible) descendant combinator.
+        var sawSpace = false;
+        while (i < n && /\s/.test(text.charAt(i))) { i++; sawSpace = true; }
+        if (i >= n) break;
+        if (text.charAt(i) === ">") {
+          pendingCombinator = ">"; i++;
+          // Skip whitespace after `>`.
+          while (i < n && /\s/.test(text.charAt(i))) i++;
+        } else if (sawSpace && steps.length > 0) {
+          pendingCombinator = " ";
+        }
+        // Read the compound run up to the next combinator/whitespace.
+        var s = i;
+        while (i < n && !/\s/.test(text.charAt(i)) && text.charAt(i) !== ">") {
+          if (text.charAt(i) === "[") { var e = text.indexOf("]", i); i = (e === -1) ? n : e + 1; }
+          else i++;
+        }
+        var compound = parseCompound(text.slice(s, i));
+        if (!compound) return null;               // malformed → whole complex fails
+        steps.push({ combinator: pendingCombinator, compound: compound });
+        pendingCombinator = "";
+      }
+      return steps.length ? steps : null;
+    }
+    function parseSelectorList(sel) {
+      // Top-level comma split (no nesting to worry about — no `:not()` etc.).
       var out = [];
-      if (!sel) return out;
-      walkElements(root, function (el) { if (matchesSimple(el, sel)) out.push(el); });
+      var parts = String(sel).split(",");
+      for (var i = 0; i < parts.length; i++) {
+        var complex = parseComplex(parts[i].trim());
+        if (complex) out.push(complex);
+      }
+      return out;
+    }
+    function matchesCompound(el, compound) {
+      if (!el || el.__type !== ELEMENT_NODE) return false;
+      if (compound.tag !== null && el.__tag.toLowerCase() !== compound.tag) return false;
+      if (compound.id !== null && getAttr(el, "id") !== compound.id) return false;
+      for (var i = 0; i < compound.classes.length; i++) {
+        if (classTokens(el).indexOf(compound.classes[i]) === -1) return false;
+      }
+      for (var j = 0; j < compound.attrs.length; j++) {
+        var a = compound.attrs[j];
+        var v = getAttr(el, a.name);
+        if (v === null) return false;
+        if (a.value !== null && v !== a.value) return false;
+      }
+      return true;
+    }
+    function matchesComplex(el, steps) {
+      // Anchor on the rightmost step (the subject), then satisfy each earlier
+      // step by walking ancestors (descendant) or the immediate parent (child).
+      var k = steps.length - 1;
+      if (!matchesCompound(el, steps[k].compound)) return false;
+      var node = el;
+      for (k = steps.length - 1; k > 0; k--) {
+        var rel = steps[k].combinator;       // how step[k] relates to step[k-1]
+        var want = steps[k - 1].compound;
+        if (rel === ">") {
+          node = node.__parent;
+          if (!matchesCompound(node, want)) return false;
+        } else {
+          // Descendant: find SOME ancestor matching `want`.
+          var anc = node.__parent, ok = false;
+          while (anc && anc.__type === ELEMENT_NODE) {
+            if (matchesCompound(anc, want)) { ok = true; node = anc; break; }
+            anc = anc.__parent;
+          }
+          if (!ok) return false;
+        }
+      }
+      return true;
+    }
+    function matchesSelector(el, sel) {
+      var list = parseSelectorList(sel);
+      for (var i = 0; i < list.length; i++) if (matchesComplex(el, list[i])) return true;
+      return false;
+    }
+    function queryAll(root, sel) {
+      var list = parseSelectorList(sel);
+      var out = [];
+      if (!list.length) return out;
+      walkElements(root, function (el) {
+        for (var i = 0; i < list.length; i++) {
+          if (matchesComplex(el, list[i])) { out.push(el); return; }
+        }
+      });
       return out;
     }
     function queryOne(root, sel) {
       var all = queryAll(root, sel);
       return all.length ? all[0] : null;
+    }
+
+    // ---- HTML serialization (for innerHTML/outerHTML getters) ----------
+    // Void elements (no close tag) — kept in lock-step with the Rust parser's
+    // VOID list so a serialize→reparse round-trip is stable.
+    var VOID_ELEMENTS = {
+      area: 1, base: 1, br: 1, col: 1, embed: 1, hr: 1, img: 1, input: 1,
+      link: 1, meta: 1, param: 1, source: 1, track: 1, wbr: 1,
+    };
+    function escapeText(s) {
+      return String(s).replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
+    }
+    function escapeAttr(s) {
+      return String(s).replace(/&/g, "&amp;").replace(/"/g, "&quot;");
+    }
+    function serializeNodeHTML(node) {
+      if (node.__type === TEXT_NODE) return escapeText(node.__text);
+      var tag = node.__tag;
+      // A node whose innerHTML was set holds a raw fragment string verbatim.
+      var inner = (typeof node.__rawHTML === "string")
+        ? node.__rawHTML
+        : serializeChildrenHTML(node);
+      var open = "<" + tag;
+      for (var i = 0; i < node.__attrs.length; i++) {
+        open += " " + node.__attrs[i][0] + '="' + escapeAttr(node.__attrs[i][1]) + '"';
+      }
+      open += ">";
+      if (VOID_ELEMENTS[tag]) return open;       // void: no children, no close
+      return open + inner + "</" + tag + ">";
+    }
+    function serializeChildrenHTML(node) {
+      if (typeof node.__rawHTML === "string") return node.__rawHTML;
+      var out = "";
+      for (var i = 0; i < node.__kids.length; i++) out += serializeNodeHTML(node.__kids[i]);
+      return out;
     }
 
     // ---- node prototype (shared accessors via defineProperty) ----------
@@ -672,6 +984,7 @@ pub const DOM_MODEL_PRELUDE: &str = r##"
           if (this.__type === TEXT_NODE) { this.__text = String(value); return; }
           for (var i = 0; i < this.__kids.length; i++) this.__kids[i].__parent = null;
           this.__kids = [];
+          if (typeof this.__rawHTML === "string") this.__rawHTML = undefined;
           var t = makeText(String(value));
           appendChild(this, t);
         },
@@ -721,6 +1034,57 @@ pub const DOM_MODEL_PRELUDE: &str = r##"
         enumerable: false, configurable: true,
       });
 
+      // innerHTML — DEFERRED REPARSE. The setter does NOT parse HTML in JS: it
+      // records the raw fragment on the node (__rawHTML) and drops the node's
+      // JS children. The fragment is reparsed by the real Rust parser at
+      // reconcile (see serialize → rebuild_document). LIMITATION: the children
+      // are not available in JS after a set, so reading them back mid-script
+      // (el.children, querySelector into the fragment, …) is not supported; the
+      // getter returns the stored raw string. The getter on a non-raw node
+      // serializes its current children to HTML in JS.
+      Object.defineProperty(el, "innerHTML", {
+        get: function () { return serializeChildrenHTML(this); },
+        set: function (v) {
+          // Detach existing children and mark the node "raw".
+          for (var i = 0; i < this.__kids.length; i++) this.__kids[i].__parent = null;
+          this.__kids = [];
+          this.__rawHTML = String(v);
+        },
+        enumerable: false, configurable: true,
+      });
+      // outerHTML getter serializes this element (open tag, contents, close) to
+      // HTML in JS. The setter is not supported (it would require splicing into
+      // the parent and reparsing in place); we leave it as a silent no-op.
+      Object.defineProperty(el, "outerHTML", {
+        get: function () { return serializeNodeHTML(this); },
+        set: function () { /* unsupported: see note above */ },
+        enumerable: false, configurable: true,
+      });
+      // insertAdjacentHTML: reuses the raw-HTML mechanism. We support the two
+      // common in-element positions by merging into __rawHTML (which the Rust
+      // parser reparses); "afterbegin" prepends, "beforeend" appends. The
+      // sibling positions "beforebegin"/"afterend" would need to splice raw HTML
+      // into the PARENT and are not supported (documented no-op). Because this
+      // routes through __rawHTML, any pre-existing JS children are first
+      // serialized into the raw string (same deferred-reparse limitation).
+      el.insertAdjacentHTML = function (position, html) {
+        position = String(position).toLowerCase();
+        html = String(html);
+        var current = (typeof this.__rawHTML === "string")
+          ? this.__rawHTML
+          : serializeChildrenHTML(this);
+        if (position === "afterbegin") {
+          for (var i = 0; i < this.__kids.length; i++) this.__kids[i].__parent = null;
+          this.__kids = [];
+          this.__rawHTML = html + current;
+        } else if (position === "beforeend") {
+          for (var j = 0; j < this.__kids.length; j++) this.__kids[j].__parent = null;
+          this.__kids = [];
+          this.__rawHTML = current + html;
+        }
+        // else: beforebegin/afterend unsupported → no-op.
+      };
+
       el.getAttribute = function (n) { return getAttr(this, String(n)); };
       el.setAttribute = function (n, v) { setAttr(this, String(n), v); };
       el.removeAttribute = function (n) { removeAttr(this, String(n)); };
@@ -731,10 +1095,9 @@ pub const DOM_MODEL_PRELUDE: &str = r##"
       el.getElementsByClassName = function (c) { return queryAll(this, "." + String(c)); };
       el.querySelector = function (s) { return queryOne(this, s); };
       el.querySelectorAll = function (s) { return queryAll(this, s); };
-      el.matches = function (s) { return matchesSimple(this, String(s).trim()); };
+      el.matches = function (s) { return matchesSelector(this, s); };
       el.closest = function (s) {
-        s = String(s).trim();
-        for (var n = this; n && n.__type === ELEMENT_NODE; n = n.__parent) if (matchesSimple(n, s)) return n;
+        for (var n = this; n && n.__type === ELEMENT_NODE; n = n.__parent) if (matchesSelector(n, s)) return n;
         return null;
       };
 
@@ -941,6 +1304,160 @@ pub const DOM_MODEL_PRELUDE: &str = r##"
       return true;
     };
 
+    // ---- ambient environment (location/navigator/screen/storage/…) -----
+    // All derived from globalThis.__CERBERUS_ENV__ = { url, width, height },
+    // injected by run_page_scripts before this prelude. We never throw: a
+    // missing/garbage env falls back to inert defaults.
+    var env = (g.__CERBERUS_ENV__ && typeof g.__CERBERUS_ENV__ === "object") ? g.__CERBERUS_ENV__ : {};
+    var envUrl = (typeof env.url === "string") ? env.url : "about:blank";
+    var vpW = (typeof env.width === "number") ? env.width : 0;
+    var vpH = (typeof env.height === "number") ? env.height : 0;
+
+    // ---- location ------------------------------------------------------
+    // A small JS regex parser for the URL into the WHATWG-ish pieces pages
+    // read. assign/replace/reload are no-ops: navigation is the browser's job
+    // in this model, not the page's.
+    function parseLocation(url) {
+      var loc = {
+        href: url, protocol: "", host: "", hostname: "", port: "",
+        origin: "", pathname: "", search: "", hash: "",
+      };
+      // scheme://authority/path?query#fragment  (authority optional).
+      var m = /^([a-zA-Z][a-zA-Z0-9+.\-]*:)(\/\/([^\/?#]*))?([^?#]*)(\?[^#]*)?(#.*)?$/.exec(url);
+      if (!m) { loc.pathname = url; return loc; }
+      loc.protocol = m[1] || "";
+      var authority = m[3] || "";
+      loc.pathname = m[4] || "";
+      loc.search = m[5] || "";
+      loc.hash = m[6] || "";
+      if (authority) {
+        loc.host = authority;
+        var colon = authority.lastIndexOf(":");
+        if (colon !== -1 && /^[0-9]+$/.test(authority.slice(colon + 1))) {
+          loc.hostname = authority.slice(0, colon);
+          loc.port = authority.slice(colon + 1);
+        } else {
+          loc.hostname = authority;
+        }
+        loc.origin = loc.protocol + "//" + authority;
+      }
+      if (!loc.pathname && authority) loc.pathname = "/";
+      return loc;
+    }
+    var locationObj = parseLocation(envUrl);
+    locationObj.assign = function () {};
+    locationObj.replace = function () {};
+    locationObj.reload = function () {};
+    locationObj.toString = function () { return this.href; };
+    g.location = locationObj;
+    window.location = locationObj;
+    document.location = locationObj;
+    Object.defineProperty(document, "URL", { get: function () { return locationObj.href; }, enumerable: true, configurable: true });
+    Object.defineProperty(document, "documentURI", { get: function () { return locationObj.href; }, enumerable: true, configurable: true });
+
+    // ---- navigator -----------------------------------------------------
+    // DELIBERATELY MINIMAL and GENERIC / low-entropy — every head looks the
+    // same. Per-head fingerprint farbling is M6 (ADR-0002 farbling prologue),
+    // not here; we do NOT expose plugins, mediaDevices, webgl, etc.
+    g.navigator = {
+      userAgent: "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Cerberus/1.0 Safari/537.36",
+      appName: "Netscape",
+      appVersion: "5.0",
+      product: "Gecko",
+      vendor: "",
+      language: "en-US",
+      languages: ["en-US"],
+      platform: "",
+      hardwareConcurrency: 4,
+      onLine: true,
+      cookieEnabled: true,
+    };
+
+    // ---- screen + window metrics ---------------------------------------
+    g.screen = {
+      width: vpW, height: vpH, availWidth: vpW, availHeight: vpH,
+      colorDepth: 24, pixelDepth: 24,
+    };
+    window.innerWidth = vpW;
+    window.innerHeight = vpH;
+    window.outerWidth = vpW;
+    window.outerHeight = vpH;
+    window.devicePixelRatio = 1;
+    window.scrollX = 0; window.scrollY = 0;
+    window.pageXOffset = 0; window.pageYOffset = 0;
+    window.scrollTo = function () {}; window.scrollBy = function () {}; window.scroll = function () {};
+
+    // ---- storage (in-memory, RUN-SCOPED) -------------------------------
+    // getItem/setItem/removeItem/clear/key/length plus index access via the
+    // methods. These live for THIS RUN ONLY — there is no persistence across
+    // run_page_scripts calls (the realm/prelude is reinstalled each time).
+    function makeStorage() {
+      var data = Object.create(null);
+      var keys = [];
+      return {
+        getItem: function (k) { k = String(k); return (k in data) ? data[k] : null; },
+        setItem: function (k, v) {
+          k = String(k);
+          if (!(k in data)) keys.push(k);
+          data[k] = String(v);
+        },
+        removeItem: function (k) {
+          k = String(k);
+          if (k in data) { delete data[k]; var i = keys.indexOf(k); if (i !== -1) keys.splice(i, 1); }
+        },
+        clear: function () { data = Object.create(null); keys = []; },
+        key: function (i) { i = i >>> 0; return (i < keys.length) ? keys[i] : null; },
+        get length() { return keys.length; },
+      };
+    }
+    g.localStorage = makeStorage();
+    g.sessionStorage = makeStorage();
+
+    // ---- getComputedStyle (inline values only) -------------------------
+    // Returns an object whose getPropertyValue(name) yields the element's
+    // inline `style` value if present, else "". We do not run a layout/CSS
+    // cascade (speed-first), so only inline declarations are visible. Also
+    // exposed as best-effort direct property access.
+    window.getComputedStyle = function (el) {
+      var decls = Object.create(null);
+      if (el && el.__type === ELEMENT_NODE) {
+        var inline = getAttr(el, "style");
+        if (inline) {
+          inline.split(";").forEach(function (d) {
+            var c = d.indexOf(":");
+            if (c === -1) return;
+            var p = d.slice(0, c).trim();
+            var v = d.slice(c + 1).trim();
+            if (p) decls[p] = v;
+          });
+        }
+      }
+      return new Proxy(decls, {
+        get: function (t, k) {
+          if (k === "getPropertyValue") return function (p) { return t[p] || ""; };
+          if (k === "getPropertyPriority") return function () { return ""; };
+          return (k in t) ? t[k] : "";
+        },
+      });
+    };
+
+    // ---- matchMedia (never matches — we don't honor media queries) -----
+    window.matchMedia = function (q) {
+      return {
+        matches: false, media: String(q), onchange: null,
+        addListener: function () {}, removeListener: function () {},
+        addEventListener: function () {}, removeEventListener: function () {},
+        dispatchEvent: function () { return false; },
+      };
+    };
+
+    // ---- history (inert) -----------------------------------------------
+    g.history = {
+      length: 1, state: null, scrollRestoration: "auto",
+      pushState: function () {}, replaceState: function () {},
+      back: function () {}, forward: function () {}, go: function () {},
+    };
+
     // ---- install: snapshot -> JS tree ----------------------------------
     g.__cerberusInstallDOM = function () {
       try {
@@ -1049,10 +1566,17 @@ pub const DOM_MODEL_PRELUDE: &str = r##"
             nodes.push({ id: id, kind: "text", text: node.__text });
             return id;
           }
-          var childIds = [];
-          for (var i = 0; i < node.__kids.length; i++) childIds.push(emit(node.__kids[i]));
           var attrs = [];
           for (var a = 0; a < node.__attrs.length; a++) attrs.push([node.__attrs[a][0], node.__attrs[a][1]]);
+          // A node whose innerHTML was set carries a raw fragment instead of JS
+          // children. Emit it with an "innerHTML" field (no children); Rust
+          // reparses it with the real HTML parser at rebuild time.
+          if (typeof node.__rawHTML === "string") {
+            nodes.push({ id: id, kind: "element", tag: node.__tag, attrs: attrs, innerHTML: node.__rawHTML });
+            return id;
+          }
+          var childIds = [];
+          for (var i = 0; i < node.__kids.length; i++) childIds.push(emit(node.__kids[i]));
           nodes.push({ id: id, kind: "element", tag: node.__tag, attrs: attrs, children: childIds });
           return id;
         }
@@ -1206,5 +1730,77 @@ mod tests {
         assert!(wire.contains("\"tag\":\"div\""));
         assert!(wire.contains("[\"id\",\"x\"]"));
         assert!(wire.contains("\"kind\":\"text\",\"text\":\"hi\""));
+    }
+
+    #[test]
+    fn rebuild_grafts_inner_html_fragment() {
+        // A wire node carrying `innerHTML` (and no children) is reparsed in Rust:
+        // the fragment's top-level nodes become the node's real children.
+        let wire = r#"{"root":1,"nodes":[
+            {"id":1,"kind":"element","tag":"div","attrs":[["id","x"]],"innerHTML":"<b>hi</b><i>there</i>"}
+        ]}"#;
+        let doc = rebuild_document(wire).expect("rebuild");
+        let root = doc.root();
+        assert_eq!(root.tag(), "div");
+        assert_eq!(root.attr("id"), Some("x"));
+        let kids: Vec<_> = root.children().filter(|c| c.is_element()).collect();
+        assert_eq!(kids.len(), 2, "two grafted element children");
+        assert_eq!(kids[0].tag(), "b");
+        assert_eq!(kids[0].text_content(), "hi");
+        assert_eq!(kids[1].tag(), "i");
+        assert_eq!(kids[1].text_content(), "there");
+    }
+
+    #[test]
+    fn rebuild_inner_html_takes_precedence_over_children() {
+        // If a node carries BOTH `innerHTML` and `children`, the reparsed
+        // fragment wins (the JS setter clears children, but we tolerate both).
+        let wire = r#"{"root":1,"nodes":[
+            {"id":1,"kind":"element","tag":"div","attrs":[],"children":[2],"innerHTML":"<span>fromhtml</span>"},
+            {"id":2,"kind":"text","text":"fromchildren"}
+        ]}"#;
+        let doc = rebuild_document(wire).expect("rebuild");
+        let root = doc.root();
+        let kids: Vec<_> = root.children().collect();
+        assert_eq!(
+            kids.len(),
+            1,
+            "only the grafted fragment, not the text child"
+        );
+        assert_eq!(kids[0].tag(), "span");
+        assert_eq!(kids[0].text_content(), "fromhtml");
+    }
+
+    #[test]
+    fn rebuild_inner_html_nested_fragment_grafts_deeply() {
+        // Nested markup grafts as a real subtree (exercises copy_subtree depth).
+        let wire = r#"{"root":1,"nodes":[
+            {"id":1,"kind":"element","tag":"ul","attrs":[],"innerHTML":"<li class=\"a\">one</li><li>two<b>!</b></li>"}
+        ]}"#;
+        let doc = rebuild_document(wire).expect("rebuild");
+        let root = doc.root();
+        assert_eq!(root.tag(), "ul");
+        let lis: Vec<_> = root.children().filter(|c| c.is_element()).collect();
+        assert_eq!(lis.len(), 2);
+        assert_eq!(lis[0].tag(), "li");
+        assert_eq!(lis[0].attr("class"), Some("a"));
+        assert_eq!(lis[0].text_content(), "one");
+        // Second <li> has nested <b>.
+        let b = lis[1]
+            .children()
+            .find(|c| c.is_element() && c.tag() == "b")
+            .expect("nested <b>");
+        assert_eq!(b.text_content(), "!");
+    }
+
+    #[test]
+    fn rebuild_inner_html_empty_fragment_yields_no_children() {
+        // An empty fragment leaves the node childless (no panic, no stray nodes).
+        let wire = r#"{"root":1,"nodes":[
+            {"id":1,"kind":"element","tag":"div","attrs":[],"innerHTML":""}
+        ]}"#;
+        let doc = rebuild_document(wire).expect("rebuild");
+        assert_eq!(doc.root().tag(), "div");
+        assert!(doc.root().children().next().is_none(), "no children");
     }
 }

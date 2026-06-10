@@ -15,7 +15,7 @@ use cerberus_dom::{parse_html, Document, DocumentBuilder, NodeRef};
 use cerberus_headless::render_document;
 use cerberus_identity::{Head, HeadManager};
 use cerberus_image::ImageCodec;
-use cerberus_js_dom::run_page_scripts;
+use cerberus_js_dom::{run_page_scripts, PageEnv};
 use cerberus_js_quickjs::QuickJsEngineFactory;
 use cerberus_layout::{
     BlockLayout, FieldKind, FormFieldBox, FormState, ImageProvider, LayoutEngine, LinkBox, NoForms,
@@ -211,7 +211,11 @@ pub fn render(config: &RenderConfig) -> Result<RenderOutcome, AppError> {
             .eval(base_realm, "void 0")
             .map_err(|e| AppError::Js(format!("{e:?}")))?;
     } else {
-        document = run_page_scripts(engine, base_realm, &document, document.scripts())
+        let env = PageEnv {
+            url: config.url.clone(),
+            viewport: (config.viewport.w, config.viewport.h),
+        };
+        document = run_page_scripts(engine, base_realm, &document, document.scripts(), &env)
             .map_err(|e| AppError::Js(format!("{e:?}")))?;
     }
     let engine_name = engine.name().to_string();
@@ -736,13 +740,17 @@ impl BrowserApp {
             return doc;
         }
         let realm = RealmId(self.heads.active().id.0);
+        let env = PageEnv {
+            url: self.toolbar.url_text.clone(),
+            viewport: (self.last_size.w, self.last_size.h),
+        };
         let engine = match self.heads.engine() {
             Ok(engine) => engine,
             Err(_) => return doc,
         };
         // Bind the result before matching so `doc`'s borrows (in the call) end
         // before the `Err` arm moves it.
-        let reconciled = run_page_scripts(engine, realm, &doc, doc.scripts());
+        let reconciled = run_page_scripts(engine, realm, &doc, doc.scripts(), &env);
         match reconciled {
             Ok(rebuilt) => rebuilt,
             Err(_) => doc,
@@ -1879,6 +1887,38 @@ mod tests {
             b.document.root().text_content().contains("built-by-script"),
             "DOMContentLoaded-built content missing; got {:?}",
             b.document.root().text_content()
+        );
+    }
+
+    #[test]
+    fn browser_script_innerhtml_is_reparsed_into_the_render() {
+        let mut b = fake_app(vec![(
+            "https://inner.test/",
+            Ok(page(
+                "https://inner.test/",
+                200,
+                None,
+                "<body><div id=\"slot\">loading</div>\
+                 <script>document.getElementById('slot').innerHTML = \
+                   '<h2>Headline</h2><p>From innerHTML</p>'</script></body>",
+            )),
+        )]);
+        b.navigate("https://inner.test/");
+        assert!(b.poll());
+        // innerHTML is reparsed by our Rust parser at reconcile, so the fragment's
+        // elements become real DOM nodes in the rendered document.
+        let text = b.document.root().text_content();
+        assert!(
+            text.contains("Headline"),
+            "innerHTML <h2> missing; got {text:?}"
+        );
+        assert!(
+            text.contains("From innerHTML"),
+            "innerHTML <p> missing; got {text:?}"
+        );
+        assert!(
+            !text.contains("loading"),
+            "placeholder should be replaced; got {text:?}"
         );
     }
 

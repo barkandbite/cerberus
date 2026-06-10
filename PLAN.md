@@ -322,9 +322,17 @@ green.
   in JS, so the `JsEngine` seam stays eval-only — no `unsafe`, no live bindings),
   and the mutated tree is serialized back and rebuilt via `DocumentBuilder`
   before styling/layout. Runs between `parse_html` and layout in both app paths;
-  script-built and `DOMContentLoaded`-built content appears in the render.
-  `innerHTML`-via-reparse and `navigator`/`location`/storage stubs are the next
-  increment. Cost: a transient ~2× DOM serialization, only on script-laden pages.
+  script-built and `DOMContentLoaded`-built content appears in the render. The
+  document model covers `getElementById`/compound + combinator `querySelector`,
+  `createElement`/`textContent`/`classList`/attributes/`append`·`insert`·`remove`,
+  **`innerHTML`/`outerHTML` (reusing our Rust `parse_html` via deferred reparse)**,
+  and a `window` environment — `location` (parsed from the page URL),
+  `localStorage`/`sessionStorage`, `getComputedStyle`, `matchMedia` (always
+  `matches:false`, speed-first), `history`, and a deliberately **low-entropy
+  `navigator`** (per-head fingerprint farbling stays M6, not here). Cost: a
+  transient ~2× DOM serialization, only on script-laden pages. Next: external
+  `<script src>`, a live-binding swap if profiling demands, broader event/DOM
+  coverage.
 - **Speed-first / raw render** → Cerberus **ignores programmed delays**: CSS
   `opacity`/`animation`/`transition`/`transform`/`visibility` are not honored;
   lazy-loading is ignored — `data-src` is preferred over a placeholder `src` and
