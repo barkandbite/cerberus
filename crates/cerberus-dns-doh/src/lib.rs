@@ -15,6 +15,19 @@ use std::time::Duration;
 
 const TIMEOUT: Duration = Duration::from_secs(10);
 
+/// Total DoH attempts before giving up. A single transient hiccup at the
+/// resolver (a 503 from the DoH endpoint, a dropped connection) otherwise fails
+/// the entire navigation — name resolution is the very first step, so it has no
+/// safety net below it. Kept small to bound worst-case latency.
+const DOH_ATTEMPTS: usize = 3;
+
+/// Whether a DoH HTTP status is worth retrying. 5xx and 429 are transient
+/// resolver-side conditions; a 4xx means our request is wrong and a retry would
+/// just repeat it.
+fn is_retriable_status(status: u16) -> bool {
+    status >= 500 || status == 429
+}
+
 /// A DoH resolver over a `TlsProvider`.
 pub struct DohResolver {
     tls: Box<dyn TlsProvider>,
@@ -58,12 +71,39 @@ impl DnsResolver for DohResolver {
         }
 
         let query = encode_query(host)?;
+        let mut last = NetError::Dns("DoH: no attempt made".into());
+        for attempt in 0..DOH_ATTEMPTS {
+            match self.resolve_once(host, &query) {
+                Ok(ips) => return Ok(ips),
+                // Definitive (bad request, NODATA): retrying changes nothing.
+                Err((false, e)) => return Err(e),
+                // Transient (5xx/429, dropped connection): back off and retry.
+                Err((true, e)) => {
+                    last = e;
+                    if attempt + 1 < DOH_ATTEMPTS {
+                        std::thread::sleep(Duration::from_millis(150 * (attempt as u64 + 1)));
+                    }
+                }
+            }
+        }
+        Err(last)
+    }
+}
+
+impl DohResolver {
+    /// One DoH round-trip. The `bool` in the error is whether it is worth
+    /// retrying: transport failures and retriable statuses are `true`; a wrong
+    /// request or an authoritative empty answer is `false`.
+    fn resolve_once(&self, host: &str, query: &[u8]) -> Result<Vec<IpAddr>, (bool, NetError)> {
         let tcp = TcpStream::connect_timeout(&SocketAddr::new(self.server_ip, 443), TIMEOUT)
-            .map_err(|e| NetError::Dns(format!("DoH connect: {e}")))?;
+            .map_err(|e| (true, NetError::Dns(format!("DoH connect: {e}"))))?;
         tcp.set_read_timeout(Some(TIMEOUT)).ok();
         tcp.set_write_timeout(Some(TIMEOUT)).ok();
 
-        let mut stream = self.tls.connect(&self.server_name, Box::new(tcp))?;
+        let mut stream = self
+            .tls
+            .connect(&self.server_name, Box::new(tcp))
+            .map_err(|e| (true, e))?;
         let resp = http1::send(
             stream.as_mut(),
             &http1::Request {
@@ -75,16 +115,20 @@ impl DnsResolver for DohResolver {
                     ("Content-Type", "application/dns-message"),
                     ("Accept", "application/dns-message"),
                 ],
-                body: &query,
+                body: query,
             },
-        )?;
+        )
+        .map_err(|e| (true, e))?;
 
         if resp.status != 200 {
-            return Err(NetError::Dns(format!("DoH HTTP {}", resp.status)));
+            return Err((
+                is_retriable_status(resp.status),
+                NetError::Dns(format!("DoH HTTP {}", resp.status)),
+            ));
         }
-        let ips = decode_a_records(&resp.body)?;
+        let ips = decode_a_records(&resp.body).map_err(|e| (true, e))?;
         if ips.is_empty() {
-            return Err(NetError::Dns(format!("no A records for {host}")));
+            return Err((false, NetError::Dns(format!("no A records for {host}"))));
         }
         Ok(ips)
     }
@@ -172,6 +216,16 @@ fn skip_name(buf: &[u8], mut pos: usize) -> Result<usize, NetError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn retries_only_transient_doh_statuses() {
+        for s in [500, 502, 503, 504, 429] {
+            assert!(is_retriable_status(s), "{s} should be retried");
+        }
+        for s in [200, 400, 403, 404, 451] {
+            assert!(!is_retriable_status(s), "{s} should NOT be retried");
+        }
+    }
 
     #[test]
     fn encodes_a_well_formed_query() {
