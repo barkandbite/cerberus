@@ -363,6 +363,7 @@ name = "cerberus-js-dom"
 version = "0.0.0"
 dependencies = [
  "cerberus-dom",
+ "cerberus-farbling",
  "cerberus-js",
  "cerberus-js-quickjs",
  "cerberus-types",

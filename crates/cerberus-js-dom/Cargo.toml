@@ -18,3 +18,4 @@ cerberus-types = { path = "../cerberus-types" }
 
 [dev-dependencies]
 cerberus-js-quickjs = { path = "../cerberus-js-quickjs" }
+cerberus-farbling = { path = "../cerberus-farbling" }

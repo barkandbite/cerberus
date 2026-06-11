@@ -1195,6 +1195,12 @@ pub const DOM_MODEL_PRELUDE: &str = r##"
       el.__parent = null;
       el.__id = (typeof id === "number") ? id : freshId();
       indexNode(el);
+      // Fingerprintable surfaces come from the farbling prologue (per-head
+      // seeded shims, installed before this model): every canvas — parsed or
+      // script-created — gets its farbled getContext/toDataURL here.
+      if (el.__tag === "canvas" && globalThis.__cerberusFarble) {
+        globalThis.__cerberusFarble.attachCanvas(el);
+      }
       return el;
     }
     function makeText(text, id) {
