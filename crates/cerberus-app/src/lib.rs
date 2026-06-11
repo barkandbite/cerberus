@@ -23,8 +23,8 @@ use cerberus_layout::{
     BlockLayout, FieldKind, FormFieldBox, FormState, ImageProvider, LayoutEngine, LinkBox, NoForms,
 };
 use cerberus_net::{
-    BuiltinHttpClient, CookieJar, FetchContext, FetchKind, HttpCache, HttpClient, HttpResponse,
-    Router, DEFAULT_USER_AGENT,
+    parse_proxy, BuiltinHttpClient, CookieJar, FetchContext, FetchKind, HttpCache, HttpClient,
+    HttpResponse, ProxyConfig, Router, DEFAULT_USER_AGENT,
 };
 use cerberus_paint::{
     DecodedImage, DisplayItem, DisplayList, Framebuffer, ImageDecoder, Rasterizer, TextShaper,
@@ -59,6 +59,10 @@ pub struct RenderConfig {
     /// Persistent profile directory. `None` (the default) is fully ephemeral:
     /// nothing touches disk — the privacy default.
     pub data_dir: Option<String>,
+    /// Capture the rendered page's text content (automation: `--dump-text`).
+    pub dump_text: bool,
+    /// Single egress proxy (`host:port`); all traffic tunnels through it.
+    pub proxy: Option<String>,
 }
 
 impl Default for RenderConfig {
@@ -70,6 +74,8 @@ impl Default for RenderConfig {
             headed: false,
             system_roots: false,
             data_dir: None,
+            dump_text: false,
+            proxy: None,
         }
     }
 }
@@ -81,6 +87,8 @@ pub struct AppOptions {
     pub system_roots: bool,
     /// Persistent profile directory. `None` (default) = fully ephemeral.
     pub data_dir: Option<PathBuf>,
+    /// Single egress proxy (`host:port`); all traffic tunnels through it.
+    pub proxy: Option<String>,
 }
 
 /// A summary of one render, plus the produced frame.
@@ -104,6 +112,8 @@ pub struct RenderOutcome {
     pub third_party_decision: Decision,
     /// Subresources refused by the consent policy (third-party, no rule).
     pub subresources_blocked: usize,
+    /// The page's text content, when [`RenderConfig::dump_text`] asked for it.
+    pub page_text: Option<String>,
     pub framebuffer: Framebuffer,
 }
 
@@ -270,8 +280,13 @@ fn save_heads(dir: &Path, heads: &[Head], active: usize) -> std::io::Result<()> 
 
 /// Build the network client: built-in `cerberus:` pages are served locally;
 /// `http(s)` goes through our HTTP engine over rustls TLS + Quad9 DoH. When a
-/// `jar` is supplied, context-carrying fetches attach/capture cookies per hop.
-pub fn network_client(system_roots: bool, jar: Option<Arc<dyn CookieJar>>) -> Router {
+/// `jar` is supplied, context-carrying fetches attach/capture cookies per hop;
+/// with a `proxy`, every connection tunnels through that single egress.
+pub fn network_client(
+    system_roots: bool,
+    jar: Option<Arc<dyn CookieJar>>,
+    proxy: Option<ProxyConfig>,
+) -> Router {
     let provider = || {
         if system_roots {
             RustlsProvider::with_system_roots().unwrap_or_default()
@@ -279,10 +294,11 @@ pub fn network_client(system_roots: bool, jar: Option<Arc<dyn CookieJar>>) -> Ro
             RustlsProvider::new()
         }
     };
-    Router::with_jar(
+    Router::with_options(
         Box::new(provider()),
         Box::new(DohResolver::quad9(Box::new(provider()))),
         jar,
+        proxy,
     )
 }
 
@@ -448,13 +464,18 @@ pub fn render(config: &RenderConfig) -> Result<RenderOutcome, AppError> {
         instance: active_instance,
         kind: FetchKind::Navigation,
     };
+    let proxy = match config.proxy.as_deref() {
+        // Fail closed: a bad proxy must not fall back to direct connections.
+        Some(p) => Some(parse_proxy(p).map_err(|e| AppError::Net(format!("{e:?}")))?),
+        None => None,
+    };
     let (response, active_ua, client) = if url.is_builtin() {
         let resp = BuiltinHttpClient
             .get(&url)
             .map_err(|e| AppError::Net(format!("{e:?}")))?;
         (resp, DEFAULT_USER_AGENT.to_string(), None)
     } else {
-        let client = network_client(config.system_roots, Some(jar.clone()));
+        let client = network_client(config.system_roots, Some(jar.clone()), proxy);
         let resp = client
             .get_in(&url, &nav_ctx)
             .map_err(|e| AppError::Net(format!("{e:?}")))?;
@@ -583,6 +604,7 @@ pub fn render(config: &RenderConfig) -> Result<RenderOutcome, AppError> {
         images_decoded,
         third_party_decision,
         subresources_blocked,
+        page_text: config.dump_text.then(|| visible_text(document.root())),
         framebuffer: surface.last_frame().cloned().unwrap_or(framebuffer),
     })
 }
@@ -663,7 +685,11 @@ struct NetLoader {
 }
 
 impl NetLoader {
-    fn new(system_roots: bool, jar: Option<Arc<dyn CookieJar>>) -> Self {
+    fn new(
+        system_roots: bool,
+        jar: Option<Arc<dyn CookieJar>>,
+        proxy: Option<ProxyConfig>,
+    ) -> Self {
         let (req_tx, req_rx) = std::sync::mpsc::channel::<Job>();
         let (out_tx, out_rx) = std::sync::mpsc::channel::<Done>();
         let waker: Arc<Mutex<Option<Arc<dyn Waker>>>> = Arc::new(Mutex::new(None));
@@ -671,7 +697,7 @@ impl NetLoader {
 
         let worker = std::thread::spawn(move || {
             // Build the network client (rustls config) once, on the worker.
-            let client = network_client(system_roots, jar);
+            let client = network_client(system_roots, jar, proxy);
             while let Ok(job) = req_rx.recv() {
                 let done = match job {
                     Job::Page { id, url, ctx } => {
@@ -868,6 +894,25 @@ fn resolve_subresource(base: Option<&Url>, src: &str) -> String {
     }
 }
 
+/// The page's user-visible text: like `text_content`, but `<script>`/`<style>`
+/// payloads are skipped (they are code, not page text — for `--dump-text`).
+fn visible_text(node: NodeRef<'_>) -> String {
+    fn walk(node: NodeRef<'_>, out: &mut String) {
+        if matches!(node.tag(), "script" | "style") {
+            return;
+        }
+        if let Some(text) = node.text() {
+            out.push_str(text);
+        }
+        for child in node.children() {
+            walk(child, out);
+        }
+    }
+    let mut out = String::new();
+    walk(node, &mut out);
+    out
+}
+
 /// Collect `<img>` sources from an element subtree, preferring `data-src` (the
 /// real URL behind lazy-loaders) over `src`.
 fn collect_image_urls(node: NodeRef<'_>, out: &mut Vec<String>) {
@@ -1036,8 +1081,15 @@ impl BrowserApp {
             }),
             None => (default_heads(), 0),
         };
+        let proxy = options.proxy.as_deref().map(|p| {
+            parse_proxy(p).unwrap_or_else(|e| {
+                // A misconfigured proxy must fail closed, not fall back to
+                // direct connections (that would silently deanonymize).
+                panic!("invalid --proxy {p:?}: {e:?}")
+            })
+        });
         let mut app = Self::build(
-            Box::new(NetLoader::new(options.system_roots, Some(jar))),
+            Box::new(NetLoader::new(options.system_roots, Some(jar), proxy)),
             storage,
             heads,
             data_dir,

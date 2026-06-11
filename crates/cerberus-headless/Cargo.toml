@@ -20,3 +20,5 @@ cerberus-layout = { path = "../cerberus-layout" }
 [dev-dependencies]
 cerberus-dom = { path = "../cerberus-dom" }
 cerberus-css = { path = "../cerberus-css" }
+# Round-trip proof: the decode adapter must read our bootstrapped PNG encoder.
+cerberus-image = { path = "../cerberus-image" }

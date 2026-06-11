@@ -8,7 +8,8 @@ use crate::{
 };
 use cerberus_url::Url;
 use std::collections::HashMap;
-use std::net::{SocketAddr, TcpStream};
+use std::io::Read;
+use std::net::{IpAddr, SocketAddr, TcpStream};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -41,6 +42,33 @@ const CONNECT_TIMEOUT: Duration = Duration::from_secs(15);
 const IO_TIMEOUT: Duration = Duration::from_secs(20);
 const MAX_REDIRECTS: u8 = 5;
 
+/// A single egress proxy (`HTTP CONNECT`). With one configured, *all* traffic
+/// — including DoH, which is itself https — tunnels through it, and target
+/// hosts are never DNS-resolved locally (no DNS leak beside the tunnel).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ProxyConfig {
+    pub host: String,
+    pub port: u16,
+}
+
+/// Parse `host:port` (an optional `http://` prefix is tolerated).
+pub fn parse_proxy(s: &str) -> Result<ProxyConfig, NetError> {
+    let s = s.trim().trim_start_matches("http://").trim_end_matches('/');
+    let (host, port) = s
+        .rsplit_once(':')
+        .ok_or_else(|| NetError::Unsupported(format!("proxy needs host:port, got {s:?}")))?;
+    let port: u16 = port
+        .parse()
+        .map_err(|_| NetError::Unsupported(format!("bad proxy port in {s:?}")))?;
+    if host.is_empty() {
+        return Err(NetError::Unsupported("empty proxy host".into()));
+    }
+    Ok(ProxyConfig {
+        host: host.to_string(),
+        port,
+    })
+}
+
 /// Our HTTP/1.1 client over injected TLS + DNS.
 pub struct HttpEngine {
     tls: Box<dyn TlsProvider>,
@@ -54,12 +82,14 @@ pub struct HttpEngine {
     /// Cookie attach/capture seam, consulted per hop (so redirects are
     /// covered). `None` (tests, tooling) sends and stores nothing.
     jar: Option<Arc<dyn CookieJar>>,
+    /// Single egress proxy. `None` = direct connections.
+    proxy: Option<ProxyConfig>,
 }
 
 impl HttpEngine {
     /// Build an engine over a TLS provider and DNS resolver, with no cookies.
     pub fn new(tls: Box<dyn TlsProvider>, dns: Box<dyn DnsResolver>) -> Self {
-        Self::with_jar(tls, dns, None)
+        Self::with_options(tls, dns, None, None)
     }
 
     /// Build an engine that attaches/captures cookies through `jar`.
@@ -68,13 +98,65 @@ impl HttpEngine {
         dns: Box<dyn DnsResolver>,
         jar: Option<Arc<dyn CookieJar>>,
     ) -> Self {
+        Self::with_options(tls, dns, jar, None)
+    }
+
+    /// Build an engine with the full option set (jar + egress proxy).
+    pub fn with_options(
+        tls: Box<dyn TlsProvider>,
+        dns: Box<dyn DnsResolver>,
+        jar: Option<Arc<dyn CookieJar>>,
+        proxy: Option<ProxyConfig>,
+    ) -> Self {
         Self {
             tls,
             dns,
             user_agents: UA_LADDER.iter().map(|s| s.to_string()).collect(),
             ua_memo: Mutex::new(HashMap::new()),
             jar,
+            proxy,
         }
+    }
+
+    /// Open the transport for `host:port`: direct (resolve + connect), or a
+    /// CONNECT tunnel when a proxy is configured. Proxied targets are *never*
+    /// resolved locally — the proxy sees only `host:port`, and DNS sees only
+    /// the proxy's own name.
+    fn open_transport(&self, host: &str, port: u16) -> Result<TcpStream, NetError> {
+        let (connect_host, connect_port, tunnel) = match &self.proxy {
+            Some(p) => (p.host.as_str(), p.port, true),
+            None => (host, port, false),
+        };
+        let ip = match connect_host.parse::<IpAddr>() {
+            Ok(ip) => ip,
+            Err(_) => self
+                .dns
+                .resolve(connect_host)?
+                .into_iter()
+                .next()
+                .ok_or_else(|| NetError::Dns(format!("no address for {connect_host}")))?,
+        };
+        let mut tcp =
+            TcpStream::connect_timeout(&SocketAddr::new(ip, connect_port), CONNECT_TIMEOUT)
+                .map_err(|e| NetError::Io(e.to_string()))?;
+        tcp.set_read_timeout(Some(IO_TIMEOUT)).ok();
+        tcp.set_write_timeout(Some(IO_TIMEOUT)).ok();
+
+        if tunnel {
+            use std::io::Write as _;
+            write!(
+                tcp,
+                "CONNECT {host}:{port} HTTP/1.1\r\nHost: {host}:{port}\r\n\r\n"
+            )
+            .map_err(|e| NetError::Io(e.to_string()))?;
+            let status = read_connect_status(&mut tcp)?;
+            if !(200..300).contains(&status) {
+                return Err(NetError::Protocol(format!(
+                    "proxy refused CONNECT: HTTP {status}"
+                )));
+            }
+        }
+        Ok(tcp)
     }
 
     fn fetch_once(
@@ -93,18 +175,10 @@ impl HttpEngine {
         }
         let port = url.port.unwrap_or(if https { 443 } else { 80 });
 
-        let ip = self
-            .dns
-            .resolve(&url.host)?
-            .into_iter()
-            .next()
-            .ok_or_else(|| NetError::Dns(format!("no address for {}", url.host)))?;
+        let tcp = self.open_transport(&url.host, port)?;
 
-        let tcp = TcpStream::connect_timeout(&SocketAddr::new(ip, port), CONNECT_TIMEOUT)
-            .map_err(|e| NetError::Io(e.to_string()))?;
-        tcp.set_read_timeout(Some(IO_TIMEOUT)).ok();
-        tcp.set_write_timeout(Some(IO_TIMEOUT)).ok();
-
+        // TLS still handshakes against the *target* host over the tunnel, so
+        // certificate validation is unchanged by a proxy.
         let mut stream: Box<dyn ReadWrite> = if https {
             self.tls.connect(&url.host, Box::new(tcp))?
         } else {
@@ -240,8 +314,18 @@ impl Router {
         dns: Box<dyn DnsResolver>,
         jar: Option<Arc<dyn CookieJar>>,
     ) -> Self {
+        Self::with_options(tls, dns, jar, None)
+    }
+
+    /// Build a router with the full option set (jar + single egress proxy).
+    pub fn with_options(
+        tls: Box<dyn TlsProvider>,
+        dns: Box<dyn DnsResolver>,
+        jar: Option<Arc<dyn CookieJar>>,
+        proxy: Option<ProxyConfig>,
+    ) -> Self {
         Self {
-            engine: HttpEngine::with_jar(tls, dns, jar),
+            engine: HttpEngine::with_options(tls, dns, jar, proxy),
         }
     }
 
@@ -273,6 +357,33 @@ impl HttpClient for Router {
             self.engine.get_in(url, ctx)
         }
     }
+}
+
+/// Read a CONNECT response's header block (up to a bounded size) and return
+/// its status code. `http1::send` reads bodies to EOF and cannot be reused
+/// here — the tunnel must stay open.
+fn read_connect_status(stream: &mut TcpStream) -> Result<u16, NetError> {
+    let mut buf = Vec::with_capacity(256);
+    let mut byte = [0u8; 1];
+    while !buf.ends_with(b"\r\n\r\n") {
+        if buf.len() > 8192 {
+            return Err(NetError::Protocol("oversized CONNECT response".into()));
+        }
+        let n = stream
+            .read(&mut byte)
+            .map_err(|e| NetError::Io(e.to_string()))?;
+        if n == 0 {
+            return Err(NetError::Protocol("proxy closed during CONNECT".into()));
+        }
+        buf.push(byte[0]);
+    }
+    let head = String::from_utf8_lossy(&buf);
+    let status = head
+        .split_whitespace()
+        .nth(1)
+        .and_then(|s| s.parse().ok())
+        .ok_or_else(|| NetError::Protocol(format!("bad CONNECT status line: {head:?}")))?;
+    Ok(status)
 }
 
 fn full_path(url: &Url) -> String {
@@ -363,7 +474,7 @@ mod tests {
 
     use crate::{CookieJar, FetchContext, FetchKind};
     use cerberus_types::{InstanceId, Origin};
-    use std::io::{Read as _, Write as _};
+    use std::io::Write as _;
     use std::net::TcpListener;
 
     /// TLS provider that must never be reached (plain-http test traffic).
@@ -481,6 +592,101 @@ mod tests {
         assert_eq!(seen.len(), 2, "captured: {seen:?}");
         assert!(seen[0].1.starts_with("a=1"));
         assert!(seen[1].1.starts_with("b=2"));
+    }
+
+    #[test]
+    fn proxy_parse_accepts_host_port_forms() {
+        assert_eq!(
+            parse_proxy("proxy.corp:3128").unwrap(),
+            ProxyConfig {
+                host: "proxy.corp".into(),
+                port: 3128
+            }
+        );
+        assert_eq!(
+            parse_proxy("http://127.0.0.1:8080/").unwrap(),
+            ProxyConfig {
+                host: "127.0.0.1".into(),
+                port: 8080
+            }
+        );
+        assert!(parse_proxy("no-port").is_err());
+        assert!(parse_proxy(":8080").is_err());
+        assert!(parse_proxy("host:notaport").is_err());
+    }
+
+    /// DNS that fails the test if anything is ever resolved — proxied fetches
+    /// must not leak target (or literal-IP proxy) lookups.
+    struct NoDns;
+    impl DnsResolver for NoDns {
+        fn resolve(&self, host: &str) -> Result<Vec<std::net::IpAddr>, NetError> {
+            panic!("DNS leak: tried to resolve {host:?} while proxied");
+        }
+    }
+
+    #[test]
+    fn proxied_fetch_tunnels_via_connect_and_never_resolves_the_target() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+
+        let server = std::thread::spawn(move || {
+            let (mut s, _) = listener.accept().unwrap();
+            // The CONNECT preamble names host:port — never a path.
+            let connect = read_request(&mut s);
+            assert!(
+                connect.starts_with("CONNECT example.test:80 HTTP/1.1\r\n"),
+                "CONNECT line: {connect:?}"
+            );
+            s.write_all(b"HTTP/1.1 200 Connection Established\r\n\r\n")
+                .unwrap();
+            // The tunneled plain-http request flows through unchanged.
+            let tunneled = read_request(&mut s);
+            assert!(tunneled.starts_with("GET /x HTTP/1.1\r\n"), "{tunneled:?}");
+            assert!(tunneled.contains("Host: example.test\r\n"));
+            s.write_all(
+                b"HTTP/1.1 200 OK\r\nContent-Length: 8\r\nConnection: close\r\n\r\ntunneled",
+            )
+            .unwrap();
+        });
+
+        let engine = HttpEngine::with_options(
+            Box::new(NoTls),
+            Box::new(NoDns),
+            None,
+            Some(ProxyConfig {
+                host: "127.0.0.1".into(),
+                port,
+            }),
+        );
+        let url = cerberus_url::parse("http://example.test/x").unwrap();
+        let resp = engine.get(&url).unwrap();
+        server.join().unwrap();
+        assert_eq!(resp.status, 200);
+        assert_eq!(resp.body, b"tunneled");
+    }
+
+    #[test]
+    fn proxy_refusal_is_a_protocol_error() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let server = std::thread::spawn(move || {
+            let (mut s, _) = listener.accept().unwrap();
+            let _ = read_request(&mut s);
+            s.write_all(b"HTTP/1.1 403 Forbidden\r\n\r\n").unwrap();
+        });
+        let engine = HttpEngine::with_options(
+            Box::new(NoTls),
+            Box::new(NoDns),
+            None,
+            Some(ProxyConfig {
+                host: "127.0.0.1".into(),
+                port,
+            }),
+        );
+        let url = cerberus_url::parse("http://example.test/").unwrap();
+        let err = engine.get(&url).unwrap_err();
+        server.join().unwrap();
+        assert!(matches!(err, NetError::Protocol(_)), "{err:?}");
     }
 
     #[test]

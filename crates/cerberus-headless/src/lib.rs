@@ -3,8 +3,11 @@
 //! Scoped to rendering and automated tests (M8). It inherits farbling and
 //! defaults third-party storage to deny — those policies are applied by the
 //! caller (the app composition root) via the consent/farbling seams; this crate
-//! is just the pixel pipeline. Output is PPM today; PNG/PDF arrive with the
-//! approved image-encoder crate (M2/M8).
+//! is just the pixel pipeline. Output formats: PPM, PNG, and single-page PDF —
+//! all bootstrapped (see `encode`), no encoder dependencies.
+
+mod encode;
+pub use encode::{pdf_bytes, png_bytes, write_pdf, write_png};
 
 use cerberus_layout::{FormState, ImageProvider, LayoutEngine};
 use cerberus_paint::{Framebuffer, Rasterizer, TextShaper};

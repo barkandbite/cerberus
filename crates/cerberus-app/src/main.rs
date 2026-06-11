@@ -43,6 +43,7 @@ fn cmd_run(args: &[String]) -> ExitCode {
     let app = cerberus_app::BrowserApp::with_config(cerberus_app::AppOptions {
         system_roots: has_flag(args, "--system-roots"),
         data_dir: flag(args, "--data-dir").map(std::path::PathBuf::from),
+        proxy: flag(args, "--proxy"),
     });
     match cerberus_shell_winit::run(app, fullscreen) {
         Ok(()) => ExitCode::SUCCESS,
@@ -75,6 +76,8 @@ fn cmd_render(args: &[String]) -> ExitCode {
     config.headed = has_flag(args, "--headed");
     config.system_roots = has_flag(args, "--system-roots");
     config.data_dir = flag(args, "--data-dir");
+    config.dump_text = has_flag(args, "--dump-text");
+    config.proxy = flag(args, "--proxy");
     config.background = Color::WHITE;
 
     let outcome = match render(&config) {
@@ -85,7 +88,13 @@ fn cmd_render(args: &[String]) -> ExitCode {
         }
     };
 
-    if let Err(e) = cerberus_headless::write_ppm(&out, &outcome.framebuffer) {
+    // Output format follows the file extension: .png / .pdf / anything-else=PPM.
+    let write_result = match out.rsplit('.').next() {
+        Some("png") => cerberus_headless::write_png(&out, &outcome.framebuffer),
+        Some("pdf") => cerberus_headless::write_pdf(&out, &outcome.framebuffer),
+        _ => cerberus_headless::write_ppm(&out, &outcome.framebuffer),
+    };
+    if let Err(e) = write_result {
         eprintln!("could not write {out}: {e}");
         return ExitCode::FAILURE;
     }
@@ -115,6 +124,10 @@ fn cmd_render(args: &[String]) -> ExitCode {
     println!("  wrote           : {out}");
     if let Some(kb) = resident_set_kb() {
         println!("  resident memory : {:.1} MB", kb as f64 / 1024.0);
+    }
+    if let Some(text) = &outcome.page_text {
+        println!("--- page text ---");
+        println!("{text}");
     }
     ExitCode::SUCCESS
 }
@@ -185,7 +198,8 @@ fn print_usage() {
          \x20 --fullscreen        start borderless-fullscreen (F11 toggles)\n\
          \x20 --system-roots      trust the OS cert store (TLS-inspecting proxies)\n\
          \x20 --data-dir <DIR>    persistent profile (cookies, vault, heads);\n\
-         \x20                     omit for fully-ephemeral (default)\n\n\
+         \x20                     omit for fully-ephemeral (default)\n\
+         \x20 --proxy <HOST:PORT> single egress proxy (CONNECT tunnel, no DNS leak)\n\n\
          RENDER OPTIONS:\n\
          \x20 --url <URL>          default: cerberus:home\n\
          \x20 --out <FILE>         default: cerberus-home.ppm\n\
@@ -193,7 +207,10 @@ fn print_usage() {
          \x20 --height <PX>        viewport height\n\
          \x20 --headed            enable consent prompts\n\
          \x20 --system-roots      trust the OS cert store (TLS-inspecting proxies)\n\
-         \x20 --data-dir <DIR>    persistent profile (cookies survive runs)\n\n\
+         \x20 --data-dir <DIR>    persistent profile (cookies survive runs)\n\
+         \x20 --dump-text         print the page's text content (automation)\n\
+         \x20 --proxy <HOST:PORT> single egress proxy (CONNECT tunnel, no DNS leak)\n\
+         \x20 (--out extension selects the format: .ppm, .png, or .pdf)\n\n\
          MEM-GATE OPTIONS:\n\
          \x20 --budget-mb <MB>     default: 64\n\
          \x20 --switches <N>       also assert RSS within +10% after N head switches"
