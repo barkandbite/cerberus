@@ -54,10 +54,17 @@ impl HttpCache {
         let Some(max_age) = parse_max_age(&cache_control) else {
             return;
         };
+        // Never store Set-Cookie: a cookie write must happen exactly once, at
+        // capture time in the engine — replaying one from cache would re-apply
+        // stale cookies (and would persist them if the cache ever goes on disk).
+        let mut response = response.clone();
+        response
+            .headers
+            .retain(|(k, _)| !k.eq_ignore_ascii_case("set-cookie"));
         self.entries.insert(
             (instance, url.to_string()),
             Entry {
-                response: response.clone(),
+                response,
                 expires: Instant::now() + Duration::from_secs(max_age),
             },
         );

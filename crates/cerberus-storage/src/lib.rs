@@ -17,7 +17,9 @@ use cerberus_crypto::{CryptoError, Secret};
 use cerberus_types::{InstanceId, Origin};
 use std::collections::HashMap;
 
+mod cookie;
 mod vault;
+pub use cookie::parse_set_cookie;
 pub use vault::{EncryptedVault, NoVault, Vault};
 
 /// A single cookie.
@@ -220,18 +222,23 @@ impl InstanceStore<'_> {
 
     /// The cookies to attach to a request for `request_origin` in the context of
     /// `first_party`. Only `Active` cookies in scope are returned — quarantined
-    /// cookies are *never* included.
+    /// cookies are *never* included — and expired or `Secure`-over-http cookies
+    /// are filtered out.
     pub fn cookies_for_request(
         &self,
         request_origin: &Origin,
         first_party: &Origin,
     ) -> Vec<Cookie> {
         let fp_site = first_party.site();
+        let https = request_origin.scheme == "https";
+        let now = cookie::unix_now();
         self.partition
             .active
             .iter()
             .filter(|sc| sc.fp_site == fp_site)
             .filter(|sc| domain_matches(&request_origin.host, &sc.cookie.domain))
+            .filter(|sc| sc.cookie.expires.is_none_or(|t| t > now))
+            .filter(|sc| !sc.cookie.secure || https)
             .map(|sc| sc.cookie.clone())
             .collect()
     }

@@ -21,13 +21,14 @@ use cerberus_layout::{
     BlockLayout, FieldKind, FormFieldBox, FormState, ImageProvider, LayoutEngine, LinkBox, NoForms,
 };
 use cerberus_net::{
-    BuiltinHttpClient, HttpCache, HttpClient, HttpResponse, Router, DEFAULT_USER_AGENT,
+    BuiltinHttpClient, CookieJar, FetchContext, FetchKind, HttpCache, HttpClient, HttpResponse,
+    Router, DEFAULT_USER_AGENT,
 };
 use cerberus_paint::{
     DecodedImage, DisplayItem, DisplayList, Framebuffer, ImageDecoder, Rasterizer, TextShaper,
 };
 use cerberus_shell::{FrameApp, HeadlessSurface, PlatformSurface, Waker};
-use cerberus_storage::{Cookie, Group, StorageEnvironment};
+use cerberus_storage::{parse_set_cookie, Group, StorageEnvironment};
 use cerberus_style::{StyleEngine, StyledDom};
 use cerberus_text::TextEngine;
 use cerberus_tls_rustls::RustlsProvider;
@@ -141,8 +142,9 @@ fn install_psl() {
 }
 
 /// Build the network client: built-in `cerberus:` pages are served locally;
-/// `http(s)` goes through our HTTP engine over rustls TLS + Quad9 DoH.
-pub fn network_client(system_roots: bool) -> Router {
+/// `http(s)` goes through our HTTP engine over rustls TLS + Quad9 DoH. When a
+/// `jar` is supplied, context-carrying fetches attach/capture cookies per hop.
+pub fn network_client(system_roots: bool, jar: Option<Arc<dyn CookieJar>>) -> Router {
     let provider = || {
         if system_roots {
             RustlsProvider::with_system_roots().unwrap_or_default()
@@ -150,10 +152,66 @@ pub fn network_client(system_roots: bool) -> Router {
             RustlsProvider::new()
         }
     };
-    Router::new(
+    Router::with_jar(
         Box::new(provider()),
         Box::new(DohResolver::quad9(Box::new(provider()))),
+        jar,
     )
+}
+
+/// The cookie seam over sealed storage: attaches only what
+/// `InstanceStore::cookies_for_request` allows (active, in-scope, unexpired,
+/// never quarantined) and routes captured `Set-Cookie`s by site relationship —
+/// same-site to the first party becomes `Active`; cross-site goes to the
+/// quarantine vault (which silently drops it while the vault is locked).
+/// The consent policy replaces this hardcoded rule at M5.
+struct SealedJar {
+    storage: Arc<Mutex<StorageEnvironment>>,
+}
+
+impl CookieJar for SealedJar {
+    fn cookie_header(
+        &self,
+        instance: InstanceId,
+        request: &Url,
+        first_party: &Origin,
+    ) -> Option<String> {
+        let origin = request.origin()?;
+        let mut env = self.storage.lock().unwrap();
+        let cookies = env
+            .instance(instance)
+            .cookies_for_request(&origin, first_party);
+        if cookies.is_empty() {
+            return None;
+        }
+        Some(
+            cookies
+                .iter()
+                .map(|c| format!("{}={}", c.name, c.value))
+                .collect::<Vec<_>>()
+                .join("; "),
+        )
+    }
+
+    fn set_cookie(&self, instance: InstanceId, request: &Url, first_party: &Origin, value: &str) {
+        let Some(origin) = request.origin() else {
+            return;
+        };
+        let Some(cookie) = parse_set_cookie(value, &origin.host, request.scheme == "https") else {
+            return;
+        };
+        let group = if origin.is_third_party_to(first_party) {
+            Group::Quarantined
+        } else {
+            Group::Active
+        };
+        let mut env = self.storage.lock().unwrap();
+        // A locked vault rejects quarantine writes: the third-party cookie is
+        // dropped, which is the correct default-deny outcome.
+        let _ = env
+            .instance(instance)
+            .set_cookie(first_party, cookie, group);
+    }
 }
 
 /// Run the full render pipeline and return a summary plus the frame.
@@ -175,20 +233,13 @@ pub fn render(config: &RenderConfig) -> Result<RenderOutcome, AppError> {
         )
     });
 
-    // --- Sealed storage: set a first-party "active" cookie in this head. ---
-    let mut storage = StorageEnvironment::with_no_vault();
-    storage
-        .instance(active_instance)
-        .set_cookie(
-            &first_party,
-            Cookie::host("session", "demo", first_party.host.clone()),
-            Group::Active,
-        )
-        .map_err(|e| AppError::Io(format!("{e:?}")))?;
-    let active_cookies = storage
-        .instance(active_instance)
-        .cookies_for_request(&first_party, &first_party)
-        .len();
+    // --- Sealed storage behind the cookie seam. The one-shot path runs with no
+    // vault: first-party cookies from the real fetch land as `Active`;
+    // cross-site ones are dropped at the quarantine door (default-deny). ---
+    let storage = Arc::new(Mutex::new(StorageEnvironment::with_no_vault()));
+    let jar: Arc<dyn CookieJar> = Arc::new(SealedJar {
+        storage: storage.clone(),
+    });
 
     // --- Consent: a representative third-party access is denied by default. ---
     let mut consent = DefaultDenyPolicy::new(config.headed);
@@ -197,22 +248,27 @@ pub fn render(config: &RenderConfig) -> Result<RenderOutcome, AppError> {
         .evaluate(active_instance, &third_party, &first_party)
         .decision;
 
-    // --- Fetch: built-in pages locally, http(s) over the real network stack.
-    // Capture the User-Agent the stack actually presented to this origin (honest
-    // by default; the escalated rung if bot management forced it) so the page's
-    // `navigator.userAgent` matches the request header exactly. ---
-    let (response, active_ua) = if url.is_builtin() {
+    // --- Fetch: built-in pages locally, http(s) over the real network stack
+    // with the cookie jar attached. Capture the User-Agent the stack actually
+    // presented to this origin (honest by default; the escalated rung if bot
+    // management forced it) so the page's `navigator.userAgent` matches the
+    // request header exactly. ---
+    let nav_ctx = FetchContext {
+        instance: active_instance,
+        kind: FetchKind::Navigation,
+    };
+    let (response, active_ua, client) = if url.is_builtin() {
         let resp = BuiltinHttpClient
             .get(&url)
             .map_err(|e| AppError::Net(format!("{e:?}")))?;
-        (resp, DEFAULT_USER_AGENT.to_string())
+        (resp, DEFAULT_USER_AGENT.to_string(), None)
     } else {
-        let client = network_client(config.system_roots);
+        let client = network_client(config.system_roots, Some(jar.clone()));
         let resp = client
-            .get(&url)
+            .get_in(&url, &nav_ctx)
             .map_err(|e| AppError::Net(format!("{e:?}")))?;
         let ua = client.user_agent_for(&url);
-        (resp, ua)
+        (resp, ua, Some(client))
     };
     let body = String::from_utf8_lossy(&response.body);
     let mut document = parse_html(&body);
@@ -246,9 +302,19 @@ pub fn render(config: &RenderConfig) -> Result<RenderOutcome, AppError> {
     let styled = CssEngine::new().style(&document);
 
     // Fetch + decode this page's images up front (the one-shot path is
-    // synchronous; the interactive browser fetches them on its worker). No
-    // network client is built when the page has no http(s) images.
-    let images = fetch_images_sync(&document, &url, config.system_roots);
+    // synchronous; the interactive browser fetches them on its worker), in the
+    // page's subresource context so image fetches carry/capture cookies under
+    // the same first party. Built-in pages reference no network images.
+    let sub_ctx = FetchContext {
+        instance: active_instance,
+        kind: FetchKind::Subresource {
+            first_party: first_party.clone(),
+        },
+    };
+    let images = match &client {
+        Some(client) => fetch_images_sync(&document, &url, client, &sub_ctx),
+        None => HashMap::new(),
+    };
     let images_requested = images.len();
     let images_decoded = images
         .values()
@@ -258,6 +324,15 @@ pub fn render(config: &RenderConfig) -> Result<RenderOutcome, AppError> {
         base: Some(&url),
         images: &images,
     };
+
+    // Cookies now resident for this page's site — captured from the real
+    // responses through the sealed jar (zero for builtin/cookieless pages).
+    let active_cookies = storage
+        .lock()
+        .unwrap()
+        .instance(active_instance)
+        .cookies_for_request(&first_party, &first_party)
+        .len();
 
     // --- Toolbar (minimal UI) over the page content, with real fonts. ---
     let text = TextEngine::new();
@@ -334,10 +409,19 @@ struct Pending {
     http_fallback: Option<String>,
 }
 
-/// A job for the network worker.
+/// A job for the network worker. The `FetchContext` travels by value: it must
+/// reflect the instance/first-party at *queue* time (a head switch mid-flight
+/// must not re-attribute the fetch).
 enum Job {
-    Page { id: u64, url: String },
-    Sub { url: String },
+    Page {
+        id: u64,
+        url: String,
+        ctx: FetchContext,
+    },
+    Sub {
+        url: String,
+        ctx: FetchContext,
+    },
 }
 
 /// A completed job (page navigation, or an image sub-resource).
@@ -356,10 +440,10 @@ enum Done {
 /// Performs page + sub-resource loads off the UI thread. Abstracted so the load
 /// state machine is testable without the network (see `FakeLoader` in tests).
 trait PageLoader {
-    /// Queue a page navigation.
-    fn request(&self, id: u64, url: String);
-    /// Queue an image sub-resource fetch (absolute URL).
-    fn request_subresource(&self, url: String);
+    /// Queue a page navigation in an identity context.
+    fn request(&self, id: u64, url: String, ctx: FetchContext);
+    /// Queue an image sub-resource fetch (absolute URL) in an identity context.
+    fn request_subresource(&self, url: String, ctx: FetchContext);
     /// Non-blocking poll for a completed job.
     fn try_recv(&mut self) -> Option<Done>;
     /// Receive a waker to notify the UI when a result is ready.
@@ -375,7 +459,7 @@ struct NetLoader {
 }
 
 impl NetLoader {
-    fn new(system_roots: bool) -> Self {
+    fn new(system_roots: bool, jar: Option<Arc<dyn CookieJar>>) -> Self {
         let (req_tx, req_rx) = std::sync::mpsc::channel::<Job>();
         let (out_tx, out_rx) = std::sync::mpsc::channel::<Done>();
         let waker: Arc<Mutex<Option<Arc<dyn Waker>>>> = Arc::new(Mutex::new(None));
@@ -383,19 +467,19 @@ impl NetLoader {
 
         let worker = std::thread::spawn(move || {
             // Build the network client (rustls config) once, on the worker.
-            let client = network_client(system_roots);
+            let client = network_client(system_roots, jar);
             while let Ok(job) = req_rx.recv() {
                 let done = match job {
-                    Job::Page { id, url } => {
-                        let result = fetch_page(&client, &url);
+                    Job::Page { id, url, ctx } => {
+                        let result = fetch_page(&client, &url, &ctx);
                         Done::Page {
                             id,
                             requested_url: url,
                             result,
                         }
                     }
-                    Job::Sub { url } => {
-                        let bytes = fetch_bytes(&client, &url);
+                    Job::Sub { url, ctx } => {
+                        let bytes = fetch_bytes(&client, &url, &ctx);
                         Done::Sub { url, bytes }
                     }
                 };
@@ -418,11 +502,11 @@ impl NetLoader {
 }
 
 impl PageLoader for NetLoader {
-    fn request(&self, id: u64, url: String) {
-        let _ = self.tx.send(Job::Page { id, url });
+    fn request(&self, id: u64, url: String, ctx: FetchContext) {
+        let _ = self.tx.send(Job::Page { id, url, ctx });
     }
-    fn request_subresource(&self, url: String) {
-        let _ = self.tx.send(Job::Sub { url });
+    fn request_subresource(&self, url: String, ctx: FetchContext) {
+        let _ = self.tx.send(Job::Sub { url, ctx });
     }
     fn try_recv(&mut self) -> Option<Done> {
         self.rx.try_recv().ok()
@@ -432,9 +516,9 @@ impl PageLoader for NetLoader {
     }
 }
 
-fn fetch_page(client: &Router, url: &str) -> Result<FetchedPage, String> {
+fn fetch_page(client: &Router, url: &str, ctx: &FetchContext) -> Result<FetchedPage, String> {
     let parsed = parse_url(url).map_err(|e| e.to_string())?;
-    let resp = client.get(&parsed).map_err(|e| format!("{e:?}"))?;
+    let resp = client.get_in(&parsed, ctx).map_err(|e| format!("{e:?}"))?;
     let user_agent = client.user_agent_for(&parsed);
     Ok(FetchedPage {
         url: url.to_string(),
@@ -445,9 +529,9 @@ fn fetch_page(client: &Router, url: &str) -> Result<FetchedPage, String> {
     })
 }
 
-fn fetch_bytes(client: &Router, url: &str) -> Result<Vec<u8>, String> {
+fn fetch_bytes(client: &Router, url: &str, ctx: &FetchContext) -> Result<Vec<u8>, String> {
     let parsed = parse_url(url).map_err(|e| e.to_string())?;
-    let resp = client.get(&parsed).map_err(|e| format!("{e:?}"))?;
+    let resp = client.get_in(&parsed, ctx).map_err(|e| format!("{e:?}"))?;
     if !(200..300).contains(&resp.status) {
         return Err(format!("HTTP {}", resp.status));
     }
@@ -474,7 +558,8 @@ const IMAGE_DECODE_BUDGET_BYTES: usize = 16 * 1024 * 1024;
 fn fetch_images_sync(
     document: &Document,
     base: &Url,
-    system_roots: bool,
+    client: &Router,
+    ctx: &FetchContext,
 ) -> HashMap<String, ImageState> {
     let mut srcs = Vec::new();
     collect_image_urls(document.root(), &mut srcs);
@@ -491,7 +576,6 @@ fn fetch_images_sync(
     }
 
     let codec = ImageCodec::new();
-    let client = network_client(system_roots);
     let mut out = HashMap::with_capacity(urls.len());
     let mut decoded_bytes = 0usize;
     for url in urls {
@@ -502,7 +586,7 @@ fn fetch_images_sync(
             out.insert(url, ImageState::Pending);
             continue;
         }
-        let state = match fetch_bytes(&client, &url)
+        let state = match fetch_bytes(client, &url, ctx)
             .and_then(|b| codec.decode(&b).map_err(|e| format!("{e:?}")))
         {
             Ok(img) => {
@@ -613,7 +697,11 @@ impl FormState for FormStore {
 /// history, background loads, and the https→prompt→block policy.
 pub struct BrowserApp {
     heads: HeadManager,
-    storage: StorageEnvironment,
+    /// Shared with the network worker's cookie jar (`SealedJar`), which
+    /// attaches/captures cookies per hop. Lock discipline: take this lock
+    /// transiently (lock → `instance()` → op → unlock) and never while holding
+    /// another lock.
+    storage: Arc<Mutex<StorageEnvironment>>,
     cache: HttpCache,
     loader: Box<dyn PageLoader>,
     toolbar: Toolbar,
@@ -656,16 +744,32 @@ pub struct BrowserApp {
 impl BrowserApp {
     /// Create a browser on the default heads, showing `cerberus:home`.
     pub fn new() -> Self {
-        Self::with_loader(Box::new(NetLoader::new(false)))
+        Self::with_options(false)
     }
 
     /// Like [`new`](Self::new) but trusting the OS root store (for TLS-inspecting
     /// proxies); see `RustlsProvider::with_system_roots`.
     pub fn with_options(system_roots: bool) -> Self {
-        Self::with_loader(Box::new(NetLoader::new(system_roots)))
+        let storage = Arc::new(Mutex::new(StorageEnvironment::with_no_vault()));
+        let jar: Arc<dyn CookieJar> = Arc::new(SealedJar {
+            storage: storage.clone(),
+        });
+        Self::with_loader_and_storage(Box::new(NetLoader::new(system_roots, Some(jar))), storage)
     }
 
+    /// Test seam: a fake loader and a fresh (jar-less) storage environment.
+    #[cfg(test)]
     fn with_loader(loader: Box<dyn PageLoader>) -> Self {
+        Self::with_loader_and_storage(
+            loader,
+            Arc::new(Mutex::new(StorageEnvironment::with_no_vault())),
+        )
+    }
+
+    fn with_loader_and_storage(
+        loader: Box<dyn PageLoader>,
+        storage: Arc<Mutex<StorageEnvironment>>,
+    ) -> Self {
         install_psl();
         let heads = HeadManager::new(default_heads(), Box::new(QuickJsEngineFactory));
         let label = heads.active().label.clone();
@@ -673,7 +777,7 @@ impl BrowserApp {
         let styled = style_engine.style(&empty_document());
         let mut app = Self {
             heads,
-            storage: StorageEnvironment::with_no_vault(),
+            storage,
             cache: HttpCache::new(),
             loader,
             toolbar: Toolbar::new(label),
@@ -769,7 +873,11 @@ impl BrowserApp {
         let id = self.next_id;
         self.next_id += 1;
         self.pending = Some(Pending { id, http_fallback });
-        self.loader.request(id, target);
+        let ctx = FetchContext {
+            instance,
+            kind: FetchKind::Navigation,
+        };
+        self.loader.request(id, target, ctx);
     }
 
     fn load_builtin(&mut self, url: &str) {
@@ -857,10 +965,6 @@ impl BrowserApp {
         self.insecure_prompt = None;
         self.current_url = parse_url(url).ok();
 
-        let origin = self.current_url.as_ref().and_then(first_party_of);
-        if let Some(origin) = origin {
-            self.set_session_cookie(&origin);
-        }
         self.request_page_images();
         self.update_nav();
     }
@@ -927,6 +1031,8 @@ impl BrowserApp {
     /// fetch for each new http(s) image. Lazy-loading hints are ignored — every
     /// image is fetched immediately (speed-first; see the layout `img` path).
     fn request_page_images(&mut self) {
+        let first_party = self.current_url.as_ref().and_then(first_party_of);
+        let instance = self.heads.active().instance;
         let mut srcs = Vec::new();
         collect_image_urls(self.document.root(), &mut srcs);
         for src in srcs {
@@ -939,8 +1045,17 @@ impl BrowserApp {
             if self.images.contains_key(&abs) {
                 continue;
             }
+            let Some(first_party) = first_party.clone() else {
+                continue;
+            };
             self.images.insert(abs.clone(), ImageState::Pending);
-            self.loader.request_subresource(abs);
+            self.loader.request_subresource(
+                abs,
+                FetchContext {
+                    instance,
+                    kind: FetchKind::Subresource { first_party },
+                },
+            );
         }
     }
 
@@ -1134,15 +1249,6 @@ impl BrowserApp {
         self.text.rasterize(&list, page);
     }
 
-    fn set_session_cookie(&mut self, first_party: &Origin) {
-        let instance = self.heads.active().instance;
-        let _ = self.storage.instance(instance).set_cookie(
-            first_party,
-            Cookie::host("session", "demo", first_party.host.clone()),
-            Group::Active,
-        );
-    }
-
     fn navigate(&mut self, input: &str) {
         let url = normalize_url(input);
         if !self.history.is_empty() {
@@ -1313,7 +1419,8 @@ impl FrameApp for BrowserApp {
             self.insecure_button = Some(paint_insecure_button(&mut fb, &self.text));
         }
         if self.settings_open {
-            paint_settings_overlay(&mut fb, size, &self.text, &self.text);
+            let vault_locked = self.storage.lock().unwrap().vault_locked();
+            paint_settings_overlay(&mut fb, size, &self.text, &self.text, vault_locked);
         }
         fb
     }
@@ -1713,6 +1820,7 @@ fn paint_settings_overlay(
     size: Size,
     shaper: &dyn TextShaper,
     raster: &dyn Rasterizer,
+    vault_locked: bool,
 ) {
     let pw = size.w * 3 / 5;
     let ph = size.h * 3 / 5;
@@ -1737,6 +1845,17 @@ fn paint_settings_overlay(
     list.push(DisplayItem::Glyphs {
         origin: Point::new(px + 12, py + 52),
         glyphs: shaper.shape("identities | vault | consent | farbling (coming soon)", 14),
+        color: Color::rgb(0x50, 0x50, 0x50),
+        style: FontStyle::REGULAR,
+    });
+    let vault_line = if vault_locked {
+        "vault: locked (quarantined cookies are dropped)"
+    } else {
+        "vault: unlocked"
+    };
+    list.push(DisplayItem::Glyphs {
+        origin: Point::new(px + 12, py + 78),
+        glyphs: shaper.shape(vault_line, 14),
         color: Color::rgb(0x50, 0x50, 0x50),
         style: FontStyle::REGULAR,
     });
@@ -1770,12 +1889,97 @@ mod tests {
         // Memory-first invariant: never more than one engine live.
         assert_eq!(outcome.engines_live, 1);
         assert_eq!(outcome.realms_live, 1);
-        // The first-party cookie is active and attachable.
-        assert_eq!(outcome.active_cookies, 1);
+        // Cookies are real now (captured from responses through the sealed
+        // jar); the builtin page sets none.
+        assert_eq!(outcome.active_cookies, 0);
         // Third-party access is denied by default in headless mode.
         assert_eq!(outcome.third_party_decision, Decision::Deny);
         // A frame was produced at the requested size.
         assert_eq!(outcome.framebuffer.size, RenderConfig::default().viewport);
+    }
+
+    // ---- The sealed cookie jar (the app side of the engine's cookie seam) ----
+
+    fn jar_with_env() -> (SealedJar, Arc<Mutex<StorageEnvironment>>) {
+        install_psl();
+        let storage = Arc::new(Mutex::new(StorageEnvironment::with_no_vault()));
+        (
+            SealedJar {
+                storage: storage.clone(),
+            },
+            storage,
+        )
+    }
+
+    #[test]
+    fn jar_stores_same_site_cookies_and_attaches_them() {
+        let (jar, _env) = jar_with_env();
+        let instance = InstanceId::from_u64_pair(0, 0x10);
+        let url = parse_url("https://shop.example.com/login").unwrap();
+        let fp = url.origin().unwrap();
+
+        assert_eq!(jar.cookie_header(instance, &url, &fp), None);
+        jar.set_cookie(instance, &url, &fp, "sid=abc; Path=/; Secure");
+        assert_eq!(
+            jar.cookie_header(instance, &url, &fp).as_deref(),
+            Some("sid=abc")
+        );
+
+        // Host-only cookie: NOT sent to a sibling subdomain...
+        let sub = parse_url("https://cdn.example.com/a.png").unwrap();
+        assert_eq!(jar.cookie_header(instance, &sub, &fp), None);
+
+        // ...but a `Domain` cookie is shared across the site.
+        jar.set_cookie(instance, &url, &fp, "site=1; Domain=example.com; Secure");
+        assert_eq!(
+            jar.cookie_header(instance, &sub, &fp).as_deref(),
+            Some("site=1")
+        );
+    }
+
+    #[test]
+    fn jar_drops_cross_site_cookies_while_vault_is_locked() {
+        let (jar, env) = jar_with_env();
+        let instance = InstanceId::from_u64_pair(0, 0x10);
+        let fp = Origin::new("https", "news.example.com", None);
+        let tracker = parse_url("https://ads.tracker.net/pixel.gif").unwrap();
+
+        // Third-party Set-Cookie: quarantine is the only path, and the locked
+        // vault rejects it — the cookie ceases to exist.
+        jar.set_cookie(instance, &tracker, &fp, "uid=xyz");
+        assert_eq!(jar.cookie_header(instance, &tracker, &fp), None);
+        assert!(env
+            .lock()
+            .unwrap()
+            .instance(instance)
+            .quarantined_names(&fp)
+            .is_empty());
+    }
+
+    #[test]
+    fn jar_is_sealed_per_instance() {
+        let (jar, _env) = jar_with_env();
+        let a = InstanceId::from_u64_pair(0, 0xA);
+        let b = InstanceId::from_u64_pair(0, 0xB);
+        let url = parse_url("https://shop.example.com/").unwrap();
+        let fp = url.origin().unwrap();
+
+        jar.set_cookie(a, &url, &fp, "sid=only-in-a");
+        assert!(jar.cookie_header(a, &url, &fp).is_some());
+        assert!(jar.cookie_header(b, &url, &fp).is_none());
+    }
+
+    #[test]
+    fn jar_rejects_malformed_and_misdomained_cookies() {
+        let (jar, _env) = jar_with_env();
+        let instance = InstanceId::from_u64_pair(0, 0x10);
+        let url = parse_url("https://shop.example.com/").unwrap();
+        let fp = url.origin().unwrap();
+
+        jar.set_cookie(instance, &url, &fp, "no-equals");
+        jar.set_cookie(instance, &url, &fp, "a=1; Domain=other.com");
+        jar.set_cookie(instance, &url, &fp, "b=2; Domain=com");
+        assert_eq!(jar.cookie_header(instance, &url, &fp), None);
     }
 
     // ---- Hermetic test harness: a fake loader, no network or threads. ----
@@ -1811,7 +2015,7 @@ mod tests {
     }
 
     impl PageLoader for FakeLoader {
-        fn request(&self, id: u64, url: String) {
+        fn request(&self, id: u64, url: String, _ctx: FetchContext) {
             let result = self
                 .responses
                 .get(&url)
@@ -1823,7 +2027,7 @@ mod tests {
                 result,
             });
         }
-        fn request_subresource(&self, url: String) {
+        fn request_subresource(&self, url: String, _ctx: FetchContext) {
             let bytes = self
                 .images
                 .get(&url)
