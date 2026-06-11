@@ -20,7 +20,9 @@ use cerberus_js_quickjs::QuickJsEngineFactory;
 use cerberus_layout::{
     BlockLayout, FieldKind, FormFieldBox, FormState, ImageProvider, LayoutEngine, LinkBox, NoForms,
 };
-use cerberus_net::{BuiltinHttpClient, HttpCache, HttpClient, HttpResponse, Router};
+use cerberus_net::{
+    BuiltinHttpClient, HttpCache, HttpClient, HttpResponse, Router, DEFAULT_USER_AGENT,
+};
 use cerberus_paint::{
     DecodedImage, DisplayItem, DisplayList, Framebuffer, ImageDecoder, Rasterizer, TextShaper,
 };
@@ -187,13 +189,23 @@ pub fn render(config: &RenderConfig) -> Result<RenderOutcome, AppError> {
         .evaluate(active_instance, &third_party, &first_party)
         .decision;
 
-    // --- Fetch: built-in pages locally, http(s) over the real network stack. ---
-    let response = if url.is_builtin() {
-        BuiltinHttpClient.get(&url)
+    // --- Fetch: built-in pages locally, http(s) over the real network stack.
+    // Capture the User-Agent the stack actually presented to this origin (honest
+    // by default; the escalated rung if bot management forced it) so the page's
+    // `navigator.userAgent` matches the request header exactly. ---
+    let (response, active_ua) = if url.is_builtin() {
+        let resp = BuiltinHttpClient
+            .get(&url)
+            .map_err(|e| AppError::Net(format!("{e:?}")))?;
+        (resp, DEFAULT_USER_AGENT.to_string())
     } else {
-        network_client(config.system_roots).get(&url)
-    }
-    .map_err(|e| AppError::Net(format!("{e:?}")))?;
+        let client = network_client(config.system_roots);
+        let resp = client
+            .get(&url)
+            .map_err(|e| AppError::Net(format!("{e:?}")))?;
+        let ua = client.user_agent_for(&url);
+        (resp, ua)
+    };
     let body = String::from_utf8_lossy(&response.body);
     let mut document = parse_html(&body);
 
@@ -214,6 +226,7 @@ pub fn render(config: &RenderConfig) -> Result<RenderOutcome, AppError> {
         let env = PageEnv {
             url: config.url.clone(),
             viewport: (config.viewport.w, config.viewport.h),
+            user_agent: active_ua,
         };
         document = run_page_scripts(engine, base_realm, &document, document.scripts(), &env)
             .map_err(|e| AppError::Js(format!("{e:?}")))?;
@@ -300,6 +313,9 @@ struct FetchedPage {
     status: u16,
     headers: Vec<(String, String)>,
     body: Vec<u8>,
+    /// The User-Agent the stack presented to this origin (for coherent
+    /// `navigator.userAgent`); honest unless this site forced an escalation.
+    user_agent: String,
 }
 
 /// In-flight navigation bookkeeping.
@@ -411,11 +427,13 @@ impl PageLoader for NetLoader {
 fn fetch_page(client: &Router, url: &str) -> Result<FetchedPage, String> {
     let parsed = parse_url(url).map_err(|e| e.to_string())?;
     let resp = client.get(&parsed).map_err(|e| format!("{e:?}"))?;
+    let user_agent = client.user_agent_for(&parsed);
     Ok(FetchedPage {
         url: url.to_string(),
         status: resp.status,
         headers: resp.headers,
         body: resp.body,
+        user_agent,
     })
 }
 
@@ -602,6 +620,10 @@ pub struct BrowserApp {
     status: u16,
     /// The committed URL of the current page (base for resolving links).
     current_url: Option<Url>,
+    /// The User-Agent presented to the current page's origin (honest by default;
+    /// the escalated rung if forced). Feeds `navigator.userAgent` so the page's
+    /// script-visible identity matches the request header.
+    active_ua: String,
     /// The `<title>` of the current page, if any.
     page_title: Option<String>,
     /// Clickable link boxes from the last rendered frame (window coordinates).
@@ -656,6 +678,7 @@ impl BrowserApp {
             styled,
             status: 0,
             current_url: None,
+            active_ua: DEFAULT_USER_AGENT.to_string(),
             page_title: None,
             links: Vec::new(),
             form_fields: Vec::new(),
@@ -721,7 +744,14 @@ impl BrowserApp {
     fn dispatch(&mut self, target: String, http_fallback: Option<String>) {
         let instance = self.heads.active().instance;
         if let Some(resp) = self.cache.get(instance, &target) {
-            self.commit_response(&target, resp.status, &resp.headers, &resp.body, false);
+            self.commit_response(
+                &target,
+                resp.status,
+                &resp.headers,
+                &resp.body,
+                DEFAULT_USER_AGENT,
+                false,
+            );
             return;
         }
         self.toolbar.url_text = target.clone();
@@ -736,9 +766,14 @@ impl BrowserApp {
     fn load_builtin(&mut self, url: &str) {
         match parse_url(url) {
             Ok(u) => match BuiltinHttpClient.get(&u) {
-                Ok(resp) => {
-                    self.commit_response(url, resp.status, &resp.headers, &resp.body, false)
-                }
+                Ok(resp) => self.commit_response(
+                    url,
+                    resp.status,
+                    &resp.headers,
+                    &resp.body,
+                    DEFAULT_USER_AGENT,
+                    false,
+                ),
                 Err(e) => self.show_error(url, &format!("{e:?}")),
             },
             Err(e) => self.show_error(url, &e.to_string()),
@@ -767,6 +802,7 @@ impl BrowserApp {
         let env = PageEnv {
             url: self.toolbar.url_text.clone(),
             viewport: (self.last_size.w, self.last_size.h),
+            user_agent: self.active_ua.clone(),
         };
         let engine = match self.heads.engine() {
             Ok(engine) => engine,
@@ -787,8 +823,12 @@ impl BrowserApp {
         status: u16,
         headers: &[(String, String)],
         body: &[u8],
+        user_agent: &str,
         store_in_cache: bool,
     ) {
+        // Record the UA this origin saw, so the page's navigator.userAgent (built
+        // in run_scripts → set_document) matches the request header.
+        self.active_ua = user_agent.to_string();
         let instance = self.heads.active().instance;
         if store_in_cache {
             self.cache.store(
@@ -842,9 +882,14 @@ impl BrowserApp {
         let http_fallback = pending.http_fallback.clone();
         self.pending = None;
         match result {
-            Ok(page) => {
-                self.commit_response(&page.url, page.status, &page.headers, &page.body, true)
-            }
+            Ok(page) => self.commit_response(
+                &page.url,
+                page.status,
+                &page.headers,
+                &page.body,
+                &page.user_agent,
+                true,
+            ),
             Err(err) => match http_fallback {
                 Some(http_url) => {
                     // The https upgrade failed; offer the plaintext risk prompt.
@@ -1792,6 +1837,7 @@ mod tests {
             status,
             headers,
             body: body.as_bytes().to_vec(),
+            user_agent: DEFAULT_USER_AGENT.to_string(),
         }
     }
 

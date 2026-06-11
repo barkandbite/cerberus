@@ -27,6 +27,11 @@ fn env() -> PageEnv {
     PageEnv {
         url: "https://example.test/path?q=1#frag".into(),
         viewport: (1280, 800),
+        // A representative escalated-rung UA, so the navigator test exercises
+        // coherence (navigator.userAgent == this) and platform derivation.
+        user_agent: "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 \
+                     (KHTML, like Gecko) Chrome/142.0.0.0 Safari/537.36"
+            .into(),
     }
 }
 
@@ -369,32 +374,83 @@ fn location_is_parsed_from_env() {
 }
 
 #[test]
-fn navigator_useragent_is_present_and_generic() {
-    // userAgent is a single fixed, low-entropy string; language is en-US; and
-    // high-entropy surfaces (plugins/mediaDevices/webgl) are absent.
+fn navigator_is_coherent_with_the_request_ua_and_locks_high_entropy() {
+    // navigator.userAgent is EXACTLY the UA the network stack presented (so the
+    // request header and the script-visible identity can't disagree),
+    // navigator.platform is derived from it, language is uniform en-US, and
+    // every high-entropy surface is absent.
     let (mut engine, realm) = engine_and_realm();
     let doc = doc_with_div_x();
     let scripts = vec!["var x = document.getElementById('x'); \
          x.setAttribute('data-ua', String(navigator.userAgent)); \
+         x.setAttribute('data-platform', String(navigator.platform)); \
          x.setAttribute('data-lang', String(navigator.language)); \
          x.setAttribute('data-hw', String(navigator.hardwareConcurrency)); \
          x.setAttribute('data-plugins', String(typeof navigator.plugins)); \
-         x.setAttribute('data-media', String(typeof navigator.mediaDevices));"
+         x.setAttribute('data-media', String(typeof navigator.mediaDevices)); \
+         x.setAttribute('data-webgl', String(typeof navigator.webgl)); \
+         x.setAttribute('data-mem', String(typeof navigator.deviceMemory)); \
+         x.setAttribute('data-batt', String(typeof navigator.getBattery)); \
+         x.setAttribute('data-wd', String(navigator.webdriver));"
         .to_string()];
 
     let out = run_page_scripts(engine.as_mut(), realm, &doc, &scripts, &env()).expect("run");
     let x = find_id(out.root(), "x").expect("#x present");
-    let ua = x.attr("data-ua").expect("ua");
-    assert!(!ua.is_empty(), "userAgent must be non-empty");
-    assert!(
-        ua.contains("Mozilla/5.0"),
-        "generic UA expected, got {ua:?}"
-    );
+    // Coherence: navigator.userAgent is exactly the request UA.
+    let want_ua = env().user_agent;
+    assert_eq!(x.attr("data-ua"), Some(want_ua.as_str()));
+    // Platform is derived from that (Windows) UA, not the empty-string anomaly.
+    assert_eq!(x.attr("data-platform"), Some("Win32"));
     assert_eq!(x.attr("data-lang"), Some("en-US"));
     assert_eq!(x.attr("data-hw"), Some("4"));
-    // Deliberately not exposed (low-entropy / anti-fingerprinting).
+    // Surface lock: no high-entropy fingerprinting APIs are exposed.
     assert_eq!(x.attr("data-plugins"), Some("undefined"));
     assert_eq!(x.attr("data-media"), Some("undefined"));
+    assert_eq!(x.attr("data-webgl"), Some("undefined"));
+    assert_eq!(x.attr("data-mem"), Some("undefined"));
+    assert_eq!(x.attr("data-batt"), Some("undefined"));
+    // webdriver is present-and-false, so its absence isn't itself a tell.
+    assert_eq!(x.attr("data-wd"), Some("false"));
+}
+
+#[test]
+fn navigator_platform_tracks_the_user_agent() {
+    // The OS in navigator.platform follows whatever UA we presented — honest
+    // (Linux) by default, or the escalated rung's OS — so the two never diverge.
+    let cases = [
+        ("Cerberus/0.0", "Linux x86_64"),
+        (
+            "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 \
+             (KHTML, like Gecko) Version/17.0 Safari/605.1.15",
+            "MacIntel",
+        ),
+        (
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 \
+             (KHTML, like Gecko) Chrome/142.0.0.0 Safari/537.36",
+            "Win32",
+        ),
+    ];
+    for (ua, want_platform) in cases {
+        let (mut engine, realm) = engine_and_realm();
+        let doc = doc_with_div_x();
+        let pe = PageEnv {
+            url: "https://example.test/".into(),
+            viewport: (800, 600),
+            user_agent: ua.into(),
+        };
+        let scripts = vec!["var x = document.getElementById('x'); \
+             x.setAttribute('data-ua', String(navigator.userAgent)); \
+             x.setAttribute('data-platform', String(navigator.platform));"
+            .to_string()];
+        let out = run_page_scripts(engine.as_mut(), realm, &doc, &scripts, &pe).expect("run");
+        let x = find_id(out.root(), "x").expect("#x present");
+        assert_eq!(x.attr("data-ua"), Some(ua), "userAgent coherent for {ua:?}");
+        assert_eq!(
+            x.attr("data-platform"),
+            Some(want_platform),
+            "platform derivation for {ua:?}"
+        );
+    }
 }
 
 #[test]

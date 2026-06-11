@@ -22,8 +22,11 @@ pub struct Request<'a> {
 
 /// Write `req` to `stream` and read the full response.
 pub fn send(stream: &mut dyn ReadWrite, req: &Request<'_>) -> Result<HttpResponse, NetError> {
+    // `Accept-Language` is sent on every request and is uniform across all users
+    // (no per-user locale entropy); it matches the script-visible
+    // `navigator.language`/`languages` so the header and the DOM agree.
     let mut head = format!(
-        "{} {} HTTP/1.1\r\nHost: {}\r\nUser-Agent: {}\r\nAccept: */*\r\nAccept-Encoding: identity\r\nConnection: close\r\n",
+        "{} {} HTTP/1.1\r\nHost: {}\r\nUser-Agent: {}\r\nAccept: */*\r\nAccept-Language: en-US,en;q=0.9\r\nAccept-Encoding: identity\r\nConnection: close\r\n",
         req.method, req.path, req.host, req.user_agent
     );
     for (k, v) in req.headers {
@@ -162,5 +165,58 @@ mod tests {
     #[test]
     fn rejects_garbage() {
         assert!(parse_response(b"not http").is_err());
+    }
+
+    #[test]
+    fn request_carries_uniform_identity_headers() {
+        use std::io::{Cursor, Read, Write};
+
+        struct Mock {
+            written: Vec<u8>,
+            resp: Cursor<Vec<u8>>,
+        }
+        impl Read for Mock {
+            fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+                self.resp.read(buf)
+            }
+        }
+        impl Write for Mock {
+            fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+                self.written.extend_from_slice(buf);
+                Ok(buf.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+
+        let mut mock = Mock {
+            written: Vec::new(),
+            resp: Cursor::new(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nhi".to_vec()),
+        };
+        let resp = send(
+            &mut mock,
+            &Request {
+                method: "GET",
+                host: "example.test",
+                path: "/p",
+                user_agent: "Cerberus/0.0",
+                headers: &[],
+                body: &[],
+            },
+        )
+        .unwrap();
+        assert_eq!(resp.status, 200);
+
+        let req = String::from_utf8(mock.written).unwrap();
+        assert!(req.starts_with("GET /p HTTP/1.1\r\n"), "request line: {req:?}");
+        assert!(req.contains("Host: example.test\r\n"));
+        assert!(req.contains("User-Agent: Cerberus/0.0\r\n"));
+        // Uniform locale, matching navigator.language/languages (no per-user
+        // entropy) so the header and the script-visible identity agree.
+        assert!(
+            req.contains("Accept-Language: en-US,en;q=0.9\r\n"),
+            "missing uniform Accept-Language: {req:?}"
+        );
     }
 }

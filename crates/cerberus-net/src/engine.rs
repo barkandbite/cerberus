@@ -107,6 +107,19 @@ impl HttpEngine {
         )
     }
 
+    /// The User-Agent we currently present to `host`: the memoized rung that
+    /// last got served, or the honest default if this origin never forced an
+    /// escalation. This is the single source of truth a caller threads into the
+    /// JS `navigator.userAgent`, so the header and the script-visible identity
+    /// can never disagree.
+    pub fn user_agent_for(&self, host: &str) -> String {
+        let idx = *self.ua_memo.lock().unwrap().get(host).unwrap_or(&0);
+        self.user_agents
+            .get(idx)
+            .cloned()
+            .unwrap_or_else(|| DEFAULT_USER_AGENT.to_string())
+    }
+
     /// Fetch with a fixed User-Agent, following redirects.
     fn fetch_redirected(&self, url: &Url, user_agent: &str) -> Result<HttpResponse, NetError> {
         let mut current = url.clone();
@@ -164,6 +177,17 @@ impl Router {
     pub fn new(tls: Box<dyn TlsProvider>, dns: Box<dyn DnsResolver>) -> Self {
         Self {
             engine: HttpEngine::new(tls, dns),
+        }
+    }
+
+    /// The User-Agent presented to `url`'s origin (see
+    /// [`HttpEngine::user_agent_for`]). Built-in pages are served locally and
+    /// always carry our honest identity.
+    pub fn user_agent_for(&self, url: &Url) -> String {
+        if url.is_builtin() {
+            DEFAULT_USER_AGENT.to_string()
+        } else {
+            self.engine.user_agent_for(&url.host)
         }
     }
 }

@@ -451,6 +451,12 @@ pub struct PageEnv {
     /// The layout viewport as `(width, height)` in CSS pixels; feeds
     /// `window.innerWidth`/`innerHeight` and `screen.*`.
     pub viewport: (u32, u32),
+    /// The User-Agent the network stack presented to this origin. Feeds
+    /// `navigator.userAgent` (and the OS-derived `navigator.platform`) so the
+    /// script-visible identity matches the request header exactly — including
+    /// when the honest-first ladder escalated for this site. Empty falls back to
+    /// the honest default inside the prelude.
+    pub user_agent: String,
 }
 
 /// Encode `s` as a JS/JSON string literal (quotes included) suitable for
@@ -494,10 +500,11 @@ pub fn run_page_scripts(
     //    `screen`; it must land *before* the model installs. The prelude is
     //    self-guarding, but a genuine engine/compile failure is fatal.
     let env_install = format!(
-        "globalThis.__CERBERUS_ENV__ = {{ url: {}, width: {}, height: {} }};",
+        "globalThis.__CERBERUS_ENV__ = {{ url: {}, width: {}, height: {}, userAgent: {} }};",
         js_string(&env.url),
         env.viewport.0,
         env.viewport.1,
+        js_string(&env.user_agent),
     );
     engine.eval(realm, &env_install)?;
     engine.eval(realm, DOM_MODEL_PRELUDE)?;
@@ -1317,6 +1324,10 @@ pub const DOM_MODEL_PRELUDE: &str = r##"
     var envUrl = (typeof env.url === "string") ? env.url : "about:blank";
     var vpW = (typeof env.width === "number") ? env.width : 0;
     var vpH = (typeof env.height === "number") ? env.height : 0;
+    // The UA the network stack actually presented to this origin (honest by
+    // default; the escalated rung if this site forced it). Falls back to our
+    // honest identity if absent, so header and navigator can never disagree.
+    var envUA = (typeof env.userAgent === "string" && env.userAgent) ? env.userAgent : "Cerberus/0.0";
 
     // ---- location ------------------------------------------------------
     // A small JS regex parser for the URL into the WHATWG-ish pieces pages
@@ -1361,21 +1372,37 @@ pub const DOM_MODEL_PRELUDE: &str = r##"
     Object.defineProperty(document, "documentURI", { get: function () { return locationObj.href; }, enumerable: true, configurable: true });
 
     // ---- navigator -----------------------------------------------------
-    // DELIBERATELY MINIMAL and GENERIC / low-entropy — every head looks the
-    // same. Per-head fingerprint farbling is M6 (ADR-0002 farbling prologue),
-    // not here; we do NOT expose plugins, mediaDevices, webgl, etc.
+    // IDENTITY MODEL (two rules):
+    //  1. The User-Agent is HONEST-FIRST and COHERENT. `userAgent` is whatever
+    //     the network stack actually sent this origin — our real `Cerberus/0.0`
+    //     by default, or, only if the site's bot management forced the fallback
+    //     ladder, the SAME escalated string the request header carried. The OS
+    //     in `platform` is derived from it. So the header and the script-visible
+    //     identity can never disagree; a mismatch would itself be a fingerprint.
+    //  2. Every OTHER signal is UNIFORM and low-entropy for every user and head,
+    //     never reflecting the real device — denying a tracker a stable
+    //     cross-site identity at all times, regardless of the UA. We expose NO
+    //     high-entropy surface: no plugins, mediaDevices, WebGL, deviceMemory,
+    //     or Battery API. (Per-head ±1 farbling of the remaining high-entropy
+    //     reads — canvas / audio / font-metrics — is the separate active step.)
+    var navPlatform = envUA.indexOf("Windows") >= 0 ? "Win32"
+      : (envUA.indexOf("Mac OS X") >= 0 || envUA.indexOf("Macintosh") >= 0) ? "MacIntel"
+      : "Linux x86_64";
     g.navigator = {
-      userAgent: "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Cerberus/1.0 Safari/537.36",
+      userAgent: envUA,
+      appCodeName: "Mozilla",
       appName: "Netscape",
-      appVersion: "5.0",
+      appVersion: envUA.indexOf("Mozilla/") === 0 ? envUA.slice(8) : envUA,
       product: "Gecko",
       vendor: "",
       language: "en-US",
-      languages: ["en-US"],
-      platform: "",
+      languages: ["en-US", "en"],
+      platform: navPlatform,
       hardwareConcurrency: 4,
+      maxTouchPoints: 0,
       onLine: true,
       cookieEnabled: true,
+      webdriver: false,
     };
 
     // ---- screen + window metrics ---------------------------------------

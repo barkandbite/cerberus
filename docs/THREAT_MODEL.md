@@ -23,9 +23,15 @@ anti-bot systems.** Cerberus is not an "anti-detect" or automation tool. We do
 
 - **No parallel/concurrent orchestration of the heads** against a target. Heads
   are foreground, one at a time.
-- **No fingerprint impersonation / anti-detect** (the Multilogin/Kameleo
-  pattern). Farbling randomizes *our own* surface; it never impersonates another
-  browser or device.
+- **No general fingerprint impersonation / anti-detect** (the Multilogin/Kameleo
+  pattern). The *device* surface is always our own — uniform, low-entropy, and
+  farbled — and never spoofs a specific machine. The **User-Agent is the one
+  deliberate exception**: honest (`Cerberus/0.0`) by default, it escalates to a
+  common, mainstream string *only* when an origin refuses to serve us, and the
+  whole identity (request header, `navigator.userAgent`, OS-derived `platform`,
+  `Accept-Language`) stays coherent so the escalation can't be detected by a
+  mismatch. This is a narrow compatibility measure, not orchestrated anti-detect —
+  there is still no proxy rotation, session warming, or CAPTCHA solving (below).
 - **No warm-session-pool, identity-warming, or session-aging.**
 - **No rotating-proxy pools, no CAPTCHA solving, no anti-bot/anti-fraud evasion.**
 
@@ -56,7 +62,13 @@ These are deliberate product boundaries, not yet-to-be-built features.
 3. **The farbling surface.** Per-instance, per-session deterministic, bounded
    noise on fingerprintable APIs. Goal: deny a tracker a stable cross-site
    identity of the active head. The three heads carry independent seeds so they
-   do not correlate.
+   do not correlate. Underneath the noise, the scripting environment is
+   **uniform and minimal**: device signals (`hardwareConcurrency`, screen,
+   `language`) report fixed low-entropy values for every user, and the
+   high-entropy surfaces a tracker reaches for — `plugins`, `mediaDevices`,
+   WebGL, `deviceMemory`, the Battery API — are simply **absent**, so there is
+   nothing to read. (Per-head ±1 farbling of canvas/audio/font-metrics is the
+   active-noise layer on top, landing with canvas support.)
 4. **The consent gate.** Cross-site / third-party storage defaults to **deny**; a
    consent event is raised in headed mode. Headless denies silently.
 
