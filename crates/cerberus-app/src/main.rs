@@ -111,6 +111,7 @@ fn cmd_render(args: &[String]) -> ExitCode {
         outcome.images_decoded, outcome.images_requested
     );
     println!("  3rd-party access : {:?}", outcome.third_party_decision);
+    println!("  blocked subres  : {}", outcome.subresources_blocked);
     println!("  wrote           : {out}");
     if let Some(kb) = resident_set_kb() {
         println!("  resident memory : {:.1} MB", kb as f64 / 1024.0);

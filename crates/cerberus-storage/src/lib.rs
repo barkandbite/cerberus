@@ -499,6 +499,18 @@ impl InstanceStore<'_> {
             .map(|q| q.state)
     }
 
+    /// Metadata of cookies currently quarantined under `first_party` (values
+    /// blank — the real values live only in the vault).
+    pub fn quarantined_cookies(&self, first_party: &Origin) -> Vec<Cookie> {
+        let fp_site = first_party.site();
+        self.partition
+            .quarantined
+            .iter()
+            .filter(|q| q.fp_site == fp_site)
+            .map(|q| q.cookie.clone())
+            .collect()
+    }
+
     /// Names of cookies currently quarantined under `first_party`.
     pub fn quarantined_names(&self, first_party: &Origin) -> Vec<String> {
         let fp_site = first_party.site();

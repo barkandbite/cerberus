@@ -324,3 +324,171 @@ mod tests {
         assert!(rects >= 9, "got {rects} rects");
     }
 }
+
+/// Height of the consent banner strip (shown below the toolbar while a
+/// third-party request awaits a decision).
+pub const BANNER_HEIGHT: u32 = 28;
+
+/// An action produced by clicking the consent banner.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum BannerAction {
+    /// Allow this third-party site under the current first party (standing rule).
+    Allow,
+    /// Deny it (standing rule).
+    Deny,
+    /// Dismiss the prompt without a standing rule (deny for now).
+    Dismiss,
+    /// The click hit no banner control.
+    None,
+}
+
+/// The consent prompt strip: one pending third-party site at a time, with
+/// Allow / Deny / dismiss controls. Pure, like [`Toolbar`]: paint +
+/// hit-test only; policy lives in `cerberus-consent`, state in the app.
+#[derive(Clone, Debug, Default)]
+pub struct ConsentBanner {
+    /// The third-party site awaiting a decision (e.g. `https://ads.tracker.net`).
+    pub request_site: String,
+    /// How many further prompts are queued behind this one.
+    pub queued: usize,
+}
+
+const BANNER_BTN_W: u32 = 52;
+
+impl ConsentBanner {
+    /// A banner for one pending request site.
+    pub fn new(request_site: impl Into<String>, queued: usize) -> Self {
+        Self {
+            request_site: request_site.into(),
+            queued,
+        }
+    }
+
+    /// The banner strip rect (full width, directly below the toolbar).
+    pub fn rect(window: Size) -> Rect {
+        Rect::new(0, TOOLBAR_HEIGHT as i32, window.w, BANNER_HEIGHT)
+    }
+
+    fn buttons(window: Size) -> [(BannerAction, Rect); 3] {
+        let y = TOOLBAR_HEIGHT as i32 + PAD;
+        let h = BANNER_HEIGHT - 2 * PAD as u32;
+        let w = window.w as i32;
+        let dismiss_x = w - PAD - h as i32; // square × button
+        let deny_x = dismiss_x - PAD - BANNER_BTN_W as i32;
+        let allow_x = deny_x - PAD - BANNER_BTN_W as i32;
+        [
+            (BannerAction::Allow, Rect::new(allow_x, y, BANNER_BTN_W, h)),
+            (BannerAction::Deny, Rect::new(deny_x, y, BANNER_BTN_W, h)),
+            (BannerAction::Dismiss, Rect::new(dismiss_x, y, h, h)),
+        ]
+    }
+
+    /// Map a click (window coordinates) to a banner action. Clicks elsewhere
+    /// in the strip return `None` (consumed by the banner, no action).
+    pub fn hit_test(&self, window: Size, x: i32, y: i32) -> BannerAction {
+        for (action, rect) in Self::buttons(window) {
+            if x >= rect.x
+                && y >= rect.y
+                && x < rect.x + rect.w as i32
+                && y < rect.y + rect.h as i32
+            {
+                return action;
+            }
+        }
+        BannerAction::None
+    }
+
+    /// Paint the strip: message text left, Allow / Deny / × right.
+    pub fn paint(&self, window: Size, shaper: &dyn TextShaper) -> DisplayList {
+        let mut list = DisplayList::new();
+        let strip = Self::rect(window);
+        list.push(DisplayItem::Rect {
+            rect: strip,
+            color: Color::rgb(0xFF, 0xF4, 0xD6), // soft warning yellow
+        });
+        list.push(DisplayItem::Rect {
+            rect: Rect::new(0, strip.y + BANNER_HEIGHT as i32 - 1, window.w, 1),
+            color: Color::rgb(0xC8, 0xB8, 0x80),
+        });
+
+        let more = if self.queued > 0 {
+            format!(" (+{} more)", self.queued)
+        } else {
+            String::new()
+        };
+        let msg = format!("{} wants third-party access{more}", self.request_site);
+        list.push(DisplayItem::Glyphs {
+            origin: Point::new(PAD + 4, strip.y + 19),
+            glyphs: shaper.shape(&msg, 13),
+            color: Color::rgb(0x40, 0x38, 0x10),
+            style: FontStyle::REGULAR,
+        });
+
+        for (action, rect) in Self::buttons(window) {
+            let (fill, label) = match action {
+                BannerAction::Allow => (Color::rgb(0xD9, 0xEF, 0xD9), "Allow"),
+                BannerAction::Deny => (Color::rgb(0xF3, 0xD9, 0xD9), "Deny"),
+                BannerAction::Dismiss => (Color::rgb(0xE8, 0xE8, 0xE8), "x"),
+                BannerAction::None => continue,
+            };
+            list.push(DisplayItem::Rect { rect, color: fill });
+            list.push(DisplayItem::Glyphs {
+                origin: Point::new(rect.x + 6, rect.y + 15),
+                glyphs: shaper.shape(label, 12),
+                color: Color::BLACK,
+                style: FontStyle::REGULAR,
+            });
+        }
+        list
+    }
+}
+
+#[cfg(test)]
+mod banner_tests {
+    use super::*;
+    use cerberus_paint::MonoShaper;
+
+    #[test]
+    fn banner_sits_directly_below_the_toolbar() {
+        let r = ConsentBanner::rect(Size::new(800, 600));
+        assert_eq!(r.y, TOOLBAR_HEIGHT as i32);
+        assert_eq!(r.h, BANNER_HEIGHT);
+        assert_eq!(r.w, 800);
+    }
+
+    #[test]
+    fn banner_buttons_hit_test_and_misses_are_none() {
+        let b = ConsentBanner::new("https://ads.tracker.net", 0);
+        let size = Size::new(800, 600);
+        let [(_, allow), (_, deny), (_, dismiss)] = ConsentBanner::buttons(size);
+        assert_eq!(
+            b.hit_test(size, allow.x + 2, allow.y + 2),
+            BannerAction::Allow
+        );
+        assert_eq!(b.hit_test(size, deny.x + 2, deny.y + 2), BannerAction::Deny);
+        assert_eq!(
+            b.hit_test(size, dismiss.x + 2, dismiss.y + 2),
+            BannerAction::Dismiss
+        );
+        // The message area consumes the click but maps to no action.
+        assert_eq!(b.hit_test(size, 10, allow.y + 2), BannerAction::None);
+    }
+
+    #[test]
+    fn banner_paints_strip_buttons_and_message() {
+        let b = ConsentBanner::new("https://ads.tracker.net", 2);
+        let list = b.paint(Size::new(800, 600), &MonoShaper);
+        let rects = list
+            .items
+            .iter()
+            .filter(|i| matches!(i, DisplayItem::Rect { .. }))
+            .count();
+        let glyphs = list
+            .items
+            .iter()
+            .filter(|i| matches!(i, DisplayItem::Glyphs { .. }))
+            .count();
+        assert!(rects >= 5, "strip + divider + 3 buttons");
+        assert!(glyphs >= 4, "message + 3 labels");
+    }
+}

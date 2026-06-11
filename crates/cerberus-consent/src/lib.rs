@@ -106,6 +106,59 @@ impl DefaultDenyPolicy {
             .find(|r| r.instance == instance && r.request_site == rs && r.first_party_site == fps)
             .map(|r| r.allow)
     }
+
+    /// Serialize the standing rules as a human-auditable line format:
+    /// `allow|deny <instance-hex> <first-party-site> <request-site>`.
+    pub fn serialize_rules(&self) -> String {
+        let mut out = String::from("cerberus-consent v1\n");
+        for r in &self.rules {
+            out.push_str(&format!(
+                "{} {} {} {}\n",
+                if r.allow { "allow" } else { "deny" },
+                r.instance,
+                r.first_party_site,
+                r.request_site,
+            ));
+        }
+        out
+    }
+
+    /// Load rules previously written by [`serialize_rules`], replacing the
+    /// current set. Unparseable lines are skipped (forward compatibility).
+    pub fn load_rules(&mut self, text: &str) {
+        let mut lines = text.lines();
+        if lines.next().map(str::trim) != Some("cerberus-consent v1") {
+            return;
+        }
+        self.rules.clear();
+        for line in lines {
+            let mut parts = line.split_whitespace();
+            let (Some(verb), Some(inst), Some(fp), Some(req)) =
+                (parts.next(), parts.next(), parts.next(), parts.next())
+            else {
+                continue;
+            };
+            let allow = match verb {
+                "allow" => true,
+                "deny" => false,
+                _ => continue,
+            };
+            let Some(instance) = InstanceId::from_hex(inst) else {
+                continue;
+            };
+            self.rules.push(Rule {
+                instance,
+                request_site: req.to_string(),
+                first_party_site: fp.to_string(),
+                allow,
+            });
+        }
+    }
+
+    /// Number of standing rules.
+    pub fn rule_count(&self) -> usize {
+        self.rules.len()
+    }
 }
 
 impl ConsentPolicy for DefaultDenyPolicy {
@@ -202,5 +255,50 @@ mod tests {
         p.add_rule(inst(), &third_party(), &fp(), true);
         let out = p.evaluate(inst(), &third_party(), &fp());
         assert_eq!(out.decision, Decision::Allow);
+    }
+
+    #[test]
+    fn rules_round_trip_through_the_line_format() {
+        let mut p = DefaultDenyPolicy::new(true);
+        p.add_rule(inst(), &third_party(), &fp(), true);
+        p.add_rule(
+            inst(),
+            &Origin::new("https", "cdn.widgets.example", None),
+            &fp(),
+            false,
+        );
+        let text = p.serialize_rules();
+
+        let mut q = DefaultDenyPolicy::new(true);
+        q.load_rules(&text);
+        assert_eq!(q.rule_count(), 2);
+        assert_eq!(
+            q.evaluate(inst(), &third_party(), &fp()).decision,
+            Decision::Allow
+        );
+        assert_eq!(
+            q.evaluate(
+                inst(),
+                &Origin::new("https", "cdn.widgets.example", None),
+                &fp()
+            )
+            .decision,
+            Decision::Deny
+        );
+        // Rules are instance-scoped: another instance still prompts.
+        let other = InstanceId::from_u64_pair(0, 99);
+        assert_eq!(
+            q.evaluate(other, &third_party(), &fp()).decision,
+            Decision::Prompt
+        );
+    }
+
+    #[test]
+    fn garbage_rule_files_load_to_empty_not_panic() {
+        let mut p = DefaultDenyPolicy::new(true);
+        p.load_rules("not a rules file");
+        assert_eq!(p.rule_count(), 0);
+        p.load_rules("cerberus-consent v1\nallow tooshort\nbogus line\n");
+        assert_eq!(p.rule_count(), 0);
     }
 }

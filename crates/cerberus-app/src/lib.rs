@@ -8,7 +8,7 @@
 //! identities → sealed storage → (built-in) fetch → parse → layout → paint →
 //! present, with the consent and farbling seams exercised along the way.
 
-use cerberus_consent::{ConsentPolicy, Decision, DefaultDenyPolicy};
+use cerberus_consent::{ConsentEvent, ConsentPolicy, Decision, DefaultDenyPolicy};
 use cerberus_crypto::Secret;
 use cerberus_crypto_rustcrypto::{Argon2idKdf, XChaCha20Poly1305Aead};
 use cerberus_css::CssEngine;
@@ -37,7 +37,7 @@ use cerberus_style::{StyleEngine, StyledDom};
 use cerberus_text::TextEngine;
 use cerberus_tls_rustls::RustlsProvider;
 use cerberus_types::{Color, FontStyle, HeadId, InstanceId, Origin, Point, RealmId, Rect, Size};
-use cerberus_ui::{Toolbar, ToolbarAction};
+use cerberus_ui::{BannerAction, ConsentBanner, Toolbar, ToolbarAction, BANNER_HEIGHT};
 use cerberus_url::{join as join_url, parse as parse_url, Url};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -100,8 +100,10 @@ pub struct RenderOutcome {
     /// `<img>` sub-resources fetched, and how many decoded successfully.
     pub images_requested: usize,
     pub images_decoded: usize,
-    /// Decision for a representative third-party access (demonstrates consent).
+    /// Decision for a representative third-party access (the default posture).
     pub third_party_decision: Decision,
+    /// Subresources refused by the consent policy (third-party, no rule).
+    pub subresources_blocked: usize,
     pub framebuffer: Framebuffer,
 }
 
@@ -163,6 +165,7 @@ fn install_psl() {
 
 const VAULT_SALT_FILE: &str = "vault.salt";
 const HEADS_FILE: &str = "heads.txt";
+const CONSENT_RULES_FILE: &str = "consent.rules";
 
 /// Load the profile's KDF salt, creating a random one on first run.
 fn load_or_create_salt(dir: &Path) -> std::io::Result<[u8; 16]> {
@@ -285,12 +288,17 @@ pub fn network_client(system_roots: bool, jar: Option<Arc<dyn CookieJar>>) -> Ro
 
 /// The cookie seam over sealed storage: attaches only what
 /// `InstanceStore::cookies_for_request` allows (active, in-scope, unexpired,
-/// never quarantined) and routes captured `Set-Cookie`s by site relationship —
-/// same-site to the first party becomes `Active`; cross-site goes to the
-/// quarantine vault (which silently drops it while the vault is locked).
-/// The consent policy replaces this hardcoded rule at M5.
+/// never quarantined) and routes captured `Set-Cookie`s through the consent
+/// policy — same-site is the first party's own; cross-site is Allowed
+/// (standing rule), Denied (dropped), or Prompted (quarantined pending the
+/// user's decision, with the event surfaced in the consent banner).
 struct SealedJar {
     storage: Arc<Mutex<StorageEnvironment>>,
+    /// The same policy object the UI-thread fetch gating consults.
+    policy: Arc<Mutex<DefaultDenyPolicy>>,
+    /// Prompt events raised on the worker, drained by the UI in `poll()`.
+    /// Lock discipline: never held while `storage` or `policy` is held.
+    events: Arc<Mutex<Vec<ConsentEvent>>>,
 }
 
 impl CookieJar for SealedJar {
@@ -301,6 +309,19 @@ impl CookieJar for SealedJar {
         first_party: &Origin,
     ) -> Option<String> {
         let origin = request.origin()?;
+        // Cross-site requests only carry cookies under a standing Allow rule
+        // (the read path raises no prompts — that happens at capture/fetch).
+        if origin.is_third_party_to(first_party) {
+            let decision = self
+                .policy
+                .lock()
+                .unwrap()
+                .evaluate(instance, &origin, first_party)
+                .decision;
+            if decision != Decision::Allow {
+                return None;
+            }
+        }
         let mut env = self.storage.lock().unwrap();
         let cookies = env
             .instance(instance)
@@ -324,14 +345,23 @@ impl CookieJar for SealedJar {
         let Some(cookie) = parse_set_cookie(value, &origin.host, request.scheme == "https") else {
             return;
         };
-        let group = if origin.is_third_party_to(first_party) {
-            Group::Quarantined
-        } else {
-            Group::Active
+        let outcome = self
+            .policy
+            .lock()
+            .unwrap()
+            .evaluate(instance, &origin, first_party);
+        let group = match outcome.decision {
+            Decision::Allow => Group::Active,
+            // Denied: the cookie ceases to exist.
+            Decision::Deny => return,
+            // Awaiting the user: quarantine. (A locked vault rejects the
+            // write, which is still deny — the cookie is simply gone.)
+            Decision::Prompt => Group::Quarantined,
         };
+        if let Some(event) = outcome.event {
+            self.events.lock().unwrap().push(event);
+        }
         let mut env = self.storage.lock().unwrap();
-        // A locked vault rejects quarantine writes: the third-party cookie is
-        // dropped, which is the correct default-deny outcome.
         let _ = env
             .instance(instance)
             .set_cookie(first_party, cookie, group);
@@ -382,14 +412,30 @@ pub fn render(config: &RenderConfig) -> Result<RenderOutcome, AppError> {
         }
         None => StorageEnvironment::with_no_vault(),
     }));
+
+    // --- Consent: the policy that gates this page's cookies and subresources.
+    // One-shot headless mode denies unruled third parties silently; a profile's
+    // standing rules are honored. ---
+    let mut policy = DefaultDenyPolicy::new(config.headed);
+    if let Some(dir) = &config.data_dir {
+        if let Ok(text) = std::fs::read_to_string(Path::new(dir).join(CONSENT_RULES_FILE)) {
+            policy.load_rules(&text);
+        }
+    }
+    let consent = Arc::new(Mutex::new(policy));
     let jar: Arc<dyn CookieJar> = Arc::new(SealedJar {
         storage: storage.clone(),
+        policy: consent.clone(),
+        // One-shot renders have no banner; prompt events are dropped.
+        events: Arc::new(Mutex::new(Vec::new())),
     });
 
-    // --- Consent: a representative third-party access is denied by default. ---
-    let mut consent = DefaultDenyPolicy::new(config.headed);
+    // The default posture for a not-yet-ruled third party (what a tracker
+    // would get): the same policy object that enforces this page below.
     let third_party = Origin::new("https", "ads.tracker.net", None);
     let third_party_decision = consent
+        .lock()
+        .unwrap()
         .evaluate(active_instance, &third_party, &first_party)
         .decision;
 
@@ -457,10 +503,16 @@ pub fn render(config: &RenderConfig) -> Result<RenderOutcome, AppError> {
         },
     };
     let images = match &client {
-        Some(client) => fetch_images_sync(&document, &url, client, &sub_ctx),
+        Some(client) => {
+            fetch_images_sync(&document, &url, client, &sub_ctx, &consent, &first_party)
+        }
         None => HashMap::new(),
     };
-    let images_requested = images.len();
+    let subresources_blocked = images
+        .values()
+        .filter(|s| matches!(s, ImageState::Blocked))
+        .count();
+    let images_requested = images.len() - subresources_blocked;
     let images_decoded = images
         .values()
         .filter(|s| matches!(s, ImageState::Ready(_)))
@@ -530,6 +582,7 @@ pub fn render(config: &RenderConfig) -> Result<RenderOutcome, AppError> {
         images_requested,
         images_decoded,
         third_party_decision,
+        subresources_blocked,
         framebuffer: surface.last_frame().cloned().unwrap_or(framebuffer),
     })
 }
@@ -711,6 +764,8 @@ fn fetch_images_sync(
     base: &Url,
     client: &Router,
     ctx: &FetchContext,
+    policy: &Mutex<DefaultDenyPolicy>,
+    first_party: &Origin,
 ) -> HashMap<String, ImageState> {
     let mut srcs = Vec::new();
     collect_image_urls(document.root(), &mut srcs);
@@ -730,6 +785,22 @@ fn fetch_images_sync(
     let mut out = HashMap::with_capacity(urls.len());
     let mut decoded_bytes = 0usize;
     for url in urls {
+        // Consent gate: unruled third-party subresources never hit the network.
+        let allowed = parse_url(&url)
+            .ok()
+            .and_then(|u| u.origin())
+            .is_some_and(|origin| {
+                policy
+                    .lock()
+                    .unwrap()
+                    .evaluate(ctx.instance, &origin, first_party)
+                    .decision
+                    == Decision::Allow
+            });
+        if !allowed {
+            out.insert(url, ImageState::Blocked);
+            continue;
+        }
         // Once the decoded-memory budget is spent, defer the remaining
         // (off-screen) images: they aren't fetched or decoded, and lay out as
         // their reserved/placeholder box instead of a resident bitmap.
@@ -767,6 +838,9 @@ enum ImageState {
     Pending,
     Ready(Arc<DecodedImage>),
     Failed,
+    /// Refused by the consent policy (third-party, no Allow rule). Paints as
+    /// the placeholder/alt box; an Allow rule un-blocks and re-requests.
+    Blocked,
 }
 
 /// Image provider over the browser's per-page store. Resolves an element's
@@ -890,6 +964,12 @@ pub struct BrowserApp {
     settings_open: bool,
     background: Color,
     last_size: Size,
+    /// Consent policy shared with the worker-side cookie jar.
+    consent: Arc<Mutex<DefaultDenyPolicy>>,
+    /// Worker-raised consent events, drained into `consent_prompts` by poll().
+    pending_consent: Arc<Mutex<Vec<ConsentEvent>>>,
+    /// Prompts awaiting the user, shown one at a time in the banner.
+    consent_prompts: Vec<ConsentEvent>,
     /// Persistent profile dir (None = ephemeral; nothing touches disk).
     data_dir: Option<PathBuf>,
     /// Passphrase being typed into the settings overlay (cleared on submit).
@@ -933,8 +1013,18 @@ impl BrowserApp {
             None => (StorageEnvironment::with_no_vault(), None),
         };
         let storage = Arc::new(Mutex::new(env));
+        let mut policy = DefaultDenyPolicy::new(true);
+        if let Some(dir) = &data_dir {
+            if let Ok(text) = std::fs::read_to_string(dir.join(CONSENT_RULES_FILE)) {
+                policy.load_rules(&text);
+            }
+        }
+        let consent = Arc::new(Mutex::new(policy));
+        let pending_consent: Arc<Mutex<Vec<ConsentEvent>>> = Arc::new(Mutex::new(Vec::new()));
         let jar: Arc<dyn CookieJar> = Arc::new(SealedJar {
             storage: storage.clone(),
+            policy: consent.clone(),
+            events: pending_consent.clone(),
         });
         let (heads, active) = match &data_dir {
             Some(dir) => load_heads(dir).unwrap_or_else(|| {
@@ -952,6 +1042,8 @@ impl BrowserApp {
             heads,
             data_dir,
         );
+        app.consent = consent;
+        app.pending_consent = pending_consent;
         if active != 0 {
             let _ = app.heads.switch_to(active);
             app.toolbar.head_label = app.heads.active().label.clone();
@@ -1010,6 +1102,9 @@ impl BrowserApp {
             settings_open: false,
             background: Color::WHITE,
             last_size: Size::new(800, 600),
+            consent: Arc::new(Mutex::new(DefaultDenyPolicy::new(true))),
+            pending_consent: Arc::new(Mutex::new(Vec::new())),
+            consent_prompts: Vec::new(),
             data_dir,
             vault_input: String::new(),
             vault_msg: None,
@@ -1258,6 +1353,12 @@ impl BrowserApp {
             let Some(first_party) = first_party.clone() else {
                 continue;
             };
+            // Consent gate: third-party subresources need an Allow rule;
+            // otherwise they are blocked (and prompted, headed).
+            if self.gate_subresource(&abs, &first_party) != Decision::Allow {
+                self.images.insert(abs, ImageState::Blocked);
+                continue;
+            }
             self.images.insert(abs.clone(), ImageState::Pending);
             self.loader.request_subresource(
                 abs,
@@ -1266,6 +1367,108 @@ impl BrowserApp {
                     kind: FetchKind::Subresource { first_party },
                 },
             );
+        }
+    }
+
+    /// Evaluate the consent policy for one subresource URL in the context of
+    /// `first_party`; queues a deduplicated banner prompt on `Prompt`.
+    fn gate_subresource(&mut self, abs_url: &str, first_party: &Origin) -> Decision {
+        let Some(origin) = parse_url(abs_url).ok().and_then(|u| u.origin()) else {
+            return Decision::Deny;
+        };
+        let instance = self.heads.active().instance;
+        let outcome = self
+            .consent
+            .lock()
+            .unwrap()
+            .evaluate(instance, &origin, first_party);
+        if let Some(event) = outcome.event {
+            self.queue_consent_prompt(event);
+        }
+        outcome.decision
+    }
+
+    /// Add a prompt to the banner queue unless an equivalent one is pending.
+    fn queue_consent_prompt(&mut self, event: ConsentEvent) {
+        let dup = self.consent_prompts.iter().any(|e| {
+            e.instance == event.instance
+                && e.request.site() == event.request.site()
+                && e.first_party.site() == event.first_party.site()
+        });
+        if !dup {
+            self.consent_prompts.push(event);
+        }
+    }
+
+    /// Apply the user's banner decision to the front prompt.
+    fn resolve_consent(&mut self, action: BannerAction) {
+        if self.consent_prompts.is_empty() {
+            return;
+        }
+        let event = self.consent_prompts.remove(0);
+        match action {
+            BannerAction::Allow | BannerAction::Deny => {
+                let allow = action == BannerAction::Allow;
+                self.consent.lock().unwrap().add_rule(
+                    event.instance,
+                    &event.request,
+                    &event.first_party,
+                    allow,
+                );
+                self.save_consent_rules();
+                if allow {
+                    self.unblock_site(&event);
+                }
+            }
+            // Dismiss: no standing rule; the default (deny) keeps applying.
+            BannerAction::Dismiss | BannerAction::None => {}
+        }
+    }
+
+    /// After an Allow rule: release matching quarantined cookies and re-request
+    /// this site's blocked subresources.
+    fn unblock_site(&mut self, event: &ConsentEvent) {
+        let allowed_site = event.request.site();
+        // Quarantined cookies whose domain belongs to the allowed site.
+        {
+            let mut env = self.storage.lock().unwrap();
+            let mut store = env.instance(event.instance);
+            let names: Vec<String> = store
+                .quarantined_cookies(&event.first_party)
+                .into_iter()
+                .filter(|c| Origin::new("https", c.domain.clone(), None).site() == allowed_site)
+                .map(|c| c.name)
+                .collect();
+            for name in names {
+                let _ = store.release_from_quarantine(&name, &event.first_party);
+            }
+        }
+        self.persist();
+        // Blocked images for that site re-enter the normal pipeline.
+        let blocked: Vec<String> = self
+            .images
+            .iter()
+            .filter(|(url, state)| {
+                matches!(state, ImageState::Blocked)
+                    && parse_url(url)
+                        .ok()
+                        .and_then(|u| u.origin())
+                        .is_some_and(|o| o.site() == allowed_site)
+            })
+            .map(|(url, _)| url.clone())
+            .collect();
+        for url in blocked {
+            self.images.remove(&url);
+        }
+        self.request_page_images();
+    }
+
+    /// Persist the standing consent rules into the profile (if any).
+    fn save_consent_rules(&self) {
+        let Some(dir) = &self.data_dir else { return };
+        let text = self.consent.lock().unwrap().serialize_rules();
+        if let Err(e) = atomic_write(&dir.join(CONSENT_RULES_FILE), text.as_bytes()) {
+            eprintln!("cerberus: cannot save consent rules: {e}");
         }
     }
 
@@ -1612,6 +1815,13 @@ impl FrameApp for BrowserApp {
 
     fn poll(&mut self) -> bool {
         let mut redraw = false;
+        // Worker-side consent events (cookie capture) surface in the banner.
+        let drained: Vec<ConsentEvent> =
+            std::mem::take(self.pending_consent.lock().unwrap().as_mut());
+        for event in drained {
+            self.queue_consent_prompt(event);
+            redraw = true;
+        }
         while let Some(done) = self.loader.try_recv() {
             redraw |= match done {
                 Done::Page {
@@ -1627,8 +1837,15 @@ impl FrameApp for BrowserApp {
 
     fn render_frame(&mut self, size: Size) -> Framebuffer {
         self.last_size = size;
-        let content = self.toolbar.content_size(size);
-        let origin = self.toolbar.content_origin();
+        let banner_h = if self.consent_prompts.is_empty() {
+            0
+        } else {
+            BANNER_HEIGHT
+        };
+        let mut content = self.toolbar.content_size(size);
+        content.h = content.h.saturating_sub(banner_h);
+        let mut origin = self.toolbar.content_origin();
+        origin.y += banner_h as i32;
 
         let provider = StoreImages {
             base: self.current_url.as_ref(),
@@ -1672,6 +1889,11 @@ impl FrameApp for BrowserApp {
         fb.blit(origin, &page);
         self.text
             .rasterize(&self.toolbar.paint(size, &self.text), &mut fb);
+        if let Some(event) = self.consent_prompts.first() {
+            let banner = ConsentBanner::new(event.request.site(), self.consent_prompts.len() - 1);
+            self.text
+                .rasterize(&banner.paint(size, &self.text), &mut fb);
+        }
         if self.insecure_prompt.is_some() {
             self.insecure_button = Some(paint_insecure_button(&mut fb, &self.text));
         }
@@ -1708,10 +1930,28 @@ impl FrameApp for BrowserApp {
             }
             return true;
         }
+        // The consent banner (when shown) owns its strip.
+        if let Some(event) = self.consent_prompts.first() {
+            let strip = ConsentBanner::rect(self.last_size);
+            if point_in_rect(strip, x, y) {
+                let banner =
+                    ConsentBanner::new(event.request.site(), self.consent_prompts.len() - 1);
+                let action = banner.hit_test(self.last_size, x, y);
+                if action != BannerAction::None {
+                    self.resolve_consent(action);
+                }
+                return true;
+            }
+        }
+        let banner_h = if self.consent_prompts.is_empty() {
+            0
+        } else {
+            BANNER_HEIGHT
+        };
         // Page-area click: a form control wins over a link, which wins over
         // plain content. A click anywhere in the page that misses every control
         // also drops form focus (and is consumed if it actually had focus).
-        if y >= cerberus_ui::TOOLBAR_HEIGHT as i32 {
+        if y >= (cerberus_ui::TOOLBAR_HEIGHT + banner_h) as i32 {
             if let Some(field) = self.field_at(x, y) {
                 return self.click_field(&field);
             }
@@ -2262,20 +2502,29 @@ mod tests {
 
     // ---- The sealed cookie jar (the app side of the engine's cookie seam) ----
 
-    fn jar_with_env() -> (SealedJar, Arc<Mutex<StorageEnvironment>>) {
+    #[allow(clippy::type_complexity)]
+    fn jar_with_env() -> (
+        SealedJar,
+        Arc<Mutex<StorageEnvironment>>,
+        Arc<Mutex<Vec<ConsentEvent>>>,
+    ) {
         install_psl();
         let storage = Arc::new(Mutex::new(StorageEnvironment::with_no_vault()));
+        let events: Arc<Mutex<Vec<ConsentEvent>>> = Arc::new(Mutex::new(Vec::new()));
         (
             SealedJar {
                 storage: storage.clone(),
+                policy: Arc::new(Mutex::new(DefaultDenyPolicy::new(true))),
+                events: events.clone(),
             },
             storage,
+            events,
         )
     }
 
     #[test]
     fn jar_stores_same_site_cookies_and_attaches_them() {
-        let (jar, _env) = jar_with_env();
+        let (jar, _env, _events) = jar_with_env();
         let instance = InstanceId::from_u64_pair(0, 0x10);
         let url = parse_url("https://shop.example.com/login").unwrap();
         let fp = url.origin().unwrap();
@@ -2301,13 +2550,14 @@ mod tests {
 
     #[test]
     fn jar_drops_cross_site_cookies_while_vault_is_locked() {
-        let (jar, env) = jar_with_env();
+        let (jar, env, events) = jar_with_env();
         let instance = InstanceId::from_u64_pair(0, 0x10);
         let fp = Origin::new("https", "news.example.com", None);
         let tracker = parse_url("https://ads.tracker.net/pixel.gif").unwrap();
 
-        // Third-party Set-Cookie: quarantine is the only path, and the locked
-        // vault rejects it — the cookie ceases to exist.
+        // Third-party Set-Cookie: the policy says Prompt, quarantine is the
+        // only path, and the locked vault rejects it — the cookie ceases to
+        // exist. The prompt event is queued for the banner.
         jar.set_cookie(instance, &tracker, &fp, "uid=xyz");
         assert_eq!(jar.cookie_header(instance, &tracker, &fp), None);
         assert!(env
@@ -2316,11 +2566,12 @@ mod tests {
             .instance(instance)
             .quarantined_names(&fp)
             .is_empty());
+        assert_eq!(events.lock().unwrap().len(), 1);
     }
 
     #[test]
     fn jar_is_sealed_per_instance() {
-        let (jar, _env) = jar_with_env();
+        let (jar, _env, _events) = jar_with_env();
         let a = InstanceId::from_u64_pair(0, 0xA);
         let b = InstanceId::from_u64_pair(0, 0xB);
         let url = parse_url("https://shop.example.com/").unwrap();
@@ -2333,7 +2584,7 @@ mod tests {
 
     #[test]
     fn jar_rejects_malformed_and_misdomained_cookies() {
-        let (jar, _env) = jar_with_env();
+        let (jar, _env, _events) = jar_with_env();
         let instance = InstanceId::from_u64_pair(0, 0x10);
         let url = parse_url("https://shop.example.com/").unwrap();
         let fp = url.origin().unwrap();
@@ -2342,6 +2593,91 @@ mod tests {
         jar.set_cookie(instance, &url, &fp, "a=1; Domain=other.com");
         jar.set_cookie(instance, &url, &fp, "b=2; Domain=com");
         assert_eq!(jar.cookie_header(instance, &url, &fp), None);
+    }
+
+    // ---- Consent enforcement (M5) ----
+
+    #[test]
+    fn third_party_images_are_blocked_then_allowed_via_the_banner() {
+        let mut b = fake_app_img(
+            vec![(
+                "https://news.test/",
+                Ok(page(
+                    "https://news.test/",
+                    200,
+                    None,
+                    "<img src=\"https://ads.tracker.net/pixel.png\"> \
+                     <img src=\"/own.png\">",
+                )),
+            )],
+            vec![
+                // Only the first-party image has a canned response; if the
+                // tracker pixel were fetched it would resolve to Failed.
+                ("https://news.test/own.png", Ok(test_png(2, 2))),
+            ],
+        );
+        b.navigate("https://news.test/");
+        assert!(b.poll());
+
+        // The third-party image never reached the loader: Blocked, not Failed.
+        assert!(matches!(
+            b.images.get("https://ads.tracker.net/pixel.png"),
+            Some(ImageState::Blocked)
+        ));
+        // The first-party image went through the normal pipeline.
+        assert!(matches!(
+            b.images.get("https://news.test/own.png"),
+            Some(ImageState::Ready(_))
+        ));
+        // A banner prompt is pending for the tracker site.
+        assert_eq!(b.consent_prompts.len(), 1);
+        assert_eq!(b.consent_prompts[0].request.site(), "https://tracker.net");
+
+        // The user allows it: a standing rule lands and the image re-requests
+        // (the loader has no canned bytes, so it resolves Failed — proof the
+        // fetch actually went out this time).
+        b.resolve_consent(BannerAction::Allow);
+        assert!(b.poll());
+        assert!(b.consent_prompts.is_empty());
+        assert!(matches!(
+            b.images.get("https://ads.tracker.net/pixel.png"),
+            Some(ImageState::Failed)
+        ));
+        // And the rule persists in the policy: gating now answers Allow.
+        let fp = Origin::new("https", "news.test", None);
+        assert_eq!(
+            b.gate_subresource("https://ads.tracker.net/pixel.png", &fp),
+            Decision::Allow
+        );
+    }
+
+    #[test]
+    fn deny_leaves_the_site_blocked_without_new_prompts() {
+        let mut b = fake_app_img(
+            vec![(
+                "https://news.test/",
+                Ok(page(
+                    "https://news.test/",
+                    200,
+                    None,
+                    "<img src=\"https://ads.tracker.net/pixel.png\">",
+                )),
+            )],
+            vec![],
+        );
+        b.navigate("https://news.test/");
+        assert!(b.poll());
+        assert_eq!(b.consent_prompts.len(), 1);
+
+        b.resolve_consent(BannerAction::Deny);
+        assert!(b.consent_prompts.is_empty());
+        // Still blocked, and re-gating answers Deny with no new prompt.
+        let fp = Origin::new("https", "news.test", None);
+        assert_eq!(
+            b.gate_subresource("https://ads.tracker.net/pixel.png", &fp),
+            Decision::Deny
+        );
+        assert!(b.consent_prompts.is_empty());
     }
 
     // ---- Hermetic test harness: a fake loader, no network or threads. ----
