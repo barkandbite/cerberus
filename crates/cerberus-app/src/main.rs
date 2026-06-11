@@ -40,8 +40,10 @@ fn main() -> ExitCode {
 #[cfg(feature = "windowing")]
 fn cmd_run(args: &[String]) -> ExitCode {
     let fullscreen = has_flag(args, "--fullscreen");
-    let system_roots = has_flag(args, "--system-roots");
-    let app = cerberus_app::BrowserApp::with_options(system_roots);
+    let app = cerberus_app::BrowserApp::with_config(cerberus_app::AppOptions {
+        system_roots: has_flag(args, "--system-roots"),
+        data_dir: flag(args, "--data-dir").map(std::path::PathBuf::from),
+    });
     match cerberus_shell_winit::run(app, fullscreen) {
         Ok(()) => ExitCode::SUCCESS,
         Err(e) => {
@@ -72,6 +74,7 @@ fn cmd_render(args: &[String]) -> ExitCode {
     }
     config.headed = has_flag(args, "--headed");
     config.system_roots = has_flag(args, "--system-roots");
+    config.data_dir = flag(args, "--data-dir");
     config.background = Color::WHITE;
 
     let outcome = match render(&config) {
@@ -155,14 +158,17 @@ fn print_usage() {
          \x20 help       Print this help\n\n\
          RUN OPTIONS:\n\
          \x20 --fullscreen        start borderless-fullscreen (F11 toggles)\n\
-         \x20 --system-roots      trust the OS cert store (TLS-inspecting proxies)\n\n\
+         \x20 --system-roots      trust the OS cert store (TLS-inspecting proxies)\n\
+         \x20 --data-dir <DIR>    persistent profile (cookies, vault, heads);\n\
+         \x20                     omit for fully-ephemeral (default)\n\n\
          RENDER OPTIONS:\n\
          \x20 --url <URL>          default: cerberus:home\n\
          \x20 --out <FILE>         default: cerberus-home.ppm\n\
          \x20 --width <PX>         viewport width\n\
          \x20 --height <PX>        viewport height\n\
          \x20 --headed            enable consent prompts\n\
-         \x20 --system-roots      trust the OS cert store (TLS-inspecting proxies)\n\n\
+         \x20 --system-roots      trust the OS cert store (TLS-inspecting proxies)\n\
+         \x20 --data-dir <DIR>    persistent profile (cookies survive runs)\n\n\
          MEM-GATE OPTIONS:\n\
          \x20 --budget-mb <MB>     default: 64"
     );

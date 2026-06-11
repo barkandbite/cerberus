@@ -10,9 +10,11 @@
 //! format land at M4; here the ciphertext blobs are kept in memory.
 
 use super::StorageError;
+use crate::disk::{self, RecordReader, RecordWriter, KIND_VAULT};
 use cerberus_crypto::{Aead, Kdf, Key, Secret};
 use cerberus_types::InstanceId;
 use std::collections::HashMap;
+use std::path::Path;
 
 /// Encrypted, instance-partitioned storage for quarantined secrets.
 pub trait Vault: Send {
@@ -33,6 +35,22 @@ pub trait Vault: Send {
     fn load(&mut self, instance: InstanceId, key: &str) -> Result<Option<Vec<u8>>, StorageError>;
     /// Remove the value under `(instance, key)`.
     fn remove(&mut self, instance: InstanceId, key: &str) -> Result<(), StorageError>;
+
+    /// Persist ciphertext blobs to `path` (no-op for memory-only vaults).
+    /// Ciphertext only — the key never touches disk.
+    fn save_to(&self, _path: &Path) -> std::io::Result<()> {
+        Ok(())
+    }
+    /// Load ciphertext blobs from `path` if it exists. Works while locked.
+    fn load_from(&mut self, _path: &Path) -> std::io::Result<()> {
+        Ok(())
+    }
+    /// Whether there are unsaved changes.
+    fn is_dirty(&self) -> bool {
+        false
+    }
+    /// Mark changes as saved.
+    fn clear_dirty(&mut self) {}
 }
 
 /// A vault that holds no key and refuses every operation. Used where quarantine
@@ -83,6 +101,7 @@ pub struct EncryptedVault {
     /// fail *at unlock* instead of at the first cookie release.
     check: Option<Blob>,
     blobs: HashMap<(InstanceId, String), Blob>,
+    dirty: bool,
 }
 
 impl EncryptedVault {
@@ -95,6 +114,7 @@ impl EncryptedVault {
             key: None,
             check: None,
             blobs: HashMap::new(),
+            dirty: false,
         }
     }
 
@@ -135,6 +155,7 @@ impl Vault for EncryptedVault {
                 let nonce = self.fresh_nonce();
                 let ciphertext = self.aead.seal(&key, &nonce, CHECK_AAD, b"cerberus")?;
                 self.check = Some(Blob { nonce, ciphertext });
+                self.dirty = true;
             }
         }
         self.key = Some(key);
@@ -159,6 +180,7 @@ impl Vault for EncryptedVault {
             .seal(secret_key, &nonce, &aad(instance, key), plaintext)?;
         self.blobs
             .insert((instance, key.to_string()), Blob { nonce, ciphertext });
+        self.dirty = true;
         Ok(())
     }
 
@@ -177,7 +199,71 @@ impl Vault for EncryptedVault {
     }
 
     fn remove(&mut self, instance: InstanceId, key: &str) -> Result<(), StorageError> {
-        self.blobs.remove(&(instance, key.to_string()));
+        if self.blobs.remove(&(instance, key.to_string())).is_some() {
+            self.dirty = true;
+        }
         Ok(())
+    }
+
+    /// On-disk layout (KIND_VAULT records): `["C", nonce, ct]` for the check
+    /// sentinel, `["B", instance, key, nonce, ct]` per blob. Ciphertext only.
+    fn save_to(&self, path: &Path) -> std::io::Result<()> {
+        let mut w = RecordWriter::new(KIND_VAULT);
+        if let Some(check) = &self.check {
+            w.record(&[b"C", &check.nonce, &check.ciphertext]);
+        }
+        for ((instance, key), blob) in &self.blobs {
+            w.record(&[
+                b"B",
+                instance.0.as_bytes(),
+                key.as_bytes(),
+                &blob.nonce,
+                &blob.ciphertext,
+            ]);
+        }
+        disk::atomic_write(path, &w.finish())
+    }
+
+    fn load_from(&mut self, path: &Path) -> std::io::Result<()> {
+        let Some(bytes) = disk::read_if_exists(path)? else {
+            return Ok(());
+        };
+        let bad = |m: &str| std::io::Error::new(std::io::ErrorKind::InvalidData, m.to_string());
+        let mut reader = RecordReader::new(&bytes, KIND_VAULT)?;
+        while let Some(fields) = reader.next_record()? {
+            match fields.first().map(Vec::as_slice) {
+                Some(b"C") if fields.len() == 3 => {
+                    self.check = Some(Blob {
+                        nonce: fields[1].clone(),
+                        ciphertext: fields[2].clone(),
+                    });
+                }
+                Some(b"B") if fields.len() == 5 => {
+                    let id: [u8; 16] = fields[1]
+                        .as_slice()
+                        .try_into()
+                        .map_err(|_| bad("bad instance id"))?;
+                    let key =
+                        String::from_utf8(fields[2].clone()).map_err(|_| bad("bad vault key"))?;
+                    self.blobs.insert(
+                        (InstanceId(cerberus_types::Id128::from_bytes(id)), key),
+                        Blob {
+                            nonce: fields[3].clone(),
+                            ciphertext: fields[4].clone(),
+                        },
+                    );
+                }
+                _ => return Err(bad("unknown vault record")),
+            }
+        }
+        Ok(())
+    }
+
+    fn is_dirty(&self) -> bool {
+        self.dirty
+    }
+
+    fn clear_dirty(&mut self) {
+        self.dirty = false;
     }
 }

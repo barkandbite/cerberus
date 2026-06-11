@@ -28,6 +28,21 @@ impl Id128 {
     pub const fn as_bytes(&self) -> &[u8; 16] {
         &self.0
     }
+
+    /// Parse the 32-char lowercase-hex form produced by `Display`.
+    pub fn from_hex(s: &str) -> Option<Self> {
+        let s = s.trim();
+        if s.len() != 32 {
+            return None;
+        }
+        let mut bytes = [0u8; 16];
+        for (i, chunk) in s.as_bytes().chunks_exact(2).enumerate() {
+            let hi = (chunk[0] as char).to_digit(16)?;
+            let lo = (chunk[1] as char).to_digit(16)?;
+            bytes[i] = ((hi << 4) | lo) as u8;
+        }
+        Some(Self(bytes))
+    }
 }
 
 impl fmt::Display for Id128 {
@@ -57,6 +72,11 @@ macro_rules! id_newtype {
             /// Construct from two `u64` halves. Convenient for deterministic tests.
             pub fn from_u64_pair(hi: u64, lo: u64) -> Self {
                 Self(Id128::from_u64_pair(hi, lo))
+            }
+
+            /// Parse the 32-char hex form produced by `Display`.
+            pub fn from_hex(s: &str) -> Option<Self> {
+                Id128::from_hex(s).map(Self)
             }
         }
 

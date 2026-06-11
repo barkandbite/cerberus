@@ -33,6 +33,8 @@ cerberus-style = { path = "../cerberus-style" }
 cerberus-css = { path = "../cerberus-css" }
 cerberus-layout = { path = "../cerberus-layout" }
 cerberus-storage = { path = "../cerberus-storage" }
+cerberus-crypto = { path = "../cerberus-crypto" }
+cerberus-crypto-rustcrypto = { path = "../cerberus-crypto-rustcrypto" }
 cerberus-consent = { path = "../cerberus-consent" }
 cerberus-farbling = { path = "../cerberus-farbling" }
 cerberus-js = { path = "../cerberus-js" }

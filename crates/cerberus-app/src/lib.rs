@@ -9,6 +9,8 @@
 //! present, with the consent and farbling seams exercised along the way.
 
 use cerberus_consent::{ConsentPolicy, Decision, DefaultDenyPolicy};
+use cerberus_crypto::Secret;
+use cerberus_crypto_rustcrypto::{Argon2idKdf, XChaCha20Poly1305Aead};
 use cerberus_css::CssEngine;
 use cerberus_dns_doh::DohResolver;
 use cerberus_dom::{parse_html, Document, DocumentBuilder, NodeRef};
@@ -28,7 +30,9 @@ use cerberus_paint::{
     DecodedImage, DisplayItem, DisplayList, Framebuffer, ImageDecoder, Rasterizer, TextShaper,
 };
 use cerberus_shell::{FrameApp, HeadlessSurface, PlatformSurface, Waker};
-use cerberus_storage::{parse_set_cookie, Group, StorageEnvironment};
+use cerberus_storage::{
+    atomic_write, parse_set_cookie, random_bytes, EncryptedVault, Group, StorageEnvironment,
+};
 use cerberus_style::{StyleEngine, StyledDom};
 use cerberus_text::TextEngine;
 use cerberus_tls_rustls::RustlsProvider;
@@ -36,6 +40,7 @@ use cerberus_types::{Color, FontStyle, HeadId, InstanceId, Origin, Point, RealmI
 use cerberus_ui::{Toolbar, ToolbarAction};
 use cerberus_url::{join as join_url, parse as parse_url, Url};
 use std::collections::HashMap;
+use std::path::{Path, PathBuf};
 use std::sync::mpsc::{Receiver, Sender};
 use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
@@ -51,6 +56,9 @@ pub struct RenderConfig {
     /// Trust the OS root store instead of the bundled roots (for TLS-inspecting
     /// proxies). Off by default.
     pub system_roots: bool,
+    /// Persistent profile directory. `None` (the default) is fully ephemeral:
+    /// nothing touches disk — the privacy default.
+    pub data_dir: Option<String>,
 }
 
 impl Default for RenderConfig {
@@ -61,8 +69,18 @@ impl Default for RenderConfig {
             background: Color::WHITE,
             headed: false,
             system_roots: false,
+            data_dir: None,
         }
     }
+}
+
+/// Launch options for the interactive browser.
+#[derive(Clone, Debug, Default)]
+pub struct AppOptions {
+    /// Trust the OS root store (TLS-inspecting proxies). Off by default.
+    pub system_roots: bool,
+    /// Persistent profile directory. `None` (default) = fully ephemeral.
+    pub data_dir: Option<PathBuf>,
 }
 
 /// A summary of one render, plus the produced frame.
@@ -139,6 +157,112 @@ pub fn default_heads() -> Vec<Head> {
 /// cookie-domain validation) uses real eTLD+1. Idempotent.
 fn install_psl() {
     cerberus_types::install_registrable_domain(cerberus_consent::psl::registrable_domain);
+}
+
+// ---- Persistent profile (--data-dir): salt, vault, cookies, heads ----
+
+const VAULT_SALT_FILE: &str = "vault.salt";
+const HEADS_FILE: &str = "heads.txt";
+
+/// Load the profile's KDF salt, creating a random one on first run.
+fn load_or_create_salt(dir: &Path) -> std::io::Result<[u8; 16]> {
+    let path = dir.join(VAULT_SALT_FILE);
+    match std::fs::read(&path) {
+        Ok(bytes) => bytes.try_into().map_err(|_| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "vault.salt is not 16 bytes",
+            )
+        }),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            let salt: [u8; 16] = random_bytes(16).try_into().expect("16 random bytes");
+            atomic_write(&path, &salt)?;
+            Ok(salt)
+        }
+        Err(e) => Err(e),
+    }
+}
+
+/// Open (or initialize) a profile's sealed storage: XChaCha20-Poly1305 +
+/// Argon2id vault (locked until the user unlocks it) over the on-disk
+/// cookie partitions.
+fn open_profile_storage(dir: &Path) -> std::io::Result<StorageEnvironment> {
+    std::fs::create_dir_all(dir)?;
+    let salt = load_or_create_salt(dir)?;
+    let vault = EncryptedVault::new(
+        Box::new(XChaCha20Poly1305Aead::new()),
+        Box::new(Argon2idKdf::new()),
+        salt,
+    );
+    StorageEnvironment::load(dir, Box::new(vault))
+}
+
+/// A profile's heads: random instance ids + farbling seeds minted on first
+/// run (per-profile unlinkability), persisted in a human-auditable text file.
+fn fresh_profile_heads() -> Vec<Head> {
+    ["work", "personal", "throwaway"]
+        .iter()
+        .enumerate()
+        .map(|(i, label)| {
+            let instance_bytes: [u8; 16] = random_bytes(16).try_into().expect("16 random bytes");
+            let seed_bytes: [u8; 8] = random_bytes(8).try_into().expect("8 random bytes");
+            Head::new(
+                HeadId::from_u64_pair(0, i as u64 + 1),
+                InstanceId(cerberus_types::Id128::from_bytes(instance_bytes)),
+                *label,
+                u64::from_le_bytes(seed_bytes),
+            )
+        })
+        .collect()
+}
+
+/// Parse `heads.txt`: `cerberus-heads v1`, `active <idx>`, then one
+/// `head <head-id> <instance-id> <seed-hex> <label>` line per head.
+fn load_heads(dir: &Path) -> Option<(Vec<Head>, usize)> {
+    let text = std::fs::read_to_string(dir.join(HEADS_FILE)).ok()?;
+    let mut lines = text.lines();
+    if lines.next()?.trim() != "cerberus-heads v1" {
+        return None;
+    }
+    let mut active = 0usize;
+    let mut heads = Vec::new();
+    for line in lines {
+        let mut parts = line.split_whitespace();
+        match parts.next() {
+            Some("active") => active = parts.next()?.parse().ok()?,
+            Some("head") => {
+                let id = HeadId::from_hex(parts.next()?)?;
+                let instance = InstanceId::from_hex(parts.next()?)?;
+                let seed = u64::from_str_radix(parts.next()?, 16).ok()?;
+                let label = parts.collect::<Vec<_>>().join(" ");
+                if label.is_empty() {
+                    return None;
+                }
+                heads.push(Head::new(id, instance, label, seed));
+            }
+            Some(_) | None => continue,
+        }
+    }
+    if heads.is_empty() || active >= heads.len() {
+        return None;
+    }
+    Some((heads, active))
+}
+
+fn save_heads(dir: &Path, heads: &[Head], active: usize) -> std::io::Result<()> {
+    use cerberus_farbling::FarblingProvider as _;
+    let mut out = String::from("cerberus-heads v1\n");
+    out.push_str(&format!("active {active}\n"));
+    for h in heads {
+        out.push_str(&format!(
+            "head {} {} {:016x} {}\n",
+            h.id,
+            h.instance,
+            h.farbling.seed(),
+            h.label
+        ));
+    }
+    atomic_write(&dir.join(HEADS_FILE), out.as_bytes())
 }
 
 /// Build the network client: built-in `cerberus:` pages are served locally;
@@ -219,8 +343,23 @@ pub fn render(config: &RenderConfig) -> Result<RenderOutcome, AppError> {
     install_psl();
     let url = parse_url(&config.url).map_err(|e| AppError::Url(e.to_string()))?;
 
-    // --- Identities: one engine live at a time, instantiated lazily. ---
-    let mut heads = HeadManager::new(default_heads(), Box::new(QuickJsEngineFactory));
+    // --- Identities: one engine live at a time, instantiated lazily. With a
+    // profile, the persisted heads are used (same instances as the interactive
+    // browser, so one-shot renders see the same sealed cookies). ---
+    let profile_heads = config.data_dir.as_deref().map(Path::new).map(|dir| {
+        load_heads(dir).unwrap_or_else(|| {
+            let heads = fresh_profile_heads();
+            if let Err(e) = save_heads(dir, &heads, 0) {
+                eprintln!("cerberus: cannot save heads: {e}");
+            }
+            (heads, 0)
+        })
+    });
+    let (head_list, active_idx) = profile_heads.unwrap_or_else(|| (default_heads(), 0));
+    let mut heads = HeadManager::new(head_list, Box::new(QuickJsEngineFactory));
+    if active_idx != 0 {
+        let _ = heads.switch_to(active_idx);
+    }
     let active_instance = heads.active().instance;
     let active_label = heads.active().label.clone();
 
@@ -233,10 +372,16 @@ pub fn render(config: &RenderConfig) -> Result<RenderOutcome, AppError> {
         )
     });
 
-    // --- Sealed storage behind the cookie seam. The one-shot path runs with no
-    // vault: first-party cookies from the real fetch land as `Active`;
-    // cross-site ones are dropped at the quarantine door (default-deny). ---
-    let storage = Arc::new(Mutex::new(StorageEnvironment::with_no_vault()));
+    // --- Sealed storage behind the cookie seam. Ephemeral by default; with a
+    // data dir the profile's cookies load (vault stays locked in one-shot
+    // mode, so cross-site cookies are dropped at the quarantine door —
+    // default-deny either way). ---
+    let storage = Arc::new(Mutex::new(match &config.data_dir {
+        Some(dir) => {
+            open_profile_storage(Path::new(dir)).map_err(|e| AppError::Io(e.to_string()))?
+        }
+        None => StorageEnvironment::with_no_vault(),
+    }));
     let jar: Arc<dyn CookieJar> = Arc::new(SealedJar {
         storage: storage.clone(),
     });
@@ -327,12 +472,18 @@ pub fn render(config: &RenderConfig) -> Result<RenderOutcome, AppError> {
 
     // Cookies now resident for this page's site — captured from the real
     // responses through the sealed jar (zero for builtin/cookieless pages).
-    let active_cookies = storage
-        .lock()
-        .unwrap()
-        .instance(active_instance)
-        .cookies_for_request(&first_party, &first_party)
-        .len();
+    let active_cookies = {
+        let mut env = storage.lock().unwrap();
+        let count = env
+            .instance(active_instance)
+            .cookies_for_request(&first_party, &first_party)
+            .len();
+        if let Some(dir) = &config.data_dir {
+            env.save(Path::new(dir))
+                .map_err(|e| AppError::Io(e.to_string()))?;
+        }
+        count
+    };
 
     // --- Toolbar (minimal UI) over the page content, with real fonts. ---
     let text = TextEngine::new();
@@ -739,6 +890,12 @@ pub struct BrowserApp {
     settings_open: bool,
     background: Color,
     last_size: Size,
+    /// Persistent profile dir (None = ephemeral; nothing touches disk).
+    data_dir: Option<PathBuf>,
+    /// Passphrase being typed into the settings overlay (cleared on submit).
+    vault_input: String,
+    /// Outcome line shown under the vault prompt.
+    vault_msg: Option<String>,
 }
 
 impl BrowserApp {
@@ -750,28 +907,77 @@ impl BrowserApp {
     /// Like [`new`](Self::new) but trusting the OS root store (for TLS-inspecting
     /// proxies); see `RustlsProvider::with_system_roots`.
     pub fn with_options(system_roots: bool) -> Self {
-        let storage = Arc::new(Mutex::new(StorageEnvironment::with_no_vault()));
+        Self::with_config(AppOptions {
+            system_roots,
+            ..AppOptions::default()
+        })
+    }
+
+    /// Create a browser from launch options. With a `data_dir`, cookies, the
+    /// vault, and head seeds persist across runs; a profile that fails to open
+    /// falls back to ephemeral (the on-disk data is left untouched, and
+    /// nothing is written over it).
+    pub fn with_config(options: AppOptions) -> Self {
+        install_psl();
+        let (env, data_dir) = match &options.data_dir {
+            Some(dir) => match open_profile_storage(dir) {
+                Ok(env) => (env, Some(dir.clone())),
+                Err(e) => {
+                    eprintln!(
+                        "cerberus: cannot open profile {}: {e}; running ephemeral",
+                        dir.display()
+                    );
+                    (StorageEnvironment::with_no_vault(), None)
+                }
+            },
+            None => (StorageEnvironment::with_no_vault(), None),
+        };
+        let storage = Arc::new(Mutex::new(env));
         let jar: Arc<dyn CookieJar> = Arc::new(SealedJar {
             storage: storage.clone(),
         });
-        Self::with_loader_and_storage(Box::new(NetLoader::new(system_roots, Some(jar))), storage)
+        let (heads, active) = match &data_dir {
+            Some(dir) => load_heads(dir).unwrap_or_else(|| {
+                let heads = fresh_profile_heads();
+                if let Err(e) = save_heads(dir, &heads, 0) {
+                    eprintln!("cerberus: cannot save heads: {e}");
+                }
+                (heads, 0)
+            }),
+            None => (default_heads(), 0),
+        };
+        let mut app = Self::build(
+            Box::new(NetLoader::new(options.system_roots, Some(jar))),
+            storage,
+            heads,
+            data_dir,
+        );
+        if active != 0 {
+            let _ = app.heads.switch_to(active);
+            app.toolbar.head_label = app.heads.active().label.clone();
+        }
+        app
     }
 
     /// Test seam: a fake loader and a fresh (jar-less) storage environment.
     #[cfg(test)]
     fn with_loader(loader: Box<dyn PageLoader>) -> Self {
-        Self::with_loader_and_storage(
+        install_psl();
+        Self::build(
             loader,
             Arc::new(Mutex::new(StorageEnvironment::with_no_vault())),
+            default_heads(),
+            None,
         )
     }
 
-    fn with_loader_and_storage(
+    fn build(
         loader: Box<dyn PageLoader>,
         storage: Arc<Mutex<StorageEnvironment>>,
+        heads: Vec<Head>,
+        data_dir: Option<PathBuf>,
     ) -> Self {
-        install_psl();
-        let heads = HeadManager::new(default_heads(), Box::new(QuickJsEngineFactory));
+        let heads = HeadManager::new(heads, Box::new(QuickJsEngineFactory));
         let label = heads.active().label.clone();
         let style_engine = CssEngine::new();
         let styled = style_engine.style(&empty_document());
@@ -804,6 +1010,9 @@ impl BrowserApp {
             settings_open: false,
             background: Color::WHITE,
             last_size: Size::new(800, 600),
+            data_dir,
+            vault_input: String::new(),
+            vault_msg: None,
         };
         app.navigate("cerberus:home");
         app
@@ -967,6 +1176,7 @@ impl BrowserApp {
 
         self.request_page_images();
         self.update_nav();
+        self.persist();
     }
 
     fn show_error(&mut self, url: &str, message: &str) {
@@ -1249,6 +1459,41 @@ impl BrowserApp {
         self.text.rasterize(&list, page);
     }
 
+    /// Attempt a vault unlock with the passphrase typed into the settings
+    /// overlay. The input is cleared either way; the derived key (and the
+    /// Secret's copy of the passphrase) zeroize on drop.
+    fn try_unlock_vault(&mut self) {
+        if self.vault_input.is_empty() {
+            return;
+        }
+        let pass = Secret::from_passphrase(&self.vault_input);
+        self.vault_input.clear();
+        let result = self.storage.lock().unwrap().unlock_vault(&pass);
+        self.vault_msg = Some(match result {
+            Ok(()) => "vault unlocked".to_string(),
+            Err(_) if self.data_dir.is_none() => {
+                "no persistent profile (start with --data-dir)".to_string()
+            }
+            Err(_) => "wrong passphrase".to_string(),
+        });
+        // First unlock seals the check sentinel — persist it.
+        self.persist();
+    }
+
+    /// Flush unsaved cookie/vault state to the profile dir (no-op when
+    /// ephemeral or clean). Called after commits, head switches, and on Drop.
+    fn persist(&mut self) {
+        let Some(dir) = self.data_dir.clone() else {
+            return;
+        };
+        let mut env = self.storage.lock().unwrap();
+        if env.needs_save() {
+            if let Err(e) = env.save(&dir) {
+                eprintln!("cerberus: cannot persist profile: {e}");
+            }
+        }
+    }
+
     fn navigate(&mut self, input: &str) {
         let url = normalize_url(input);
         if !self.history.is_empty() {
@@ -1297,6 +1542,12 @@ impl BrowserApp {
         let _ = self.heads.switch_to(next);
         self.toolbar.head_label = self.heads.active().label.clone();
         let _ = self.heads.engine();
+        if let Some(dir) = self.data_dir.clone() {
+            if let Err(e) = save_heads(&dir, self.heads.heads(), self.heads.active_index()) {
+                eprintln!("cerberus: cannot save heads: {e}");
+            }
+        }
+        self.persist();
     }
 
     fn handle(&mut self, action: ToolbarAction) -> bool {
@@ -1338,6 +1589,12 @@ impl BrowserApp {
 impl Default for BrowserApp {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+impl Drop for BrowserApp {
+    fn drop(&mut self) {
+        self.persist();
     }
 }
 
@@ -1420,7 +1677,15 @@ impl FrameApp for BrowserApp {
         }
         if self.settings_open {
             let vault_locked = self.storage.lock().unwrap().vault_locked();
-            paint_settings_overlay(&mut fb, size, &self.text, &self.text, vault_locked);
+            paint_settings_overlay(
+                &mut fb,
+                size,
+                &self.text,
+                &self.text,
+                vault_locked,
+                self.vault_input.chars().count(),
+                self.vault_msg.as_deref(),
+            );
         }
         fb
     }
@@ -1435,7 +1700,12 @@ impl FrameApp for BrowserApp {
             }
         }
         if self.settings_open {
-            self.settings_open = false;
+            // Clicks inside the panel stay in the panel (passphrase entry);
+            // clicking outside dismisses it.
+            if !point_in_rect(settings_panel_rect(self.last_size), x, y) {
+                self.settings_open = false;
+                self.vault_msg = None;
+            }
             return true;
         }
         // Page-area click: a form control wins over a link, which wins over
@@ -1463,6 +1733,13 @@ impl FrameApp for BrowserApp {
     }
 
     fn text_input(&mut self, c: char) -> bool {
+        // The settings overlay captures typing for the vault passphrase.
+        if self.settings_open {
+            if !c.is_control() {
+                self.vault_input.push(c);
+            }
+            return true;
+        }
         // The URL box takes priority while it is focused.
         if self.toolbar.url_focused {
             self.toolbar.type_char(c);
@@ -1479,6 +1756,10 @@ impl FrameApp for BrowserApp {
     }
 
     fn submit(&mut self) -> bool {
+        if self.settings_open {
+            self.try_unlock_vault();
+            return true;
+        }
         if self.toolbar.url_focused {
             let action = self.toolbar.submit_url();
             return self.handle(action);
@@ -1492,6 +1773,10 @@ impl FrameApp for BrowserApp {
     }
 
     fn backspace(&mut self) -> bool {
+        if self.settings_open {
+            self.vault_input.pop();
+            return true;
+        }
         if self.toolbar.url_focused {
             self.toolbar.backspace();
             return true;
@@ -1814,18 +2099,27 @@ fn paint_insecure_button(fb: &mut Framebuffer, text: &TextEngine) -> Rect {
     rect
 }
 
-/// Paint a simple centered settings panel (placeholder; real settings at M5+).
+/// The settings panel's window rect (shared by paint and hit-testing).
+fn settings_panel_rect(size: Size) -> Rect {
+    let pw = size.w * 3 / 5;
+    let ph = size.h * 3 / 5;
+    let px = (size.w.saturating_sub(pw) / 2) as i32;
+    let py = (size.h.saturating_sub(ph) / 2) as i32;
+    Rect::new(px, py, pw, ph)
+}
+
+/// Paint the centered settings panel: vault state + passphrase entry.
 fn paint_settings_overlay(
     fb: &mut Framebuffer,
     size: Size,
     shaper: &dyn TextShaper,
     raster: &dyn Rasterizer,
     vault_locked: bool,
+    input_chars: usize,
+    vault_msg: Option<&str>,
 ) {
-    let pw = size.w * 3 / 5;
-    let ph = size.h * 3 / 5;
-    let px = (size.w.saturating_sub(pw) / 2) as i32;
-    let py = (size.h.saturating_sub(ph) / 2) as i32;
+    let panel = settings_panel_rect(size);
+    let (px, py, pw, ph) = (panel.x, panel.y, panel.w, panel.h);
 
     let mut list = DisplayList::new();
     list.push(DisplayItem::Rect {
@@ -1859,6 +2153,30 @@ fn paint_settings_overlay(
         color: Color::rgb(0x50, 0x50, 0x50),
         style: FontStyle::REGULAR,
     });
+    if vault_locked {
+        // Masked passphrase entry: type + Enter while the panel is open.
+        let mask = "\u{2022}".repeat(input_chars);
+        list.push(DisplayItem::Glyphs {
+            origin: Point::new(px + 12, py + 104),
+            glyphs: shaper.shape(&format!("passphrase: {mask}_"), 14),
+            color: Color::BLACK,
+            style: FontStyle::REGULAR,
+        });
+        list.push(DisplayItem::Glyphs {
+            origin: Point::new(px + 12, py + 126),
+            glyphs: shaper.shape("(type, then Enter to unlock)", 12),
+            color: Color::rgb(0x80, 0x80, 0x80),
+            style: FontStyle::REGULAR,
+        });
+    }
+    if let Some(msg) = vault_msg {
+        list.push(DisplayItem::Glyphs {
+            origin: Point::new(px + 12, py + 150),
+            glyphs: shaper.shape(msg, 14),
+            color: Color::rgb(0x90, 0x30, 0x30),
+            style: FontStyle::REGULAR,
+        });
+    }
     raster.rasterize(&list, fb);
 }
 
@@ -1896,6 +2214,50 @@ mod tests {
         assert_eq!(outcome.third_party_decision, Decision::Deny);
         // A frame was produced at the requested size.
         assert_eq!(outcome.framebuffer.size, RenderConfig::default().viewport);
+    }
+
+    // ---- Persistent profile helpers ----
+
+    #[test]
+    fn profile_heads_round_trip_and_are_random_per_profile() {
+        use cerberus_farbling::FarblingProvider as _;
+        let dir = std::env::temp_dir().join(format!("cerb-heads-test-{}", std::process::id()));
+        std::fs::remove_dir_all(&dir).ok();
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let heads = fresh_profile_heads();
+        // Fresh profiles mint distinct random instances and seeds.
+        assert_ne!(heads[0].instance, heads[1].instance);
+        assert_ne!(heads[0].farbling.seed(), heads[1].farbling.seed());
+
+        save_heads(&dir, &heads, 2).unwrap();
+        let (loaded, active) = load_heads(&dir).unwrap();
+        assert_eq!(active, 2);
+        assert_eq!(loaded.len(), heads.len());
+        for (a, b) in heads.iter().zip(&loaded) {
+            assert_eq!(a.id, b.id);
+            assert_eq!(a.instance, b.instance);
+            assert_eq!(a.label, b.label);
+            assert_eq!(a.farbling.seed(), b.farbling.seed());
+        }
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn profile_salt_is_created_once_and_stable() {
+        let dir = std::env::temp_dir().join(format!("cerb-salt-test-{}", std::process::id()));
+        std::fs::remove_dir_all(&dir).ok();
+
+        let env = open_profile_storage(&dir).unwrap();
+        assert!(env.vault_locked());
+        drop(env);
+        let salt1 = std::fs::read(dir.join(VAULT_SALT_FILE)).unwrap();
+        assert_eq!(salt1.len(), 16);
+
+        let _env = open_profile_storage(&dir).unwrap();
+        let salt2 = std::fs::read(dir.join(VAULT_SALT_FILE)).unwrap();
+        assert_eq!(salt1, salt2, "salt must be stable across opens");
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     // ---- The sealed cookie jar (the app side of the engine's cookie seam) ----

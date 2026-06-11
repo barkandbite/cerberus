@@ -16,12 +16,21 @@
 use cerberus_crypto::{CryptoError, Secret};
 use cerberus_types::{InstanceId, Origin};
 use std::collections::HashMap;
+use std::path::Path;
 
 mod cookie;
+mod disk;
 mod rand;
 mod vault;
 pub use cookie::parse_set_cookie;
+pub use disk::atomic_write;
 pub use vault::{EncryptedVault, NoVault, Vault};
+
+/// Random bytes from the OS CSPRNG (exported for salt/seed generation by the
+/// composition root, so the entropy source has one implementation).
+pub fn random_bytes(n: usize) -> Vec<u8> {
+    rand::random_bytes(n)
+}
 
 /// A single cookie.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -135,6 +144,8 @@ struct Partition {
 pub struct StorageEnvironment {
     partitions: HashMap<InstanceId, Partition>,
     vault: Box<dyn Vault>,
+    /// Unsaved cookie changes (the vault tracks its own dirtiness).
+    dirty: bool,
 }
 
 impl StorageEnvironment {
@@ -143,6 +154,7 @@ impl StorageEnvironment {
         Self {
             partitions: HashMap::new(),
             vault,
+            dirty: false,
         }
     }
 
@@ -162,6 +174,7 @@ impl StorageEnvironment {
             instance: id,
             partition,
             vault: self.vault.as_mut(),
+            dirty: &mut self.dirty,
         }
     }
 
@@ -174,6 +187,206 @@ impl StorageEnvironment {
     pub fn unlock_vault(&mut self, passphrase: &Secret) -> Result<(), StorageError> {
         self.vault.unlock(passphrase)
     }
+
+    /// Load an environment from `dir` (layout: `instances/<id>/cookies.bin` +
+    /// `vault.bin`), backed by `vault`. Missing files mean a fresh profile.
+    /// Expired cookies are dropped at load. The vault's ciphertext blobs load
+    /// while it is still locked.
+    pub fn load(dir: &Path, mut vault: Box<dyn Vault>) -> std::io::Result<Self> {
+        vault.load_from(&dir.join("vault.bin"))?;
+        let mut partitions: HashMap<InstanceId, Partition> = HashMap::new();
+        let instances_dir = dir.join("instances");
+        if instances_dir.is_dir() {
+            for entry in std::fs::read_dir(&instances_dir)? {
+                let entry = entry?;
+                let Some(id) = entry
+                    .file_name()
+                    .to_str()
+                    .and_then(cerberus_types::InstanceId::from_hex)
+                else {
+                    continue; // not an instance dir; leave it alone
+                };
+                if let Some(bytes) = disk::read_if_exists(&entry.path().join("cookies.bin"))? {
+                    partitions.insert(id, load_partition(&bytes)?);
+                }
+            }
+        }
+        Ok(Self {
+            partitions,
+            vault,
+            dirty: false,
+        })
+    }
+
+    /// Persist all unsaved state into `dir` (atomic per file). A no-op when
+    /// nothing changed.
+    pub fn save(&mut self, dir: &Path) -> std::io::Result<()> {
+        if self.dirty {
+            for (id, partition) in &self.partitions {
+                let path = dir
+                    .join("instances")
+                    .join(id.to_string())
+                    .join("cookies.bin");
+                disk::atomic_write(&path, &save_partition(partition))?;
+            }
+            self.dirty = false;
+        }
+        if self.vault.is_dirty() {
+            self.vault.save_to(&dir.join("vault.bin"))?;
+            self.vault.clear_dirty();
+        }
+        Ok(())
+    }
+
+    /// Whether there are unsaved changes (cookies or vault blobs).
+    pub fn needs_save(&self) -> bool {
+        self.dirty || self.vault.is_dirty()
+    }
+}
+
+/// Cookie record layouts (KIND_COOKIES). Active:
+/// `["A", fp_site, name, value, domain, path, expires, flags]`. Quarantined
+/// (value lives only in the vault): `["Q", state, fp_site, name, domain,
+/// path, expires, flags]`. `expires` is 8B LE or empty for session cookies;
+/// `flags` is bit0 secure, bit1 http_only, bits 2-3 SameSite.
+fn save_partition(partition: &Partition) -> Vec<u8> {
+    let mut w = disk::RecordWriter::new(disk::KIND_COOKIES);
+    for sc in &partition.active {
+        let expires = encode_expires(sc.cookie.expires);
+        w.record(&[
+            b"A",
+            sc.fp_site.as_bytes(),
+            sc.cookie.name.as_bytes(),
+            sc.cookie.value.as_bytes(),
+            sc.cookie.domain.as_bytes(),
+            sc.cookie.path.as_bytes(),
+            &expires,
+            &[encode_flags(&sc.cookie)],
+        ]);
+    }
+    for q in &partition.quarantined {
+        let expires = encode_expires(q.cookie.expires);
+        w.record(&[
+            b"Q",
+            &[encode_state(q.state)],
+            q.fp_site.as_bytes(),
+            q.cookie.name.as_bytes(),
+            q.cookie.domain.as_bytes(),
+            q.cookie.path.as_bytes(),
+            &expires,
+            &[encode_flags(&q.cookie)],
+        ]);
+    }
+    w.finish()
+}
+
+fn load_partition(bytes: &[u8]) -> std::io::Result<Partition> {
+    let bad = |m: &str| std::io::Error::new(std::io::ErrorKind::InvalidData, m.to_string());
+    let now = cookie::unix_now();
+    let mut partition = Partition::default();
+    let mut reader = disk::RecordReader::new(bytes, disk::KIND_COOKIES)?;
+    while let Some(fields) = reader.next_record()? {
+        let text = |i: usize| -> std::io::Result<String> {
+            String::from_utf8(fields.get(i).cloned().unwrap_or_default())
+                .map_err(|_| bad("bad utf8 in cookie record"))
+        };
+        match fields.first().map(Vec::as_slice) {
+            Some(b"A") if fields.len() == 8 => {
+                let expires = decode_expires(&fields[6]);
+                // Sessions cookies (no expiry) do not survive a restart, and
+                // expired ones are dropped at the door.
+                let Some(t) = expires else { continue };
+                if t <= now {
+                    continue;
+                }
+                let (secure, http_only, same_site) = decode_flags(fields[7].first().copied());
+                partition.active.push(ScopedCookie {
+                    fp_site: text(1)?,
+                    cookie: Cookie {
+                        name: text(2)?,
+                        value: text(3)?,
+                        domain: text(4)?,
+                        path: text(5)?,
+                        expires,
+                        secure,
+                        http_only,
+                        same_site,
+                    },
+                });
+            }
+            Some(b"Q") if fields.len() == 8 => {
+                let (secure, http_only, same_site) = decode_flags(fields[7].first().copied());
+                partition.quarantined.push(QuarantineEntry {
+                    fp_site: text(2)?,
+                    cookie: Cookie {
+                        name: text(3)?,
+                        value: String::new(),
+                        domain: text(4)?,
+                        path: text(5)?,
+                        expires: decode_expires(&fields[6]),
+                        secure,
+                        http_only,
+                        same_site,
+                    },
+                    state: decode_state(fields[1].first().copied()),
+                });
+            }
+            _ => return Err(bad("unknown cookie record")),
+        }
+    }
+    Ok(partition)
+}
+
+fn encode_expires(expires: Option<u64>) -> Vec<u8> {
+    expires
+        .map(|t| t.to_le_bytes().to_vec())
+        .unwrap_or_default()
+}
+
+fn decode_expires(bytes: &[u8]) -> Option<u64> {
+    let arr: [u8; 8] = bytes.try_into().ok()?;
+    Some(u64::from_le_bytes(arr))
+}
+
+fn encode_flags(c: &Cookie) -> u8 {
+    let ss = match c.same_site {
+        SameSite::None => 0u8,
+        SameSite::Lax => 1,
+        SameSite::Strict => 2,
+    };
+    (c.secure as u8) | ((c.http_only as u8) << 1) | (ss << 2)
+}
+
+fn decode_flags(byte: Option<u8>) -> (bool, bool, SameSite) {
+    let b = byte.unwrap_or(0);
+    let ss = match (b >> 2) & 0b11 {
+        0 => SameSite::None,
+        2 => SameSite::Strict,
+        _ => SameSite::Lax,
+    };
+    (b & 1 != 0, b & 2 != 0, ss)
+}
+
+fn encode_state(s: QuarantineState) -> u8 {
+    match s {
+        QuarantineState::Intercepted => 0,
+        QuarantineState::Quarantined => 1,
+        QuarantineState::PendingConsent => 2,
+        QuarantineState::Active => 3,
+        QuarantineState::Expired => 4,
+        QuarantineState::Revoked => 5,
+    }
+}
+
+fn decode_state(b: Option<u8>) -> QuarantineState {
+    match b.unwrap_or(1) {
+        0 => QuarantineState::Intercepted,
+        2 => QuarantineState::PendingConsent,
+        3 => QuarantineState::Active,
+        4 => QuarantineState::Expired,
+        5 => QuarantineState::Revoked,
+        _ => QuarantineState::Quarantined,
+    }
 }
 
 /// A handle bound to exactly one instance's partition. All cookie access flows
@@ -182,6 +395,7 @@ pub struct InstanceStore<'a> {
     instance: InstanceId,
     partition: &'a mut Partition,
     vault: &'a mut dyn Vault,
+    dirty: &'a mut bool,
 }
 
 impl InstanceStore<'_> {
@@ -203,6 +417,7 @@ impl InstanceStore<'_> {
         match group {
             Group::Active => {
                 self.insert_active(fp_site, cookie);
+                *self.dirty = true;
                 Ok(QuarantineState::Active)
             }
             Group::Quarantined => {
@@ -216,6 +431,7 @@ impl InstanceStore<'_> {
                     cookie: meta,
                     state: QuarantineState::Quarantined,
                 });
+                *self.dirty = true;
                 Ok(QuarantineState::Quarantined)
             }
         }
@@ -269,6 +485,7 @@ impl InstanceStore<'_> {
         let mut entry = self.partition.quarantined.remove(pos);
         entry.cookie.value = String::from_utf8_lossy(&value_bytes).into_owned();
         self.insert_active(fp_site, entry.cookie);
+        *self.dirty = true;
         Ok(())
     }
 
@@ -520,5 +737,142 @@ mod tests {
             )
             .unwrap_err();
         assert_eq!(err, StorageError::VaultLocked);
+    }
+
+    fn fresh_vault() -> Box<dyn Vault> {
+        Box::new(EncryptedVault::new(
+            Box::new(TestAead),
+            Box::new(TestKdf),
+            *b"saltsaltsaltsalt",
+        ))
+    }
+
+    fn persistent_cookie(name: &str, value: &str) -> Cookie {
+        let mut c = Cookie::host(name, value, "example.com");
+        c.expires = Some(crate::cookie::unix_now() + 3600);
+        c
+    }
+
+    #[test]
+    fn environment_round_trips_through_disk_with_quarantine_intact() {
+        let dir = std::env::temp_dir().join(format!("cerb-env-test-{}", std::process::id()));
+        std::fs::remove_dir_all(&dir).ok();
+
+        // Session 1: unlock, store an active + a quarantined cookie, save.
+        let mut env = StorageEnvironment::new(fresh_vault());
+        env.unlock_vault(&Secret::from_passphrase("correct horse"))
+            .unwrap();
+        env.instance(instance_a())
+            .set_cookie(&fp(), persistent_cookie("sid", "keep-me"), Group::Active)
+            .unwrap();
+        env.instance(instance_a())
+            .set_cookie(
+                &fp(),
+                persistent_cookie("track", "vault-secret"),
+                Group::Quarantined,
+            )
+            .unwrap();
+        assert!(env.needs_save());
+        env.save(&dir).unwrap();
+        assert!(!env.needs_save());
+        drop(env);
+
+        // Session 2 (a fresh process): blobs load while locked; the metadata
+        // is there, the value is not.
+        let mut env = StorageEnvironment::load(&dir, fresh_vault()).unwrap();
+        assert!(env.vault_locked());
+        assert_eq!(
+            env.instance(instance_a()).quarantined_names(&fp()),
+            vec!["track".to_string()]
+        );
+        let active = env
+            .instance(instance_a())
+            .cookies_for_request(&req(), &fp());
+        assert_eq!(active.len(), 1);
+        assert_eq!(active[0].value, "keep-me");
+
+        // Wrong passphrase: still locked (sentinel persisted).
+        assert!(env.unlock_vault(&Secret::from_passphrase("wrong")).is_err());
+        assert!(env.vault_locked());
+
+        // Right passphrase: release decrypts the original value.
+        env.unlock_vault(&Secret::from_passphrase("correct horse"))
+            .unwrap();
+        env.instance(instance_a())
+            .release_from_quarantine("track", &fp())
+            .unwrap();
+        let active = env
+            .instance(instance_a())
+            .cookies_for_request(&req(), &fp());
+        let track = active.iter().find(|c| c.name == "track").unwrap();
+        assert_eq!(track.value, "vault-secret");
+
+        // Sealing survives the disk: instance B sees nothing.
+        assert!(env
+            .instance(instance_b())
+            .cookies_for_request(&req(), &fp())
+            .is_empty());
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn session_cookies_do_not_survive_a_restart() {
+        let dir = std::env::temp_dir().join(format!("cerb-sess-test-{}", std::process::id()));
+        std::fs::remove_dir_all(&dir).ok();
+
+        let mut env = StorageEnvironment::with_no_vault();
+        env.instance(instance_a())
+            .set_cookie(
+                &fp(),
+                Cookie::host("session-only", "gone", "example.com"),
+                Group::Active,
+            )
+            .unwrap();
+        env.save(&dir).unwrap();
+
+        let mut env = StorageEnvironment::load(&dir, Box::new(NoVault)).unwrap();
+        assert!(env
+            .instance(instance_a())
+            .cookies_for_request(&req(), &fp())
+            .is_empty());
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn tampered_vault_blob_fails_to_open_after_reload() {
+        let dir = std::env::temp_dir().join(format!("cerb-tamper-test-{}", std::process::id()));
+        std::fs::remove_dir_all(&dir).ok();
+
+        let mut env = StorageEnvironment::new(fresh_vault());
+        env.unlock_vault(&Secret::from_passphrase("correct horse"))
+            .unwrap();
+        env.instance(instance_a())
+            .set_cookie(
+                &fp(),
+                persistent_cookie("track", "secret"),
+                Group::Quarantined,
+            )
+            .unwrap();
+        env.save(&dir).unwrap();
+
+        // Flip one byte at the end of vault.bin (inside the last ciphertext).
+        let vault_path = dir.join("vault.bin");
+        let mut bytes = std::fs::read(&vault_path).unwrap();
+        let last = bytes.len() - 1;
+        bytes[last] ^= 0x01;
+        std::fs::write(&vault_path, &bytes).unwrap();
+
+        let mut env = StorageEnvironment::load(&dir, fresh_vault()).unwrap();
+        // Either the sentinel or the blob was tampered with; in both cases the
+        // data never comes back as silently-corrupt plaintext.
+        let unlock = env.unlock_vault(&Secret::from_passphrase("correct horse"));
+        if unlock.is_ok() {
+            assert!(env
+                .instance(instance_a())
+                .release_from_quarantine("track", &fp())
+                .is_err());
+        }
+        std::fs::remove_dir_all(&dir).ok();
     }
 }
