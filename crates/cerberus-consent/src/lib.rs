@@ -6,6 +6,8 @@
 //! The prompt UX itself and persistent rules are M5; the scaffold ships the
 //! decision core and in-memory rules.
 
+pub mod psl;
+
 use cerberus_types::{InstanceId, Origin};
 
 /// What to do with an attempted cookie/storage access.

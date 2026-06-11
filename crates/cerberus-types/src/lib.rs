@@ -210,10 +210,12 @@ impl Origin {
         }
     }
 
-    /// A coarse "site" key for first-party vs third-party comparisons.
+    /// A "site" key for first-party vs third-party comparisons: scheme plus
+    /// the registrable domain (eTLD+1).
     ///
-    /// NOTE: placeholder. Real registrable-domain (eTLD+1) handling via the
-    /// Public Suffix List arrives with the consent engine (M5).
+    /// Uses the Public Suffix List matcher installed by the composition root
+    /// via [`install_registrable_domain`]; until one is installed (e.g. in
+    /// leaf-crate unit tests) a conservative last-two-labels fallback applies.
     pub fn site(&self) -> String {
         format!("{}://{}", self.scheme, registrable_domain(&self.host))
     }
@@ -224,8 +226,26 @@ impl Origin {
     }
 }
 
-/// Placeholder registrable-domain extraction: the last two dot-labels.
-fn registrable_domain(host: &str) -> String {
+/// The installed PSL-backed registrable-domain function (set once at startup).
+///
+/// Lives here as a function pointer so `cerberus-types` (the dependency root,
+/// which must stay data-free) can serve `Origin::site()` to *both* storage
+/// partitioning and consent policy without a dependency cycle on the crate
+/// that embeds the PSL snapshot (`cerberus-consent`).
+static REGISTRABLE_DOMAIN: std::sync::OnceLock<fn(&str) -> String> = std::sync::OnceLock::new();
+
+/// Install the real eTLD+1 implementation. Idempotent; first install wins.
+/// Called by the composition root before any `Origin::site()` comparison.
+pub fn install_registrable_domain(f: fn(&str) -> String) {
+    let _ = REGISTRABLE_DOMAIN.set(f);
+}
+
+/// Registrable-domain extraction: the installed PSL matcher, or a conservative
+/// last-two-labels fallback when none is installed.
+pub fn registrable_domain(host: &str) -> String {
+    if let Some(f) = REGISTRABLE_DOMAIN.get() {
+        return f(host);
+    }
     let labels: Vec<&str> = host.split('.').filter(|s| !s.is_empty()).collect();
     let n = labels.len();
     if n >= 2 {

@@ -209,7 +209,10 @@ mod tests {
         assert_eq!(resp.status, 200);
 
         let req = String::from_utf8(mock.written).unwrap();
-        assert!(req.starts_with("GET /p HTTP/1.1\r\n"), "request line: {req:?}");
+        assert!(
+            req.starts_with("GET /p HTTP/1.1\r\n"),
+            "request line: {req:?}"
+        );
         assert!(req.contains("Host: example.test\r\n"));
         assert!(req.contains("User-Agent: Cerberus/0.0\r\n"));
         // Uniform locale, matching navigator.language/languages (no per-user

@@ -133,6 +133,13 @@ pub fn default_heads() -> Vec<Head> {
     ]
 }
 
+/// Install the PSL-backed registrable-domain matcher into `cerberus-types`
+/// so every `Origin::site()` comparison (storage partitioning, consent,
+/// cookie-domain validation) uses real eTLD+1. Idempotent.
+fn install_psl() {
+    cerberus_types::install_registrable_domain(cerberus_consent::psl::registrable_domain);
+}
+
 /// Build the network client: built-in `cerberus:` pages are served locally;
 /// `http(s)` goes through our HTTP engine over rustls TLS + Quad9 DoH.
 pub fn network_client(system_roots: bool) -> Router {
@@ -151,6 +158,7 @@ pub fn network_client(system_roots: bool) -> Router {
 
 /// Run the full render pipeline and return a summary plus the frame.
 pub fn render(config: &RenderConfig) -> Result<RenderOutcome, AppError> {
+    install_psl();
     let url = parse_url(&config.url).map_err(|e| AppError::Url(e.to_string()))?;
 
     // --- Identities: one engine live at a time, instantiated lazily. ---
@@ -658,6 +666,7 @@ impl BrowserApp {
     }
 
     fn with_loader(loader: Box<dyn PageLoader>) -> Self {
+        install_psl();
         let heads = HeadManager::new(default_heads(), Box::new(QuickJsEngineFactory));
         let label = heads.active().label.clone();
         let style_engine = CssEngine::new();
