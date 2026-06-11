@@ -6,15 +6,17 @@
 //! `argon2` for Argon2id; see ADR-0003) and land at M4. Test code supplies its
 //! own throwaway impls of these traits — never shipped.
 
-use std::sync::atomic::{compiler_fence, Ordering};
+use zeroize::Zeroize;
 
-/// A secret byte string (passphrase or derived key) that is best-effort zeroed
-/// on drop and never prints its contents.
+/// A secret byte string (passphrase or derived key) that is zeroized on drop
+/// (volatile writes via the audited `zeroize` crate, ADR-0003) and never
+/// prints its contents.
 ///
-/// NOTE: the zeroing here is best-effort. The audited `zeroize` crate
-/// (ADR-pending) provides the real volatile-write + `mlock` guarantees the
-/// threat model requires; this is a placeholder so the API is honest about
-/// intent without yet pulling the dependency.
+/// Scope note: pages holding key material are *not* `mlock`ed in v1 — that
+/// would require `unsafe`/libc, and the workspace denies unsafe outside
+/// vetted adapters. The trade-off (swap exposure on memory pressure) is
+/// documented in the threat model; OS-level swap encryption is the
+/// compensating control.
 pub struct Secret(Vec<u8>);
 
 impl Secret {
@@ -46,12 +48,7 @@ impl Secret {
 
 impl Drop for Secret {
     fn drop(&mut self) {
-        for b in &mut self.0 {
-            *b = 0;
-        }
-        // Discourage the compiler from eliding the zeroing above. Not a hard
-        // guarantee — see the type docs.
-        compiler_fence(Ordering::SeqCst);
+        self.0.zeroize();
     }
 }
 

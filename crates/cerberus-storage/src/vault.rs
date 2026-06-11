@@ -70,13 +70,18 @@ struct Blob {
     ciphertext: Vec<u8>,
 }
 
+/// AAD binding the unlock-check sentinel (see [`EncryptedVault::unlock`]).
+const CHECK_AAD: &[u8] = b"cerberus-vault-check-v1";
+
 /// AEAD-encrypted vault composed over the injected `Aead` + `Kdf`.
 pub struct EncryptedVault {
     aead: Box<dyn Aead>,
     kdf: Box<dyn Kdf>,
     salt: [u8; 16],
     key: Option<Key>,
-    nonce_counter: u64,
+    /// Sentinel sealed at first unlock; verifying it makes a wrong passphrase
+    /// fail *at unlock* instead of at the first cookie release.
+    check: Option<Blob>,
     blobs: HashMap<(InstanceId, String), Blob>,
 }
 
@@ -88,18 +93,16 @@ impl EncryptedVault {
             kdf,
             salt,
             key: None,
-            nonce_counter: 0,
+            check: None,
             blobs: HashMap::new(),
         }
     }
 
-    fn next_nonce(&mut self) -> Vec<u8> {
-        let mut nonce = vec![0u8; self.aead.nonce_len()];
-        let ctr = self.nonce_counter.to_be_bytes();
-        let n = ctr.len().min(nonce.len());
-        nonce[..n].copy_from_slice(&ctr[..n]);
-        self.nonce_counter += 1;
-        nonce
+    /// A fresh *random* nonce per sealed blob. Never a counter: a persisted
+    /// counter would reset across restarts and reuse nonces, which breaks the
+    /// AEAD outright. XChaCha20's 24-byte nonce makes random draws safe.
+    fn fresh_nonce(&self) -> Vec<u8> {
+        crate::rand::random_bytes(self.aead.nonce_len())
     }
 }
 
@@ -120,6 +123,20 @@ impl Vault for EncryptedVault {
         let key = self
             .kdf
             .derive(passphrase, &self.salt, self.aead.key_len())?;
+        match &self.check {
+            // A wrong passphrase fails here — the sentinel won't authenticate —
+            // and the vault stays locked.
+            Some(blob) => {
+                self.aead
+                    .open(&key, &blob.nonce, CHECK_AAD, &blob.ciphertext)?;
+            }
+            // First unlock: seal the sentinel under the fresh key.
+            None => {
+                let nonce = self.fresh_nonce();
+                let ciphertext = self.aead.seal(&key, &nonce, CHECK_AAD, b"cerberus")?;
+                self.check = Some(Blob { nonce, ciphertext });
+            }
+        }
         self.key = Some(key);
         Ok(())
     }
@@ -135,7 +152,7 @@ impl Vault for EncryptedVault {
         key: &str,
         plaintext: &[u8],
     ) -> Result<(), StorageError> {
-        let nonce = self.next_nonce();
+        let nonce = self.fresh_nonce();
         let secret_key = self.key.as_ref().ok_or(StorageError::VaultLocked)?;
         let ciphertext = self
             .aead

@@ -18,6 +18,7 @@ use cerberus_types::{InstanceId, Origin};
 use std::collections::HashMap;
 
 mod cookie;
+mod rand;
 mod vault;
 pub use cookie::parse_set_cookie;
 pub use vault::{EncryptedVault, NoVault, Vault};
@@ -478,6 +479,33 @@ mod tests {
             .cookies_for_request(&req(), &fp());
         let track = attached.iter().find(|c| c.name == "track").unwrap();
         assert_eq!(track.value, "xyz");
+    }
+
+    #[test]
+    fn wrong_passphrase_fails_at_unlock_and_vault_stays_locked() {
+        let vault =
+            EncryptedVault::new(Box::new(TestAead), Box::new(TestKdf), *b"saltsaltsaltsalt");
+        let mut env = StorageEnvironment::new(Box::new(vault));
+        // First unlock seals the check sentinel.
+        env.unlock_vault(&Secret::from_passphrase("correct horse"))
+            .unwrap();
+        // Re-lock by... there is no public lock on the environment; simulate a
+        // restart by checking a *wrong* passphrase against the sentinel via a
+        // fresh unlock attempt below.
+        assert!(!env.vault_locked());
+
+        let vault2 =
+            EncryptedVault::new(Box::new(TestAead), Box::new(TestKdf), *b"saltsaltsaltsalt");
+        let mut v: Box<dyn Vault> = Box::new(vault2);
+        v.unlock(&Secret::from_passphrase("correct horse")).unwrap();
+        v.lock();
+        assert!(v.is_locked());
+        // Wrong passphrase: the sentinel fails authentication; still locked.
+        assert!(v.unlock(&Secret::from_passphrase("wrong pass!!")).is_err());
+        assert!(v.is_locked());
+        // Right passphrase unlocks.
+        v.unlock(&Secret::from_passphrase("correct horse")).unwrap();
+        assert!(!v.is_locked());
     }
 
     #[test]

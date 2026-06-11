@@ -44,22 +44,24 @@ committed.
 | `rquickjs` 0.9 (bundled QuickJS) | `JsEngine` / `cerberus-js-quickjs` | **Approved** (ADR-0002), wiring at M3 | MIT (QuickJS) / MIT (binding) | Engine is infeasible & dangerous to write; QuickJS chosen over V8 for memory |
 | ~~V8 via `v8` (rusty_v8)~~ | ~~`cerberus-js-v8`~~ | **Superseded** by QuickJS (ADR-0002, 2026-06-10); kept as a documented swap-in if compat demands | BSD-3-Clause | — |
 
-### Proposed for the vault (needs your approval — M4)
+### Vault crates (Approved & wired at M4, 2026-06-11)
 
-We do **not** hand-roll AEAD or the KDF. Proposed specific crates, all RustCrypto,
-widely used, with published audits/RFC test vectors:
+We do **not** hand-roll AEAD or the KDF. The proposed crates were ratified per
+the standing decision directive and are wired behind `Aead`/`Kdf` in the
+dedicated adapter crate `cerberus-crypto-rustcrypto` (named only by the
+composition root):
 
-| Purpose | Proposed crate | License | Notes |
-| --- | --- | --- | --- |
-| AEAD | `chacha20poly1305` (XChaCha20-Poly1305) | Apache-2.0 / MIT | RFC 8439; 24-byte XNonce eases nonce management for at-rest blobs. `aes-gcm` is the alternative if hardware-AES is preferred. |
-| KDF | `argon2` | Apache-2.0 / MIT | Argon2id, as mandated; tunable memory/time cost. |
-| Key hygiene | `zeroize` | Apache-2.0 / MIT | Volatile zeroization; replaces the best-effort placeholder in `cerberus-crypto`. |
-| Locked memory | `region` **or** direct `libc` `mlock` | Apache-2.0/MIT | For `mlock`/`munlock` of key pages; smallest viable option TBD at M4. |
+| Purpose | Crate | Status | License | Notes |
+| --- | --- | --- | --- | --- |
+| AEAD | `chacha20poly1305` (XChaCha20-Poly1305) | **Approved**, wired M4 | Apache-2.0 / MIT | RFC 8439 + 24-byte XNonce: random nonce per at-rest blob, no counter state. |
+| KDF | `argon2` | **Approved**, wired M4 | Apache-2.0 / MIT | Argon2id, m=19 MiB / t=2 / p=1 (OWASP band); cost is transient at unlock. |
+| Key hygiene | `zeroize` | **Approved**, wired M4 | Apache-2.0 / MIT | Replaced the best-effort `compiler_fence` placeholder in `cerberus-crypto::Secret`. |
+| Locked memory | ~~`region` / `libc` `mlock`~~ | **Rejected for v1** | — | Would require `unsafe` (denied workspace-wide) for a partial mitigation. Key pages may swap; documented in THREAT_MODEL with OS swap encryption as the compensating control. |
 
-Behind `Aead` / `Kdf` (already defined in `cerberus-crypto`) plus a small
-key-locking helper. Until approved, `cerberus-crypto` ships **only the traits and
-zeroizing key types** (best-effort, clearly documented) and **no primitives**;
-tests use throwaway in-crate impls that are never shipped.
+`cargo deny check` passes (advisories/bans/licenses/sources) over the resulting
+tree. The vault additionally seals a check sentinel at first unlock so a wrong
+passphrase fails *at unlock* (and nonces are always random — a persisted
+counter would reuse nonces across restarts).
 
 ### Heads-up for M2 (propose then, not now)
 

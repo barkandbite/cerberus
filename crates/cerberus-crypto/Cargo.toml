@@ -10,3 +10,8 @@ repository.workspace = true
 
 [lints]
 workspace = true
+
+[dependencies]
+# Volatile zeroization for key material (ADR-0003, approved at M4). Replaces
+# the M0 best-effort compiler_fence placeholder.
+zeroize = "1"
