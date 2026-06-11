@@ -1,0 +1,16 @@
+[package]
+publish = false
+name = "cerberus-style"
+description = "Neutral computed-style types, a styled tree, and the StyleEngine seam."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+cerberus-types = { path = "../cerberus-types" }
+cerberus-dom = { path = "../cerberus-dom" }

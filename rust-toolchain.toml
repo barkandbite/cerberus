@@ -1,0 +1,5 @@
+# Pinned toolchain for reproducible builds and CI parity (see PLAN.md "Repro").
+[toolchain]
+channel = "1.94.1"
+components = ["clippy", "rustfmt"]
+profile = "minimal"

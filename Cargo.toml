@@ -1,0 +1,40 @@
+# Cerberus — Cargo workspace (virtual manifest).
+#
+# Architecture: ports & adapters. One crate per subsystem. Every third-party
+# dependency is wrapped behind one of our traits in a dedicated adapter crate,
+# so no foreign type ever crosses a module boundary. See docs/adr/0001.
+#
+# Memory is priority #1 (see PLAN.md): one process, one JS engine instance live
+# at a time. The scaffold is intentionally dependency-free (std only) so it
+# builds offline; approved heavy deps (V8, rustls, AEAD) land behind adapters
+# only after the relevant ADR is ratified.
+
+[workspace]
+resolver = "2"
+members = ["crates/*"]
+
+[workspace.package]
+version = "0.0.0"
+edition = "2021"
+rust-version = "1.94"
+# Provisional: recommended in ADR-0002 (V8 → permissive path). Ratify on engine
+# choice. SpiderMonkey would pull MPL considerations instead.
+license = "Apache-2.0"
+repository = "https://github.com/barkandbite/cerberus"
+
+# Lints applied workspace-wide. `unsafe_code = "deny"` is overridable per-crate
+# (future FFI adapters opt in explicitly and visibly); the scaffold has none.
+[workspace.lints.rust]
+unsafe_code = "deny"
+rust_2018_idioms = { level = "warn", priority = -1 }
+
+[workspace.lints.clippy]
+all = { level = "warn", priority = -1 }
+
+# Release profile leans toward a small, reproducible binary. RSS (the actual
+# priority) is governed at runtime; see the memory gate in PLAN.md.
+[profile.release]
+lto = "thin"
+codegen-units = 1
+strip = true
+panic = "abort"

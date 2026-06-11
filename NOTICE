@@ -1,0 +1,18 @@
+Cerberus — third-party data notices
+===================================
+
+Public Suffix List
+------------------
+`crates/cerberus-consent/src/psl_snapshot.dat` is a comment-stripped snapshot
+of the Public Suffix List (VERSION 2026-06-10_05-34-24_UTC, ICANN and private
+sections), obtained from https://publicsuffix.org/list/public_suffix_list.dat.
+
+The Public Suffix List is licensed under the Mozilla Public License, v. 2.0.
+A copy of the MPL is available at https://mozilla.org/MPL/2.0/. The snapshot is
+data consumed by Cerberus' own matcher (`cerberus-consent/src/psl.rs`); no MPL
+code is included. To refresh: re-download the list, strip `//` comment lines
+and blank lines, and replace the snapshot file.
+
+Bundled fonts
+-------------
+Roboto (bundled in `cerberus-text`) is licensed under the Apache License 2.0.

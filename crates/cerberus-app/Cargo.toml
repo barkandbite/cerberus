@@ -1,0 +1,50 @@
+[package]
+publish = false
+name = "cerberus-app"
+description = "Composition root: wires the subsystem seams, runs the trivial render and the memory gate."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[lints]
+workspace = true
+
+[features]
+# Windowing is on by default. Build with --no-default-features for a pure
+# headless binary that pulls none of the winit/softbuffer tree.
+default = ["windowing"]
+windowing = ["dep:cerberus-shell-winit"]
+
+[dependencies]
+cerberus-shell-winit = { path = "../cerberus-shell-winit", optional = true }
+cerberus-types = { path = "../cerberus-types" }
+cerberus-url = { path = "../cerberus-url" }
+cerberus-ui = { path = "../cerberus-ui" }
+cerberus-text = { path = "../cerberus-text" }
+cerberus-net = { path = "../cerberus-net" }
+cerberus-tls-rustls = { path = "../cerberus-tls-rustls" }
+cerberus-dns-doh = { path = "../cerberus-dns-doh" }
+cerberus-dom = { path = "../cerberus-dom" }
+cerberus-paint = { path = "../cerberus-paint" }
+cerberus-image = { path = "../cerberus-image" }
+cerberus-style = { path = "../cerberus-style" }
+cerberus-css = { path = "../cerberus-css" }
+cerberus-layout = { path = "../cerberus-layout" }
+cerberus-storage = { path = "../cerberus-storage" }
+cerberus-crypto = { path = "../cerberus-crypto" }
+cerberus-crypto-rustcrypto = { path = "../cerberus-crypto-rustcrypto" }
+cerberus-consent = { path = "../cerberus-consent" }
+cerberus-farbling = { path = "../cerberus-farbling" }
+cerberus-js = { path = "../cerberus-js" }
+cerberus-js-quickjs = { path = "../cerberus-js-quickjs" }
+cerberus-js-dom = { path = "../cerberus-js-dom" }
+cerberus-identity = { path = "../cerberus-identity" }
+cerberus-shell = { path = "../cerberus-shell" }
+cerberus-headless = { path = "../cerberus-headless" }
+
+[dev-dependencies]
+# Dev-only: generates PNG fixtures for the image-pipeline tests. Production
+# decoding goes through the cerberus-image adapter, never this crate directly.
+image = { version = "0.25", default-features = false, features = ["png"] }

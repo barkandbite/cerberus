@@ -1,0 +1,15 @@
+[package]
+publish = false
+name = "cerberus-js"
+description = "The JsEngine trait (the seam for V8/SpiderMonkey/QuickJS) plus a null engine."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+cerberus-types = { path = "../cerberus-types" }

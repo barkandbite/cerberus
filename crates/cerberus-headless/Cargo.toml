@@ -1,0 +1,24 @@
+[package]
+publish = false
+name = "cerberus-headless"
+description = "Headless rendering: orchestrate layout+paint into a framebuffer and serialize (PPM now)."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+cerberus-types = { path = "../cerberus-types" }
+cerberus-style = { path = "../cerberus-style" }
+cerberus-paint = { path = "../cerberus-paint" }
+cerberus-layout = { path = "../cerberus-layout" }
+
+[dev-dependencies]
+cerberus-dom = { path = "../cerberus-dom" }
+cerberus-css = { path = "../cerberus-css" }
+# Round-trip proof: the decode adapter must read our bootstrapped PNG encoder.
+cerberus-image = { path = "../cerberus-image" }

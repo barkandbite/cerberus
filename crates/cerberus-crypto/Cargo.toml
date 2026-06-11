@@ -1,0 +1,17 @@
+[package]
+publish = false
+name = "cerberus-crypto"
+description = "Crypto seams: Aead and Kdf traits plus zeroizing key material. No primitives implemented here."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+# Volatile zeroization for key material (ADR-0003, approved at M4). Replaces
+# the M0 best-effort compiler_fence placeholder.
+zeroize = "1"
