@@ -2420,6 +2420,22 @@ fn paint_settings_overlay(
     raster.rasterize(&list, fb);
 }
 
+/// Measure RSS around `switches` head switches on a live browser (PLAN §5:
+/// after a switch the resident set must stay within +10% of the pre-switch
+/// idle — the proof that engine teardown leaks neither realms nor heap).
+/// Returns `(before_kb, after_kb)`, or `None` where procfs is unavailable.
+pub fn head_switch_rss(switches: usize) -> Option<(u64, u64)> {
+    let mut app = BrowserApp::new();
+    // Warm the engine once so the baseline includes a live isolate.
+    let _ = app.heads.engine();
+    let before = resident_set_kb()?;
+    for _ in 0..switches {
+        app.switch_head();
+    }
+    let after = resident_set_kb()?;
+    Some((before, after))
+}
+
 /// Resident set size in kilobytes, read from `/proc/self/status` (Linux only).
 /// Returns `None` on platforms without procfs.
 pub fn resident_set_kb() -> Option<u64> {
@@ -2680,6 +2696,39 @@ mod tests {
         assert!(b.consent_prompts.is_empty());
     }
 
+    // ---- Heads (M7): the switch swaps the sealed instance everywhere ----
+
+    #[test]
+    fn head_switch_changes_the_sealed_instance_and_engine() {
+        let loader = FakeLoader::new(vec![(
+            "https://a.test/",
+            Ok(page("https://a.test/", 200, None, "<p>one</p>")),
+        )]);
+        let seen = loader.seen_instances.clone();
+        let mut b = BrowserApp::with_loader(Box::new(loader));
+
+        b.navigate("https://a.test/");
+        assert!(b.poll());
+        let first_instance = b.heads.active().instance;
+
+        b.switch_head();
+        assert_ne!(b.heads.active().instance, first_instance);
+        // Memory-first invariant survives the switch: at most one engine.
+        assert!(b.engines_live() <= 1);
+
+        b.navigate("https://a.test/");
+        assert!(b.poll());
+
+        // The network worker was handed two *different* sealed instances —
+        // the fetch path itself is what isolates the heads (the per-instance
+        // cache means head B's load cannot be served from head A's entry).
+        let seen = seen.lock().unwrap();
+        assert_eq!(seen.len(), 2, "two page loads requested");
+        assert_eq!(seen[0], first_instance);
+        assert_ne!(seen[1], seen[0]);
+        assert_eq!(seen[1], b.heads.active().instance);
+    }
+
     // ---- Hermetic test harness: a fake loader, no network or threads. ----
 
     use std::cell::RefCell;
@@ -2689,6 +2738,8 @@ mod tests {
         responses: HashMap<String, Result<FetchedPage, String>>,
         images: HashMap<String, Result<Vec<u8>, String>>,
         queue: RefCell<VecDeque<Done>>,
+        /// Instances seen on page requests, in order (head-switch tests).
+        seen_instances: Arc<Mutex<Vec<InstanceId>>>,
     }
 
     impl FakeLoader {
@@ -2700,6 +2751,7 @@ mod tests {
                     .collect(),
                 images: HashMap::new(),
                 queue: RefCell::new(VecDeque::new()),
+                seen_instances: Arc::new(Mutex::new(Vec::new())),
             }
         }
 
@@ -2713,7 +2765,8 @@ mod tests {
     }
 
     impl PageLoader for FakeLoader {
-        fn request(&self, id: u64, url: String, _ctx: FetchContext) {
+        fn request(&self, id: u64, url: String, ctx: FetchContext) {
+            self.seen_instances.lock().unwrap().push(ctx.instance);
             let result = self
                 .responses
                 .get(&url)

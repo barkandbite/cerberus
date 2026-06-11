@@ -6,7 +6,7 @@
 //!   version   Print the version.
 //!   help      Print usage.
 
-use cerberus_app::{render, resident_set_kb, RenderConfig};
+use cerberus_app::{head_switch_rss, render, resident_set_kb, RenderConfig};
 use cerberus_types::{Color, Size};
 use std::process::ExitCode;
 
@@ -137,13 +137,37 @@ fn cmd_mem_gate(args: &[String]) -> ExitCode {
     };
 
     let mb = kb as f64 / 1024.0;
-    if mb <= budget_mb {
-        println!("mem-gate PASS: resident {mb:.1} MB <= budget {budget_mb:.1} MB");
-        ExitCode::SUCCESS
-    } else {
+    if mb > budget_mb {
         eprintln!("mem-gate FAIL: resident {mb:.1} MB > budget {budget_mb:.1} MB");
-        ExitCode::FAILURE
+        return ExitCode::FAILURE;
     }
+    println!("mem-gate PASS: resident {mb:.1} MB <= budget {budget_mb:.1} MB");
+
+    // Head-switch leak gate (PLAN §5): RSS after N switches stays within +10%
+    // of the pre-switch idle (with a 2 MB absolute floor so tiny baselines
+    // aren't judged by allocator noise). Proves engine teardown leaks neither
+    // realms nor heap.
+    let switches: usize = flag(args, "--switches")
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(0);
+    if switches > 0 {
+        let Some((before, after)) = head_switch_rss(switches) else {
+            eprintln!("mem-gate: switch leak check unavailable on this platform; skipping");
+            return ExitCode::SUCCESS;
+        };
+        let (before_mb, after_mb) = (before as f64 / 1024.0, after as f64 / 1024.0);
+        let allowed_mb = (before_mb * 1.10).max(before_mb + 2.0);
+        if after_mb > allowed_mb {
+            eprintln!(
+                "mem-gate FAIL: {after_mb:.1} MB after {switches} head switches (pre-switch {before_mb:.1} MB, allowed {allowed_mb:.1} MB)"
+            );
+            return ExitCode::FAILURE;
+        }
+        println!(
+            "mem-gate PASS: {after_mb:.1} MB after {switches} head switches (pre-switch {before_mb:.1} MB, allowed {allowed_mb:.1} MB)"
+        );
+    }
+    ExitCode::SUCCESS
 }
 
 fn print_usage() {
@@ -171,7 +195,8 @@ fn print_usage() {
          \x20 --system-roots      trust the OS cert store (TLS-inspecting proxies)\n\
          \x20 --data-dir <DIR>    persistent profile (cookies survive runs)\n\n\
          MEM-GATE OPTIONS:\n\
-         \x20 --budget-mb <MB>     default: 64"
+         \x20 --budget-mb <MB>     default: 64\n\
+         \x20 --switches <N>       also assert RSS within +10% after N head switches"
     );
 }
 
