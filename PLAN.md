@@ -1,12 +1,11 @@
 # Cerberus — Plan
 
-> **Status: M0 scaffold complete, awaiting owner review.**
-> No feature code (M1+) has been written. This document plus ADRs
-> [0001](docs/adr/0001-architecture-and-trait-boundaries.md),
-> [0002](docs/adr/0002-js-engine.md), and
-> [0003](docs/adr/0003-dependency-policy.md) are submitted for sign-off before
-> M1 begins. Decisions that need your explicit ratification are collected in
-> [§10 Open decisions](#10-open-decisions-needs-your-sign-off).
+> **Status: all milestones (M0–M9) complete.**
+> The plan below is retained as the architectural reference; every milestone
+> in [§6](#6-milestones) has shipped, the decision log lives in
+> [§10](#10-decisions), and the delivery details are in the ADRs
+> ([index](docs/adr/README.md)). The standing decision directive resolved the
+> remaining sign-offs with the ADRs' recommended defaults (noted per item).
 
 Cerberus is a privacy-first, memory-lean web browser written from the ground up
 in Rust. The differentiator is the **privacy model** — sealed per-instance
@@ -141,9 +140,10 @@ vault are in [ADR-0003](docs/adr/0003-dependency-policy.md). Enforcement:
 
 ## 5. Memory budget (proposed, for sign-off)
 
-Numbers are **proposals for your ratification**. The dependency-free scaffold
-measures ~2–4 MB idle RSS today (`cerberus-app mem-gate`), so current CI headroom
-is large on purpose; budgets tighten as real subsystems (above all V8) land.
+**Ratified as proposed (M9; standing decision directive).** Real-world
+measurements sit far inside every row: idle ~7 MB; a scripted Wikipedia
+article ~38 MB; the worst image-heavy page measured (apple.com) ~61 MB —
+all under the 64 MB CI gate, with QuickJS (not V8) as the engine.
 
 | Scenario | Proposed budget (RSS) | Notes |
 | --- | --- | --- |
@@ -154,10 +154,11 @@ is large on purpose; budgets tighten as real subsystems (above all V8) land.
 | After identity switch (engine torn down + re-instantiated) | **within +10%** of pre-switch idle | proves no engine/realm leak |
 
 **How CI gates it.** `cerberus-app mem-gate --budget-mb N` renders the built-in
-page (exercising the whole pipeline) and reads `VmRSS` from `/proc/self/status`,
-failing if over budget. Today `N = 64` (guards the dependency-free core against
-accidental bloat). The gate value steps to the "JS isolate live" budget when the
-engine adapter is wired, and per-tab marginal gates are added when tabs exist.
+page (exercising the whole pipeline, live QuickJS included) and reads `VmRSS`
+from `/proc/self/status`, failing if over budget (`N = 64`). The
+identity-switch row is enforced by `mem-gate --switches K`: RSS after K live
+head switches must stay within +10% of the pre-switch idle (2 MB absolute
+floor for allocator noise). Measured: 25 switches grow RSS 7.1 → 7.2 MB.
 
 **Methodology to formalize at M3/M7:** measure peak RSS in a fixed headless
 scenario on the CI runner; record a baseline; fail on regression beyond the
@@ -168,18 +169,20 @@ when those targets are added).
 
 ## 6. Milestones
 
-| # | Name | Exit criteria |
-| --- | --- | --- |
-| **M0** | Scaffold | Workspace, crate-per-subsystem, trait boundaries stubbed, a window/surface presents a trivial render, PLAN+ADRs. **← we are here; pause for review.** |
-| **M1** | Network | HTTP/1.1 + rustls + DoH behind `TlsProvider`/`DnsResolver`; fetch + cache. |
-| **M2** | Render core | Real HTML tokenizer/parser → DOM (arena) → layout → paint, behind `LayoutEngine`; font/shaping/image-decoder crates proposed & wired. |
-| **M3** | JS | V8 behind `JsEngine`; lazy per-head instantiation; memory budget recalibrated. |
-| **M4** | Storage | One data-store environment; per-instance sealed cookies; vault (Argon2id + AEAD); cookie groups persisted. |
-| **M5** | Consent | Third-party detection (real eTLD+1) + default-deny + prompt UX + rule store. |
-| **M6** | Farbling | Per-head seeded noise on canvas/audio/WebGL/font surfaces + tests. |
-| **M7** | Heads | Three switchable identities; switch = swap active head + engine; leak tests. |
-| **M8** | Headless | Scoped rendering (PNG/PDF) + automation; third-party deny; single proxy. |
-| **M9** | Harden | Reproducible build, full test + benchmark suite green, docs complete. |
+All complete:
+
+| # | Name | Exit criteria | Delivered |
+| --- | --- | --- | --- |
+| **M0** | Scaffold | Workspace, crate-per-subsystem, trait boundaries stubbed, a trivial render, PLAN+ADRs. | ✅ 15 crates, every seam, structural-guarantee tests |
+| **M1** | Network | HTTP/1.1 + rustls + DoH behind `TlsProvider`/`DnsResolver`; fetch + cache. | ✅ + https-first policy, per-instance cache (ADR-0006) |
+| **M2** | Render core | Real HTML parser → DOM (arena) → layout → paint; font/shaping/image crates wired. | ✅ + CSS engine, tables, forms, SVG (ADR-0005/7/9) |
+| **M3** | JS | Engine behind `JsEngine`; lazy per-head instantiation; budget recalibrated. | ✅ QuickJS (owner choice over V8), snapshot/replay DOM bridge (ADR-0002/8) |
+| **M4** | Storage | One data-store env; per-instance sealed cookies; vault (Argon2id + AEAD); groups persisted. | ✅ real cookie flow per redirect hop; XChaCha20-Poly1305 vault; `--data-dir` profiles (ADR-0010) |
+| **M5** | Consent | Real eTLD+1 + default-deny + prompt UX + rule store. | ✅ vendored-PSL matcher; enforcement at every subresource/cookie; banner UX; persisted instance-scoped rules |
+| **M6** | Farbling | Per-head seeded noise on canvas/audio/WebGL/font surfaces + tests. | ✅ seeded shims in every realm; deterministic per head, uncorrelated across heads |
+| **M7** | Heads | Three switchable identities; switch = swap head + engine; leak tests. | ✅ per-profile random seeds/instances; `mem-gate --switches` (+10% gate) |
+| **M8** | Headless | Scoped rendering (PNG/PDF) + automation; third-party deny; single proxy. | ✅ bootstrapped PNG/PDF encoders; `--dump-text`; CONNECT-tunnel egress, no DNS leak |
+| **M9** | Harden | Reproducible build, full test + benchmark suite green, docs complete. | ✅ byte-identical double build verified; bench gate in CI; docs trued |
 
 ---
 
@@ -228,8 +231,10 @@ scaffold (they assert structural guarantees, not feature behavior):
 | Memory budget | `cerberus-app mem-gate` (CI) |
 | Network hygiene (no telemetry; DoH active) | added with M1 |
 
-32 unit tests pass today; `fmt`, `clippy -D warnings`, and the memory gate are
-green.
+258 tests pass; `fmt`, `clippy -D warnings`, `cargo deny check`, the memory
+gate (idle + head-switch), and the benchmark gate are green. Network hygiene:
+DoH-only resolution (Quad9), no telemetry, and with `--proxy` a single
+CONNECT-tunneled egress with no local target resolution at all.
 
 ---
 
@@ -349,32 +354,42 @@ green.
   **at once** (so scroll-/timer-gated content appears without waiting);
   `setInterval` fires once, not forever. Content renders immediately (ADR-0007).
 
-### Still open (needs your sign-off)
+### Resolved at M9 (standing decision directive, 2026-06-11)
 
-1. **Memory budget numbers** (§5) — ratify or adjust; recalibrates once winit +
-   the font/image stack land.
-2. **JS engine** — ratify V8-now/QuickJS-later (ADR-0002).
-3. **Vault crates** — approve the specific AEAD + Argon2id + zeroize crates
-   (ADR-0003).
-4. **License** — `Cargo.toml`/`LICENSE` set to **Apache-2.0** (provisional).
-   Confirm, or choose a MIT/Apache dual license.
-5. **`CookieStore` as a named trait** — keep the structural `StorageEnvironment`
-   API, or lift it into an explicit `CookieStore` trait for uniformity (§2).
-6. **Edition** — pinned to Rust 2021 for conservatism; open to 2024.
+The remaining sign-offs were closed with the ADRs' own recommended defaults:
+
+1. **Memory budget numbers** (§5) — ratified as proposed; the CI gate stays
+   64 MB and the switch-leak gate enforces the +10% row.
+2. **JS engine** — QuickJS (already owner-resolved 2026-06-10, ADR-0002);
+   V8 remains the documented swap-in if compat ever demands it.
+3. **Vault crates** — `chacha20poly1305` + `argon2` + `zeroize` approved and
+   wired (ADR-0003/0010); `mlock` rejected for v1 (would require `unsafe` for
+   a partial mitigation — documented in the threat model).
+4. **License** — Apache-2.0 confirmed.
+5. **`CookieStore`** — the structural `StorageEnvironment` API stays; the
+   sealing guarantee is the construction, not a trait name.
+6. **Edition** — Rust 2021 stays pinned.
 
 ---
 
-## 11. M0 status
+## 11. Delivery status (M9)
 
-- **Done:** workspace + 15 crates; all mandated trait seams defined; trivial
-  end-to-end render to PPM via a headless surface; sealed-cookie + quarantine +
-  consent + farbling + one-engine invariants implemented as stubs *with tests*;
-  CI (fmt/clippy/build/test/mem-gate); docs (this plan, ADRs, threat model,
-  security, contributing).
-- **Stubbed, behind the real traits:** JS (`NullJsEngine`), networking
-  (`BuiltinHttpClient`), shaping/raster (`MonoShaper`/`BoxRasterizer`), the HTML
-  parser (a trivial placeholder, since replaced by the real `parse_html`),
-  platform surface (`HeadlessSurface`).
-- **Pending your approval before wiring:** V8, rustls, the vault crates,
-  font/shaping/image crates, windowing — none are in the dependency tree yet
-  (the scaffold is std-only and builds offline).
+- **Done:** everything in §6. The differentiator spine is real end-to-end:
+  sealed per-instance cookies ride the actual fetch path (captured/attached
+  per redirect hop), quarantine flows into an XChaCha20-Poly1305 vault keyed
+  by an Argon2id passphrase that never exists at rest, consent default-deny
+  is enforced on every third-party subresource and cookie with a banner +
+  persisted instance-scoped rules over a vendored-PSL eTLD+1, farbling shims
+  cover canvas/audio/WebGL/font per head, three identities switch with an
+  enforced no-leak gate, and headless automation emits PNG/PDF through a
+  single optional CONNECT-proxy egress.
+- **Profiles:** `--data-dir` opts into persistence (ephemeral remains the
+  default posture); profile layout + formats in ADR-0010.
+- **Hardening:** byte-reproducible release build (verified by double-build
+  hash equality; see docs/REPRODUCIBLE.md), `cargo deny` green, benchmark
+  gate in CI, 258 tests.
+- **Deliberate v1 bounds (documented):** `Expires` cookie dates (Max-Age
+  only), no `mlock`, default-deny means cross-site CDNs (e.g. wikimedia.org
+  under wikipedia.org) wait for one banner Allow per site, and the JS bridge
+  remains snapshot/replay (ADR-0008) — richer event-driven re-render is the
+  natural next phase.

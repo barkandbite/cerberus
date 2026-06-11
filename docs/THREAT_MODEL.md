@@ -53,12 +53,19 @@ These are deliberate product boundaries, not yet-to-be-built features.
    tagged with its own `instance_id`. Cross-instance reads are impossible *by
    construction* (no API exists to do it), not by a policy check. See
    ADR-0001 §"Storage sealing".
-2. **The vault.** AEAD-encrypted at rest at a randomized on-disk path. The key is
-   derived from the passphrase via Argon2id, held only in locked (`mlock`'d),
-   zeroized memory, and **lives nowhere at rest and not in the OS keystore**.
-   Full disk access reveals nothing without the passphrase.
+2. **The vault.** XChaCha20-Poly1305-encrypted at rest (`vault.bin`,
+   ADR-0010): ciphertext blobs bound to their `(instance, key)` slot via AAD,
+   each sealed with a fresh random 24-byte nonce. The key is derived from the
+   passphrase via Argon2id (m=19 MiB), held only in zeroized memory, and
+   **lives nowhere at rest and not in the OS keystore**. A wrong passphrase
+   fails at unlock (check sentinel) and the vault stays locked. Full disk
+   access reveals nothing without the passphrase.
    - **Accepted trade-off:** unlock requires the passphrase; losing the
      passphrase loses the vault.
+   - **Accepted trade-off (v1):** key pages are *not* `mlock`'d — that would
+     require `unsafe` (denied workspace-wide) for a partial mitigation. Under
+     memory pressure key material could reach swap; OS-level swap encryption
+     is the compensating control.
 3. **The farbling surface.** Per-instance, per-session deterministic, bounded
    noise on fingerprintable APIs. Goal: deny a tracker a stable cross-site
    identity of the active head. The three heads carry independent seeds so they
@@ -66,17 +73,28 @@ These are deliberate product boundaries, not yet-to-be-built features.
    **uniform and minimal**: device signals (`hardwareConcurrency`, screen,
    `language`) report fixed low-entropy values for every user, and the
    high-entropy surfaces a tracker reaches for — `plugins`, `mediaDevices`,
-   WebGL, `deviceMemory`, the Battery API — are simply **absent**, so there is
-   nothing to read. (Per-head ±1 farbling of canvas/audio/font-metrics is the
-   active-noise layer on top, landing with canvas support.)
-4. **The consent gate.** Cross-site / third-party storage defaults to **deny**; a
-   consent event is raised in headed mode. Headless denies silently.
+   `deviceMemory`, the Battery API — are simply **absent**, so there is
+   nothing to read. The active-noise layer (M6) ships: canvas readbacks are
+   synthesized per (head seed, draw-op log), WebGL identifies uniformly as
+   "Cerberus" while `readPixels` carries per-head noise, audio readbacks are
+   seeded near-silence, and `measureText` jitters ≤2% per head — all
+   deterministic within a head, uncorrelated across heads.
+4. **The consent gate.** Cross-site / third-party access defaults to **deny**,
+   enforced on the real pipeline: subresource fetches and cookie
+   attach/capture all consult the policy, keyed by registrable domain
+   (eTLD+1) over a vendored Public Suffix List snapshot — so `cdn.site.com`
+   is first-party to `site.com`, while `alice.github.io` and `bob.github.io`
+   are different sites. Headed mode prompts (banner) and persists
+   instance-scoped rules; headless denies silently.
 
 ## Headless mode
 
 Scoped to rendering (PNG/PDF) and automated tests. It **inherits farbling**;
-third-party storage defaults to **deny**; there is **no auto-release of
-quarantine**; and only a **single user-configured proxy** is allowed (no pools).
+third-party storage defaults to **deny** (silently — no prompts); there is
+**no auto-release of quarantine**; and only a **single user-configured proxy**
+is allowed (no pools) — `--proxy HOST:PORT` tunnels *all* traffic (DoH
+included) through one HTTP CONNECT egress, never resolves target hosts
+locally, and fails closed on misconfiguration.
 
 ## Out of scope
 

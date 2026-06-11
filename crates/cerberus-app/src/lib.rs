@@ -21,6 +21,7 @@ use cerberus_js_dom::{run_page_scripts, PageEnv};
 use cerberus_js_quickjs::QuickJsEngineFactory;
 use cerberus_layout::{
     BlockLayout, FieldKind, FormFieldBox, FormState, ImageProvider, LayoutEngine, LinkBox, NoForms,
+    NoImages,
 };
 use cerberus_net::{
     parse_proxy, BuiltinHttpClient, CookieJar, FetchContext, FetchKind, HttpCache, HttpClient,
@@ -2470,6 +2471,136 @@ fn paint_settings_overlay(
         });
     }
     raster.rasterize(&list, fb);
+}
+
+/// One pipeline-stage benchmark result.
+pub struct BenchStage {
+    pub name: &'static str,
+    pub median_ms: f64,
+}
+
+/// Time the render pipeline stage-by-stage over a synthetic fixture page
+/// (~200 elements: headings, paragraphs, a table, lists, inline styles, and a
+/// script). Medians over `iters` runs. The fixture is embedded so results are
+/// comparable across machines and runs — this is the M9 benchmark suite.
+pub fn bench_pipeline(iters: usize) -> Vec<BenchStage> {
+    use std::time::Instant;
+    install_psl();
+
+    // Build the fixture once (string building is not part of any stage).
+    let mut html = String::from("<html><head><title>bench</title></head><body>");
+    for i in 0..40 {
+        html.push_str(&format!(
+            "<h2 style=\"color:#336699\">Section {i}</h2>             <p>Paragraph with <b>bold</b>, <i>italics</i>, and a              <a href=\"/l{i}\">link {i}</a>.</p>             <ul><li>alpha {i}</li><li>beta</li><li>gamma</li></ul>"
+        ));
+    }
+    html.push_str("<table>");
+    for r in 0..20 {
+        html.push_str(&format!(
+            "<tr><td>r{r}c0</td><td>r{r}c1</td><th>r{r}h</th></tr>"
+        ));
+    }
+    html.push_str("</table>");
+    html.push_str(
+        "<script>for (var i=0;i<200;i++){var d=document.createElement('div');         d.textContent='js '+i;document.body.appendChild(d);}</script>",
+    );
+    html.push_str("</body></html>");
+
+    let median = |mut xs: Vec<f64>| -> f64 {
+        xs.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        xs[xs.len() / 2]
+    };
+    let time = |f: &mut dyn FnMut()| -> f64 {
+        let t = Instant::now();
+        f();
+        t.elapsed().as_secs_f64() * 1000.0
+    };
+
+    let mut out = Vec::new();
+
+    let mut parse_times = Vec::with_capacity(iters);
+    for _ in 0..iters {
+        parse_times.push(time(&mut || {
+            std::hint::black_box(parse_html(&html));
+        }));
+    }
+    out.push(BenchStage {
+        name: "parse",
+        median_ms: median(parse_times),
+    });
+
+    let document = parse_html(&html);
+    let css = CssEngine::new();
+    let mut style_times = Vec::with_capacity(iters);
+    for _ in 0..iters {
+        style_times.push(time(&mut || {
+            std::hint::black_box(css.style(&document));
+        }));
+    }
+    out.push(BenchStage {
+        name: "style",
+        median_ms: median(style_times),
+    });
+
+    let styled = css.style(&document);
+    let text = TextEngine::new();
+    let viewport = Size::new(1280, 1024);
+    let mut layout_times = Vec::with_capacity(iters);
+    for _ in 0..iters {
+        layout_times.push(time(&mut || {
+            let mut layout = BlockLayout::default();
+            std::hint::black_box(layout.layout(&styled, viewport, &text, &NoImages, &NoForms));
+        }));
+    }
+    out.push(BenchStage {
+        name: "layout",
+        median_ms: median(layout_times),
+    });
+
+    let mut paint_times = Vec::with_capacity(iters);
+    for _ in 0..iters {
+        paint_times.push(time(&mut || {
+            let mut layout = BlockLayout::default();
+            std::hint::black_box(render_document(
+                &styled,
+                viewport,
+                Color::WHITE,
+                &mut layout,
+                &text,
+                &text,
+                &NoImages,
+                &NoForms,
+            ));
+        }));
+    }
+    out.push(BenchStage {
+        name: "layout+paint",
+        median_ms: median(paint_times),
+    });
+
+    // JS: engine instantiation + the fixture's script through the DOM bridge.
+    let mut js_times = Vec::with_capacity(iters.min(5)); // engines are heavier
+    for _ in 0..iters.min(5) {
+        js_times.push(time(&mut || {
+            let mut heads = HeadManager::new(default_heads(), Box::new(QuickJsEngineFactory));
+            let realm = RealmId(heads.active().id.0);
+            let engine = heads.engine().expect("engine");
+            let env = PageEnv {
+                url: "https://bench.test/".into(),
+                viewport: (1280, 1024),
+                user_agent: DEFAULT_USER_AGENT.into(),
+            };
+            std::hint::black_box(
+                run_page_scripts(engine, realm, &document, document.scripts(), &env).expect("js"),
+            );
+        }));
+    }
+    out.push(BenchStage {
+        name: "js (engine+bridge)",
+        median_ms: median(js_times),
+    });
+
+    out
 }
 
 /// Measure RSS around `switches` head switches on a live browser (PLAN §5:

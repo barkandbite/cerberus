@@ -41,3 +41,8 @@ jobs:
       # engine adapter is wired.
       - name: Memory gate (idle RSS + head-switch leak check)
         run: cargo run -q -p cerberus-app --release --locked -- mem-gate --budget-mb 64 --switches 25
+
+      # Pipeline benchmark (PLAN §9 / M9). The budget is deliberately loose —
+      # a regression gate against order-of-magnitude slips, not a microbench.
+      - name: Benchmark gate
+        run: cargo run -q -p cerberus-app --release --locked -- bench --assert-total-ms 500

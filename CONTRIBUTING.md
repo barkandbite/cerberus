@@ -32,7 +32,9 @@ cargo fmt --all                 # format (CI checks --check)
 cargo clippy --workspace --all-targets -- -D warnings
 cargo test --workspace
 cargo run -p cerberus-app -- render          # trivial render -> cerberus-home.ppm
-cargo run -p cerberus-app --release -- mem-gate --budget-mb 64
+cargo run -p cerberus-app --release -- mem-gate --budget-mb 64 --switches 25
+cargo run -p cerberus-app --release -- bench --assert-total-ms 500
+cargo deny check   # licenses/advisories/bans/sources — required for any dep change
 ```
 
 The toolchain is pinned in `rust-toolchain.toml`; `rustup show` installs it.

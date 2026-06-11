@@ -2,10 +2,12 @@
 
 A privacy-first, memory-lean web browser, built from the ground up in Rust.
 
-> **Status: M0 scaffold — under review.** The workspace, all subsystem trait
-> boundaries, and an end-to-end trivial render are in place; no feature code
-> (M1+) has been written yet. See **[PLAN.md](PLAN.md)** and the
-> **[ADRs](docs/adr/)**, which are up for sign-off before M1.
+> **Status: all milestones (M0–M9) delivered.** Real networking (HTTP/1.1 +
+> rustls + DoH), our own HTML/CSS/layout/paint pipeline, QuickJS page scripts,
+> sealed cookies on the live fetch path, the encrypted quarantine vault,
+> enforced consent, per-head farbling, switchable identities with a leak gate,
+> headless PNG/PDF automation, and a reproducible build. See
+> **[PLAN.md](PLAN.md)** and the **[ADRs](docs/adr/)**.
 
 ## What makes Cerberus different
 
@@ -45,30 +47,45 @@ defined. Details in **[ADR-0001](docs/adr/0001-architecture-and-trait-boundaries
 
 ## Build & run
 
-The scaffold is **std-only and builds offline**. The toolchain is pinned in
-`rust-toolchain.toml`.
+The toolchain is pinned in `rust-toolchain.toml`; builds use the committed
+`Cargo.lock` (see [docs/REPRODUCIBLE.md](docs/REPRODUCIBLE.md) to byte-verify
+a release binary).
 
 ```sh
-cargo build --workspace
-cargo test  --workspace
+cargo build --workspace --locked
+cargo test  --workspace --locked
 
-# Render the built-in page to a PPM and print a summary:
-cargo run -p cerberus-app -- render --out home.ppm
+# Open the browser in a window (needs a display):
+cargo run -p cerberus-app --features windowing -- run
 
-# The CI memory regression gate:
-cargo run -p cerberus-app --release -- mem-gate --budget-mb 64
+# Headless: render any page to PPM / PNG / PDF (picked by extension):
+cargo run -p cerberus-app --release -- render --url https://example.com --out page.png
+cargo run -p cerberus-app --release -- render --url https://example.com --out page.pdf --dump-text
+
+# Persistent profile (cookies, vault, consent rules, head seeds survive runs;
+# omit --data-dir for the fully-ephemeral default):
+cargo run -p cerberus-app --release -- render --url https://example.com --out p.png --data-dir ~/.cerberus
+
+# Single egress proxy (CONNECT tunnel; target hosts are never resolved locally):
+cargo run -p cerberus-app --release -- render --url https://example.com --out p.png --proxy 127.0.0.1:3128
+
+# The CI gates: memory (idle + head-switch leak) and the pipeline benchmark:
+cargo run -p cerberus-app --release -- mem-gate --budget-mb 64 --switches 25
+cargo run -p cerberus-app --release -- bench --assert-total-ms 500
 ```
 
-Example `render` output (idle RSS for the dependency-free scaffold is ~2–4 MB):
+Example `render` output against a real site:
 
 ```
-rendered cerberus:home (800x600)
+rendered https://github.com/ (800x600)
   http status     : 200
   active head     : work
-  js engine       : null (engines live: 1, realms: 1)
-  active cookies  : 1
+  js engine       : quickjs (engines live: 1, realms: 1)
+  page scripts    : 6 executed
+  active cookies  : 3
   3rd-party access : Deny
-  resident memory : 3.9 MB
+  blocked subres  : 0
+  resident memory : 29.6 MB
 ```
 
 ## Documentation

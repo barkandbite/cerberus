@@ -21,6 +21,7 @@ fn main() -> ExitCode {
         "run" => cmd_run(rest),
         "render" => cmd_render(rest),
         "mem-gate" => cmd_mem_gate(rest),
+        "bench" => cmd_bench(rest),
         "version" | "--version" | "-V" => {
             println!("cerberus {}", env!("CARGO_PKG_VERSION"));
             ExitCode::SUCCESS
@@ -183,6 +184,30 @@ fn cmd_mem_gate(args: &[String]) -> ExitCode {
     ExitCode::SUCCESS
 }
 
+/// The M9 benchmark suite: per-stage medians over the embedded fixture.
+/// `--assert-total-ms <N>` turns it into a (generous) CI regression gate.
+fn cmd_bench(args: &[String]) -> ExitCode {
+    let iters: usize = flag(args, "--iters")
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(20);
+    let stages = cerberus_app::bench_pipeline(iters);
+    println!("pipeline benchmark (medians over {iters} iterations):");
+    let mut total = 0.0;
+    for stage in &stages {
+        println!("  {:<18} {:>8.2} ms", stage.name, stage.median_ms);
+        total += stage.median_ms;
+    }
+    println!("  {:<18} {total:>8.2} ms", "total");
+    if let Some(budget) = flag(args, "--assert-total-ms").and_then(|s| s.parse::<f64>().ok()) {
+        if total > budget {
+            eprintln!("bench FAIL: total {total:.2} ms > budget {budget:.2} ms");
+            return ExitCode::FAILURE;
+        }
+        println!("bench PASS: total {total:.2} ms <= budget {budget:.2} ms");
+    }
+    ExitCode::SUCCESS
+}
+
 fn print_usage() {
     println!(
         "cerberus — a privacy-first, memory-lean browser (M0 scaffold)\n\n\
@@ -192,6 +217,7 @@ fn print_usage() {
          \x20 run        Open the browser in a window (needs a display)\n\
          \x20 render     Render a page to PPM and print a summary (headless)\n\
          \x20 mem-gate   Render and assert resident memory within budget\n\
+         \x20 bench      Time the render pipeline stages (see --assert-total-ms)\n\
          \x20 version    Print the version\n\
          \x20 help       Print this help\n\n\
          RUN OPTIONS:\n\
