@@ -4,29 +4,61 @@
 //!
 //! No `image` (or `resvg`) type crosses the boundary — `decode` returns our
 //! `cerberus_paint::DecodedImage`. Large images are downscaled to a memory cap so
-//! a single image can't blow the RSS budget (memory is priority #1). SVG is a
-//! vector format, so it is rasterized at its intrinsic size, capped to the same
+//! a single image can't blow the RSS budget (memory is priority #1) — and to
+//! make that true for the *transient* decode too (not just the retained
+//! bitmap), images whose header-declared resolution exceeds a pixel ceiling are
+//! declined before any full-resolution buffer is allocated. SVG is a vector
+//! format, so it is rasterized at its intrinsic size, capped to the same
 //! longest-side budget.
 
 use cerberus_paint::{DecodedImage, ImageDecoder, PaintError};
 use cerberus_types::Size;
+use std::io::Cursor;
+
+/// Default ceiling on an image's *intrinsic* pixel count before we will fully
+/// decode it. `max_dim` caps the *retained* bitmap, but the `image` crate
+/// decodes at full resolution first and downscales after — so a 60-megapixel
+/// JPEG would still spike RSS by ~240 MB transiently, breaking the very promise
+/// in this module's header. We instead read the header-declared dimensions
+/// (cheap, no pixel allocation) and decline anything past this ceiling, which
+/// bounds the transient decode buffer to ~`6e6 * 4` ≈ 24 MB. ~6 MP comfortably
+/// covers retina hero images (e.g. 2880×1620 ≈ 4.7 MP) while refusing the
+/// pathological ones that would blow the budget.
+pub const DEFAULT_MAX_DECODE_PIXELS: u64 = 6_000_000;
 
 /// Decoder over the `image` crate.
 pub struct ImageCodec {
     /// Longest-side cap in pixels; larger images are downscaled.
     max_dim: u32,
+    /// Intrinsic pixel-count ceiling for full decode (see
+    /// [`DEFAULT_MAX_DECODE_PIXELS`]); larger images are declined, not decoded.
+    max_decode_pixels: u64,
 }
 
 impl ImageCodec {
-    /// A decoder capping decoded images at 1600px on the longest side.
+    /// A decoder capping decoded images at 1600px on the longest side and
+    /// declining intrinsic images above [`DEFAULT_MAX_DECODE_PIXELS`].
     pub fn new() -> Self {
-        Self { max_dim: 1600 }
+        Self {
+            max_dim: 1600,
+            max_decode_pixels: DEFAULT_MAX_DECODE_PIXELS,
+        }
     }
 
-    /// A decoder with an explicit longest-side pixel cap.
+    /// A decoder with an explicit longest-side pixel cap (default decode ceiling).
     pub fn with_max_dim(max_dim: u32) -> Self {
         Self {
             max_dim: max_dim.max(1),
+            max_decode_pixels: DEFAULT_MAX_DECODE_PIXELS,
+        }
+    }
+
+    /// A decoder with an explicit longest-side cap *and* intrinsic-pixel decode
+    /// ceiling — the latter bounds the transient decode buffer (memory priority).
+    pub fn with_limits(max_dim: u32, max_decode_pixels: u64) -> Self {
+        Self {
+            max_dim: max_dim.max(1),
+            max_decode_pixels: max_decode_pixels.max(1),
         }
     }
 
@@ -96,6 +128,22 @@ impl ImageDecoder for ImageCodec {
             return self.decode_svg(bytes);
         }
 
+        // Bound the transient decode buffer: read the header-declared dimensions
+        // (no pixel allocation) and decline images whose intrinsic size exceeds
+        // the decode ceiling, rather than letting `load_from_memory` allocate a
+        // full-resolution bitmap we would only shrink afterwards.
+        let dims = image::ImageReader::new(Cursor::new(bytes))
+            .with_guessed_format()
+            .map_err(|e| PaintError::Decode(e.to_string()))?
+            .into_dimensions()
+            .map_err(|e| PaintError::Decode(e.to_string()))?;
+        if (dims.0 as u64) * (dims.1 as u64) > self.max_decode_pixels {
+            return Err(PaintError::Decode(format!(
+                "intrinsic {}x{} exceeds {}px decode budget",
+                dims.0, dims.1, self.max_decode_pixels
+            )));
+        }
+
         let img = image::load_from_memory(bytes).map_err(|e| PaintError::Decode(e.to_string()))?;
 
         let img = if img.width() > self.max_dim || img.height() > self.max_dim {
@@ -151,6 +199,15 @@ mod tests {
     #[test]
     fn rejects_garbage() {
         assert!(ImageCodec::new().decode(b"not an image").is_err());
+    }
+
+    #[test]
+    fn declines_images_over_the_decode_pixel_ceiling() {
+        // 40x10 = 400 px. A 200-px ceiling must decline it *without* decoding,
+        // while a generous ceiling still decodes the same bytes fine.
+        let bytes = png_bytes(40, 10);
+        assert!(ImageCodec::with_limits(1600, 200).decode(&bytes).is_err());
+        assert!(ImageCodec::with_limits(1600, 10_000).decode(&bytes).is_ok());
     }
 
     const RED_SVG: &[u8] = br##"<svg xmlns="http://www.w3.org/2000/svg" width="10" height="10"><rect width="10" height="10" fill="#ff0000"/></svg>"##;

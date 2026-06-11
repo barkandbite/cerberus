@@ -432,6 +432,19 @@ fn fetch_bytes(client: &Router, url: &str) -> Result<Vec<u8>, String> {
 /// URL. Used by the one-shot [`render`]; the interactive browser fetches images
 /// on its worker instead. Returns an empty map — and builds no network client —
 /// when the page has no http(s) images.
+/// Per-page cap on *decoded* image memory. Images are fetched/decoded in
+/// document order, which in block layout runs top-to-bottom — so on an
+/// image-heavy page (e.g. apple.com's ~100 hero shots) this keeps the images
+/// near the top, where the one-shot viewport actually looks, and defers the
+/// off-screen tail the frame would crop away anyway, rather than holding every
+/// full-resolution bitmap resident at once. Pages under the cap are unaffected.
+///
+/// Sized from measurement: decoded image volume costs ~1.4 MB of RSS per image
+/// on apple.com, so a 16 MB ceiling (≈8–14 images, comfortably more than a
+/// 900px viewport shows) keeps that page at ~61 MB — inside the 64 MB budget —
+/// versus ~101 MB unbounded, while leaving light pages untouched.
+const IMAGE_DECODE_BUDGET_BYTES: usize = 16 * 1024 * 1024;
+
 fn fetch_images_sync(
     document: &Document,
     base: &Url,
@@ -453,17 +466,28 @@ fn fetch_images_sync(
 
     let codec = ImageCodec::new();
     let client = network_client(system_roots);
-    urls.into_iter()
-        .map(|url| {
-            let state = match fetch_bytes(&client, &url)
-                .and_then(|b| codec.decode(&b).map_err(|e| format!("{e:?}")))
-            {
-                Ok(img) => ImageState::Ready(Arc::new(img)),
-                Err(_) => ImageState::Failed,
-            };
-            (url, state)
-        })
-        .collect()
+    let mut out = HashMap::with_capacity(urls.len());
+    let mut decoded_bytes = 0usize;
+    for url in urls {
+        // Once the decoded-memory budget is spent, defer the remaining
+        // (off-screen) images: they aren't fetched or decoded, and lay out as
+        // their reserved/placeholder box instead of a resident bitmap.
+        if decoded_bytes >= IMAGE_DECODE_BUDGET_BYTES {
+            out.insert(url, ImageState::Pending);
+            continue;
+        }
+        let state = match fetch_bytes(&client, &url)
+            .and_then(|b| codec.decode(&b).map_err(|e| format!("{e:?}")))
+        {
+            Ok(img) => {
+                decoded_bytes += img.rgba.len();
+                ImageState::Ready(Arc::new(img))
+            }
+            Err(_) => ImageState::Failed,
+        };
+        out.insert(url, state);
+    }
+    out
 }
 
 /// Normalize a URL-bar entry: keep `cerberus:`/explicit-scheme inputs, otherwise
