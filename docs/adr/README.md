@@ -18,6 +18,7 @@ with the code so the reasoning travels with the repo.
 | [0008](0008-page-scripts-dom-bridge.md) | Page-script execution via a snapshot/replay DOM bridge | Accepted |
 | [0009](0009-svg-rasterization.md) | SVG image rasterization (resvg / usvg / tiny-skia) | Accepted |
 | [0010](0010-vault-format-and-profile-layout.md) | Vault on-disk format & persistent-profile layout | Accepted |
+| [0011](0011-cookie-dispositions-and-timing-hud.md) | Per-cookie dispositions & the Rust-side timing HUD | Accepted |
 
 ## When to write one
 
