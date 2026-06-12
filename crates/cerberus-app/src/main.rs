@@ -22,6 +22,7 @@ fn main() -> ExitCode {
         "render" => cmd_render(rest),
         "mem-gate" => cmd_mem_gate(rest),
         "bench" => cmd_bench(rest),
+        "cookies" => cmd_cookies(rest),
         "version" | "--version" | "-V" => {
             println!("cerberus {}", env!("CARGO_PKG_VERSION"));
             ExitCode::SUCCESS
@@ -208,6 +209,33 @@ fn cmd_bench(args: &[String]) -> ExitCode {
     ExitCode::SUCCESS
 }
 
+/// `cookies` — inspect and retune the per-cookie disposition policy of a
+/// persistent profile, headlessly.
+fn cmd_cookies(args: &[String]) -> ExitCode {
+    let Some(dir) = flag(args, "--data-dir") else {
+        eprintln!("cookies: --data-dir <DIR> is required");
+        return ExitCode::FAILURE;
+    };
+    let site = flag(args, "--site");
+    let set = flag(args, "--set");
+    match cerberus_app::cookie_admin(&dir, site.as_deref(), set.as_deref()) {
+        Ok(lines) => {
+            if lines.is_empty() {
+                println!("(no cookies)");
+            } else {
+                for line in lines {
+                    println!("{line}");
+                }
+            }
+            ExitCode::SUCCESS
+        }
+        Err(e) => {
+            eprintln!("cookies: {e}");
+            ExitCode::FAILURE
+        }
+    }
+}
+
 fn print_usage() {
     println!(
         "cerberus — a privacy-first, memory-lean browser (M0 scaffold)\n\n\
@@ -218,6 +246,7 @@ fn print_usage() {
          \x20 render     Render a page to PPM and print a summary (headless)\n\
          \x20 mem-gate   Render and assert resident memory within budget\n\
          \x20 bench      Time the render pipeline stages (see --assert-total-ms)\n\
+         \x20 cookies    Inspect/retune a profile's cookie dispositions (--data-dir)\n\
          \x20 version    Print the version\n\
          \x20 help       Print this help\n\n\
          RUN OPTIONS:\n\

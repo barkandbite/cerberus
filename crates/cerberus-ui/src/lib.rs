@@ -492,3 +492,345 @@ mod banner_tests {
         assert!(glyphs >= 4, "message + 3 labels");
     }
 }
+
+// ---- Cookie manager (M10): a transparent, per-cookie disposition inspector ----
+
+/// Height of one cookie row in the inspector.
+pub const COOKIE_ROW_H: u32 = 26;
+
+/// One row of the cookie inspector, prepared by the app from a `CookieView`.
+#[derive(Clone, Debug)]
+pub struct CookieRow {
+    /// `name` (and, when revealed, `=value`); domain shown dimmed after it.
+    pub primary: String,
+    /// The dimmer right-hand detail (domain + expiry).
+    pub detail: String,
+    /// The disposition chip text (e.g. `allow`, `Timed 3600s`).
+    pub chip: String,
+}
+
+/// A click outcome in the cookie inspector. Row indices are absolute (into the
+/// full list the app passed), already adjusted for the scroll offset.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CookieAction {
+    Close,
+    /// Cycle the global-default disposition.
+    CycleGlobal,
+    /// Cycle one cookie's disposition.
+    Cycle(usize),
+    /// Reveal/hide one cookie's value.
+    Reveal(usize),
+    /// Delete one cookie.
+    Delete(usize),
+    ScrollUp,
+    ScrollDown,
+    None,
+}
+
+/// The cookie inspector panel: a scrollable list of every stored cookie with a
+/// per-row disposition chip, a reveal toggle, and a delete control, plus a
+/// global-default chip. Pure paint + hit-test, like [`ConsentBanner`]; the app
+/// owns the data, the scroll offset, and applies the actions to storage.
+pub struct CookieManager;
+
+const COOKIE_CHIP_W: u32 = 96;
+const COOKIE_BTN_W: u32 = 22;
+const COOKIE_LIST_TOP: i32 = 84; // panel-local y where rows begin
+const COOKIE_LIST_BOTTOM_PAD: u32 = 40;
+
+impl CookieManager {
+    /// The inspector panel rect (centered, 74% of the window).
+    pub fn panel_rect(window: Size) -> Rect {
+        let pw = window.w * 74 / 100;
+        let ph = window.h * 74 / 100;
+        let px = (window.w.saturating_sub(pw) / 2) as i32;
+        let py = (window.h.saturating_sub(ph) / 2) as i32;
+        Rect::new(px, py, pw, ph)
+    }
+
+    /// How many rows fit in the list area for this window.
+    pub fn visible_rows(window: Size) -> usize {
+        let panel = Self::panel_rect(window);
+        let list_h = (panel.h as i32 - COOKIE_LIST_TOP - COOKIE_LIST_BOTTOM_PAD as i32).max(0);
+        (list_h / COOKIE_ROW_H as i32).max(0) as usize
+    }
+
+    fn close_rect(window: Size) -> Rect {
+        let p = Self::panel_rect(window);
+        Rect::new(p.x + p.w as i32 - 28, p.y + 8, 20, 20)
+    }
+
+    fn global_chip_rect(window: Size) -> Rect {
+        let p = Self::panel_rect(window);
+        Rect::new(
+            p.x + p.w as i32 - COOKIE_CHIP_W as i32 - 12,
+            p.y + 48,
+            COOKIE_CHIP_W,
+            20,
+        )
+    }
+
+    fn scroll_rects(window: Size) -> (Rect, Rect) {
+        let p = Self::panel_rect(window);
+        let x = p.x + p.w as i32 - 28;
+        let down_y = p.y + p.h as i32 - 28;
+        (
+            Rect::new(x, p.y + COOKIE_LIST_TOP, 20, 20), // up
+            Rect::new(x, down_y, 20, 20),
+        ) // down
+    }
+
+    /// Per-row control rects (chip, reveal, delete) for the `i`-th *visible*
+    /// row (0-based from the top of the list).
+    fn row_controls(window: Size, vis_i: usize) -> (Rect, Rect, Rect, i32) {
+        let p = Self::panel_rect(window);
+        let y = p.y + COOKIE_LIST_TOP + vis_i as i32 * COOKIE_ROW_H as i32;
+        let delete = Rect::new(
+            p.x + p.w as i32 - 28 - 24,
+            y + 2,
+            COOKIE_BTN_W,
+            COOKIE_BTN_W,
+        );
+        let chip = Rect::new(
+            delete.x - COOKIE_CHIP_W as i32 - 6,
+            y + 2,
+            COOKIE_CHIP_W,
+            20,
+        );
+        let reveal = Rect::new(
+            chip.x - COOKIE_BTN_W as i32 - 6,
+            y + 2,
+            COOKIE_BTN_W,
+            COOKIE_BTN_W,
+        );
+        (chip, reveal, delete, y)
+    }
+
+    /// Map a click to an action. `len` is the total row count; `scroll` is the
+    /// app's current top offset.
+    pub fn hit_test(window: Size, len: usize, scroll: usize, x: i32, y: i32) -> CookieAction {
+        let inside = |r: Rect| x >= r.x && y >= r.y && x < r.x + r.w as i32 && y < r.y + r.h as i32;
+        if inside(Self::close_rect(window)) {
+            return CookieAction::Close;
+        }
+        if inside(Self::global_chip_rect(window)) {
+            return CookieAction::CycleGlobal;
+        }
+        let (up, down) = Self::scroll_rects(window);
+        if inside(up) {
+            return CookieAction::ScrollUp;
+        }
+        if inside(down) {
+            return CookieAction::ScrollDown;
+        }
+        let visible = Self::visible_rows(window);
+        for vis_i in 0..visible {
+            let abs = scroll + vis_i;
+            if abs >= len {
+                break;
+            }
+            let (chip, reveal, delete, _) = Self::row_controls(window, vis_i);
+            if inside(chip) {
+                return CookieAction::Cycle(abs);
+            }
+            if inside(reveal) {
+                return CookieAction::Reveal(abs);
+            }
+            if inside(delete) {
+                return CookieAction::Delete(abs);
+            }
+        }
+        CookieAction::None
+    }
+
+    /// Paint the inspector. `rows` is the full list; `scroll` is the top row.
+    pub fn paint(
+        window: Size,
+        shaper: &dyn TextShaper,
+        global_chip: &str,
+        rows: &[CookieRow],
+        scroll: usize,
+    ) -> DisplayList {
+        let mut list = DisplayList::new();
+        let p = Self::panel_rect(window);
+        // Backdrop + panel.
+        list.push(DisplayItem::Rect {
+            rect: Rect::new(p.x - 1, p.y - 1, p.w + 2, p.h + 2),
+            color: Color::rgb(0x30, 0x30, 0x30),
+        });
+        list.push(DisplayItem::Rect {
+            rect: p,
+            color: Color::rgb(0xFA, 0xFA, 0xFA),
+        });
+        // Title + count.
+        list.push(DisplayItem::Glyphs {
+            origin: Point::new(p.x + 12, p.y + 26),
+            glyphs: shaper.shape(&format!("Cookies ({})", rows.len()), 20),
+            color: Color::BLACK,
+            style: FontStyle::REGULAR,
+        });
+        // Close button.
+        let close = Self::close_rect(window);
+        list.push(DisplayItem::Rect {
+            rect: close,
+            color: Color::rgb(0xE0, 0xE0, 0xE0),
+        });
+        list.push(DisplayItem::Glyphs {
+            origin: Point::new(close.x + 6, close.y + 15),
+            glyphs: shaper.shape("x", 13),
+            color: Color::BLACK,
+            style: FontStyle::REGULAR,
+        });
+        // Global default chip.
+        list.push(DisplayItem::Glyphs {
+            origin: Point::new(p.x + 12, p.y + 63),
+            glyphs: shaper.shape("global default:", 13),
+            color: Color::rgb(0x50, 0x50, 0x50),
+            style: FontStyle::REGULAR,
+        });
+        let gchip = Self::global_chip_rect(window);
+        list.push(DisplayItem::Rect {
+            rect: gchip,
+            color: Color::rgb(0xD9, 0xE7, 0xF7),
+        });
+        list.push(DisplayItem::Glyphs {
+            origin: Point::new(gchip.x + 6, gchip.y + 15),
+            glyphs: shaper.shape(global_chip, 12),
+            color: Color::BLACK,
+            style: FontStyle::REGULAR,
+        });
+        // Rows.
+        let visible = Self::visible_rows(window);
+        for vis_i in 0..visible {
+            let abs = scroll + vis_i;
+            let Some(row) = rows.get(abs) else { break };
+            let (chip, reveal, delete, y) = Self::row_controls(window, vis_i);
+            if vis_i % 2 == 1 {
+                list.push(DisplayItem::Rect {
+                    rect: Rect::new(p.x + 4, y, p.w - 8, COOKIE_ROW_H),
+                    color: Color::rgb(0xF0, 0xF0, 0xF0),
+                });
+            }
+            list.push(DisplayItem::Glyphs {
+                origin: Point::new(p.x + 12, y + 17),
+                glyphs: shaper.shape(&row.primary, 13),
+                color: Color::BLACK,
+                style: FontStyle::REGULAR,
+            });
+            list.push(DisplayItem::Glyphs {
+                origin: Point::new(p.x + 12 + 260, y + 17),
+                glyphs: shaper.shape(&row.detail, 11),
+                color: Color::rgb(0x80, 0x80, 0x80),
+                style: FontStyle::REGULAR,
+            });
+            // reveal (eye), chip, delete (x)
+            list.push(DisplayItem::Rect {
+                rect: reveal,
+                color: Color::rgb(0xE8, 0xE8, 0xE8),
+            });
+            list.push(DisplayItem::Glyphs {
+                origin: Point::new(reveal.x + 5, reveal.y + 15),
+                glyphs: shaper.shape("o", 12),
+                color: Color::BLACK,
+                style: FontStyle::REGULAR,
+            });
+            list.push(DisplayItem::Rect {
+                rect: chip,
+                color: Color::rgb(0xD9, 0xEF, 0xD9),
+            });
+            list.push(DisplayItem::Glyphs {
+                origin: Point::new(chip.x + 5, chip.y + 15),
+                glyphs: shaper.shape(&row.chip, 12),
+                color: Color::BLACK,
+                style: FontStyle::REGULAR,
+            });
+            list.push(DisplayItem::Rect {
+                rect: delete,
+                color: Color::rgb(0xF3, 0xD9, 0xD9),
+            });
+            list.push(DisplayItem::Glyphs {
+                origin: Point::new(delete.x + 6, delete.y + 15),
+                glyphs: shaper.shape("x", 12),
+                color: Color::BLACK,
+                style: FontStyle::REGULAR,
+            });
+        }
+        // Scroll affordances.
+        let (up, down) = Self::scroll_rects(window);
+        for (r, glyph) in [(up, "^"), (down, "v")] {
+            list.push(DisplayItem::Rect {
+                rect: r,
+                color: Color::rgb(0xE0, 0xE0, 0xE0),
+            });
+            list.push(DisplayItem::Glyphs {
+                origin: Point::new(r.x + 6, r.y + 15),
+                glyphs: shaper.shape(glyph, 12),
+                color: Color::BLACK,
+                style: FontStyle::REGULAR,
+            });
+        }
+        list
+    }
+}
+
+#[cfg(test)]
+mod cookie_manager_tests {
+    use super::*;
+    use cerberus_paint::MonoShaper;
+
+    fn rows(n: usize) -> Vec<CookieRow> {
+        (0..n)
+            .map(|i| CookieRow {
+                primary: format!("c{i}"),
+                detail: "example.com".into(),
+                chip: "allow".into(),
+            })
+            .collect()
+    }
+
+    #[test]
+    fn close_and_global_chip_hit_test() {
+        let w = Size::new(1000, 800);
+        let close = CookieManager::close_rect(w);
+        assert_eq!(
+            CookieManager::hit_test(w, 0, 0, close.x + 2, close.y + 2),
+            CookieAction::Close
+        );
+        let g = CookieManager::global_chip_rect(w);
+        assert_eq!(
+            CookieManager::hit_test(w, 0, 0, g.x + 2, g.y + 2),
+            CookieAction::CycleGlobal
+        );
+    }
+
+    #[test]
+    fn row_controls_map_to_absolute_indices_with_scroll() {
+        let w = Size::new(1000, 800);
+        let (chip, reveal, delete, _) = CookieManager::row_controls(w, 0);
+        // With scroll=3, the top visible row is absolute index 3.
+        assert_eq!(
+            CookieManager::hit_test(w, 50, 3, chip.x + 2, chip.y + 2),
+            CookieAction::Cycle(3)
+        );
+        assert_eq!(
+            CookieManager::hit_test(w, 50, 3, reveal.x + 2, reveal.y + 2),
+            CookieAction::Reveal(3)
+        );
+        assert_eq!(
+            CookieManager::hit_test(w, 50, 3, delete.x + 2, delete.y + 2),
+            CookieAction::Delete(3)
+        );
+    }
+
+    #[test]
+    fn paint_emits_panel_and_rows() {
+        let w = Size::new(1000, 800);
+        let list = CookieManager::paint(w, &MonoShaper, "allow", &rows(3), 0);
+        let glyphs = list
+            .items
+            .iter()
+            .filter(|i| matches!(i, DisplayItem::Glyphs { .. }))
+            .count();
+        assert!(glyphs >= 3, "title + global + per-row labels");
+    }
+}
