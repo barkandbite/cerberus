@@ -20,10 +20,12 @@ use std::path::Path;
 
 mod cookie;
 mod disk;
+mod policy;
 mod rand;
 mod vault;
-pub use cookie::parse_set_cookie;
+pub use cookie::{parse_http_date, parse_set_cookie};
 pub use disk::atomic_write;
+pub use policy::{CookieDisposition, CookiePolicy, DEFAULT_TIMED_SECS};
 pub use vault::{EncryptedVault, NoVault, Vault};
 
 /// Random bytes from the OS CSPRNG (exported for salt/seed generation by the
@@ -117,11 +119,31 @@ impl From<CryptoError> for StorageError {
     }
 }
 
-/// An active cookie, scoped to the first-party site it was set under.
+/// An active cookie, scoped to the first-party site it was set under, with the
+/// user's disposition (lifetime/persistence policy resolved at capture).
 #[derive(Clone, Debug)]
 struct ScopedCookie {
     fp_site: String,
     cookie: Cookie,
+    disposition: CookieDisposition,
+    /// Remaining sends for an `AllowOnce` cookie; `None` for all others.
+    sends_left: Option<u8>,
+}
+
+/// A read-only view of one stored cookie, for the inspector / CLI. Exposes
+/// everything (transparency); the UI masks the value until the user reveals it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CookieView {
+    pub fp_site: String,
+    pub name: String,
+    pub domain: String,
+    pub path: String,
+    pub value: String,
+    pub expires: Option<u64>,
+    pub disposition: CookieDisposition,
+    pub secure: bool,
+    pub http_only: bool,
+    pub same_site: SameSite,
 }
 
 /// Metadata for a quarantined cookie. The secret value lives in the vault.
@@ -244,15 +266,22 @@ impl StorageEnvironment {
     }
 }
 
-/// Cookie record layouts (KIND_COOKIES). Active:
-/// `["A", fp_site, name, value, domain, path, expires, flags]`. Quarantined
+/// Cookie record layouts (KIND_COOKIES). Active (9 fields):
+/// `["A", fp_site, name, value, domain, path, expires, flags, disposition]` —
+/// a legacy 8-field record (no disposition) loads as `Allow`. Quarantined
 /// (value lives only in the vault): `["Q", state, fp_site, name, domain,
 /// path, expires, flags]`. `expires` is 8B LE or empty for session cookies;
 /// `flags` is bit0 secure, bit1 http_only, bits 2-3 SameSite.
 fn save_partition(partition: &Partition) -> Vec<u8> {
     let mut w = disk::RecordWriter::new(disk::KIND_COOKIES);
     for sc in &partition.active {
+        // Memory-only dispositions (Session/AllowOnce) and cookies without a
+        // real future expiry never touch disk.
+        if !sc.disposition.persistent() || sc.cookie.expires.is_none() {
+            continue;
+        }
         let expires = encode_expires(sc.cookie.expires);
+        let disposition = sc.disposition.encode();
         w.record(&[
             b"A",
             sc.fp_site.as_bytes(),
@@ -262,6 +291,7 @@ fn save_partition(partition: &Partition) -> Vec<u8> {
             sc.cookie.path.as_bytes(),
             &expires,
             &[encode_flags(&sc.cookie)],
+            &disposition,
         ]);
     }
     for q in &partition.quarantined {
@@ -291,7 +321,8 @@ fn load_partition(bytes: &[u8]) -> std::io::Result<Partition> {
                 .map_err(|_| bad("bad utf8 in cookie record"))
         };
         match fields.first().map(Vec::as_slice) {
-            Some(b"A") if fields.len() == 8 => {
+            // 8-field = legacy (no disposition ⇒ Allow); 9-field carries it.
+            Some(b"A") if fields.len() == 8 || fields.len() == 9 => {
                 let expires = decode_expires(&fields[6]);
                 // Sessions cookies (no expiry) do not survive a restart, and
                 // expired ones are dropped at the door.
@@ -300,6 +331,10 @@ fn load_partition(bytes: &[u8]) -> std::io::Result<Partition> {
                     continue;
                 }
                 let (secure, http_only, same_site) = decode_flags(fields[7].first().copied());
+                let disposition = fields
+                    .get(8)
+                    .map(|b| CookieDisposition::decode(b))
+                    .unwrap_or(CookieDisposition::Allow);
                 partition.active.push(ScopedCookie {
                     fp_site: text(1)?,
                     cookie: Cookie {
@@ -312,6 +347,8 @@ fn load_partition(bytes: &[u8]) -> std::io::Result<Partition> {
                         http_only,
                         same_site,
                     },
+                    disposition,
+                    sends_left: None,
                 });
             }
             Some(b"Q") if fields.len() == 8 => {
@@ -404,19 +441,44 @@ impl InstanceStore<'_> {
         self.instance
     }
 
-    /// Classify and store a cookie. `Active` lands in the partition scoped to
-    /// `first_party`; `Quarantined` is encrypted into the vault and never
-    /// attached to a request until released.
+    /// Classify and store a cookie under the default `Allow` disposition
+    /// (honor the cookie's own lifetime). See [`set_cookie_with`].
     pub fn set_cookie(
         &mut self,
         first_party: &Origin,
         cookie: Cookie,
         group: Group,
     ) -> Result<QuarantineState, StorageError> {
+        self.set_cookie_with(first_party, cookie, group, CookieDisposition::Allow)
+    }
+
+    /// Classify and store a cookie under an explicit disposition. `Active`
+    /// lands in the partition scoped to `first_party`, with the disposition
+    /// applied (`Block` drops it; `Timed` overrides the expiry;
+    /// `Session`/`AllowOnce` are memory-only). `Quarantined` is encrypted into
+    /// the vault and never attached until released.
+    pub fn set_cookie_with(
+        &mut self,
+        first_party: &Origin,
+        mut cookie: Cookie,
+        group: Group,
+        disposition: CookieDisposition,
+    ) -> Result<QuarantineState, StorageError> {
         let fp_site = first_party.site();
         match group {
             Group::Active => {
-                self.insert_active(fp_site, cookie);
+                let sends_left = match disposition {
+                    // Never store; treat as a no-op success.
+                    CookieDisposition::Block => return Ok(QuarantineState::Revoked),
+                    // The user's clock overrides the site's.
+                    CookieDisposition::Timed(secs) => {
+                        cookie.expires = Some(cookie::unix_now().saturating_add(secs));
+                        None
+                    }
+                    CookieDisposition::AllowOnce => Some(1),
+                    CookieDisposition::Session | CookieDisposition::Allow => None,
+                };
+                self.insert_active(fp_site, cookie, disposition, sends_left);
                 *self.dirty = true;
                 Ok(QuarantineState::Active)
             }
@@ -456,8 +518,32 @@ impl InstanceStore<'_> {
             .filter(|sc| domain_matches(&request_origin.host, &sc.cookie.domain))
             .filter(|sc| sc.cookie.expires.is_none_or(|t| t > now))
             .filter(|sc| !sc.cookie.secure || https)
+            .filter(|sc| sc.sends_left != Some(0))
             .map(|sc| sc.cookie.clone())
             .collect()
+    }
+
+    /// Account for an `AllowOnce` send: after the cookies for this request have
+    /// been attached, decrement each matching `AllowOnce` cookie and drop those
+    /// that are now spent. Call exactly once per request that actually sent the
+    /// header (the jar's `cookie_header`).
+    pub fn consume_allow_once(&mut self, request_origin: &Origin, first_party: &Origin) {
+        let fp_site = first_party.site();
+        let host = &request_origin.host;
+        let mut changed = false;
+        for sc in &mut self.partition.active {
+            if sc.fp_site == fp_site
+                && domain_matches(host, &sc.cookie.domain)
+                && matches!(sc.disposition, CookieDisposition::AllowOnce)
+            {
+                sc.sends_left = Some(sc.sends_left.unwrap_or(1).saturating_sub(1));
+                changed = true;
+            }
+        }
+        if changed {
+            self.partition.active.retain(|sc| sc.sends_left != Some(0));
+            *self.dirty = true;
+        }
     }
 
     /// Release a quarantined cookie into the active set, scoped to
@@ -484,7 +570,9 @@ impl InstanceStore<'_> {
 
         let mut entry = self.partition.quarantined.remove(pos);
         entry.cookie.value = String::from_utf8_lossy(&value_bytes).into_owned();
-        self.insert_active(fp_site, entry.cookie);
+        // A released cookie joins the active set under the default disposition;
+        // the user can retune it from the inspector.
+        self.insert_active(fp_site, entry.cookie, CookieDisposition::Allow, None);
         *self.dirty = true;
         Ok(())
     }
@@ -522,11 +610,99 @@ impl InstanceStore<'_> {
             .collect()
     }
 
-    fn insert_active(&mut self, fp_site: String, cookie: Cookie) {
+    fn insert_active(
+        &mut self,
+        fp_site: String,
+        cookie: Cookie,
+        disposition: CookieDisposition,
+        sends_left: Option<u8>,
+    ) {
         self.partition
             .active
             .retain(|sc| !(sc.fp_site == fp_site && sc.cookie.name == cookie.name));
-        self.partition.active.push(ScopedCookie { fp_site, cookie });
+        self.partition.active.push(ScopedCookie {
+            fp_site,
+            cookie,
+            disposition,
+            sends_left,
+        });
+    }
+
+    /// Every active cookie in this instance (all sites), for the inspector/CLI.
+    pub fn cookie_views(&self) -> Vec<CookieView> {
+        self.partition
+            .active
+            .iter()
+            .map(|sc| CookieView {
+                fp_site: sc.fp_site.clone(),
+                name: sc.cookie.name.clone(),
+                domain: sc.cookie.domain.clone(),
+                path: sc.cookie.path.clone(),
+                value: sc.cookie.value.clone(),
+                expires: sc.cookie.expires,
+                disposition: sc.disposition,
+                secure: sc.cookie.secure,
+                http_only: sc.cookie.http_only,
+                same_site: sc.cookie.same_site,
+            })
+            .collect()
+    }
+
+    /// Change a stored cookie's disposition (inspector). `Block` deletes it;
+    /// `Timed` resets its expiry from now; `AllowOnce` refreshes its budget.
+    /// Returns whether a matching cookie was found.
+    pub fn set_disposition(
+        &mut self,
+        fp_site: &str,
+        name: &str,
+        disposition: CookieDisposition,
+    ) -> bool {
+        if matches!(disposition, CookieDisposition::Block) {
+            return self.delete_cookie(fp_site, name);
+        }
+        let now = cookie::unix_now();
+        let Some(sc) = self
+            .partition
+            .active
+            .iter_mut()
+            .find(|sc| sc.fp_site == fp_site && sc.cookie.name == name)
+        else {
+            return false;
+        };
+        sc.disposition = disposition;
+        sc.sends_left = match disposition {
+            CookieDisposition::AllowOnce => Some(1),
+            _ => None,
+        };
+        if let CookieDisposition::Timed(secs) = disposition {
+            sc.cookie.expires = Some(now.saturating_add(secs));
+        }
+        *self.dirty = true;
+        true
+    }
+
+    /// Delete one active cookie. Returns whether it existed.
+    pub fn delete_cookie(&mut self, fp_site: &str, name: &str) -> bool {
+        let before = self.partition.active.len();
+        self.partition
+            .active
+            .retain(|sc| !(sc.fp_site == fp_site && sc.cookie.name == name));
+        let removed = self.partition.active.len() != before;
+        if removed {
+            *self.dirty = true;
+        }
+        removed
+    }
+
+    /// Delete every active cookie under one first-party site. Returns the count.
+    pub fn clear_site(&mut self, fp_site: &str) -> usize {
+        let before = self.partition.active.len();
+        self.partition.active.retain(|sc| sc.fp_site != fp_site);
+        let removed = before - self.partition.active.len();
+        if removed > 0 {
+            *self.dirty = true;
+        }
+        removed
     }
 }
 
@@ -826,6 +1002,117 @@ mod tests {
             .is_empty());
 
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn dispositions_drive_lifetime_and_persistence() {
+        let dir = std::env::temp_dir().join(format!("cerb-disp-test-{}", std::process::id()));
+        std::fs::remove_dir_all(&dir).ok();
+
+        let mut env = StorageEnvironment::with_no_vault();
+        let inst = instance_a();
+        // Allow with a real future expiry → persists.
+        let mut allow = Cookie::host("keep", "1", "example.com");
+        allow.expires = Some(crate::cookie::unix_now() + 3600);
+        env.instance(inst)
+            .set_cookie_with(&fp(), allow, Group::Active, CookieDisposition::Allow)
+            .unwrap();
+        // Session → memory-only.
+        env.instance(inst)
+            .set_cookie_with(
+                &fp(),
+                Cookie::host("sess", "1", "example.com"),
+                Group::Active,
+                CookieDisposition::Session,
+            )
+            .unwrap();
+        // Timed → expiry overridden to now+secs regardless of the cookie.
+        env.instance(inst)
+            .set_cookie_with(
+                &fp(),
+                Cookie::host("timed", "1", "example.com"),
+                Group::Active,
+                CookieDisposition::Timed(120),
+            )
+            .unwrap();
+        // Block → dropped at the door.
+        env.instance(inst)
+            .set_cookie_with(
+                &fp(),
+                Cookie::host("blocked", "1", "example.com"),
+                Group::Active,
+                CookieDisposition::Block,
+            )
+            .unwrap();
+
+        let views = env.instance(inst).cookie_views();
+        assert_eq!(views.len(), 3, "blocked never stored: {views:?}");
+        let timed = views.iter().find(|v| v.name == "timed").unwrap();
+        assert_eq!(timed.disposition, CookieDisposition::Timed(120));
+        let now = crate::cookie::unix_now();
+        assert!(timed.expires.unwrap() <= now + 120 && timed.expires.unwrap() > now);
+
+        env.save(&dir).unwrap();
+        // Reload: only Allow + Timed survive (Session is memory-only).
+        let mut env = StorageEnvironment::load(&dir, Box::new(NoVault)).unwrap();
+        let mut names: Vec<String> = env
+            .instance(inst)
+            .cookie_views()
+            .into_iter()
+            .map(|v| v.name)
+            .collect();
+        names.sort();
+        assert_eq!(names, vec!["keep".to_string(), "timed".to_string()]);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn allow_once_sends_exactly_once() {
+        let mut env = StorageEnvironment::with_no_vault();
+        let inst = instance_a();
+        env.instance(inst)
+            .set_cookie_with(
+                &fp(),
+                Cookie::host("one", "v", "example.com"),
+                Group::Active,
+                CookieDisposition::AllowOnce,
+            )
+            .unwrap();
+        // First request: present.
+        assert_eq!(
+            env.instance(inst).cookies_for_request(&req(), &fp()).len(),
+            1
+        );
+        env.instance(inst).consume_allow_once(&req(), &fp());
+        // Second request: gone.
+        assert!(env
+            .instance(inst)
+            .cookies_for_request(&req(), &fp())
+            .is_empty());
+    }
+
+    #[test]
+    fn inspector_set_disposition_and_delete() {
+        let mut env = StorageEnvironment::with_no_vault();
+        let inst = instance_a();
+        env.instance(inst)
+            .set_cookie(&fp(), Cookie::host("c", "v", "example.com"), Group::Active)
+            .unwrap();
+        // Retune to Timed.
+        assert!(env.instance(inst).set_disposition(
+            &fp().site(),
+            "c",
+            CookieDisposition::Timed(30)
+        ));
+        let v = env.instance(inst).cookie_views();
+        assert_eq!(v[0].disposition, CookieDisposition::Timed(30));
+        // Setting Block deletes it.
+        assert!(env
+            .instance(inst)
+            .set_disposition(&fp().site(), "c", CookieDisposition::Block));
+        assert!(env.instance(inst).cookie_views().is_empty());
+        // Deleting a missing cookie returns false.
+        assert!(!env.instance(inst).delete_cookie(&fp().site(), "nope"));
     }
 
     #[test]

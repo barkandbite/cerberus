@@ -86,6 +86,12 @@ These are deliberate product boundaries, not yet-to-be-built features.
    is first-party to `site.com`, while `alice.github.io` and `bob.github.io`
    are different sites. Headed mode prompts (banner) and persists
    instance-scoped rules; headless denies silently.
+   On top of the gate, every accepted cookie carries a user **disposition**
+   (Allow / Session / Timed(user duration) / Block / Allow-once) resolved from
+   a per-cookie/per-site/global policy — so the user, not the site, decides
+   what persists and for how long. Session/Allow-once cookies never touch disk;
+   the cookie inspector and the `cookies` CLI make the whole jar visible
+   (ADR-0011).
 
 ## Headless mode
 

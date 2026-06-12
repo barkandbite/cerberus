@@ -32,19 +32,27 @@ use cerberus_paint::{
 };
 use cerberus_shell::{FrameApp, HeadlessSurface, PlatformSurface, Waker};
 use cerberus_storage::{
-    atomic_write, parse_set_cookie, random_bytes, EncryptedVault, Group, StorageEnvironment,
+    atomic_write, parse_set_cookie, random_bytes, CookieDisposition, CookiePolicy, CookieView,
+    EncryptedVault, Group, StorageEnvironment, DEFAULT_TIMED_SECS,
 };
 use cerberus_style::{StyleEngine, StyledDom};
 use cerberus_text::TextEngine;
 use cerberus_tls_rustls::RustlsProvider;
 use cerberus_types::{Color, FontStyle, HeadId, InstanceId, Origin, Point, RealmId, Rect, Size};
-use cerberus_ui::{BannerAction, ConsentBanner, Toolbar, ToolbarAction, BANNER_HEIGHT};
+use cerberus_ui::{
+    BannerAction, ConsentBanner, CookieAction, CookieManager, CookieRow, PerfHud, Toolbar,
+    ToolbarAction, BANNER_HEIGHT,
+};
 use cerberus_url::{join as join_url, parse as parse_url, Url};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::{Receiver, Sender};
 use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
+use std::time::{Duration, Instant};
+
+mod timings;
+use timings::Timings;
 
 /// What to render and how.
 #[derive(Clone, Debug)]
@@ -64,6 +72,8 @@ pub struct RenderConfig {
     pub dump_text: bool,
     /// Single egress proxy (`host:port`); all traffic tunnels through it.
     pub proxy: Option<String>,
+    /// Collect per-stage timings into [`RenderOutcome::timings`] (`--timers`).
+    pub timers: bool,
 }
 
 impl Default for RenderConfig {
@@ -77,6 +87,7 @@ impl Default for RenderConfig {
             data_dir: None,
             dump_text: false,
             proxy: None,
+            timers: false,
         }
     }
 }
@@ -115,6 +126,8 @@ pub struct RenderOutcome {
     pub subresources_blocked: usize,
     /// The page's text content, when [`RenderConfig::dump_text`] asked for it.
     pub page_text: Option<String>,
+    /// Per-stage `(label, milliseconds)` timings, when `--timers` is set (M11).
+    pub timings: Vec<(String, f64)>,
     pub framebuffer: Framebuffer,
 }
 
@@ -177,6 +190,19 @@ fn install_psl() {
 const VAULT_SALT_FILE: &str = "vault.salt";
 const HEADS_FILE: &str = "heads.txt";
 const CONSENT_RULES_FILE: &str = "consent.rules";
+const COOKIES_POLICY_FILE: &str = "cookies.policy";
+
+/// Load the per-cookie disposition policy from a profile dir (default when
+/// absent or ephemeral).
+fn load_cookie_policy(dir: Option<&Path>) -> CookiePolicy {
+    let mut policy = CookiePolicy::new();
+    if let Some(dir) = dir {
+        if let Ok(text) = std::fs::read_to_string(dir.join(COOKIES_POLICY_FILE)) {
+            policy.load(&text);
+        }
+    }
+    policy
+}
 
 /// Load the profile's KDF salt, creating a random one on first run.
 fn load_or_create_salt(dir: &Path) -> std::io::Result<[u8; 16]> {
@@ -279,6 +305,72 @@ fn save_heads(dir: &Path, heads: &[Head], active: usize) -> std::io::Result<()> 
     atomic_write(&dir.join(HEADS_FILE), out.as_bytes())
 }
 
+/// The active head's sealed instance for a profile dir (or the first default
+/// head when there's no `heads.txt`).
+fn profile_active_instance(dir: &Path) -> InstanceId {
+    match load_heads(dir) {
+        Some((heads, active)) => heads[active].instance,
+        None => default_heads()[0].instance,
+    }
+}
+
+/// Headless cookie administration (`cerberus-app cookies`): list the active
+/// head's cookies in a profile and optionally set a disposition. `set` is
+/// `NAME=DISP` (e.g. `cart=timed:3600`); `site` is the first-party site key.
+/// Returns one display line per cookie. Pure over a `--data-dir` profile, so
+/// it is fully testable without a window.
+pub fn cookie_admin(
+    data_dir: &str,
+    site: Option<&str>,
+    set: Option<&str>,
+) -> Result<Vec<String>, AppError> {
+    install_psl();
+    let dir = Path::new(data_dir);
+    let mut env = open_profile_storage(dir).map_err(|e| AppError::Io(e.to_string()))?;
+    let mut policy = load_cookie_policy(Some(dir));
+    let instance = profile_active_instance(dir);
+
+    if let Some(set) = set {
+        let (name, tok) = set
+            .split_once('=')
+            .ok_or_else(|| AppError::Io(format!("--set wants NAME=DISP, got {set:?}")))?;
+        let disp = CookieDisposition::parse_token(tok)
+            .ok_or_else(|| AppError::Io(format!("unknown disposition {tok:?}")))?;
+        let site = site.ok_or_else(|| AppError::Io("--set needs --site".into()))?;
+        policy.set_override(site, name, disp);
+        atomic_write(
+            &dir.join(COOKIES_POLICY_FILE),
+            policy.serialize().as_bytes(),
+        )
+        .map_err(|e| AppError::Io(e.to_string()))?;
+        env.instance(instance).set_disposition(site, name, disp);
+        env.save(dir).map_err(|e| AppError::Io(e.to_string()))?;
+    }
+
+    let mut lines: Vec<String> = env
+        .instance(instance)
+        .cookie_views()
+        .into_iter()
+        .filter(|v| site.is_none_or(|s| v.fp_site == s))
+        .map(|v: CookieView| {
+            let exp = v
+                .expires
+                .map(|t| t.to_string())
+                .unwrap_or_else(|| "session".into());
+            format!(
+                "{}  {}={}  [{}]  exp={}",
+                v.fp_site,
+                v.name,
+                v.value,
+                v.disposition.label(),
+                exp
+            )
+        })
+        .collect();
+    lines.sort();
+    Ok(lines)
+}
+
 /// Build the network client: built-in `cerberus:` pages are served locally;
 /// `http(s)` goes through our HTTP engine over rustls TLS + Quad9 DoH. When a
 /// `jar` is supplied, context-carrying fetches attach/capture cookies per hop;
@@ -313,6 +405,9 @@ struct SealedJar {
     storage: Arc<Mutex<StorageEnvironment>>,
     /// The same policy object the UI-thread fetch gating consults.
     policy: Arc<Mutex<DefaultDenyPolicy>>,
+    /// Per-cookie disposition policy (Allow/Session/Timed/Block/Allow-once),
+    /// applied to accepted cookies on capture and consulted on attach.
+    cookies: Arc<Mutex<CookiePolicy>>,
     /// Prompt events raised on the worker, drained by the UI in `poll()`.
     /// Lock discipline: never held while `storage` or `policy` is held.
     events: Arc<Mutex<Vec<ConsentEvent>>>,
@@ -340,19 +435,19 @@ impl CookieJar for SealedJar {
             }
         }
         let mut env = self.storage.lock().unwrap();
-        let cookies = env
-            .instance(instance)
-            .cookies_for_request(&origin, first_party);
+        let mut store = env.instance(instance);
+        let cookies = store.cookies_for_request(&origin, first_party);
         if cookies.is_empty() {
             return None;
         }
-        Some(
-            cookies
-                .iter()
-                .map(|c| format!("{}={}", c.name, c.value))
-                .collect::<Vec<_>>()
-                .join("; "),
-        )
+        let header = cookies
+            .iter()
+            .map(|c| format!("{}={}", c.name, c.value))
+            .collect::<Vec<_>>()
+            .join("; ");
+        // Account for Allow-once cookies now that they've been attached.
+        store.consume_allow_once(&origin, first_party);
+        Some(header)
     }
 
     fn set_cookie(&self, instance: InstanceId, request: &Url, first_party: &Origin, value: &str) {
@@ -378,16 +473,29 @@ impl CookieJar for SealedJar {
         if let Some(event) = outcome.event {
             self.events.lock().unwrap().push(event);
         }
+        // For an accepted (Active) cookie, the user's disposition decides its
+        // lifetime/persistence (Block drops it entirely). Quarantined cookies
+        // keep the default until the user releases them.
+        let disposition = if group == Group::Active {
+            self.cookies
+                .lock()
+                .unwrap()
+                .resolve(&first_party.site(), &cookie.name)
+        } else {
+            CookieDisposition::Allow
+        };
         let mut env = self.storage.lock().unwrap();
         let _ = env
             .instance(instance)
-            .set_cookie(first_party, cookie, group);
+            .set_cookie_with(first_party, cookie, group, disposition);
     }
 }
 
 /// Run the full render pipeline and return a summary plus the frame.
 pub fn render(config: &RenderConfig) -> Result<RenderOutcome, AppError> {
     install_psl();
+    let mut timings = Timings::new();
+    timings.begin_navigation();
     let url = parse_url(&config.url).map_err(|e| AppError::Url(e.to_string()))?;
 
     // --- Identities: one engine live at a time, instantiated lazily. With a
@@ -440,9 +548,13 @@ pub fn render(config: &RenderConfig) -> Result<RenderOutcome, AppError> {
         }
     }
     let consent = Arc::new(Mutex::new(policy));
+    let cookie_policy = Arc::new(Mutex::new(load_cookie_policy(
+        config.data_dir.as_deref().map(Path::new),
+    )));
     let jar: Arc<dyn CookieJar> = Arc::new(SealedJar {
         storage: storage.clone(),
         policy: consent.clone(),
+        cookies: cookie_policy.clone(),
         // One-shot renders have no banner; prompt events are dropped.
         events: Arc::new(Mutex::new(Vec::new())),
     });
@@ -470,6 +582,7 @@ pub fn render(config: &RenderConfig) -> Result<RenderOutcome, AppError> {
         Some(p) => Some(parse_proxy(p).map_err(|e| AppError::Net(format!("{e:?}")))?),
         None => None,
     };
+    let fetch_t = Instant::now();
     let (response, active_ua, client) = if url.is_builtin() {
         let resp = BuiltinHttpClient
             .get(&url)
@@ -483,6 +596,7 @@ pub fn render(config: &RenderConfig) -> Result<RenderOutcome, AppError> {
         let ua = client.user_agent_for(&url);
         (resp, ua, Some(client))
     };
+    timings.record(format!("GET {}", url.host), fetch_t.elapsed());
     let body = String::from_utf8_lossy(&response.body);
     let mut document = parse_html(&body);
 
@@ -494,6 +608,7 @@ pub fn render(config: &RenderConfig) -> Result<RenderOutcome, AppError> {
     // warm with a trivial eval and pays nothing for the bridge. ---
     let base_realm = RealmId(heads.active().id.0);
     let scripts_ran = document.scripts().len();
+    let scripts_t = Instant::now();
     let engine = heads.engine().map_err(|e| AppError::Js(format!("{e:?}")))?;
     if scripts_ran == 0 {
         engine
@@ -511,8 +626,11 @@ pub fn render(config: &RenderConfig) -> Result<RenderOutcome, AppError> {
     let engine_name = engine.name().to_string();
     let realms_live = engine.realm_count();
     let engines_live = heads.engines_live();
+    timings.record("scripts", scripts_t.elapsed());
 
+    let style_t = Instant::now();
     let styled = CssEngine::new().style(&document);
+    timings.record("style", style_t.elapsed());
 
     // Fetch + decode this page's images up front (the one-shot path is
     // synchronous; the interactive browser fetches them on its worker), in the
@@ -566,6 +684,7 @@ pub fn render(config: &RenderConfig) -> Result<RenderOutcome, AppError> {
     let content = toolbar.content_size(config.viewport);
 
     // Lay out + paint the page into the content area only.
+    let layout_t = Instant::now();
     let mut layout = BlockLayout::default();
     let page = render_document(
         &styled,
@@ -577,6 +696,8 @@ pub fn render(config: &RenderConfig) -> Result<RenderOutcome, AppError> {
         &provider,
         &NoForms,
     );
+    timings.record("layout+paint", layout_t.elapsed());
+    timings.record_page_load();
 
     // Compose: page under the toolbar, toolbar painted on top.
     let mut framebuffer = Framebuffer::new(config.viewport);
@@ -606,6 +727,11 @@ pub fn render(config: &RenderConfig) -> Result<RenderOutcome, AppError> {
         third_party_decision,
         subresources_blocked,
         page_text: config.dump_text.then(|| visible_text(document.root())),
+        timings: if config.timers {
+            timings.as_pairs()
+        } else {
+            Vec::new()
+        },
         framebuffer: surface.last_frame().cloned().unwrap_or(framebuffer),
     })
 }
@@ -626,6 +752,8 @@ struct FetchedPage {
     /// The User-Agent the stack presented to this origin (for coherent
     /// `navigator.userAgent`); honest unless this site forced an escalation.
     user_agent: String,
+    /// Wall-clock the request→full-response took (server response time, M11).
+    elapsed: Duration,
 }
 
 /// In-flight navigation bookkeeping.
@@ -661,6 +789,7 @@ enum Done {
     Sub {
         url: String,
         bytes: Result<Vec<u8>, String>,
+        elapsed: Duration,
     },
 }
 
@@ -710,8 +839,13 @@ impl NetLoader {
                         }
                     }
                     Job::Sub { url, ctx } => {
+                        let t = std::time::Instant::now();
                         let bytes = fetch_bytes(&client, &url, &ctx);
-                        Done::Sub { url, bytes }
+                        Done::Sub {
+                            url,
+                            bytes,
+                            elapsed: t.elapsed(),
+                        }
                     }
                 };
                 if out_tx.send(done).is_err() {
@@ -749,7 +883,9 @@ impl PageLoader for NetLoader {
 
 fn fetch_page(client: &Router, url: &str, ctx: &FetchContext) -> Result<FetchedPage, String> {
     let parsed = parse_url(url).map_err(|e| e.to_string())?;
+    let t = std::time::Instant::now();
     let resp = client.get_in(&parsed, ctx).map_err(|e| format!("{e:?}"))?;
+    let elapsed = t.elapsed();
     let user_agent = client.user_agent_for(&parsed);
     Ok(FetchedPage {
         url: url.to_string(),
@@ -757,6 +893,7 @@ fn fetch_page(client: &Router, url: &str, ctx: &FetchContext) -> Result<FetchedP
         headers: resp.headers,
         body: resp.body,
         user_agent,
+        elapsed,
     })
 }
 
@@ -1012,6 +1149,8 @@ pub struct BrowserApp {
     last_size: Size,
     /// Consent policy shared with the worker-side cookie jar.
     consent: Arc<Mutex<DefaultDenyPolicy>>,
+    /// Per-cookie disposition policy, shared with the worker's `SealedJar`.
+    cookie_policy: Arc<Mutex<CookiePolicy>>,
     /// Worker-raised consent events, drained into `consent_prompts` by poll().
     pending_consent: Arc<Mutex<Vec<ConsentEvent>>>,
     /// Prompts awaiting the user, shown one at a time in the banner.
@@ -1022,6 +1161,18 @@ pub struct BrowserApp {
     vault_input: String,
     /// Outcome line shown under the vault prompt.
     vault_msg: Option<String>,
+    /// Whether the cookie inspector overlay is open.
+    cookie_manager_open: bool,
+    /// Top row offset of the cookie inspector list.
+    cookie_scroll: usize,
+    /// Cookies whose value the user has revealed `(fp_site, name)`.
+    cookie_revealed: std::collections::HashSet<(String, String)>,
+    /// In-progress TTL edit in the inspector `(fp_site, name, digits)`.
+    cookie_ttl_edit: Option<(String, String, String)>,
+    /// Per-page performance measurements (M11).
+    timings: Timings,
+    /// Whether the performance HUD is shown.
+    hud_on: bool,
 }
 
 impl BrowserApp {
@@ -1066,10 +1217,12 @@ impl BrowserApp {
             }
         }
         let consent = Arc::new(Mutex::new(policy));
+        let cookie_policy = Arc::new(Mutex::new(load_cookie_policy(data_dir.as_deref())));
         let pending_consent: Arc<Mutex<Vec<ConsentEvent>>> = Arc::new(Mutex::new(Vec::new()));
         let jar: Arc<dyn CookieJar> = Arc::new(SealedJar {
             storage: storage.clone(),
             policy: consent.clone(),
+            cookies: cookie_policy.clone(),
             events: pending_consent.clone(),
         });
         let (heads, active) = match &data_dir {
@@ -1096,6 +1249,7 @@ impl BrowserApp {
             data_dir,
         );
         app.consent = consent;
+        app.cookie_policy = cookie_policy;
         app.pending_consent = pending_consent;
         if active != 0 {
             let _ = app.heads.switch_to(active);
@@ -1156,11 +1310,18 @@ impl BrowserApp {
             background: Color::WHITE,
             last_size: Size::new(800, 600),
             consent: Arc::new(Mutex::new(DefaultDenyPolicy::new(true))),
+            cookie_policy: Arc::new(Mutex::new(CookiePolicy::new())),
             pending_consent: Arc::new(Mutex::new(Vec::new())),
             consent_prompts: Vec::new(),
             data_dir,
             vault_input: String::new(),
             vault_msg: None,
+            cookie_manager_open: false,
+            cookie_scroll: 0,
+            cookie_revealed: std::collections::HashSet::new(),
+            cookie_ttl_edit: None,
+            timings: Timings::new(),
+            hud_on: false,
         };
         app.navigate("cerberus:home");
         app
@@ -1187,6 +1348,8 @@ impl BrowserApp {
         self.insecure_prompt = None;
         self.insecure_button = None;
         self.toolbar.url_focused = false;
+        // New page: reset the performance table and stamp the clock (M11).
+        self.timings.begin_navigation();
         // Drop the previous page's images: the store only ever holds the
         // current page's sub-resources (memory is priority #1).
         self.images.clear();
@@ -1258,9 +1421,15 @@ impl BrowserApp {
     /// scripts (if any) run first against the JS document model and their DOM
     /// mutations are reconciled back before styling (ADR-0008).
     fn set_document(&mut self, doc: Document) {
+        // Time scripts and style separately (M11); `Instant` directly because
+        // both calls borrow `self`.
+        let t = Instant::now();
         let doc = self.run_scripts(doc);
+        self.timings.record("scripts", t.elapsed());
         self.page_title = doc.title();
+        let t = Instant::now();
         self.styled = self.style_engine.style(&doc);
+        self.timings.record("style", t.elapsed());
         self.document = doc;
     }
 
@@ -1324,6 +1493,9 @@ impl BrowserApp {
 
         self.request_page_images();
         self.update_nav();
+        // Page-load total covers fetch → parse → scripts → style (M11);
+        // layout+paint is timed per frame in render_frame.
+        self.timings.record_page_load();
         self.persist();
     }
 
@@ -1353,14 +1525,22 @@ impl BrowserApp {
         let http_fallback = pending.http_fallback.clone();
         self.pending = None;
         match result {
-            Ok(page) => self.commit_response(
-                &page.url,
-                page.status,
-                &page.headers,
-                &page.body,
-                &page.user_agent,
-                true,
-            ),
+            Ok(page) => {
+                // Server response time for the navigation (M11).
+                let label = parse_url(&page.url)
+                    .ok()
+                    .map(|u| format!("GET {}", u.host))
+                    .unwrap_or_else(|| "GET".into());
+                self.timings.record(label, page.elapsed);
+                self.commit_response(
+                    &page.url,
+                    page.status,
+                    &page.headers,
+                    &page.body,
+                    &page.user_agent,
+                    true,
+                )
+            }
             Err(err) => match http_fallback {
                 Some(http_url) => {
                     // The https upgrade failed; offer the plaintext risk prompt.
@@ -1375,7 +1555,15 @@ impl BrowserApp {
     }
 
     /// Apply a decoded image sub-resource (or its failure) to the store.
-    fn handle_subresource(&mut self, url: String, bytes: Result<Vec<u8>, String>) -> bool {
+    fn handle_subresource(
+        &mut self,
+        url: String,
+        bytes: Result<Vec<u8>, String>,
+        elapsed: Duration,
+    ) -> bool {
+        // Subresources are aggregated into one stable row so an image-heavy
+        // page doesn't flood (and reflow) the HUD.
+        self.timings.add("subresources", elapsed);
         let state =
             match bytes.and_then(|b| self.image_codec.decode(&b).map_err(|e| format!("{e:?}"))) {
                 Ok(img) => ImageState::Ready(Arc::new(img)),
@@ -1421,6 +1609,144 @@ impl BrowserApp {
                 },
             );
         }
+    }
+
+    // ---- Cookie inspector (M10) ----
+
+    /// Snapshot the active head's cookies as inspector rows (sorted, with
+    /// values masked unless revealed).
+    fn cookie_rows(&self) -> Vec<(String, String, CookieRow)> {
+        let instance = self.heads.active().instance;
+        let mut views = self
+            .storage
+            .lock()
+            .unwrap()
+            .instance(instance)
+            .cookie_views();
+        views.sort_by(|a, b| (&a.fp_site, &a.name).cmp(&(&b.fp_site, &b.name)));
+        views
+            .into_iter()
+            .map(|v| {
+                let revealed = self
+                    .cookie_revealed
+                    .contains(&(v.fp_site.clone(), v.name.clone()));
+                let shown = if revealed {
+                    format!("{}={}", v.name, v.value)
+                } else {
+                    format!("{}=•••", v.name)
+                };
+                let exp = v
+                    .expires
+                    .map(|t| format!("exp {t}"))
+                    .unwrap_or_else(|| "session".into());
+                let row = CookieRow {
+                    primary: shown,
+                    detail: format!("{}  {}", v.domain, exp),
+                    chip: v.disposition.label(),
+                };
+                (v.fp_site, v.name, row)
+            })
+            .collect()
+    }
+
+    /// Persist the cookie policy (and any cookie changes) to the profile.
+    fn save_cookie_policy(&mut self) {
+        if let Some(dir) = &self.data_dir {
+            let text = self.cookie_policy.lock().unwrap().serialize();
+            if let Err(e) = atomic_write(&dir.join(COOKIES_POLICY_FILE), text.as_bytes()) {
+                eprintln!("cerberus: cannot save cookie policy: {e}");
+            }
+        }
+        self.persist();
+    }
+
+    /// Apply one inspector action to storage + the policy, then persist.
+    fn apply_cookie_action(&mut self, action: CookieAction) {
+        let rows = self.cookie_rows();
+        let instance = self.heads.active().instance;
+        match action {
+            CookieAction::Close => {
+                self.cookie_manager_open = false;
+                self.cookie_ttl_edit = None;
+            }
+            CookieAction::ScrollUp => self.cookie_scroll = self.cookie_scroll.saturating_sub(1),
+            CookieAction::ScrollDown => {
+                if self.cookie_scroll + 1 < rows.len() {
+                    self.cookie_scroll += 1;
+                }
+            }
+            CookieAction::CycleGlobal => {
+                let next = self.cookie_policy.lock().unwrap().global().cycle();
+                self.cookie_policy.lock().unwrap().set_global(next);
+                self.save_cookie_policy();
+            }
+            CookieAction::Reveal(i) => {
+                if let Some((site, name, _)) = rows.get(i) {
+                    let key = (site.clone(), name.clone());
+                    if !self.cookie_revealed.remove(&key) {
+                        self.cookie_revealed.insert(key);
+                    }
+                }
+            }
+            CookieAction::Delete(i) => {
+                if let Some((site, name, _)) = rows.get(i) {
+                    self.storage
+                        .lock()
+                        .unwrap()
+                        .instance(instance)
+                        .delete_cookie(site, name);
+                    self.cookie_policy.lock().unwrap().set_override(
+                        site,
+                        name,
+                        CookieDisposition::Block,
+                    );
+                    self.save_cookie_policy();
+                }
+            }
+            CookieAction::Cycle(i) => {
+                if let Some((site, name, _)) = rows.get(i).cloned() {
+                    let current = self.cookie_policy.lock().unwrap().resolve(&site, &name);
+                    let next = current.cycle();
+                    self.cookie_policy
+                        .lock()
+                        .unwrap()
+                        .set_override(&site, &name, next);
+                    self.storage
+                        .lock()
+                        .unwrap()
+                        .instance(instance)
+                        .set_disposition(&site, &name, next);
+                    self.save_cookie_policy();
+                    // Landing on Timed opens an inline editor for the exact secs.
+                    if let CookieDisposition::Timed(secs) = next {
+                        self.cookie_ttl_edit = Some((site, name, secs.to_string()));
+                    } else {
+                        self.cookie_ttl_edit = None;
+                    }
+                }
+            }
+            CookieAction::None => {}
+        }
+    }
+
+    /// Commit the in-progress TTL edit (Enter, or before another action).
+    fn commit_ttl_edit(&mut self) {
+        let Some((site, name, buf)) = self.cookie_ttl_edit.take() else {
+            return;
+        };
+        let secs: u64 = buf.parse().unwrap_or(DEFAULT_TIMED_SECS);
+        let d = CookieDisposition::Timed(secs);
+        let instance = self.heads.active().instance;
+        self.cookie_policy
+            .lock()
+            .unwrap()
+            .set_override(&site, &name, d);
+        self.storage
+            .lock()
+            .unwrap()
+            .instance(instance)
+            .set_disposition(&site, &name, d);
+        self.save_cookie_policy();
     }
 
     /// Evaluate the consent policy for one subresource URL in the context of
@@ -1882,7 +2208,11 @@ impl FrameApp for BrowserApp {
                     requested_url,
                     result,
                 } => self.handle_page(id, requested_url, result),
-                Done::Sub { url, bytes } => self.handle_subresource(url, bytes),
+                Done::Sub {
+                    url,
+                    bytes,
+                    elapsed,
+                } => self.handle_subresource(url, bytes, elapsed),
             };
         }
         redraw
@@ -1900,16 +2230,22 @@ impl FrameApp for BrowserApp {
         let mut origin = self.toolbar.content_origin();
         origin.y += banner_h as i32;
 
-        let provider = StoreImages {
-            base: self.current_url.as_ref(),
-            images: &self.images,
+        // Time layout+paint (M11). The image provider's borrow of `self` is
+        // scoped to this block so the timing record (a `&mut self` op) is free.
+        let t = Instant::now();
+        let (laid, mut page) = {
+            let provider = StoreImages {
+                base: self.current_url.as_ref(),
+                images: &self.images,
+            };
+            let mut layout = BlockLayout::default();
+            let laid = layout.layout(&self.styled, content, &self.text, &provider, &self.forms);
+            let mut page = Framebuffer::new(content);
+            page.clear(self.background);
+            self.text.rasterize(&laid.display, &mut page);
+            (laid, page)
         };
-        let mut layout = BlockLayout::default();
-        let laid = layout.layout(&self.styled, content, &self.text, &provider, &self.forms);
-
-        let mut page = Framebuffer::new(content);
-        page.clear(self.background);
-        self.text.rasterize(&laid.display, &mut page);
+        self.timings.record("layout+paint", t.elapsed());
 
         // Record link hit-boxes in window coordinates for click handling.
         self.links = laid
@@ -1960,7 +2296,35 @@ impl FrameApp for BrowserApp {
                 vault_locked,
                 self.vault_input.chars().count(),
                 self.vault_msg.as_deref(),
+                self.hud_on,
             );
+        }
+        if self.cookie_manager_open {
+            let global = self.cookie_policy.lock().unwrap().global().label();
+            let rows: Vec<CookieRow> = self.cookie_rows().into_iter().map(|(_, _, r)| r).collect();
+            self.text.rasterize(
+                &CookieManager::paint(size, &self.text, &global, &rows, self.cookie_scroll),
+                &mut fb,
+            );
+            if let Some((_, _, buf)) = &self.cookie_ttl_edit {
+                let p = CookieManager::panel_rect(size);
+                let mut list = DisplayList::new();
+                list.push(DisplayItem::Glyphs {
+                    origin: Point::new(p.x + 12, p.y + p.h as i32 - 14),
+                    glyphs: self
+                        .text
+                        .shape(&format!("Timed seconds: {buf}_  (Enter)"), 13),
+                    color: Color::rgb(0x20, 0x40, 0x70),
+                    style: FontStyle::REGULAR,
+                });
+                self.text.rasterize(&list, &mut fb);
+            }
+        }
+        // Performance HUD on top of everything, when enabled (M11).
+        if self.hud_on {
+            let rows = self.timings.display_rows();
+            self.text
+                .rasterize(&PerfHud::paint(size, &self.text, &rows), &mut fb);
         }
         fb
     }
@@ -1974,7 +2338,34 @@ impl FrameApp for BrowserApp {
                 }
             }
         }
+        if self.cookie_manager_open {
+            // The inspector owns all clicks while open. Commit any pending TTL
+            // edit first, then apply the clicked control (a click outside the
+            // panel closes it).
+            self.commit_ttl_edit();
+            if point_in_rect(CookieManager::panel_rect(self.last_size), x, y) {
+                let len = self.cookie_rows().len();
+                let action = CookieManager::hit_test(self.last_size, len, self.cookie_scroll, x, y);
+                self.apply_cookie_action(action);
+            } else {
+                self.cookie_manager_open = false;
+            }
+            return true;
+        }
         if self.settings_open {
+            // A click on the "manage cookies" row opens the inspector.
+            if point_in_rect(settings_cookies_rect(self.last_size), x, y) {
+                self.settings_open = false;
+                self.vault_msg = None;
+                self.cookie_manager_open = true;
+                self.cookie_scroll = 0;
+                return true;
+            }
+            // Toggle the performance HUD.
+            if point_in_rect(settings_timers_rect(self.last_size), x, y) {
+                self.hud_on = !self.hud_on;
+                return true;
+            }
             // Clicks inside the panel stay in the panel (passphrase entry);
             // clicking outside dismisses it.
             if !point_in_rect(settings_panel_rect(self.last_size), x, y) {
@@ -2026,6 +2417,15 @@ impl FrameApp for BrowserApp {
     }
 
     fn text_input(&mut self, c: char) -> bool {
+        // The cookie inspector's TTL editor captures digits.
+        if self.cookie_manager_open {
+            if let Some((_, _, buf)) = &mut self.cookie_ttl_edit {
+                if c.is_ascii_digit() && buf.len() < 9 {
+                    buf.push(c);
+                }
+            }
+            return true;
+        }
         // The settings overlay captures typing for the vault passphrase.
         if self.settings_open {
             if !c.is_control() {
@@ -2049,6 +2449,10 @@ impl FrameApp for BrowserApp {
     }
 
     fn submit(&mut self) -> bool {
+        if self.cookie_manager_open {
+            self.commit_ttl_edit();
+            return true;
+        }
         if self.settings_open {
             self.try_unlock_vault();
             return true;
@@ -2066,6 +2470,12 @@ impl FrameApp for BrowserApp {
     }
 
     fn backspace(&mut self) -> bool {
+        if self.cookie_manager_open {
+            if let Some((_, _, buf)) = &mut self.cookie_ttl_edit {
+                buf.pop();
+            }
+            return true;
+        }
         if self.settings_open {
             self.vault_input.pop();
             return true;
@@ -2401,7 +2811,20 @@ fn settings_panel_rect(size: Size) -> Rect {
     Rect::new(px, py, pw, ph)
 }
 
+/// The clickable "manage cookies" row inside the settings overlay.
+fn settings_cookies_rect(size: Size) -> Rect {
+    let p = settings_panel_rect(size);
+    Rect::new(p.x + 12, p.y + 176, 220, 22)
+}
+
+/// The clickable "performance HUD" toggle row inside the settings overlay.
+fn settings_timers_rect(size: Size) -> Rect {
+    let p = settings_panel_rect(size);
+    Rect::new(p.x + 12, p.y + 204, 220, 22)
+}
+
 /// Paint the centered settings panel: vault state + passphrase entry.
+#[allow(clippy::too_many_arguments)]
 fn paint_settings_overlay(
     fb: &mut Framebuffer,
     size: Size,
@@ -2410,6 +2833,7 @@ fn paint_settings_overlay(
     vault_locked: bool,
     input_chars: usize,
     vault_msg: Option<&str>,
+    hud_on: bool,
 ) {
     let panel = settings_panel_rect(size);
     let (px, py, pw, ph) = (panel.x, panel.y, panel.w, panel.h);
@@ -2470,6 +2894,37 @@ fn paint_settings_overlay(
             style: FontStyle::REGULAR,
         });
     }
+    // Entry point to the cookie inspector.
+    let cr = settings_cookies_rect(size);
+    list.push(DisplayItem::Rect {
+        rect: cr,
+        color: Color::rgb(0xE6, 0xEE, 0xF6),
+    });
+    list.push(DisplayItem::Glyphs {
+        origin: Point::new(cr.x + 6, cr.y + 16),
+        glyphs: shaper.shape("manage cookies  >", 14),
+        color: Color::rgb(0x20, 0x40, 0x70),
+        style: FontStyle::REGULAR,
+    });
+    // Performance HUD toggle.
+    let tr = settings_timers_rect(size);
+    list.push(DisplayItem::Rect {
+        rect: tr,
+        color: Color::rgb(0xE6, 0xEE, 0xF6),
+    });
+    list.push(DisplayItem::Glyphs {
+        origin: Point::new(tr.x + 6, tr.y + 16),
+        glyphs: shaper.shape(
+            if hud_on {
+                "performance HUD: on"
+            } else {
+                "performance HUD: off"
+            },
+            14,
+        ),
+        color: Color::rgb(0x20, 0x40, 0x70),
+        style: FontStyle::REGULAR,
+    });
     raster.rasterize(&list, fb);
 }
 
@@ -2706,24 +3161,28 @@ mod tests {
         SealedJar,
         Arc<Mutex<StorageEnvironment>>,
         Arc<Mutex<Vec<ConsentEvent>>>,
+        Arc<Mutex<CookiePolicy>>,
     ) {
         install_psl();
         let storage = Arc::new(Mutex::new(StorageEnvironment::with_no_vault()));
         let events: Arc<Mutex<Vec<ConsentEvent>>> = Arc::new(Mutex::new(Vec::new()));
+        let cookies = Arc::new(Mutex::new(CookiePolicy::new()));
         (
             SealedJar {
                 storage: storage.clone(),
                 policy: Arc::new(Mutex::new(DefaultDenyPolicy::new(true))),
+                cookies: cookies.clone(),
                 events: events.clone(),
             },
             storage,
             events,
+            cookies,
         )
     }
 
     #[test]
     fn jar_stores_same_site_cookies_and_attaches_them() {
-        let (jar, _env, _events) = jar_with_env();
+        let (jar, _env, _events, _cookies) = jar_with_env();
         let instance = InstanceId::from_u64_pair(0, 0x10);
         let url = parse_url("https://shop.example.com/login").unwrap();
         let fp = url.origin().unwrap();
@@ -2749,7 +3208,7 @@ mod tests {
 
     #[test]
     fn jar_drops_cross_site_cookies_while_vault_is_locked() {
-        let (jar, env, events) = jar_with_env();
+        let (jar, env, events, _cookies) = jar_with_env();
         let instance = InstanceId::from_u64_pair(0, 0x10);
         let fp = Origin::new("https", "news.example.com", None);
         let tracker = parse_url("https://ads.tracker.net/pixel.gif").unwrap();
@@ -2770,7 +3229,7 @@ mod tests {
 
     #[test]
     fn jar_is_sealed_per_instance() {
-        let (jar, _env, _events) = jar_with_env();
+        let (jar, _env, _events, _cookies) = jar_with_env();
         let a = InstanceId::from_u64_pair(0, 0xA);
         let b = InstanceId::from_u64_pair(0, 0xB);
         let url = parse_url("https://shop.example.com/").unwrap();
@@ -2782,8 +3241,204 @@ mod tests {
     }
 
     #[test]
+    fn jar_applies_the_cookie_disposition_policy() {
+        let (jar, env, _events, cookies) = jar_with_env();
+        let instance = InstanceId::from_u64_pair(0, 0x10);
+        let url = parse_url("https://shop.example.com/").unwrap();
+        let fp = url.origin().unwrap();
+        let site = fp.site();
+
+        // Global default Block → first-party cookie is dropped on capture.
+        cookies.lock().unwrap().set_global(CookieDisposition::Block);
+        jar.set_cookie(instance, &url, &fp, "a=1; Secure");
+        assert!(env
+            .lock()
+            .unwrap()
+            .instance(instance)
+            .cookie_views()
+            .is_empty());
+
+        // A per-cookie Timed override wins over the global Block.
+        cookies
+            .lock()
+            .unwrap()
+            .set_override(&site, "b", CookieDisposition::Timed(120));
+        jar.set_cookie(instance, &url, &fp, "b=2; Secure");
+        let views = env.lock().unwrap().instance(instance).cookie_views();
+        assert_eq!(views.len(), 1);
+        assert_eq!(views[0].name, "b");
+        assert_eq!(views[0].disposition, CookieDisposition::Timed(120));
+
+        // Allow-once: attached on the first request, gone on the second.
+        cookies
+            .lock()
+            .unwrap()
+            .set_override(&site, "c", CookieDisposition::AllowOnce);
+        jar.set_cookie(instance, &url, &fp, "c=3; Secure");
+        let h1 = jar.cookie_header(instance, &url, &fp).unwrap();
+        assert!(h1.contains("c=3"));
+        let h2 = jar.cookie_header(instance, &url, &fp).unwrap_or_default();
+        assert!(
+            !h2.contains("c=3"),
+            "allow-once must not send twice: {h2:?}"
+        );
+    }
+
+    #[test]
+    fn cookie_admin_lists_and_sets_a_profile() {
+        let dir = std::env::temp_dir().join(format!("cerb-cadmin-{}", std::process::id()));
+        std::fs::remove_dir_all(&dir).ok();
+        let dir_s = dir.to_str().unwrap();
+
+        // Empty profile lists nothing.
+        assert!(cookie_admin(dir_s, None, None).unwrap().is_empty());
+
+        // Seed a cookie into the active head's instance via the storage layer.
+        install_psl();
+        let instance = profile_active_instance(&dir);
+        {
+            let mut env = open_profile_storage(&dir).unwrap();
+            let mut c = cerberus_storage::Cookie::host("sid", "v", "example.com");
+            c.expires =
+                Some(cerberus_storage::parse_http_date("Tue, 19 Jan 2038 03:14:07 GMT").unwrap());
+            env.instance(instance)
+                .set_cookie(&Origin::new("https", "example.com", None), c, Group::Active)
+                .unwrap();
+            env.save(&dir).unwrap();
+        }
+        let listed = cookie_admin(dir_s, None, None).unwrap();
+        assert_eq!(listed.len(), 1);
+        assert!(listed[0].contains("sid=v") && listed[0].contains("[allow]"));
+
+        // Retune it to Timed via the admin path; the policy file is written.
+        cookie_admin(dir_s, Some("https://example.com"), Some("sid=timed:60")).unwrap();
+        assert!(dir.join("cookies.policy").exists());
+        let after = cookie_admin(dir_s, None, None).unwrap();
+        assert!(after[0].contains("Timed 60s"), "got {:?}", after[0]);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn render_collects_stable_named_timings() {
+        let cfg = RenderConfig {
+            timers: true,
+            ..RenderConfig::default()
+        };
+        let outcome = render(&cfg).expect("render");
+        let labels: Vec<&str> = outcome.timings.iter().map(|(l, _)| l.as_str()).collect();
+        // The builtin page exercises fetch → scripts → style → layout+paint,
+        // plus the page-load total, in a stable order.
+        assert!(labels.contains(&"scripts"), "{labels:?}");
+        assert!(labels.contains(&"style"), "{labels:?}");
+        assert!(labels.contains(&"layout+paint"), "{labels:?}");
+        assert!(labels.contains(&"page load"), "{labels:?}");
+        assert!(labels.iter().any(|l| l.starts_with("GET ")), "{labels:?}");
+        // page load is last (recorded after the stages) and ≥ 0.
+        assert_eq!(*labels.last().unwrap(), "page load");
+        assert!(outcome.timings.iter().all(|(_, ms)| *ms >= 0.0));
+
+        // Without --timers the field stays empty (zero overhead surfaced).
+        let plain = render(&RenderConfig::default()).expect("render");
+        assert!(plain.timings.is_empty());
+    }
+
+    #[test]
+    fn interactive_timings_record_a_network_row_in_stable_order() {
+        let mut app = fake_app(vec![(
+            "https://t.test/",
+            Ok(page("https://t.test/", 200, None, "<p>hi</p>")),
+        )]);
+        app.navigate("https://t.test/");
+        assert!(app.poll());
+        app.render_frame(Size::new(800, 600));
+        let labels: Vec<String> = app.timings.rows().iter().map(|r| r.label.clone()).collect();
+        // The FakeLoader injects a 7ms elapsed for the navigation request.
+        assert!(labels.iter().any(|l| l == "GET t.test"), "{labels:?}");
+        assert!(labels.iter().any(|l| l == "layout+paint"), "{labels:?}");
+        assert!(labels.iter().any(|l| l == "page load"), "{labels:?}");
+        // A second frame updates layout+paint in place — no new row, no reorder.
+        let before = labels.len();
+        app.render_frame(Size::new(800, 600));
+        assert_eq!(app.timings.rows().len(), before);
+    }
+
+    #[test]
+    fn cookie_inspector_cycles_deletes_and_edits_ttl() {
+        let mut app = fake_app(vec![(
+            "cerberus:home",
+            Ok(page("cerberus:home", 200, None, "<p>hi</p>")),
+        )]);
+        let inst = app.heads.active().instance;
+        let fp = Origin::new("https", "example.com", None);
+        app.storage
+            .lock()
+            .unwrap()
+            .instance(inst)
+            .set_cookie(
+                &fp,
+                cerberus_storage::Cookie::host("sid", "v", "example.com"),
+                Group::Active,
+            )
+            .unwrap();
+        app.cookie_manager_open = true;
+
+        let rows = app.cookie_rows();
+        assert_eq!(rows.len(), 1);
+        // Value masked until revealed.
+        assert!(rows[0].2.primary.contains("•••"));
+        app.apply_cookie_action(CookieAction::Reveal(0));
+        assert!(app.cookie_rows()[0].2.primary.contains("sid=v"));
+
+        // Cycle: Allow → Session.
+        app.apply_cookie_action(CookieAction::Cycle(0));
+        assert_eq!(
+            app.cookie_policy
+                .lock()
+                .unwrap()
+                .resolve("https://example.com", "sid"),
+            CookieDisposition::Session
+        );
+        // Cycle again: Session → Timed(default), which opens the TTL editor.
+        app.apply_cookie_action(CookieAction::Cycle(0));
+        assert!(app.cookie_ttl_edit.is_some());
+        // Type a new TTL and commit.
+        if let Some((_, _, buf)) = &mut app.cookie_ttl_edit {
+            *buf = "90".to_string();
+        }
+        app.commit_ttl_edit();
+        assert_eq!(
+            app.cookie_policy
+                .lock()
+                .unwrap()
+                .resolve("https://example.com", "sid"),
+            CookieDisposition::Timed(90)
+        );
+
+        // Delete removes the cookie and records a Block override.
+        app.apply_cookie_action(CookieAction::Delete(0));
+        assert!(app.cookie_rows().is_empty());
+        assert_eq!(
+            app.cookie_policy
+                .lock()
+                .unwrap()
+                .resolve("https://example.com", "sid"),
+            CookieDisposition::Block
+        );
+
+        // Global default cycles without panicking.
+        app.apply_cookie_action(CookieAction::CycleGlobal);
+        assert_ne!(
+            app.cookie_policy.lock().unwrap().global(),
+            CookieDisposition::Allow
+        );
+        // Close.
+        app.apply_cookie_action(CookieAction::Close);
+        assert!(!app.cookie_manager_open);
+    }
+
+    #[test]
     fn jar_rejects_malformed_and_misdomained_cookies() {
-        let (jar, _env, _events) = jar_with_env();
+        let (jar, _env, _events, _cookies) = jar_with_env();
         let instance = InstanceId::from_u64_pair(0, 0x10);
         let url = parse_url("https://shop.example.com/").unwrap();
         let fp = url.origin().unwrap();
@@ -2967,7 +3622,11 @@ mod tests {
                 .get(&url)
                 .cloned()
                 .unwrap_or_else(|| Err(format!("no canned image for {url}")));
-            self.queue.borrow_mut().push_back(Done::Sub { url, bytes });
+            self.queue.borrow_mut().push_back(Done::Sub {
+                url,
+                bytes,
+                elapsed: Duration::from_millis(0),
+            });
         }
         fn try_recv(&mut self) -> Option<Done> {
             self.queue.get_mut().pop_front()
@@ -2985,6 +3644,7 @@ mod tests {
             headers,
             body: body.as_bytes().to_vec(),
             user_agent: DEFAULT_USER_AGENT.to_string(),
+            elapsed: Duration::from_millis(7),
         }
     }
 

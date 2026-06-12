@@ -25,6 +25,12 @@ The differentiator is the **privacy model**, not the renderer:
   instance) or *quarantined*; everyday first-party browsing isn't gated.
 - **Consent gate** — third-party storage defaults to **deny**, with a prompt in
   headed mode.
+- **Transparent cookies** — every cookie is visible and user-controllable:
+  per-cookie **Allow / Session / Timed(your duration) / Block / Allow-once**,
+  with per-site and global defaults, in an inspector and a `cookies` CLI.
+- **Performance HUD** — an optional, stable top-right overlay of nanosecond
+  timings (page load, server response, scripts, style, layout+paint), measured
+  browser-side so it adds no fingerprint surface.
 - **Farbling** — per-head, per-session bounded noise on fingerprintable surfaces
   (canvas, audio, WebGL, fonts), so trackers can't build a stable cross-site
   identity. This randomizes our *own* surface; it never impersonates another
@@ -68,6 +74,13 @@ cargo run -p cerberus-app --release -- render --url https://example.com --out p.
 
 # Single egress proxy (CONNECT tunnel; target hosts are never resolved locally):
 cargo run -p cerberus-app --release -- render --url https://example.com --out p.png --proxy 127.0.0.1:3128
+
+# Inspect / retune a profile's per-cookie dispositions, headlessly:
+cargo run -p cerberus-app --release -- cookies --data-dir ~/.cerberus
+cargo run -p cerberus-app --release -- cookies --data-dir ~/.cerberus --site https://example.com --set sid=timed:3600
+
+# Per-stage performance timings (also a top-right HUD in the windowed browser):
+cargo run -p cerberus-app --release -- render --url https://example.com --out p.png --timers
 
 # The CI gates: memory (idle + head-switch leak) and the pipeline benchmark:
 cargo run -p cerberus-app --release -- mem-gate --budget-mb 64 --switches 25

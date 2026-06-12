@@ -169,7 +169,7 @@ when those targets are added).
 
 ## 6. Milestones
 
-All complete:
+M0–M9 (the v1 spine) complete; M10–M11 (the post-v1 transparency wave) added:
 
 | # | Name | Exit criteria | Delivered |
 | --- | --- | --- | --- |
@@ -183,6 +183,12 @@ All complete:
 | **M7** | Heads | Three switchable identities; switch = swap head + engine; leak tests. | ✅ per-profile random seeds/instances; `mem-gate --switches` (+10% gate) |
 | **M8** | Headless | Scoped rendering (PNG/PDF) + automation; third-party deny; single proxy. | ✅ bootstrapped PNG/PDF encoders; `--dump-text`; CONNECT-tunnel egress, no DNS leak |
 | **M9** | Harden | Reproducible build, full test + benchmark suite green, docs complete. | ✅ byte-identical double build verified; bench gate in CI; docs trued |
+| **M10** | Transparent cookies | Per-cookie user control + a visible inspector. | ✅ Allow/Session/Timed/Block/Allow-once dispositions over a 3-tier policy, layered under consent; Expires parsing; cookie inspector overlay + `cookies` CLI (ADR-0011) |
+| **M11** | Performance HUD | A nanosecond, non-bouncing timing overlay. | ✅ Rust-side stable named timings (network/scripts/style/layout+paint/page-load); top-right `PerfHud`; `--timers` + `RenderOutcome.timings` (ADR-0011) |
+
+**Next (M12+, sequenced):** events + bounded event loop + fetch/XHR (the
+SPA enabler — also lights up the HUD's handler/fetch rows), then flexbox/grid
++ positioning, tabs + POST, and cross-platform. Each gets its own plan.
 
 ---
 
