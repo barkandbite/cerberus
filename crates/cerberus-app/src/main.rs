@@ -80,6 +80,7 @@ fn cmd_render(args: &[String]) -> ExitCode {
     config.data_dir = flag(args, "--data-dir");
     config.dump_text = has_flag(args, "--dump-text");
     config.proxy = flag(args, "--proxy");
+    config.timers = has_flag(args, "--timers");
     config.background = Color::WHITE;
 
     let outcome = match render(&config) {
@@ -126,6 +127,12 @@ fn cmd_render(args: &[String]) -> ExitCode {
     println!("  wrote           : {out}");
     if let Some(kb) = resident_set_kb() {
         println!("  resident memory : {:.1} MB", kb as f64 / 1024.0);
+    }
+    if !outcome.timings.is_empty() {
+        println!("--- timings ---");
+        for (label, ms) in &outcome.timings {
+            println!("  {label:<18} {ms:>8.3} ms");
+        }
     }
     if let Some(text) = &outcome.page_text {
         println!("--- page text ---");
@@ -264,6 +271,7 @@ fn print_usage() {
          \x20 --system-roots      trust the OS cert store (TLS-inspecting proxies)\n\
          \x20 --data-dir <DIR>    persistent profile (cookies survive runs)\n\
          \x20 --dump-text         print the page's text content (automation)\n\
+         \x20 --timers            collect + print per-stage performance timings\n\
          \x20 --proxy <HOST:PORT> single egress proxy (CONNECT tunnel, no DNS leak)\n\
          \x20 (--out extension selects the format: .ppm, .png, or .pdf)\n\n\
          MEM-GATE OPTIONS:\n\

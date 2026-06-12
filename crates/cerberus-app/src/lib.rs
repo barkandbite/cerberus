@@ -40,8 +40,8 @@ use cerberus_text::TextEngine;
 use cerberus_tls_rustls::RustlsProvider;
 use cerberus_types::{Color, FontStyle, HeadId, InstanceId, Origin, Point, RealmId, Rect, Size};
 use cerberus_ui::{
-    BannerAction, ConsentBanner, CookieAction, CookieManager, CookieRow, Toolbar, ToolbarAction,
-    BANNER_HEIGHT,
+    BannerAction, ConsentBanner, CookieAction, CookieManager, CookieRow, PerfHud, Toolbar,
+    ToolbarAction, BANNER_HEIGHT,
 };
 use cerberus_url::{join as join_url, parse as parse_url, Url};
 use std::collections::HashMap;
@@ -49,6 +49,10 @@ use std::path::{Path, PathBuf};
 use std::sync::mpsc::{Receiver, Sender};
 use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
+use std::time::{Duration, Instant};
+
+mod timings;
+use timings::Timings;
 
 /// What to render and how.
 #[derive(Clone, Debug)]
@@ -68,6 +72,8 @@ pub struct RenderConfig {
     pub dump_text: bool,
     /// Single egress proxy (`host:port`); all traffic tunnels through it.
     pub proxy: Option<String>,
+    /// Collect per-stage timings into [`RenderOutcome::timings`] (`--timers`).
+    pub timers: bool,
 }
 
 impl Default for RenderConfig {
@@ -81,6 +87,7 @@ impl Default for RenderConfig {
             data_dir: None,
             dump_text: false,
             proxy: None,
+            timers: false,
         }
     }
 }
@@ -119,6 +126,8 @@ pub struct RenderOutcome {
     pub subresources_blocked: usize,
     /// The page's text content, when [`RenderConfig::dump_text`] asked for it.
     pub page_text: Option<String>,
+    /// Per-stage `(label, milliseconds)` timings, when `--timers` is set (M11).
+    pub timings: Vec<(String, f64)>,
     pub framebuffer: Framebuffer,
 }
 
@@ -485,6 +494,8 @@ impl CookieJar for SealedJar {
 /// Run the full render pipeline and return a summary plus the frame.
 pub fn render(config: &RenderConfig) -> Result<RenderOutcome, AppError> {
     install_psl();
+    let mut timings = Timings::new();
+    timings.begin_navigation();
     let url = parse_url(&config.url).map_err(|e| AppError::Url(e.to_string()))?;
 
     // --- Identities: one engine live at a time, instantiated lazily. With a
@@ -571,6 +582,7 @@ pub fn render(config: &RenderConfig) -> Result<RenderOutcome, AppError> {
         Some(p) => Some(parse_proxy(p).map_err(|e| AppError::Net(format!("{e:?}")))?),
         None => None,
     };
+    let fetch_t = Instant::now();
     let (response, active_ua, client) = if url.is_builtin() {
         let resp = BuiltinHttpClient
             .get(&url)
@@ -584,6 +596,7 @@ pub fn render(config: &RenderConfig) -> Result<RenderOutcome, AppError> {
         let ua = client.user_agent_for(&url);
         (resp, ua, Some(client))
     };
+    timings.record(format!("GET {}", url.host), fetch_t.elapsed());
     let body = String::from_utf8_lossy(&response.body);
     let mut document = parse_html(&body);
 
@@ -595,6 +608,7 @@ pub fn render(config: &RenderConfig) -> Result<RenderOutcome, AppError> {
     // warm with a trivial eval and pays nothing for the bridge. ---
     let base_realm = RealmId(heads.active().id.0);
     let scripts_ran = document.scripts().len();
+    let scripts_t = Instant::now();
     let engine = heads.engine().map_err(|e| AppError::Js(format!("{e:?}")))?;
     if scripts_ran == 0 {
         engine
@@ -612,8 +626,11 @@ pub fn render(config: &RenderConfig) -> Result<RenderOutcome, AppError> {
     let engine_name = engine.name().to_string();
     let realms_live = engine.realm_count();
     let engines_live = heads.engines_live();
+    timings.record("scripts", scripts_t.elapsed());
 
+    let style_t = Instant::now();
     let styled = CssEngine::new().style(&document);
+    timings.record("style", style_t.elapsed());
 
     // Fetch + decode this page's images up front (the one-shot path is
     // synchronous; the interactive browser fetches them on its worker), in the
@@ -667,6 +684,7 @@ pub fn render(config: &RenderConfig) -> Result<RenderOutcome, AppError> {
     let content = toolbar.content_size(config.viewport);
 
     // Lay out + paint the page into the content area only.
+    let layout_t = Instant::now();
     let mut layout = BlockLayout::default();
     let page = render_document(
         &styled,
@@ -678,6 +696,8 @@ pub fn render(config: &RenderConfig) -> Result<RenderOutcome, AppError> {
         &provider,
         &NoForms,
     );
+    timings.record("layout+paint", layout_t.elapsed());
+    timings.record_page_load();
 
     // Compose: page under the toolbar, toolbar painted on top.
     let mut framebuffer = Framebuffer::new(config.viewport);
@@ -707,6 +727,11 @@ pub fn render(config: &RenderConfig) -> Result<RenderOutcome, AppError> {
         third_party_decision,
         subresources_blocked,
         page_text: config.dump_text.then(|| visible_text(document.root())),
+        timings: if config.timers {
+            timings.as_pairs()
+        } else {
+            Vec::new()
+        },
         framebuffer: surface.last_frame().cloned().unwrap_or(framebuffer),
     })
 }
@@ -727,6 +752,8 @@ struct FetchedPage {
     /// The User-Agent the stack presented to this origin (for coherent
     /// `navigator.userAgent`); honest unless this site forced an escalation.
     user_agent: String,
+    /// Wall-clock the request→full-response took (server response time, M11).
+    elapsed: Duration,
 }
 
 /// In-flight navigation bookkeeping.
@@ -762,6 +789,7 @@ enum Done {
     Sub {
         url: String,
         bytes: Result<Vec<u8>, String>,
+        elapsed: Duration,
     },
 }
 
@@ -811,8 +839,13 @@ impl NetLoader {
                         }
                     }
                     Job::Sub { url, ctx } => {
+                        let t = std::time::Instant::now();
                         let bytes = fetch_bytes(&client, &url, &ctx);
-                        Done::Sub { url, bytes }
+                        Done::Sub {
+                            url,
+                            bytes,
+                            elapsed: t.elapsed(),
+                        }
                     }
                 };
                 if out_tx.send(done).is_err() {
@@ -850,7 +883,9 @@ impl PageLoader for NetLoader {
 
 fn fetch_page(client: &Router, url: &str, ctx: &FetchContext) -> Result<FetchedPage, String> {
     let parsed = parse_url(url).map_err(|e| e.to_string())?;
+    let t = std::time::Instant::now();
     let resp = client.get_in(&parsed, ctx).map_err(|e| format!("{e:?}"))?;
+    let elapsed = t.elapsed();
     let user_agent = client.user_agent_for(&parsed);
     Ok(FetchedPage {
         url: url.to_string(),
@@ -858,6 +893,7 @@ fn fetch_page(client: &Router, url: &str, ctx: &FetchContext) -> Result<FetchedP
         headers: resp.headers,
         body: resp.body,
         user_agent,
+        elapsed,
     })
 }
 
@@ -1133,6 +1169,10 @@ pub struct BrowserApp {
     cookie_revealed: std::collections::HashSet<(String, String)>,
     /// In-progress TTL edit in the inspector `(fp_site, name, digits)`.
     cookie_ttl_edit: Option<(String, String, String)>,
+    /// Per-page performance measurements (M11).
+    timings: Timings,
+    /// Whether the performance HUD is shown.
+    hud_on: bool,
 }
 
 impl BrowserApp {
@@ -1280,6 +1320,8 @@ impl BrowserApp {
             cookie_scroll: 0,
             cookie_revealed: std::collections::HashSet::new(),
             cookie_ttl_edit: None,
+            timings: Timings::new(),
+            hud_on: false,
         };
         app.navigate("cerberus:home");
         app
@@ -1306,6 +1348,8 @@ impl BrowserApp {
         self.insecure_prompt = None;
         self.insecure_button = None;
         self.toolbar.url_focused = false;
+        // New page: reset the performance table and stamp the clock (M11).
+        self.timings.begin_navigation();
         // Drop the previous page's images: the store only ever holds the
         // current page's sub-resources (memory is priority #1).
         self.images.clear();
@@ -1377,9 +1421,15 @@ impl BrowserApp {
     /// scripts (if any) run first against the JS document model and their DOM
     /// mutations are reconciled back before styling (ADR-0008).
     fn set_document(&mut self, doc: Document) {
+        // Time scripts and style separately (M11); `Instant` directly because
+        // both calls borrow `self`.
+        let t = Instant::now();
         let doc = self.run_scripts(doc);
+        self.timings.record("scripts", t.elapsed());
         self.page_title = doc.title();
+        let t = Instant::now();
         self.styled = self.style_engine.style(&doc);
+        self.timings.record("style", t.elapsed());
         self.document = doc;
     }
 
@@ -1443,6 +1493,9 @@ impl BrowserApp {
 
         self.request_page_images();
         self.update_nav();
+        // Page-load total covers fetch → parse → scripts → style (M11);
+        // layout+paint is timed per frame in render_frame.
+        self.timings.record_page_load();
         self.persist();
     }
 
@@ -1472,14 +1525,22 @@ impl BrowserApp {
         let http_fallback = pending.http_fallback.clone();
         self.pending = None;
         match result {
-            Ok(page) => self.commit_response(
-                &page.url,
-                page.status,
-                &page.headers,
-                &page.body,
-                &page.user_agent,
-                true,
-            ),
+            Ok(page) => {
+                // Server response time for the navigation (M11).
+                let label = parse_url(&page.url)
+                    .ok()
+                    .map(|u| format!("GET {}", u.host))
+                    .unwrap_or_else(|| "GET".into());
+                self.timings.record(label, page.elapsed);
+                self.commit_response(
+                    &page.url,
+                    page.status,
+                    &page.headers,
+                    &page.body,
+                    &page.user_agent,
+                    true,
+                )
+            }
             Err(err) => match http_fallback {
                 Some(http_url) => {
                     // The https upgrade failed; offer the plaintext risk prompt.
@@ -1494,7 +1555,15 @@ impl BrowserApp {
     }
 
     /// Apply a decoded image sub-resource (or its failure) to the store.
-    fn handle_subresource(&mut self, url: String, bytes: Result<Vec<u8>, String>) -> bool {
+    fn handle_subresource(
+        &mut self,
+        url: String,
+        bytes: Result<Vec<u8>, String>,
+        elapsed: Duration,
+    ) -> bool {
+        // Subresources are aggregated into one stable row so an image-heavy
+        // page doesn't flood (and reflow) the HUD.
+        self.timings.add("subresources", elapsed);
         let state =
             match bytes.and_then(|b| self.image_codec.decode(&b).map_err(|e| format!("{e:?}"))) {
                 Ok(img) => ImageState::Ready(Arc::new(img)),
@@ -2139,7 +2208,11 @@ impl FrameApp for BrowserApp {
                     requested_url,
                     result,
                 } => self.handle_page(id, requested_url, result),
-                Done::Sub { url, bytes } => self.handle_subresource(url, bytes),
+                Done::Sub {
+                    url,
+                    bytes,
+                    elapsed,
+                } => self.handle_subresource(url, bytes, elapsed),
             };
         }
         redraw
@@ -2157,16 +2230,22 @@ impl FrameApp for BrowserApp {
         let mut origin = self.toolbar.content_origin();
         origin.y += banner_h as i32;
 
-        let provider = StoreImages {
-            base: self.current_url.as_ref(),
-            images: &self.images,
+        // Time layout+paint (M11). The image provider's borrow of `self` is
+        // scoped to this block so the timing record (a `&mut self` op) is free.
+        let t = Instant::now();
+        let (laid, mut page) = {
+            let provider = StoreImages {
+                base: self.current_url.as_ref(),
+                images: &self.images,
+            };
+            let mut layout = BlockLayout::default();
+            let laid = layout.layout(&self.styled, content, &self.text, &provider, &self.forms);
+            let mut page = Framebuffer::new(content);
+            page.clear(self.background);
+            self.text.rasterize(&laid.display, &mut page);
+            (laid, page)
         };
-        let mut layout = BlockLayout::default();
-        let laid = layout.layout(&self.styled, content, &self.text, &provider, &self.forms);
-
-        let mut page = Framebuffer::new(content);
-        page.clear(self.background);
-        self.text.rasterize(&laid.display, &mut page);
+        self.timings.record("layout+paint", t.elapsed());
 
         // Record link hit-boxes in window coordinates for click handling.
         self.links = laid
@@ -2217,6 +2296,7 @@ impl FrameApp for BrowserApp {
                 vault_locked,
                 self.vault_input.chars().count(),
                 self.vault_msg.as_deref(),
+                self.hud_on,
             );
         }
         if self.cookie_manager_open {
@@ -2239,6 +2319,12 @@ impl FrameApp for BrowserApp {
                 });
                 self.text.rasterize(&list, &mut fb);
             }
+        }
+        // Performance HUD on top of everything, when enabled (M11).
+        if self.hud_on {
+            let rows = self.timings.display_rows();
+            self.text
+                .rasterize(&PerfHud::paint(size, &self.text, &rows), &mut fb);
         }
         fb
     }
@@ -2273,6 +2359,11 @@ impl FrameApp for BrowserApp {
                 self.vault_msg = None;
                 self.cookie_manager_open = true;
                 self.cookie_scroll = 0;
+                return true;
+            }
+            // Toggle the performance HUD.
+            if point_in_rect(settings_timers_rect(self.last_size), x, y) {
+                self.hud_on = !self.hud_on;
                 return true;
             }
             // Clicks inside the panel stay in the panel (passphrase entry);
@@ -2726,7 +2817,14 @@ fn settings_cookies_rect(size: Size) -> Rect {
     Rect::new(p.x + 12, p.y + 176, 220, 22)
 }
 
+/// The clickable "performance HUD" toggle row inside the settings overlay.
+fn settings_timers_rect(size: Size) -> Rect {
+    let p = settings_panel_rect(size);
+    Rect::new(p.x + 12, p.y + 204, 220, 22)
+}
+
 /// Paint the centered settings panel: vault state + passphrase entry.
+#[allow(clippy::too_many_arguments)]
 fn paint_settings_overlay(
     fb: &mut Framebuffer,
     size: Size,
@@ -2735,6 +2833,7 @@ fn paint_settings_overlay(
     vault_locked: bool,
     input_chars: usize,
     vault_msg: Option<&str>,
+    hud_on: bool,
 ) {
     let panel = settings_panel_rect(size);
     let (px, py, pw, ph) = (panel.x, panel.y, panel.w, panel.h);
@@ -2804,6 +2903,25 @@ fn paint_settings_overlay(
     list.push(DisplayItem::Glyphs {
         origin: Point::new(cr.x + 6, cr.y + 16),
         glyphs: shaper.shape("manage cookies  >", 14),
+        color: Color::rgb(0x20, 0x40, 0x70),
+        style: FontStyle::REGULAR,
+    });
+    // Performance HUD toggle.
+    let tr = settings_timers_rect(size);
+    list.push(DisplayItem::Rect {
+        rect: tr,
+        color: Color::rgb(0xE6, 0xEE, 0xF6),
+    });
+    list.push(DisplayItem::Glyphs {
+        origin: Point::new(tr.x + 6, tr.y + 16),
+        glyphs: shaper.shape(
+            if hud_on {
+                "performance HUD: on"
+            } else {
+                "performance HUD: off"
+            },
+            14,
+        ),
         color: Color::rgb(0x20, 0x40, 0x70),
         style: FontStyle::REGULAR,
     });
@@ -3201,6 +3319,50 @@ mod tests {
     }
 
     #[test]
+    fn render_collects_stable_named_timings() {
+        let cfg = RenderConfig {
+            timers: true,
+            ..RenderConfig::default()
+        };
+        let outcome = render(&cfg).expect("render");
+        let labels: Vec<&str> = outcome.timings.iter().map(|(l, _)| l.as_str()).collect();
+        // The builtin page exercises fetch → scripts → style → layout+paint,
+        // plus the page-load total, in a stable order.
+        assert!(labels.contains(&"scripts"), "{labels:?}");
+        assert!(labels.contains(&"style"), "{labels:?}");
+        assert!(labels.contains(&"layout+paint"), "{labels:?}");
+        assert!(labels.contains(&"page load"), "{labels:?}");
+        assert!(labels.iter().any(|l| l.starts_with("GET ")), "{labels:?}");
+        // page load is last (recorded after the stages) and ≥ 0.
+        assert_eq!(*labels.last().unwrap(), "page load");
+        assert!(outcome.timings.iter().all(|(_, ms)| *ms >= 0.0));
+
+        // Without --timers the field stays empty (zero overhead surfaced).
+        let plain = render(&RenderConfig::default()).expect("render");
+        assert!(plain.timings.is_empty());
+    }
+
+    #[test]
+    fn interactive_timings_record_a_network_row_in_stable_order() {
+        let mut app = fake_app(vec![(
+            "https://t.test/",
+            Ok(page("https://t.test/", 200, None, "<p>hi</p>")),
+        )]);
+        app.navigate("https://t.test/");
+        assert!(app.poll());
+        app.render_frame(Size::new(800, 600));
+        let labels: Vec<String> = app.timings.rows().iter().map(|r| r.label.clone()).collect();
+        // The FakeLoader injects a 7ms elapsed for the navigation request.
+        assert!(labels.iter().any(|l| l == "GET t.test"), "{labels:?}");
+        assert!(labels.iter().any(|l| l == "layout+paint"), "{labels:?}");
+        assert!(labels.iter().any(|l| l == "page load"), "{labels:?}");
+        // A second frame updates layout+paint in place — no new row, no reorder.
+        let before = labels.len();
+        app.render_frame(Size::new(800, 600));
+        assert_eq!(app.timings.rows().len(), before);
+    }
+
+    #[test]
     fn cookie_inspector_cycles_deletes_and_edits_ttl() {
         let mut app = fake_app(vec![(
             "cerberus:home",
@@ -3460,7 +3622,11 @@ mod tests {
                 .get(&url)
                 .cloned()
                 .unwrap_or_else(|| Err(format!("no canned image for {url}")));
-            self.queue.borrow_mut().push_back(Done::Sub { url, bytes });
+            self.queue.borrow_mut().push_back(Done::Sub {
+                url,
+                bytes,
+                elapsed: Duration::from_millis(0),
+            });
         }
         fn try_recv(&mut self) -> Option<Done> {
             self.queue.get_mut().pop_front()
@@ -3478,6 +3644,7 @@ mod tests {
             headers,
             body: body.as_bytes().to_vec(),
             user_agent: DEFAULT_USER_AGENT.to_string(),
+            elapsed: Duration::from_millis(7),
         }
     }
 

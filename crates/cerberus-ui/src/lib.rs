@@ -834,3 +834,99 @@ mod cookie_manager_tests {
         assert!(glyphs >= 3, "title + global + per-row labels");
     }
 }
+
+// ---- Performance HUD (M11): a fixed-corner, stable timing overlay ----
+
+/// A fixed top-right overlay of named timings. Pure paint, like the other
+/// chrome; the app owns the `Timings` and passes pre-formatted rows. Rows are
+/// drawn in the order given (the app keeps them stable), so the HUD never
+/// reorders or bounces as values update.
+pub struct PerfHud;
+
+const HUD_ROW_H: i32 = 16;
+const HUD_PAD: i32 = 6;
+const HUD_W: u32 = 240;
+
+impl PerfHud {
+    /// Paint `rows` (`(label, value)`) into the top-right corner, just below
+    /// the toolbar. Empty input paints nothing.
+    pub fn paint(window: Size, shaper: &dyn TextShaper, rows: &[(String, String)]) -> DisplayList {
+        let mut list = DisplayList::new();
+        if rows.is_empty() {
+            return list;
+        }
+        let h = HUD_PAD * 2 + rows.len() as i32 * HUD_ROW_H + HUD_ROW_H;
+        let x = (window.w as i32 - HUD_W as i32 - 8).max(0);
+        let y = TOOLBAR_HEIGHT as i32 + 8;
+        // Semi-opaque dark panel (the rasterizer composites the solid fill).
+        list.push(DisplayItem::Rect {
+            rect: Rect::new(x, y, HUD_W, h as u32),
+            color: Color::rgb(0x10, 0x12, 0x16),
+        });
+        list.push(DisplayItem::Glyphs {
+            origin: Point::new(x + HUD_PAD, y + HUD_PAD + 12),
+            glyphs: shaper.shape("performance", 12),
+            color: Color::rgb(0x9A, 0xD0, 0xFF),
+            style: FontStyle::REGULAR,
+        });
+        for (i, (label, value)) in rows.iter().enumerate() {
+            let ry = y + HUD_PAD + HUD_ROW_H * (i as i32 + 1) + 12;
+            list.push(DisplayItem::Glyphs {
+                origin: Point::new(x + HUD_PAD, ry),
+                glyphs: shaper.shape(label, 12),
+                color: Color::rgb(0xD8, 0xD8, 0xD8),
+                style: FontStyle::REGULAR,
+            });
+            // Value column, right-aligned within the panel.
+            let vw: u32 = shaper.shape(value, 12).iter().map(|g| g.advance).sum();
+            let vx = x + HUD_W as i32 - HUD_PAD - vw as i32;
+            list.push(DisplayItem::Glyphs {
+                origin: Point::new(vx, ry),
+                glyphs: shaper.shape(value, 12),
+                color: Color::rgb(0x86, 0xE3, 0x9A),
+                style: FontStyle::REGULAR,
+            });
+        }
+        list
+    }
+}
+
+#[cfg(test)]
+mod perf_hud_tests {
+    use super::*;
+    use cerberus_paint::MonoShaper;
+
+    #[test]
+    fn empty_hud_paints_nothing() {
+        let list = PerfHud::paint(Size::new(800, 600), &MonoShaper, &[]);
+        assert!(list.items.is_empty());
+    }
+
+    #[test]
+    fn hud_sits_in_the_top_right_and_lists_rows() {
+        let rows = vec![
+            ("page load".to_string(), "12.30 ms".to_string()),
+            ("GET example.com".to_string(), "8.10 ms".to_string()),
+        ];
+        let w = Size::new(800, 600);
+        let list = PerfHud::paint(w, &MonoShaper, &rows);
+        // The panel rect is in the right half, below the toolbar.
+        let panel = list
+            .items
+            .iter()
+            .find_map(|i| match i {
+                DisplayItem::Rect { rect, .. } => Some(*rect),
+                _ => None,
+            })
+            .unwrap();
+        assert!(panel.x > w.w as i32 / 2);
+        assert!(panel.y >= TOOLBAR_HEIGHT as i32);
+        // header + 2 rows × (label+value) glyph runs.
+        let glyphs = list
+            .items
+            .iter()
+            .filter(|i| matches!(i, DisplayItem::Glyphs { .. }))
+            .count();
+        assert_eq!(glyphs, 1 + 2 * 2);
+    }
+}
