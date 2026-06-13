@@ -19,7 +19,7 @@ use cerberus_identity::{Head, HeadManager};
 use cerberus_image::ImageCodec;
 use cerberus_js_dom::{
     dispatch_event, fire_load, install_page, run_event_loop, run_page_scripts, serialize_dom,
-    EventLoopBudget, PageEnv, RebuiltDom,
+    set_node_value, EventLoopBudget, PageEnv, RebuiltDom,
 };
 use cerberus_js_quickjs::QuickJsEngineFactory;
 use cerberus_layout::{
@@ -2012,6 +2012,36 @@ impl BrowserApp {
         self.document = document;
     }
 
+    /// Fire a DOM `input` event at the focused control after a keystroke: push
+    /// the live value into the model (so a handler reads `e.target.value`),
+    /// dispatch, then read any handler-made value change back into the form
+    /// store. A no-op on script-less pages (no realm / JS correlate) — M12b.
+    fn fire_input(&mut self, field_id: u32) {
+        let Some(node) = self.control_node_id(field_id) else {
+            return;
+        };
+        let Some(&js_id) = self.node_to_js.get(&node) else {
+            return;
+        };
+        let value = self
+            .forms
+            .values
+            .get(&field_id)
+            .cloned()
+            .unwrap_or_default();
+        {
+            let realm = RealmId(self.heads.active().id.0);
+            if let Ok(engine) = self.heads.engine() {
+                let _ = set_node_value(engine, realm, js_id, &value);
+            }
+        }
+        self.dispatch_dom(node, "input", "{}");
+        // A handler may have rewritten the value (input masking); reflect it.
+        if let Some(v) = control_value(self.document.root(), field_id) {
+            self.forms.values.insert(field_id, v);
+        }
+    }
+
     /// Check radio `id` and clear every other radio sharing its `name` in the
     /// same enclosing form (mutually-exclusive radio-group behaviour).
     fn check_radio(&mut self, id: u32) {
@@ -2567,6 +2597,7 @@ impl FrameApp for BrowserApp {
         if let Some(id) = self.focused_field {
             if !c.is_control() {
                 self.forms.values.entry(id).or_default().push(c);
+                self.fire_input(id);
             }
             return true;
         }
@@ -2613,6 +2644,7 @@ impl FrameApp for BrowserApp {
             if let Some(v) = self.forms.values.get_mut(&id) {
                 v.pop();
             }
+            self.fire_input(id);
             return true;
         }
         false
@@ -2704,6 +2736,16 @@ struct ControlRef<'a> {
 /// origin — e.g. `innerHTML`-reparsed fragments — simply don't appear).
 fn invert_id_map(map: &HashMap<u64, NodeId>) -> HashMap<NodeId, u64> {
     map.iter().map(|(&js, &node)| (node, js)).collect()
+}
+
+/// The `value` attribute of the control with field index `field_id` in `root`
+/// (its current live value after a dispatch), `None` if not found.
+fn control_value(root: NodeRef<'_>, field_id: u32) -> Option<String> {
+    collect_controls(root)
+        .iter()
+        .find(|c| c.id == field_id)
+        .and_then(|c| c.el.attr("value"))
+        .map(str::to_string)
 }
 
 /// Whether `tag` is a control that consumes a field id (the same set layout
@@ -4463,6 +4505,42 @@ mod tests {
         assert_eq!(
             b.toolbar.url_text, "https://site.test/next",
             "a non-prevented link click still navigates"
+        );
+    }
+
+    #[test]
+    fn typing_into_a_field_fires_input_and_reflects_handler_changes() {
+        // A scripted input whose `input` handler uppercases its value: typing
+        // fires the event, the handler reads e.target.value, and its rewrite
+        // flows back into the rendered field value.
+        let mut b = loaded(
+            vec![(
+                "https://site.test/",
+                Ok(page(
+                    "https://site.test/",
+                    200,
+                    None,
+                    "<input id='t'>\
+                     <script>document.getElementById('t').addEventListener('input', function (e) { \
+                       e.target.value = e.target.value.toUpperCase(); });</script>",
+                )),
+            )],
+            "https://site.test/",
+        );
+        b.render_frame(Size::new(800, 600));
+        let r = b
+            .form_fields
+            .iter()
+            .find(|f| matches!(f.kind, FieldKind::Text))
+            .expect("text field box")
+            .rect;
+        assert!(b.pointer_down(r.x + 1, r.y + 1), "focus the field");
+        assert!(b.text_input('h'));
+        assert!(b.text_input('i'));
+        assert_eq!(
+            b.forms.value(0),
+            Some("HI"),
+            "the input handler uppercased the typed value and it round-tripped"
         );
     }
 

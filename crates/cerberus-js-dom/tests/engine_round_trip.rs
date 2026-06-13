@@ -11,7 +11,7 @@ use cerberus_dom::{Document, DocumentBuilder, NodeRef};
 use cerberus_js::{JsEngine, JsEngineFactory, JsValue};
 use cerberus_js_dom::{
     dispatch_event, install_page, run_event_loop, run_page_scripts, run_scripts, serialize_dom,
-    EventLoopBudget, PageEnv,
+    set_node_value, EventLoopBudget, PageEnv,
 };
 use cerberus_js_quickjs::QuickJsEngineFactory;
 use cerberus_types::RealmId;
@@ -939,4 +939,50 @@ fn event_loop_caps_setinterval_by_virtual_clock() {
         "stopped on the clock budget, not the task cap"
     );
     assert_eq!(num_global(engine.as_mut(), realm, "globalThis.n"), 5.0);
+}
+
+// ---------------------------------------------------------------------------
+// Keyboard / input events (M12b): set_node_value pushes the live value into the
+// model so an `input` handler reads e.target.value, and a handler's value rewrite
+// round-trips back through serialize.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn set_value_then_input_event_sees_and_can_change_value() {
+    let (mut engine, realm) = engine_and_realm();
+    // <html><body><input id="t"></body></html>
+    let mut b = DocumentBuilder::new();
+    let input = b.element_attrs("input", vec![("id".into(), "t".into())], []);
+    let body = b.element("body", [input]);
+    let html = b.element("html", [body]);
+    let doc = b.finish(html);
+    let t_id = u64::from(find_id(doc.root(), "t").expect("#t").id());
+
+    install_page(engine.as_mut(), realm, &doc, &env()).expect("install");
+    run_scripts(
+        engine.as_mut(),
+        realm,
+        &[
+            "document.getElementById('t').addEventListener('input', function (e) { \
+             e.target.setAttribute('data-seen', e.target.value); \
+             e.target.value = e.target.value.toUpperCase(); });"
+                .to_string(),
+        ],
+    )
+    .expect("run");
+
+    // The app sets the live value, then fires `input`.
+    set_node_value(engine.as_mut(), realm, t_id, "hi").expect("set value");
+    let out = dispatch_event(engine.as_mut(), realm, t_id, "input", "{}").expect("dispatch");
+    let t = find_id(out.dom.document.root(), "t").expect("#t");
+    assert_eq!(
+        t.attr("data-seen"),
+        Some("hi"),
+        "the handler read the just-set live value via e.target.value"
+    );
+    assert_eq!(
+        t.attr("value"),
+        Some("HI"),
+        "the handler's value rewrite is reflected in the serialized DOM"
+    );
 }

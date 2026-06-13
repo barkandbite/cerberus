@@ -706,6 +706,22 @@ pub struct Dispatched {
     pub dom: RebuiltDom,
 }
 
+/// Set a form control's live `value` (the JS `el.value` property) before firing
+/// an `input` event, so the handler reads the just-typed text. `node_id` is a JS
+/// model id (a key of [`RebuiltDom::id_map`]); a missing node is a safe no-op.
+pub fn set_node_value(
+    engine: &mut dyn JsEngine,
+    realm: RealmId,
+    node_id: u64,
+    value: &str,
+) -> Result<(), BridgeError> {
+    let call = format!("__cerberusSetValue({}, {})", node_id, js_string(value));
+    match engine.eval(realm, &call) {
+        Ok(_) | Err(JsError::Eval(_)) => Ok(()),
+        Err(other) => Err(BridgeError::Js(other)),
+    }
+}
+
 /// Dispatch a DOM `event_type` at the live node identified by `node_id` (a JS
 /// model id — a key of [`RebuiltDom::id_map`]), run its listeners through the
 /// target and bubbling phases, then read the mutated model back out.
@@ -1288,6 +1304,12 @@ pub const DOM_MODEL_PRELUDE: &str = r##"
     defAccessor(ELEMENT_PROTO, "id",
       function () { return getAttr(this, "id") || ""; },
       function (v) { setAttr(this, "id", v); });
+    // Form-control current value, backed by the `value` attribute so handlers
+    // can read/modify `el.value` and the change reflects in serialize/layout
+    // (M12b input events).
+    defAccessor(ELEMENT_PROTO, "value",
+      function () { var v = getAttr(this, "value"); return v === null ? "" : v; },
+      function (v) { setAttr(this, "value", String(v)); });
     defAccessor(ELEMENT_PROTO, "className",
       function () { return getAttr(this, "class") || ""; },
       function (v) { setAttr(this, "class", v); });
@@ -1794,6 +1816,16 @@ pub const DOM_MODEL_PRELUDE: &str = r##"
         try { document.dispatchEvent(loadDoc); } catch (e) {}
         var loadWin = { type: "load", target: window, bubbles: false, cancelable: false };
         try { window.dispatchEvent(loadWin); } catch (e) {}
+      } catch (e) {}
+    };
+
+    // ---- form-control value injection (M12b input events) -------------
+    // Set a control's live value from Rust before firing an `input` event, so a
+    // handler reads the just-typed e.target.value. Safe no-op for a missing id.
+    g.__cerberusSetValue = function (nodeId, value) {
+      try {
+        var n = byId[nodeId];
+        if (n) n.value = String(value);
       } catch (e) {}
     };
 
