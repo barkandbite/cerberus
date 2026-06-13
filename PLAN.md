@@ -190,6 +190,12 @@ M0–M9 (the v1 spine) complete; M10–M11 (the post-v1 transparency wave) added
 SPA enabler — also lights up the HUD's handler/fetch rows), then flexbox/grid
 + positioning, tabs + POST, and cross-platform. Each gets its own plan.
 
+**Parking lot (not scheduled):**
+[multi-window mirrored control](docs/ideas/multi-window-mirroring.md) — drive N
+sealed identities from one master window (clicks/scrolls/inputs replayed to every
+mirror), built on the M12 dispatch layer plus a macro record/replay layer whose
+catch-up model is what keeps the ≤1-live-engine budget (§1).
+
 ---
 
 ## 7. Risks & mitigations
