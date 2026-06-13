@@ -201,8 +201,33 @@ enum WireNode {
     },
 }
 
+/// A rebuilt [`Document`] paired with the map from JS-model node ids (the wire
+/// ids — each live node's stable `__id`) to the fresh [`NodeId`]s in the rebuilt
+/// tree.
+///
+/// The map lets a caller correlate a rendered Rust node back to the live JS node
+/// it came from — e.g. to dispatch a DOM event at the element under a click, or
+/// to scope a re-render to a changed subtree (M12b/M12c). Nodes introduced by an
+/// `innerHTML` reparse have no JS id and are absent from the map. (ADR-0012.)
+#[derive(Debug)]
+pub struct RebuiltDom {
+    /// The reconstructed immutable document.
+    pub document: Document,
+    /// JS-model id (wire id) → fresh [`NodeId`] in [`RebuiltDom::document`].
+    pub id_map: HashMap<u64, NodeId>,
+}
+
 /// Parse a JSON wire document and rebuild it into a fresh immutable
 /// [`Document`].
+///
+/// See [`rebuild_document_mapped`] for the variant that also returns the
+/// JS-id → [`NodeId`] map ([`RebuiltDom`]).
+pub fn rebuild_document(json: &str) -> Result<Document, BridgeError> {
+    Ok(rebuild_document_mapped(json)?.document)
+}
+
+/// Like [`rebuild_document`], but also returns the JS-id → [`NodeId`] map (see
+/// [`RebuiltDom`]).
 ///
 /// The wire ids are arbitrary; we renumber to fresh [`DocumentBuilder`] ids. The
 /// builder requires children to exist before their parent, so we perform a
@@ -210,7 +235,7 @@ enum WireNode {
 /// materialized only after all of its `children` ids have been, and each wire id
 /// is mapped to the [`NodeId`] the builder hands back. Cycles and dangling
 /// `children` ids are rejected as [`BridgeError::Structure`].
-pub fn rebuild_document(json: &str) -> Result<Document, BridgeError> {
+pub fn rebuild_document_mapped(json: &str) -> Result<RebuiltDom, BridgeError> {
     let value = json::parse(json).map_err(BridgeError::Json)?;
 
     let root_id = value
@@ -309,7 +334,11 @@ pub fn rebuild_document(json: &str) -> Result<Document, BridgeError> {
     let root_fresh = *fresh
         .get(&root_id)
         .expect("root materialized by post-order");
-    Ok(builder.finish(root_fresh))
+    let document = builder.finish(root_fresh);
+    Ok(RebuiltDom {
+        document,
+        id_map: fresh,
+    })
 }
 
 /// Reparse an `innerHTML` fragment with [`cerberus_dom::parse_html`] and copy
@@ -472,22 +501,22 @@ fn js_string(s: &str) -> String {
 /// Run page `<script>`s against a JS document model snapshotted from `document`,
 /// and return a fresh Rust [`Document`] reflecting their mutations.
 ///
-/// All work goes through `engine.eval(realm, …)`:
+/// This is the one-shot composition of the persistent-realm seams below:
+/// [`install_page`] → [`run_scripts`] → [`fire_load`] → [`serialize_dom`]. It
+/// installs the model, runs the scripts, fires load, and reads the mutated tree
+/// back out in a single call — what the one-shot headless [`render`] path and an
+/// initial page load want.
 ///
-/// 1. Inject `env` as a global, then install [`DOM_MODEL_PRELUDE`] (which reads
-///    that global to build `location`/`navigator`/`screen`/storage and defines
-///    `document`, `window`, helpers).
-/// 2. Hand the model a snapshot of `document` and call `__cerberusInstallDOM()`.
-/// 3. Evaluate each script in `scripts`, in order. **A script that throws does
-///    not abort the run** — browsers continue to the next `<script>`, so we
-///    swallow [`JsError::Eval`] and keep going. Any *other* engine error
-///    (e.g. [`JsError::NoSuchRealm`]) is infrastructure-level and propagates.
-/// 4. Fire `load`/`DOMContentLoaded` via `__cerberusFireLoad()` (page-listener
-///    errors are likewise swallowed by the model).
-/// 5. Serialize the mutated tree and [`rebuild_document`] it.
+/// For an **interactive** page (an SPA), the caller instead [`install_page`]s
+/// once and then drives the *same* realm across many interactions (events,
+/// timers, async resolves), reading each result with [`serialize_dom`], **never
+/// re-installing** — re-running install resets the model and discards
+/// script-created state (ADR-0012, persistent realm).
 ///
-/// Steps 1, 2 and the final serialize are bridge infrastructure: an engine error
-/// there is fatal and returned as [`BridgeError::Js`].
+/// All work goes through `engine.eval(realm, …)`. A script that throws does not
+/// abort the run (browsers continue to the next `<script>`); any other engine
+/// error (e.g. [`JsError::NoSuchRealm`]) is infrastructure-level and propagates
+/// as [`BridgeError::Js`].
 pub fn run_page_scripts(
     engine: &mut dyn JsEngine,
     realm: RealmId,
@@ -495,10 +524,32 @@ pub fn run_page_scripts(
     scripts: &[String],
     env: &PageEnv,
 ) -> Result<Document, BridgeError> {
-    // 1. Inject the ambient environment, then install the document model. The
-    //    env global is read by the prelude as it builds `location`/`navigator`/
-    //    `screen`; it must land *before* the model installs. The prelude is
-    //    self-guarding, but a genuine engine/compile failure is fatal.
+    install_page(engine, realm, document, env)?;
+    run_scripts(engine, realm, scripts)?;
+    fire_load(engine, realm)?;
+    Ok(serialize_dom(engine, realm)?.document)
+}
+
+/// Install the JS document model for `document` into `realm`: the ambient `env`
+/// globals, the [`DOM_MODEL_PRELUDE`], and a snapshot of `document`.
+///
+/// Run this **once per page / navigation**. Afterwards drive the live realm with
+/// [`run_scripts`], [`serialize_dom`] (and, later, event dispatch) rather than
+/// re-installing: `__cerberusInstallDOM()` resets the model's id counter and node
+/// index and rebuilds the tree from the snapshot, discarding any script-created
+/// nodes, listeners, and timers — exactly what a persistent, interactive page
+/// must *not* do between interactions (ADR-0012).
+///
+/// `env` is injected before the model installs (the prelude reads it to build
+/// `location`/`navigator`/`screen`); the prelude is self-guarding, but a genuine
+/// engine/compile failure here is fatal.
+pub fn install_page(
+    engine: &mut dyn JsEngine,
+    realm: RealmId,
+    document: &Document,
+    env: &PageEnv,
+) -> Result<(), BridgeError> {
+    // Inject the ambient environment, then install the document model.
     let env_install = format!(
         "globalThis.__CERBERUS_ENV__ = {{ url: {}, width: {}, height: {}, userAgent: {} }};",
         js_string(&env.url),
@@ -509,34 +560,64 @@ pub fn run_page_scripts(
     engine.eval(realm, &env_install)?;
     engine.eval(realm, DOM_MODEL_PRELUDE)?;
 
-    // 2. Hand it the snapshot and build the JS tree.
+    // Hand it the snapshot and build the JS tree.
     let install = format!(
         "globalThis.__CERBERUS_DOM__ = {}; __cerberusInstallDOM();",
         serialize_document(document)
     );
     engine.eval(realm, &install)?;
+    Ok(())
+}
 
-    // 3. Run each page script. A throw is page-level (not infrastructure): the
-    //    browser keeps going to the next <script>, so we swallow `Eval` errors.
-    //    A realm-level error (no such realm, etc.) is infrastructure and aborts.
+/// Evaluate page `scripts` in document order against an already-[`install_page`]d
+/// realm.
+///
+/// **A script that throws does not abort the run** — browsers continue to the
+/// next `<script>`, so we swallow [`JsError::Eval`] and keep going. Any *other*
+/// engine error (e.g. [`JsError::NoSuchRealm`]) is infrastructure-level and
+/// propagates as [`BridgeError::Js`].
+pub fn run_scripts(
+    engine: &mut dyn JsEngine,
+    realm: RealmId,
+    scripts: &[String],
+) -> Result<(), BridgeError> {
     for script in scripts {
         match engine.eval(realm, script) {
             Ok(_) | Err(JsError::Eval(_)) => {}
             Err(other) => return Err(BridgeError::Js(other)),
         }
     }
+    Ok(())
+}
 
-    // 4. Fire DOMContentLoaded + load. The model swallows listener errors itself;
-    //    a realm-level error is still fatal.
+/// Fire `DOMContentLoaded` then `load` into an installed realm via
+/// `__cerberusFireLoad()` (synchronous, no waiting — speed-first).
+///
+/// Page-listener errors are swallowed by the model itself; only a realm-level
+/// error propagates as [`BridgeError::Js`].
+pub fn fire_load(engine: &mut dyn JsEngine, realm: RealmId) -> Result<(), BridgeError> {
     match engine.eval(realm, "__cerberusFireLoad();") {
-        Ok(_) | Err(JsError::Eval(_)) => {}
-        Err(other) => return Err(BridgeError::Js(other)),
+        Ok(_) | Err(JsError::Eval(_)) => Ok(()),
+        Err(other) => Err(BridgeError::Js(other)),
     }
+}
 
-    // 5. Serialize the mutated tree back out and rebuild a fresh Rust Document.
-    let out = engine.eval(realm, "__cerberusSerializeDOM()")?;
-    match out {
-        JsValue::Str(s) => rebuild_document(&s),
+/// Read the realm's **current** live document model back into a fresh Rust
+/// [`Document`] (plus the JS-id → [`NodeId`] map, see [`RebuiltDom`]), **without**
+/// resetting or re-running anything.
+///
+/// This is the persistent-realm re-render seam (ADR-0012): after the initial
+/// [`install_page`]/[`run_scripts`], an interaction (a dispatched event, a timer
+/// callback, an async resolve) mutates the live JS model in place, and this reads
+/// the mutated tree out so the app can restyle/relayout/repaint. It evaluates the
+/// model's `__cerberusSerializeDOM()` (JS tree → wire JSON) and
+/// [`rebuild_document_mapped`]s the result.
+///
+/// Note the direction: this is the inverse of [`serialize_document`], which turns
+/// a Rust [`Document`] into wire JSON for [`install_page`].
+pub fn serialize_dom(engine: &mut dyn JsEngine, realm: RealmId) -> Result<RebuiltDom, BridgeError> {
+    match engine.eval(realm, "__cerberusSerializeDOM()")? {
+        JsValue::Str(s) => rebuild_document_mapped(&s),
         other => Err(BridgeError::Structure(format!(
             "__cerberusSerializeDOM did not return a string: {other:?}"
         ))),

@@ -19,6 +19,7 @@ with the code so the reasoning travels with the repo.
 | [0009](0009-svg-rasterization.md) | SVG image rasterization (resvg / usvg / tiny-skia) | Accepted |
 | [0010](0010-vault-format-and-profile-layout.md) | Vault on-disk format & persistent-profile layout | Accepted |
 | [0011](0011-cookie-dispositions-and-timing-hud.md) | Per-cookie dispositions & the Rust-side timing HUD | Accepted |
+| [0012](0012-persistent-realm-and-incremental-sync.md) | Persistent JS realm & incremental DOM sync (evolves 0008) | Accepted |
 
 ## When to write one
 

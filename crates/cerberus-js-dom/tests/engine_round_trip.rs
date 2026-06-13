@@ -9,7 +9,7 @@
 
 use cerberus_dom::{Document, DocumentBuilder, NodeRef};
 use cerberus_js::{JsEngine, JsEngineFactory};
-use cerberus_js_dom::{run_page_scripts, PageEnv};
+use cerberus_js_dom::{install_page, run_page_scripts, run_scripts, serialize_dom, PageEnv};
 use cerberus_js_quickjs::QuickJsEngineFactory;
 use cerberus_types::RealmId;
 
@@ -518,4 +518,139 @@ fn window_metrics_come_from_viewport() {
     let out = run_page_scripts(engine.as_mut(), realm, &doc, &scripts, &env()).expect("run");
     let x = find_id(out.root(), "x").expect("#x present");
     assert_eq!(x.text_content(), "1280x800|1280x800");
+}
+
+// ---------------------------------------------------------------------------
+// Persistent realm: install once, interact (and read back) many times (M12a,
+// ADR-0012). The realm and its live document model survive between calls; only
+// `install_page` resets them, so script-created state accumulates across
+// `run_scripts` batches and `serialize_dom` reads the *current* tree back out
+// without re-running anything.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn serialize_dom_reads_live_model_without_rerunning() {
+    let (mut engine, realm) = engine_and_realm();
+    let doc = doc_with_div_x();
+
+    // Install once, then run an initial batch that appends <p id="a">.
+    install_page(engine.as_mut(), realm, &doc, &env()).expect("install");
+    run_scripts(
+        engine.as_mut(),
+        realm,
+        &[
+            "var p = document.createElement('p'); p.setAttribute('id','a'); \
+           p.textContent = 'first'; document.body.appendChild(p);"
+                .to_string(),
+        ],
+    )
+    .expect("batch 1");
+
+    // Reading the model back does NOT re-run anything; <p id=a> is present.
+    let first = serialize_dom(engine.as_mut(), realm).expect("serialize 1");
+    let a = find_id(first.document.root(), "a").expect("#a after batch 1");
+    assert_eq!(a.text_content(), "first");
+}
+
+#[test]
+fn persistent_realm_accumulates_across_interactions() {
+    let (mut engine, realm) = engine_and_realm();
+    let doc = doc_with_div_x();
+    install_page(engine.as_mut(), realm, &doc, &env()).expect("install");
+
+    // Batch 1: append <p id="a">.
+    run_scripts(
+        engine.as_mut(),
+        realm,
+        &[
+            "var p = document.createElement('p'); p.setAttribute('id','a'); \
+           document.body.appendChild(p);"
+                .to_string(),
+        ],
+    )
+    .expect("batch 1");
+
+    // Batch 2 — WITHOUT re-installing — must still see #a from batch 1 (proving
+    // the live model persisted), and only then appends <p id="b">.
+    run_scripts(
+        engine.as_mut(),
+        realm,
+        &["if (document.getElementById('a')) { \
+             var q = document.createElement('p'); q.setAttribute('id','b'); \
+             document.body.appendChild(q); \
+           }"
+        .to_string()],
+    )
+    .expect("batch 2");
+
+    let out = serialize_dom(engine.as_mut(), realm).expect("serialize");
+    assert!(
+        find_id(out.document.root(), "a").is_some(),
+        "#a from the first interaction must survive into the second"
+    );
+    assert!(
+        find_id(out.document.root(), "b").is_some(),
+        "#b is appended only if batch 2 saw #a — proves the realm persisted"
+    );
+}
+
+#[test]
+fn reinstall_resets_the_live_model() {
+    // The flip side: `install_page` IS a reset. After re-installing the original
+    // snapshot, script-created #a is gone and the snapshot's #x is back — which
+    // is exactly why interactive pages must install only once (ADR-0012).
+    let (mut engine, realm) = engine_and_realm();
+    let doc = doc_with_div_x();
+
+    install_page(engine.as_mut(), realm, &doc, &env()).expect("install 1");
+    run_scripts(
+        engine.as_mut(),
+        realm,
+        &[
+            "var p = document.createElement('p'); p.setAttribute('id','a'); \
+           document.body.appendChild(p);"
+                .to_string(),
+        ],
+    )
+    .expect("batch");
+    let before = serialize_dom(engine.as_mut(), realm).expect("serialize before");
+    assert!(
+        find_id(before.document.root(), "a").is_some(),
+        "#a present before reinstall"
+    );
+    drop(before);
+
+    install_page(engine.as_mut(), realm, &doc, &env()).expect("install 2");
+    let after = serialize_dom(engine.as_mut(), realm).expect("serialize after");
+    assert!(
+        find_id(after.document.root(), "a").is_none(),
+        "re-install must reset the model back to the snapshot"
+    );
+    assert!(
+        find_id(after.document.root(), "x").is_some(),
+        "#x is restored from the snapshot after reinstall"
+    );
+}
+
+#[test]
+fn serialize_dom_id_map_correlates_rendered_nodes_to_js_ids() {
+    // The id map lets the app map a rendered Rust node back to the live JS node
+    // it came from (M12b hit-testing): #x's NodeId appears among the map values.
+    let (mut engine, realm) = engine_and_realm();
+    let doc = doc_with_div_x();
+    install_page(engine.as_mut(), realm, &doc, &env()).expect("install");
+    run_scripts(
+        engine.as_mut(),
+        realm,
+        &["document.getElementById('x').setAttribute('data-k','v');".to_string()],
+    )
+    .expect("run");
+
+    let rebuilt = serialize_dom(engine.as_mut(), realm).expect("serialize");
+    assert!(!rebuilt.id_map.is_empty(), "id map should not be empty");
+    let x = find_id(rebuilt.document.root(), "x").expect("#x present");
+    assert!(
+        rebuilt.id_map.values().any(|&nid| nid == x.id()),
+        "the rendered #x NodeId must appear in the JS-id → NodeId map"
+    );
 }
