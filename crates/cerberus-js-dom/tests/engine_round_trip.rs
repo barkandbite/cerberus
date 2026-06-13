@@ -9,7 +9,9 @@
 
 use cerberus_dom::{Document, DocumentBuilder, NodeRef};
 use cerberus_js::{JsEngine, JsEngineFactory};
-use cerberus_js_dom::{install_page, run_page_scripts, run_scripts, serialize_dom, PageEnv};
+use cerberus_js_dom::{
+    dispatch_event, install_page, run_page_scripts, run_scripts, serialize_dom, PageEnv,
+};
 use cerberus_js_quickjs::QuickJsEngineFactory;
 use cerberus_types::RealmId;
 
@@ -653,4 +655,174 @@ fn serialize_dom_id_map_correlates_rendered_nodes_to_js_ids() {
         rebuilt.id_map.values().any(|&nid| nid == x.id()),
         "the rendered #x NodeId must appear in the JS-id → NodeId map"
     );
+}
+
+// ---------------------------------------------------------------------------
+// Real DOM event dispatch (M12b): __cerberusDispatch runs listeners through the
+// target + bubbling phases and reports preventDefault; serialize_dom then reads
+// the handler's mutations back. The JS node id equals the snapshot NodeId right
+// after install (serialize_document keys the wire id off NodeId), so we dispatch
+// at the input doc's #x id.
+// ---------------------------------------------------------------------------
+
+/// Install `doc` and return #x's id in the fresh model (== its Rust `NodeId`).
+fn install_and_x_id(engine: &mut dyn JsEngine, realm: RealmId, doc: &Document) -> u64 {
+    install_page(engine, realm, doc, &env()).expect("install");
+    u64::from(find_id(doc.root(), "x").expect("#x in doc").id())
+}
+
+#[test]
+fn dispatch_click_runs_target_listener_and_bubbles_to_ancestor() {
+    let (mut engine, realm) = engine_and_realm();
+    let doc = doc_with_div_x();
+    let x_id = install_and_x_id(engine.as_mut(), realm, &doc);
+    run_scripts(
+        engine.as_mut(),
+        realm,
+        &[
+            "document.getElementById('x').addEventListener('click', function () { \
+             this.textContent = 'clicked'; }); \
+           document.body.addEventListener('click', function (e) { \
+             e.currentTarget.setAttribute('data-bubbled', '1'); });"
+                .to_string(),
+        ],
+    )
+    .expect("wire listeners");
+
+    let out = dispatch_event(engine.as_mut(), realm, x_id, "click", "{}").expect("dispatch");
+    assert!(out.dispatched, "target existed");
+    assert!(!out.default_prevented, "no preventDefault");
+    let x = find_id(out.dom.document.root(), "x").expect("#x");
+    assert_eq!(x.text_content(), "clicked", "target listener ran");
+    let body = find_tag(out.dom.document.root(), "body").expect("body");
+    assert_eq!(
+        body.attr("data-bubbled"),
+        Some("1"),
+        "click bubbled to the body listener"
+    );
+}
+
+#[test]
+fn dispatch_prevent_default_is_reported() {
+    let (mut engine, realm) = engine_and_realm();
+    let doc = doc_with_div_x();
+    let x_id = install_and_x_id(engine.as_mut(), realm, &doc);
+    run_scripts(
+        engine.as_mut(),
+        realm,
+        &[
+            "document.getElementById('x').addEventListener('click', function (e) { \
+             e.preventDefault(); });"
+                .to_string(),
+        ],
+    )
+    .expect("wire listener");
+
+    let out = dispatch_event(engine.as_mut(), realm, x_id, "click", "{}").expect("dispatch");
+    assert!(out.dispatched);
+    assert!(
+        out.default_prevented,
+        "preventDefault on a cancelable event must be reported"
+    );
+}
+
+#[test]
+fn dispatch_stop_propagation_halts_bubbling() {
+    let (mut engine, realm) = engine_and_realm();
+    let doc = doc_with_div_x();
+    let x_id = install_and_x_id(engine.as_mut(), realm, &doc);
+    run_scripts(
+        engine.as_mut(),
+        realm,
+        &[
+            "document.getElementById('x').addEventListener('click', function (e) { \
+             e.stopPropagation(); this.setAttribute('data-hit', '1'); }); \
+           document.body.addEventListener('click', function (e) { \
+             e.currentTarget.setAttribute('data-bubbled', '1'); });"
+                .to_string(),
+        ],
+    )
+    .expect("wire listeners");
+
+    let out = dispatch_event(engine.as_mut(), realm, x_id, "click", "{}").expect("dispatch");
+    let x = find_id(out.dom.document.root(), "x").expect("#x");
+    assert_eq!(x.attr("data-hit"), Some("1"), "target listener still ran");
+    let body = find_tag(out.dom.document.root(), "body").expect("body");
+    assert_eq!(
+        body.attr("data-bubbled"),
+        None,
+        "stopPropagation must prevent the ancestor listener"
+    );
+}
+
+#[test]
+fn dispatch_non_bubbling_event_stays_on_target() {
+    let (mut engine, realm) = engine_and_realm();
+    let doc = doc_with_div_x();
+    let x_id = install_and_x_id(engine.as_mut(), realm, &doc);
+    run_scripts(
+        engine.as_mut(),
+        realm,
+        &[
+            "document.getElementById('x').addEventListener('focus', function () { \
+             this.setAttribute('data-focused', '1'); }); \
+           document.body.addEventListener('focus', function (e) { \
+             e.currentTarget.setAttribute('data-bubbled', '1'); });"
+                .to_string(),
+        ],
+    )
+    .expect("wire listeners");
+
+    let out = dispatch_event(engine.as_mut(), realm, x_id, "focus", "{\"bubbles\":false}")
+        .expect("dispatch");
+    let x = find_id(out.dom.document.root(), "x").expect("#x");
+    assert_eq!(x.attr("data-focused"), Some("1"), "target listener ran");
+    let body = find_tag(out.dom.document.root(), "body").expect("body");
+    assert_eq!(
+        body.attr("data-bubbled"),
+        None,
+        "a non-bubbling event must not reach ancestors"
+    );
+}
+
+#[test]
+fn dispatch_carries_init_fields_to_listener() {
+    let (mut engine, realm) = engine_and_realm();
+    let doc = doc_with_div_x();
+    let x_id = install_and_x_id(engine.as_mut(), realm, &doc);
+    run_scripts(
+        engine.as_mut(),
+        realm,
+        &[
+            "document.getElementById('x').addEventListener('keydown', function (e) { \
+             this.setAttribute('data-key', String(e.key)); });"
+                .to_string(),
+        ],
+    )
+    .expect("wire listener");
+
+    let out = dispatch_event(
+        engine.as_mut(),
+        realm,
+        x_id,
+        "keydown",
+        "{\"key\":\"Enter\"}",
+    )
+    .expect("dispatch");
+    let x = find_id(out.dom.document.root(), "x").expect("#x");
+    assert_eq!(
+        x.attr("data-key"),
+        Some("Enter"),
+        "the init field reached the listener as e.key"
+    );
+}
+
+#[test]
+fn dispatch_to_unknown_node_is_a_noop() {
+    let (mut engine, realm) = engine_and_realm();
+    let doc = doc_with_div_x();
+    install_page(engine.as_mut(), realm, &doc, &env()).expect("install");
+    let out = dispatch_event(engine.as_mut(), realm, 999_999, "click", "{}").expect("dispatch");
+    assert!(!out.dispatched, "no such node");
+    assert!(!out.default_prevented);
 }

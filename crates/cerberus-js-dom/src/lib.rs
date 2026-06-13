@@ -624,6 +624,72 @@ pub fn serialize_dom(engine: &mut dyn JsEngine, realm: RealmId) -> Result<Rebuil
     }
 }
 
+/// The outcome of dispatching a DOM event into the live realm (see
+/// [`dispatch_event`]).
+#[derive(Debug)]
+pub struct Dispatched {
+    /// `true` if the target node existed and the event was delivered.
+    pub dispatched: bool,
+    /// `true` if a listener called `preventDefault` on the (cancelable) event —
+    /// the caller should then **skip** the browser default action.
+    pub default_prevented: bool,
+    /// The document re-read after the handlers ran, with its JS-id → [`NodeId`]
+    /// map (so the next interaction can still correlate nodes).
+    pub dom: RebuiltDom,
+}
+
+/// Dispatch a DOM `event_type` at the live node identified by `node_id` (a JS
+/// model id — a key of [`RebuiltDom::id_map`]), run its listeners through the
+/// target and bubbling phases, then read the mutated model back out.
+///
+/// `event_init_json` is a JSON **object literal** of extra event fields (e.g.
+/// `{"key":"Enter"}`, `{"button":0}`, or `{"bubbles":false}`); pass `"{}"` for
+/// none. The realm must already be [`install_page`]d. Inspect
+/// [`Dispatched::default_prevented`] to decide whether to still perform the
+/// browser default action (link navigation, form submit, …).
+pub fn dispatch_event(
+    engine: &mut dyn JsEngine,
+    realm: RealmId,
+    node_id: u64,
+    event_type: &str,
+    event_init_json: &str,
+) -> Result<Dispatched, BridgeError> {
+    let call = format!(
+        "__cerberusDispatch({}, {}, {})",
+        node_id,
+        js_string(event_type),
+        event_init_json
+    );
+    let (dispatched, default_prevented) = match engine.eval(realm, &call)? {
+        JsValue::Str(s) => parse_dispatch_result(&s)?,
+        other => {
+            return Err(BridgeError::Structure(format!(
+                "__cerberusDispatch did not return a string: {other:?}"
+            )))
+        }
+    };
+    let dom = serialize_dom(engine, realm)?;
+    Ok(Dispatched {
+        dispatched,
+        default_prevented,
+        dom,
+    })
+}
+
+/// Decode the `{dispatched, defaultPrevented}` blob from `__cerberusDispatch`.
+/// The values are wire integers (1/0) because the bridge's JSON has no boolean
+/// type (see [`mod@json`]); absent/garbage fields decode as `false`.
+fn parse_dispatch_result(s: &str) -> Result<(bool, bool), BridgeError> {
+    let v = json::parse(s).map_err(BridgeError::Json)?;
+    let dispatched = v.get("dispatched").and_then(Json::as_u64).unwrap_or(0) != 0;
+    let default_prevented = v
+        .get("defaultPrevented")
+        .and_then(Json::as_u64)
+        .unwrap_or(0)
+        != 0;
+    Ok((dispatched, default_prevented))
+}
+
 // ---------------------------------------------------------------------------
 // The JS document model
 // ---------------------------------------------------------------------------
@@ -1658,6 +1724,74 @@ pub const DOM_MODEL_PRELUDE: &str = r##"
         var loadWin = { type: "load", target: window, bubbles: false, cancelable: false };
         try { window.dispatchEvent(loadWin); } catch (e) {}
       } catch (e) {}
+    };
+
+    // ---- event dispatch (M12b) -----------------------------------------
+    // Dispatch a real DOM event at the node with the given JS id, running its
+    // listeners through the target and bubbling phases (capture is not
+    // modelled). `init` carries extra event fields (e.g. {key:"Enter"} or
+    // {button:0}) and may set bubbles/cancelable (both default true).
+    // document/window participate in bubbling. The mutated DOM is read
+    // separately via __cerberusSerializeDOM; this returns {dispatched,
+    // defaultPrevented} as 1/0 (the wire JSON has no boolean type) so the Rust
+    // side can decide whether to run the browser default action.
+    g.__cerberusDispatch = function (nodeId, type, init) {
+      try {
+        type = String(type);
+        var target = byId[nodeId];
+        if (!target) return JSON.stringify({ dispatched: 0, defaultPrevented: 0 });
+
+        var ev = {
+          type: type,
+          target: target,
+          currentTarget: null,
+          eventPhase: 0,
+          bubbles: !(init && init.bubbles === false),
+          cancelable: !(init && init.cancelable === false),
+          defaultPrevented: false,
+          isTrusted: true,
+          timeStamp: 0,
+          __stop: false,
+          __stopNow: false,
+          preventDefault: function () { if (this.cancelable) this.defaultPrevented = true; },
+          stopPropagation: function () { this.__stop = true; },
+          stopImmediatePropagation: function () { this.__stop = true; this.__stopNow = true; },
+        };
+        // Copy caller-supplied fields (key, code, button, detail, …) without
+        // clobbering the machinery above.
+        if (init && typeof init === "object") {
+          for (var k in init) {
+            if (Object.prototype.hasOwnProperty.call(init, k) && !(k in ev)) ev[k] = init[k];
+          }
+        }
+
+        // Propagation path: target → ancestor elements → document → window.
+        var path = [];
+        for (var n = target; n; n = n.__parent) path.push(n);
+        if (ev.bubbles) { path.push(document); path.push(window); }
+
+        // Target phase (index 0) then bubbling; a non-bubbling event runs only
+        // the target's own listeners.
+        var limit = ev.bubbles ? path.length : 1;
+        for (var i = 0; i < limit; i++) {
+          var cur = path[i];
+          var arr = cur.__listeners ? cur.__listeners[type] : null;
+          if (arr && arr.length) {
+            ev.currentTarget = cur;
+            ev.eventPhase = (cur === target) ? 2 : 3; // AT_TARGET / BUBBLING_PHASE
+            var copy = arr.slice();
+            for (var j = 0; j < copy.length; j++) {
+              try { copy[j].call(cur, ev); } catch (e) {}
+              if (ev.__stopNow) break;
+            }
+          }
+          if (ev.__stop) break;
+        }
+
+        return JSON.stringify({ dispatched: 1, defaultPrevented: ev.defaultPrevented ? 1 : 0 });
+      } catch (e) {
+        return JSON.stringify({ dispatched: 0, defaultPrevented: 0 });
+      }
     };
 
     // ---- serialize: JS tree -> wire JSON -------------------------------
