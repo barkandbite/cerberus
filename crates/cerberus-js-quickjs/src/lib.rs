@@ -11,20 +11,28 @@
 //! many realms (one per tab) sharing its heap. Dropping a context frees its
 //! realm; dropping the engine frees the runtime.
 //!
-//! # Speed-first delay neutralization
+//! # Speed-first delay neutralization & the bounded event loop
 //!
 //! Product directive: "pure speed, ignore programmed delays." Every realm gets
 //! the [`SPEED_FIRST_PRELUDE`] evaluated into it at creation, *before* any
 //! per-head farbling prologue or page script. The prelude reinstalls the timer,
-//! animation-frame, idle-callback and observer host APIs as delay-free shims so
-//! content that a page would normally reveal on a timer, an animation frame, or a
-//! scroll-into-view appears immediately. Implementing these in JavaScript (rather
-//! than Rust bindings) is the simplest no-`unsafe` path and keeps the whole
-//! neutralization surface in one auditable string.
+//! animation-frame, idle-callback and observer host APIs so a page's programmed
+//! delays cost nothing. Implementing these in JavaScript (rather than Rust
+//! bindings) is the simplest no-`unsafe` path and keeps the whole surface in one
+//! auditable string.
 //!
-//! Notable semantics (intentional, and load-bearing for speed):
-//! * `setInterval` fires its callback **once, immediately**, then never again —
-//!   a real repeating interval would simply hang this single-threaded engine.
+//! Timers do not fire at call time: they **enqueue** a task on a per-realm
+//! **virtual clock**, which the host drains with a **bounded loop** via
+//! `__cerberusStepTimer` (one task per call) under hard caps — so ordering is
+//! correct (sync → microtasks → macrotask) and every page terminates (ADR-0013;
+//! the driver is `cerberus-js-dom::run_event_loop`). Because delays are virtual,
+//! the loop still resolves "reveal on a timer" content at once, just in order.
+//!
+//! Notable semantics (intentional):
+//! * Virtual time means `setTimeout`/`setInterval` delays never wall-block, and
+//!   `setInterval` ticks until the virtual-clock cap rather than looping forever.
+//! * `queueMicrotask` is a real microtask (`Promise.resolve().then`), ordered
+//!   against Promise reactions.
 //! * `IntersectionObserver.observe` synchronously reports the target as fully
 //!   intersecting, which is what makes lazy/scroll-in content load at once.
 
@@ -45,64 +53,97 @@ const SPEED_FIRST_PRELUDE: &str = r#"
     var g = globalThis;
 
     // Monotonic, non-zero handle source shared by every "schedule" shim. Real
-    // browsers hand back opaque positive integers; pages only ever compare them
-    // or pass them to the matching clear*, which are no-ops here.
+    // browsers hand back opaque positive integers; pages compare them or pass
+    // them to the matching clear*/cancel*.
     var nextId = 1;
     function newId() { return nextId++; }
 
-    // setTimeout(fn, delay, ...args): run `fn` synchronously *now*, ignoring the
-    // delay. Non-function first args (the legacy "eval a string" form) are
-    // ignored. Returns a handle.
-    g.setTimeout = function (fn) {
-      var args = Array.prototype.slice.call(arguments, 2);
-      if (typeof fn === "function") {
-        try { fn.apply(undefined, args); } catch (e) {}
+    // ---- bounded virtual-clock event loop (ADR-0013) -------------------
+    // Timers ENQUEUE a task due at a virtual time rather than firing at call
+    // time. The host drains the queue via __cerberusStepTimer (one task per
+    // call), draining microtasks between tasks, under hard caps — so ordering is
+    // correct (sync -> microtasks -> macrotask) and every page terminates. The
+    // driver is cerberus-js-dom::run_event_loop.
+    var clock = 0;  // virtual "now", in ms
+    var tasks = []; // pending macrotasks: {id, kind, due, cb, args, interval}
+
+    function schedule(kind, fn, due, args, interval) {
+      var id = newId();
+      tasks.push({
+        id: id,
+        kind: kind,
+        due: due,
+        cb: (typeof fn === "function") ? fn : null,
+        args: args,
+        interval: interval, // null = one-shot; else a >=1 ms period
+      });
+      return id;
+    }
+    function cancel(id) {
+      for (var i = 0; i < tasks.length; i++) {
+        if (tasks[i].id === id) { tasks.splice(i, 1); return; }
       }
-      return newId();
+    }
+
+    g.setTimeout = function (fn, delay) {
+      var d = +delay; if (!(d >= 0)) d = 0;
+      return schedule("timeout", fn, clock + d, Array.prototype.slice.call(arguments, 2), null);
     };
-
-    // setInterval(fn, delay, ...args): fire ONCE, immediately, then stop. We must
-    // not actually repeat — a real interval loop would hang this single-threaded
-    // engine forever. Firing once is the speed-first neutralization: code that
-    // polls "until ready" on an interval gets one tick, which is usually enough
-    // to advance state, and never blocks.
-    g.setInterval = function (fn) {
-      var args = Array.prototype.slice.call(arguments, 2);
-      if (typeof fn === "function") {
-        try { fn.apply(undefined, args); } catch (e) {}
-      }
-      return newId();
+    g.setInterval = function (fn, delay) {
+      var d = +delay; if (!(d >= 1)) d = 1; // clamp period so the clock advances each tick
+      return schedule("interval", fn, clock + d, Array.prototype.slice.call(arguments, 2), d);
     };
+    g.clearTimeout = function (id) { cancel(id); };
+    g.clearInterval = function (id) { cancel(id); };
 
-    // Cancellation APIs are no-ops: nothing is ever actually pending.
-    g.clearTimeout = function () {};
-    g.clearInterval = function () {};
-    g.cancelAnimationFrame = function () {};
-    g.cancelIdleCallback = function () {};
-
-    // requestAnimationFrame(fn): invoke immediately with a timestamp of 0 instead
-    // of waiting for a frame.
     g.requestAnimationFrame = function (fn) {
-      if (typeof fn === "function") {
-        try { fn(0); } catch (e) {}
-      }
-      return newId();
+      // ~60fps virtual frame; the callback receives the (virtual) timestamp.
+      return schedule("raf", fn, clock + 16, null, null);
     };
+    g.cancelAnimationFrame = function (id) { cancel(id); };
 
-    // requestIdleCallback(fn): invoke immediately with a deadline that reports no
-    // time remaining and no timeout, instead of waiting for idle time.
     g.requestIdleCallback = function (fn) {
-      if (typeof fn === "function") {
-        try { fn({ didTimeout: false, timeRemaining: function () { return 0; } }); } catch (e) {}
-      }
-      return newId();
+      return schedule("idle", fn, clock, null, null);
     };
+    g.cancelIdleCallback = function (id) { cancel(id); };
 
-    // queueMicrotask(fn): run immediately. (Equivalent to enqueuing a resolved
-    // promise, but synchronous is simpler and indistinguishable for our purposes.)
+    // queueMicrotask(fn): a real microtask, so it orders correctly against
+    // Promise reactions (both drain through the job queue between macrotasks).
     g.queueMicrotask = function (fn) {
       if (typeof fn === "function") {
-        try { fn(); } catch (e) {}
+        Promise.resolve().then(function () { try { fn(); } catch (e) {} });
+      }
+    };
+
+    // Run ONE due macrotask within the virtual-clock budget. Returns 1 if a task
+    // ran, 0 if none is due (<= maxClock). The host calls this repeatedly,
+    // draining microtasks between calls, under a task-count cap (see ADR-0013).
+    g.__cerberusStepTimer = function (maxClock) {
+      try {
+        var best = -1;
+        for (var i = 0; i < tasks.length; i++) {
+          if (tasks[i].due <= maxClock && (best === -1 || tasks[i].due < tasks[best].due)) {
+            best = i;
+          }
+        }
+        if (best === -1) return 0;
+        var task = tasks[best];
+        if (clock < task.due) clock = task.due; // advance virtual time to the task
+        if (task.interval != null) {
+          task.due = clock + task.interval;     // re-arm in place
+        } else {
+          tasks.splice(best, 1);                // one-shot: remove before running
+        }
+        if (task.cb) {
+          try {
+            if (task.kind === "raf") task.cb(clock);
+            else if (task.kind === "idle") task.cb({ didTimeout: false, timeRemaining: function () { return 0; } });
+            else task.cb.apply(undefined, task.args || []);
+          } catch (e) {}
+        }
+        return 1;
+      } catch (e) {
+        return 0;
       }
     };
 
@@ -451,58 +492,94 @@ mod tests {
     }
 
     #[test]
-    fn speed_first_settimeout_fires_immediately() {
+    fn settimeout_enqueues_then_fires_on_step() {
         let r = realm(1);
         let mut e = engine_with_realm(r);
-        // A 5-second timer must have already fired by the time eval returns.
-        assert_eq!(
-            e.eval(r, "let x = 0; setTimeout(() => { x = 9; }, 5000); x")
-                .unwrap(),
-            JsValue::Number(9.0)
-        );
-    }
-
-    #[test]
-    fn speed_first_setinterval_fires_once() {
-        let r = realm(1);
-        let mut e = engine_with_realm(r);
-        // setInterval fires exactly once (it must not loop / hang); the counter
-        // lands at 1.
-        assert_eq!(
-            e.eval(r, "let n = 0; setInterval(() => { n++; }, 1000); n")
-                .unwrap(),
-            JsValue::Number(1.0)
-        );
-    }
-
-    #[test]
-    fn speed_first_raf_and_idle_fire_immediately() {
-        let r = realm(1);
-        let mut e = engine_with_realm(r);
-        assert_eq!(
-            e.eval(r, "let t = -1; requestAnimationFrame(ts => { t = ts; }); t")
-                .unwrap(),
-            JsValue::Number(0.0)
-        );
+        // A timer no longer fires at call time (ADR-0013): x is still 0 right
+        // after scheduling.
         assert_eq!(
             e.eval(
                 r,
-                "let r = -1; requestIdleCallback(d => { r = d.timeRemaining(); }); r"
+                "globalThis.x = 0; setTimeout(() => { globalThis.x = 9; }, 5000); x"
             )
             .unwrap(),
             JsValue::Number(0.0)
         );
+        // Stepping the loop runs the due task — the virtual clock ignores the 5s.
+        assert_eq!(
+            e.eval(r, "__cerberusStepTimer(1000000)").unwrap(),
+            JsValue::Number(1.0)
+        );
+        assert_eq!(e.eval(r, "x").unwrap(), JsValue::Number(9.0));
+        // Queue now empty: the next step reports nothing ran.
+        assert_eq!(
+            e.eval(r, "__cerberusStepTimer(1000000)").unwrap(),
+            JsValue::Number(0.0)
+        );
     }
 
     #[test]
-    fn speed_first_queue_microtask_runs() {
+    fn setinterval_ticks_each_step_and_is_clock_bounded() {
         let r = realm(1);
         let mut e = engine_with_realm(r);
+        e.eval(
+            r,
+            "globalThis.n = 0; setInterval(() => { globalThis.n++; }, 1000);",
+        )
+        .unwrap();
+        // Each step advances the virtual clock by the period and runs one tick.
+        for _ in 0..3 {
+            assert_eq!(
+                e.eval(r, "__cerberusStepTimer(1000000)").unwrap(),
+                JsValue::Number(1.0)
+            );
+        }
+        assert_eq!(e.eval(r, "n").unwrap(), JsValue::Number(3.0));
+        // Bounded by the virtual-clock budget: clock is 3000, next due 4000, so a
+        // step capped at 3500 runs nothing (this is what stops an interval loop).
         assert_eq!(
-            e.eval(r, "let m = false; queueMicrotask(() => { m = true; }); m")
-                .unwrap(),
-            JsValue::Bool(true)
+            e.eval(r, "__cerberusStepTimer(3500)").unwrap(),
+            JsValue::Number(0.0)
         );
+    }
+
+    #[test]
+    fn raf_and_idle_enqueue_then_fire_on_step() {
+        let r = realm(1);
+        let mut e = engine_with_realm(r);
+        e.eval(
+            r,
+            "globalThis.t = -1; requestAnimationFrame(ts => { globalThis.t = ts; });",
+        )
+        .unwrap();
+        e.eval(
+            r,
+            "globalThis.rem = -1; requestIdleCallback(d => { globalThis.rem = d.timeRemaining(); });",
+        )
+        .unwrap();
+        // Drain the loop: idle (due 0) reports no time remaining; rAF runs at the
+        // virtual frame timestamp (16).
+        while e.eval(r, "__cerberusStepTimer(1000000)").unwrap() == JsValue::Number(1.0) {}
+        assert_eq!(e.eval(r, "t").unwrap(), JsValue::Number(16.0));
+        assert_eq!(e.eval(r, "rem").unwrap(), JsValue::Number(0.0));
+    }
+
+    #[test]
+    fn queue_microtask_runs_as_a_real_microtask() {
+        let r = realm(1);
+        let mut e = engine_with_realm(r);
+        // Real microtask timing: NOT run within the scheduling eval (like a
+        // Promise reaction)...
+        assert_eq!(
+            e.eval(
+                r,
+                "globalThis.m = false; queueMicrotask(() => { globalThis.m = true; }); m"
+            )
+            .unwrap(),
+            JsValue::Bool(false)
+        );
+        // ...but the post-eval job pump drains it before the next eval.
+        assert_eq!(e.eval(r, "m").unwrap(), JsValue::Bool(true));
     }
 
     #[test]
