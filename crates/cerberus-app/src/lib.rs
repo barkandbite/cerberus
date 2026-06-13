@@ -4390,6 +4390,82 @@ mod tests {
         );
     }
 
+    #[test]
+    fn link_click_with_preventdefault_intercepts_navigation() {
+        // A direct <a> onclick handler that calls preventDefault stops the
+        // navigation (SPA router pattern), reached via the inline link hit box.
+        let mut b = loaded(
+            vec![(
+                "https://site.test/",
+                Ok(page(
+                    "https://site.test/",
+                    200,
+                    None,
+                    "<a href='/next' id='lnk'>go</a>\
+                     <script>document.getElementById('lnk').addEventListener('click', function (e) { \
+                       e.preventDefault(); \
+                       document.getElementById('lnk').setAttribute('data-x', '1'); });</script>",
+                )),
+            )],
+            "https://site.test/",
+        );
+        b.render_frame(Size::new(800, 600));
+        let lnk = node_id_of(b.document.root(), "lnk").expect("#lnk node id");
+        let r = b
+            .elements
+            .iter()
+            .find(|e| e.node == lnk)
+            .expect("#lnk has an inline link hit box")
+            .rect;
+        assert!(b.pointer_down(r.x + 1, r.y + 1), "click consumed");
+        assert_eq!(
+            attr_of_id(b.document.root(), "lnk", "data-x").as_deref(),
+            Some("1"),
+            "the anchor's click handler ran"
+        );
+        assert!(
+            b.pending.is_none(),
+            "preventDefault intercepted the navigation"
+        );
+        assert_eq!(
+            b.toolbar.url_text, "https://site.test/",
+            "URL unchanged (no navigation)"
+        );
+    }
+
+    #[test]
+    fn link_click_without_preventdefault_still_navigates() {
+        // A non-preventing handler runs, then the default link navigation
+        // proceeds (dispatch does not swallow ordinary link clicks).
+        let mut b = loaded(
+            vec![(
+                "https://site.test/",
+                Ok(page(
+                    "https://site.test/",
+                    200,
+                    None,
+                    "<a href='/next' id='lnk'>go</a>\
+                     <script>document.getElementById('lnk').addEventListener('click', function () { \
+                       document.getElementById('lnk').setAttribute('data-x', '1'); });</script>",
+                )),
+            )],
+            "https://site.test/",
+        );
+        b.render_frame(Size::new(800, 600));
+        let lnk = node_id_of(b.document.root(), "lnk").expect("#lnk node id");
+        let r = b
+            .elements
+            .iter()
+            .find(|e| e.node == lnk)
+            .expect("#lnk has an inline link hit box")
+            .rect;
+        assert!(b.pointer_down(r.x + 1, r.y + 1), "click consumed");
+        assert_eq!(
+            b.toolbar.url_text, "https://site.test/next",
+            "a non-prevented link click still navigates"
+        );
+    }
+
     /// A page with a single checkbox `name='a' value='1'` plus a submit button.
     fn checkbox_page() -> Vec<(&'static str, Result<FetchedPage, String>)> {
         vec![(

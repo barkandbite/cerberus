@@ -184,6 +184,7 @@ struct LinePiece {
     font: FontStyle,
     underline: bool,
     href: Option<String>,
+    link_node: Option<NodeId>,
 }
 
 /// Flow state.
@@ -206,6 +207,9 @@ struct Ctx<'a> {
     line_h: i32,
     line: Vec<LinePiece>,
     line_align: TextAlign,
+    /// The `NodeId` of the enclosing `<a>` while flowing its inline content, so
+    /// each link piece can carry it into a hit box for event dispatch (M12b).
+    cur_link_node: Option<NodeId>,
 }
 
 impl<'a> Ctx<'a> {
@@ -233,6 +237,7 @@ impl<'a> Ctx<'a> {
             line_h: 0,
             line: Vec::new(),
             line_align: TextAlign::Left,
+            cur_link_node: None,
         }
     }
 
@@ -268,6 +273,7 @@ impl<'a> Ctx<'a> {
             line_h: 0,
             line: Vec::new(),
             line_align: TextAlign::Left,
+            cur_link_node: None,
         }
     }
 
@@ -323,6 +329,12 @@ impl<'a> Ctx<'a> {
         } else {
             in_link
         };
+        // While flowing an <a>'s inline content, tag each link piece with the
+        // anchor's node so a click on the link dispatches at the <a> (M12b).
+        let saved_link_node = self.cur_link_node;
+        if node.tag == "a" {
+            self.cur_link_node = Some(node.node_id);
+        }
 
         let is_block = matches!(style.display, Display::Block | Display::ListItem);
         let saved_left = self.left;
@@ -385,6 +397,7 @@ impl<'a> Ctx<'a> {
             self.left = saved_left;
             self.x = self.left;
         }
+        self.cur_link_node = saved_link_node;
     }
 
     fn add_text(&mut self, text: &str, style: &ComputedStyle, href: Option<&str>) {
@@ -448,6 +461,7 @@ impl<'a> Ctx<'a> {
             font: style.font,
             underline: style.underline,
             href: href.map(str::to_string),
+            link_node: self.cur_link_node,
         });
         self.x += w as i32;
         self.line_h = self.line_h.max(line_height(px));
@@ -793,10 +807,13 @@ impl<'a> Ctx<'a> {
             }
             if let Some(href) = piece.href {
                 let h = (piece.px as i32 + piece.px as i32 / 3).max(1) as u32;
-                self.links.push(LinkBox {
-                    rect: Rect::new(x, piece.y, piece.w, h),
-                    href,
-                });
+                let rect = Rect::new(x, piece.y, piece.w, h);
+                // Tag the link's box with its <a> node so a click dispatches at
+                // the anchor (and can preventDefault navigation) — M12b.
+                if let Some(node) = piece.link_node {
+                    self.elements.push(ElementBox { rect, node });
+                }
+                self.links.push(LinkBox { rect, href });
             }
         }
     }
