@@ -13,11 +13,13 @@ use cerberus_crypto::Secret;
 use cerberus_crypto_rustcrypto::{Argon2idKdf, XChaCha20Poly1305Aead};
 use cerberus_css::CssEngine;
 use cerberus_dns_doh::DohResolver;
-use cerberus_dom::{parse_html, Document, DocumentBuilder, NodeRef};
+use cerberus_dom::{parse_html, Document, DocumentBuilder, NodeId, NodeRef};
 use cerberus_headless::render_document;
 use cerberus_identity::{Head, HeadManager};
 use cerberus_image::ImageCodec;
-use cerberus_js_dom::{run_page_scripts, PageEnv};
+use cerberus_js_dom::{
+    dispatch_event, fire_load, install_page, run_page_scripts, serialize_dom, PageEnv, RebuiltDom,
+};
 use cerberus_js_quickjs::QuickJsEngineFactory;
 use cerberus_layout::{
     BlockLayout, FieldKind, FormFieldBox, FormState, ImageProvider, LayoutEngine, LinkBox, NoForms,
@@ -1134,6 +1136,11 @@ pub struct BrowserApp {
     links: Vec<LinkBox>,
     /// Interactive form-control hit boxes from the last frame (window coords).
     form_fields: Vec<FormFieldBox>,
+    /// Map from a rendered node's `NodeId` (in `document`) to its live JS-model
+    /// id, refreshed whenever scripts run or an event is dispatched. Lets a
+    /// click correlate the hit node back to the realm node to dispatch at (M12b /
+    /// ADR-0012). Empty for script-less pages (no realm, no dispatch targets).
+    node_to_js: HashMap<NodeId, u64>,
     /// Live form-control state for the current page.
     forms: FormStore,
     /// The currently focused text field/textarea, if any (a field id).
@@ -1300,6 +1307,7 @@ impl BrowserApp {
             page_title: None,
             links: Vec::new(),
             form_fields: Vec::new(),
+            node_to_js: HashMap::new(),
             forms: FormStore::default(),
             focused_field: None,
             pending: None,
@@ -1438,6 +1446,10 @@ impl BrowserApp {
     /// keep the engine lazy); on any bridge failure we fall back to the
     /// unscripted DOM so the page still renders.
     fn run_scripts(&mut self, doc: Document) -> Document {
+        // Each navigation rebuilds the realm's model, so the previous node↔JS
+        // correlation is stale. A script-less page has no realm and no dispatch
+        // targets: keep the map empty and return the DOM untouched.
+        self.node_to_js.clear();
         if doc.scripts().is_empty() {
             return doc;
         }
@@ -1451,11 +1463,24 @@ impl BrowserApp {
             Ok(engine) => engine,
             Err(_) => return doc,
         };
-        // Bind the result before matching so `doc`'s borrows (in the call) end
-        // before the `Err` arm moves it.
-        let reconciled = run_page_scripts(engine, realm, &doc, doc.scripts(), &env);
-        match reconciled {
-            Ok(rebuilt) => rebuilt,
+        // Persistent-realm path (ADR-0012): install the model once, run the page
+        // scripts, fire load, then read the mutated tree back *with* its
+        // JS-id → NodeId map so later interactions can dispatch events at the
+        // right realm node. On any bridge failure, fall back to the unscripted
+        // DOM so the page still renders.
+        if install_page(engine, realm, &doc, &env).is_err() {
+            return doc;
+        }
+        if cerberus_js_dom::run_scripts(engine, realm, doc.scripts()).is_err() {
+            return doc;
+        }
+        let _ = fire_load(engine, realm);
+        match serialize_dom(engine, realm) {
+            Ok(rebuilt) => {
+                let RebuiltDom { document, id_map } = rebuilt;
+                self.node_to_js = invert_id_map(&id_map);
+                document
+            }
             Err(_) => doc,
         }
     }
@@ -1888,6 +1913,15 @@ impl BrowserApp {
     /// Handle a click that landed on form control `field`. Returns true (the
     /// click is always consumed once it hits a control).
     fn click_field(&mut self, field: &FormFieldBox) -> bool {
+        // M12b: dispatch a real `click` to any JS listener first; the default
+        // action below (focus, toggle, cycle, submit) runs only if no handler
+        // called preventDefault. Script-less pages have no JS correlate, so this
+        // is a no-op and the default action proceeds exactly as before.
+        if let Some(node) = self.control_node_id(field.id) {
+            if self.dispatch_dom(node, "click", "{}") {
+                return true;
+            }
+        }
         match field.kind {
             FieldKind::Text | FieldKind::Textarea => {
                 self.focused_field = Some(field.id);
@@ -1912,6 +1946,57 @@ impl BrowserApp {
             }
         }
         true
+    }
+
+    /// The `NodeId` (in `self.document`) of the form control with field index
+    /// `field_id`, via the same canonical pre-order walk layout uses for ids.
+    fn control_node_id(&self, field_id: u32) -> Option<NodeId> {
+        collect_controls(self.document.root())
+            .iter()
+            .find(|c| c.id == field_id)
+            .map(|c| c.el.id())
+    }
+
+    /// Dispatch DOM `event_type` at `node` (a `NodeId` in `self.document`) into
+    /// the live JS realm, reconcile any mutations the handler made, and report
+    /// whether it called `preventDefault`. Returns `false` (a no-op) when the
+    /// page has no realm or the node has no JS correlate, so non-scripted pages
+    /// behave exactly as before (M12b / ADR-0012).
+    fn dispatch_dom(&mut self, node: NodeId, event_type: &str, init_json: &str) -> bool {
+        let Some(&js_id) = self.node_to_js.get(&node) else {
+            return false;
+        };
+        let realm = RealmId(self.heads.active().id.0);
+        let t = Instant::now();
+        let result = {
+            let engine = match self.heads.engine() {
+                Ok(engine) => engine,
+                Err(_) => return false,
+            };
+            dispatch_event(engine, realm, js_id, event_type, init_json)
+        };
+        let Ok(dispatched) = result else {
+            return false;
+        };
+        // HUD handler row (M11): "click handler", "input handler", …
+        self.timings
+            .record(format!("{event_type} handler"), t.elapsed());
+        let prevented = dispatched.default_prevented;
+        self.reconcile_dispatched(dispatched.dom);
+        prevented
+    }
+
+    /// Adopt the DOM read back after an event dispatch: refresh the node↔JS map,
+    /// restyle, and swap in the new document (the next frame relays out and
+    /// repaints). Mirrors the styling half of [`BrowserApp::set_document`].
+    fn reconcile_dispatched(&mut self, dom: RebuiltDom) {
+        let RebuiltDom { document, id_map } = dom;
+        self.node_to_js = invert_id_map(&id_map);
+        self.page_title = document.title();
+        let t = Instant::now();
+        self.styled = self.style_engine.style(&document);
+        self.timings.record("style", t.elapsed());
+        self.document = document;
     }
 
     /// Check radio `id` and clear every other radio sharing its `name` in the
@@ -2572,6 +2657,13 @@ struct ControlRef<'a> {
     id: u32,
     el: NodeRef<'a>,
     form: Option<NodeRef<'a>>,
+}
+
+/// Invert a JS-id → `NodeId` map into `NodeId` → JS-id. Each rebuilt node has a
+/// unique id, so this is a bijection over the correlated nodes (nodes with no JS
+/// origin — e.g. `innerHTML`-reparsed fragments — simply don't appear).
+fn invert_id_map(map: &HashMap<u64, NodeId>) -> HashMap<NodeId, u64> {
+    map.iter().map(|(&js, &node)| (node, js)).collect()
 }
 
 /// Whether `tag` is a control that consumes a field id (the same set layout
@@ -4111,6 +4203,73 @@ mod tests {
         assert!(b.pointer_down(submit.x + 1, submit.y + 1), "click submit");
         // The DOM value "a b" round-trips through the encoder (space -> +).
         assert_eq!(b.toolbar.url_text, "https://site.test/go?q=a+b");
+    }
+
+    /// The value of `attr` on the first element with `id` (depth-first).
+    fn attr_of_id(node: NodeRef<'_>, id: &str, attr: &str) -> Option<String> {
+        if node.is_element() && node.attr("id") == Some(id) {
+            return node.attr(attr).map(str::to_string);
+        }
+        node.children().find_map(|c| attr_of_id(c, id, attr))
+    }
+
+    #[test]
+    fn button_click_dispatches_to_js_and_preventdefault_stops_the_default() {
+        // A scripted page: clicking the button runs its JS handler, which bumps
+        // a data attribute and calls preventDefault — so the DOM mutates and the
+        // default form submit does NOT navigate. A second click proves the realm
+        // persisted (the counter advances rather than resetting).
+        let mut b = loaded(
+            vec![(
+                "https://site.test/",
+                Ok(page(
+                    "https://site.test/",
+                    200,
+                    None,
+                    "<form action='/go'><input type='submit' id='b' value='+1'></form>\
+                     <script>document.getElementById('b').addEventListener('click', function (e) { \
+                       e.preventDefault(); \
+                       var n = document.getElementById('b'); \
+                       var c = parseInt(n.getAttribute('data-count') || '0', 10) + 1; \
+                       n.setAttribute('data-count', String(c)); \
+                     });</script>",
+                )),
+            )],
+            "https://site.test/",
+        );
+
+        b.render_frame(Size::new(800, 600));
+        let r1 = b
+            .form_fields
+            .iter()
+            .find(|f| matches!(f.kind, FieldKind::Button))
+            .expect("button box")
+            .rect;
+        assert!(b.pointer_down(r1.x + 1, r1.y + 1), "first click consumed");
+        assert_eq!(
+            attr_of_id(b.document.root(), "b", "data-count").as_deref(),
+            Some("1"),
+            "the click handler ran and mutated the DOM"
+        );
+        assert!(
+            b.pending.is_none(),
+            "preventDefault must stop the default submit/navigation"
+        );
+
+        // Second click on the persistent realm: the counter advances to 2.
+        b.render_frame(Size::new(800, 600));
+        let r2 = b
+            .form_fields
+            .iter()
+            .find(|f| matches!(f.kind, FieldKind::Button))
+            .expect("button box")
+            .rect;
+        assert!(b.pointer_down(r2.x + 1, r2.y + 1), "second click consumed");
+        assert_eq!(
+            attr_of_id(b.document.root(), "b", "data-count").as_deref(),
+            Some("2"),
+            "the realm persisted across clicks (counter advanced, not reset)"
+        );
     }
 
     /// A page with a single checkbox `name='a' value='1'` plus a submit button.
