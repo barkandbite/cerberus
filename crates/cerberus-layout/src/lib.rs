@@ -11,6 +11,7 @@
 //! (each cell's content flowed into its own box). Real box widths, floats, and
 //! positioning are still ahead.
 
+use cerberus_dom::NodeId;
 use cerberus_paint::{DecodedImage, DisplayItem, DisplayList, GlyphBox, TextShaper};
 use cerberus_style::{ComputedStyle, Display, StyledChild, StyledDom, StyledNode, TextAlign};
 use cerberus_types::{Color, FontStyle, Point, Rect, Size};
@@ -48,13 +49,27 @@ pub struct FormFieldBox {
     pub kind: FieldKind,
 }
 
-/// The result of laying out a document: what to paint, where the links are, and
-/// the interactive form-control hit boxes.
+/// A generic element hit region (layout-local coords) tagging a painted block
+/// element's box with the `NodeId` it came from. Unlike [`LinkBox`]/
+/// [`FormFieldBox`] (which drive a *default* action), these let the app dispatch
+/// a real DOM event at whatever element was clicked and let it bubble — so
+/// handlers on arbitrary elements, and event delegation, work (M12b). Boxes
+/// nest (a parent contains its children); the app picks the smallest one
+/// containing the point.
+#[derive(Clone, Debug, PartialEq)]
+pub struct ElementBox {
+    pub rect: Rect,
+    pub node: NodeId,
+}
+
+/// The result of laying out a document: what to paint, where the links are, the
+/// interactive form-control hit boxes, and the generic element hit map.
 #[derive(Clone, Debug, Default)]
 pub struct LaidOut {
     pub display: DisplayList,
     pub links: Vec<LinkBox>,
     pub fields: Vec<FormFieldBox>,
+    pub elements: Vec<ElementBox>,
 }
 
 /// Supplies the live state of form controls to layout, keyed by field id (the
@@ -149,6 +164,7 @@ impl LayoutEngine for BlockLayout {
             display: ctx.display,
             links: ctx.links,
             fields: ctx.fields,
+            elements: ctx.elements,
         }
     }
 }
@@ -178,6 +194,7 @@ struct Ctx<'a> {
     display: DisplayList,
     links: Vec<LinkBox>,
     fields: Vec<FormFieldBox>,
+    elements: Vec<ElementBox>,
     /// Next form-control id (0-based pre-order index across the whole document).
     field_id: u32,
     left0: i32,
@@ -206,6 +223,7 @@ impl<'a> Ctx<'a> {
             display: DisplayList::new(),
             links: Vec::new(),
             fields: Vec::new(),
+            elements: Vec::new(),
             field_id: 0,
             left0: margin,
             right: margin + max_width,
@@ -240,6 +258,7 @@ impl<'a> Ctx<'a> {
             display: DisplayList::new(),
             links: Vec::new(),
             fields: Vec::new(),
+            elements: Vec::new(),
             field_id,
             left0: left,
             right: right.max(left + 1),
@@ -346,6 +365,21 @@ impl<'a> Ctx<'a> {
                         },
                     );
                 }
+            }
+            // Generic hit box for this block element (M12b): the content extent
+            // it occupied. Boxes nest (a parent contains its children); the app
+            // resolves a click to the smallest one and lets the event bubble.
+            let elem_h = (self.y - bg_start_y).max(0) as u32;
+            if elem_h > 0 {
+                self.elements.push(ElementBox {
+                    rect: Rect::new(
+                        self.left0,
+                        bg_start_y,
+                        (self.right - self.left0).max(0) as u32,
+                        elem_h,
+                    ),
+                    node: node.node_id,
+                });
             }
             self.y += style.margin_bottom;
             self.left = saved_left;

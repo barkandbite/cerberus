@@ -8,8 +8,11 @@
 //! these tests also confirm the two prelude layers compose.
 
 use cerberus_dom::{Document, DocumentBuilder, NodeRef};
-use cerberus_js::{JsEngine, JsEngineFactory};
-use cerberus_js_dom::{run_page_scripts, PageEnv};
+use cerberus_js::{JsEngine, JsEngineFactory, JsValue};
+use cerberus_js_dom::{
+    dispatch_event, install_page, run_event_loop, run_page_scripts, run_scripts, serialize_dom,
+    EventLoopBudget, PageEnv,
+};
 use cerberus_js_quickjs::QuickJsEngineFactory;
 use cerberus_types::RealmId;
 
@@ -172,8 +175,9 @@ fn console_log_is_captured() {
 fn speed_first_still_applies() {
     let (mut engine, realm) = engine_and_realm();
     let doc = doc_with_div_x();
-    // setTimeout with a long delay must still have fired by serialize time,
-    // because the QuickJS realm's speed-first prelude runs it immediately.
+    // A long-delay setTimeout still fires by serialize time: run_page_scripts
+    // drains the bounded event loop (ADR-0013) and virtual time ignores the
+    // 9999ms delay — speed-first, now correctly ordered.
     let scripts = vec![
         "setTimeout(function () { document.getElementById('x').textContent = 'timed'; }, 9999);"
             .to_string(),
@@ -184,7 +188,7 @@ fn speed_first_still_applies() {
     assert_eq!(
         x.text_content(),
         "timed",
-        "speed-first setTimeout should have fired immediately"
+        "the long-delay timer fired via the bounded loop (virtual time ignores the delay)"
     );
 }
 
@@ -518,4 +522,421 @@ fn window_metrics_come_from_viewport() {
     let out = run_page_scripts(engine.as_mut(), realm, &doc, &scripts, &env()).expect("run");
     let x = find_id(out.root(), "x").expect("#x present");
     assert_eq!(x.text_content(), "1280x800|1280x800");
+}
+
+// ---------------------------------------------------------------------------
+// Persistent realm: install once, interact (and read back) many times (M12a,
+// ADR-0012). The realm and its live document model survive between calls; only
+// `install_page` resets them, so script-created state accumulates across
+// `run_scripts` batches and `serialize_dom` reads the *current* tree back out
+// without re-running anything.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn serialize_dom_reads_live_model_without_rerunning() {
+    let (mut engine, realm) = engine_and_realm();
+    let doc = doc_with_div_x();
+
+    // Install once, then run an initial batch that appends <p id="a">.
+    install_page(engine.as_mut(), realm, &doc, &env()).expect("install");
+    run_scripts(
+        engine.as_mut(),
+        realm,
+        &[
+            "var p = document.createElement('p'); p.setAttribute('id','a'); \
+           p.textContent = 'first'; document.body.appendChild(p);"
+                .to_string(),
+        ],
+    )
+    .expect("batch 1");
+
+    // Reading the model back does NOT re-run anything; <p id=a> is present.
+    let first = serialize_dom(engine.as_mut(), realm).expect("serialize 1");
+    let a = find_id(first.document.root(), "a").expect("#a after batch 1");
+    assert_eq!(a.text_content(), "first");
+}
+
+#[test]
+fn persistent_realm_accumulates_across_interactions() {
+    let (mut engine, realm) = engine_and_realm();
+    let doc = doc_with_div_x();
+    install_page(engine.as_mut(), realm, &doc, &env()).expect("install");
+
+    // Batch 1: append <p id="a">.
+    run_scripts(
+        engine.as_mut(),
+        realm,
+        &[
+            "var p = document.createElement('p'); p.setAttribute('id','a'); \
+           document.body.appendChild(p);"
+                .to_string(),
+        ],
+    )
+    .expect("batch 1");
+
+    // Batch 2 — WITHOUT re-installing — must still see #a from batch 1 (proving
+    // the live model persisted), and only then appends <p id="b">.
+    run_scripts(
+        engine.as_mut(),
+        realm,
+        &["if (document.getElementById('a')) { \
+             var q = document.createElement('p'); q.setAttribute('id','b'); \
+             document.body.appendChild(q); \
+           }"
+        .to_string()],
+    )
+    .expect("batch 2");
+
+    let out = serialize_dom(engine.as_mut(), realm).expect("serialize");
+    assert!(
+        find_id(out.document.root(), "a").is_some(),
+        "#a from the first interaction must survive into the second"
+    );
+    assert!(
+        find_id(out.document.root(), "b").is_some(),
+        "#b is appended only if batch 2 saw #a — proves the realm persisted"
+    );
+}
+
+#[test]
+fn reinstall_resets_the_live_model() {
+    // The flip side: `install_page` IS a reset. After re-installing the original
+    // snapshot, script-created #a is gone and the snapshot's #x is back — which
+    // is exactly why interactive pages must install only once (ADR-0012).
+    let (mut engine, realm) = engine_and_realm();
+    let doc = doc_with_div_x();
+
+    install_page(engine.as_mut(), realm, &doc, &env()).expect("install 1");
+    run_scripts(
+        engine.as_mut(),
+        realm,
+        &[
+            "var p = document.createElement('p'); p.setAttribute('id','a'); \
+           document.body.appendChild(p);"
+                .to_string(),
+        ],
+    )
+    .expect("batch");
+    let before = serialize_dom(engine.as_mut(), realm).expect("serialize before");
+    assert!(
+        find_id(before.document.root(), "a").is_some(),
+        "#a present before reinstall"
+    );
+    drop(before);
+
+    install_page(engine.as_mut(), realm, &doc, &env()).expect("install 2");
+    let after = serialize_dom(engine.as_mut(), realm).expect("serialize after");
+    assert!(
+        find_id(after.document.root(), "a").is_none(),
+        "re-install must reset the model back to the snapshot"
+    );
+    assert!(
+        find_id(after.document.root(), "x").is_some(),
+        "#x is restored from the snapshot after reinstall"
+    );
+}
+
+#[test]
+fn serialize_dom_id_map_correlates_rendered_nodes_to_js_ids() {
+    // The id map lets the app map a rendered Rust node back to the live JS node
+    // it came from (M12b hit-testing): #x's NodeId appears among the map values.
+    let (mut engine, realm) = engine_and_realm();
+    let doc = doc_with_div_x();
+    install_page(engine.as_mut(), realm, &doc, &env()).expect("install");
+    run_scripts(
+        engine.as_mut(),
+        realm,
+        &["document.getElementById('x').setAttribute('data-k','v');".to_string()],
+    )
+    .expect("run");
+
+    let rebuilt = serialize_dom(engine.as_mut(), realm).expect("serialize");
+    assert!(!rebuilt.id_map.is_empty(), "id map should not be empty");
+    let x = find_id(rebuilt.document.root(), "x").expect("#x present");
+    assert!(
+        rebuilt.id_map.values().any(|&nid| nid == x.id()),
+        "the rendered #x NodeId must appear in the JS-id → NodeId map"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Real DOM event dispatch (M12b): __cerberusDispatch runs listeners through the
+// target + bubbling phases and reports preventDefault; serialize_dom then reads
+// the handler's mutations back. The JS node id equals the snapshot NodeId right
+// after install (serialize_document keys the wire id off NodeId), so we dispatch
+// at the input doc's #x id.
+// ---------------------------------------------------------------------------
+
+/// Install `doc` and return #x's id in the fresh model (== its Rust `NodeId`).
+fn install_and_x_id(engine: &mut dyn JsEngine, realm: RealmId, doc: &Document) -> u64 {
+    install_page(engine, realm, doc, &env()).expect("install");
+    u64::from(find_id(doc.root(), "x").expect("#x in doc").id())
+}
+
+#[test]
+fn dispatch_click_runs_target_listener_and_bubbles_to_ancestor() {
+    let (mut engine, realm) = engine_and_realm();
+    let doc = doc_with_div_x();
+    let x_id = install_and_x_id(engine.as_mut(), realm, &doc);
+    run_scripts(
+        engine.as_mut(),
+        realm,
+        &[
+            "document.getElementById('x').addEventListener('click', function () { \
+             this.textContent = 'clicked'; }); \
+           document.body.addEventListener('click', function (e) { \
+             e.currentTarget.setAttribute('data-bubbled', '1'); });"
+                .to_string(),
+        ],
+    )
+    .expect("wire listeners");
+
+    let out = dispatch_event(engine.as_mut(), realm, x_id, "click", "{}").expect("dispatch");
+    assert!(out.dispatched, "target existed");
+    assert!(!out.default_prevented, "no preventDefault");
+    let x = find_id(out.dom.document.root(), "x").expect("#x");
+    assert_eq!(x.text_content(), "clicked", "target listener ran");
+    let body = find_tag(out.dom.document.root(), "body").expect("body");
+    assert_eq!(
+        body.attr("data-bubbled"),
+        Some("1"),
+        "click bubbled to the body listener"
+    );
+}
+
+#[test]
+fn dispatch_prevent_default_is_reported() {
+    let (mut engine, realm) = engine_and_realm();
+    let doc = doc_with_div_x();
+    let x_id = install_and_x_id(engine.as_mut(), realm, &doc);
+    run_scripts(
+        engine.as_mut(),
+        realm,
+        &[
+            "document.getElementById('x').addEventListener('click', function (e) { \
+             e.preventDefault(); });"
+                .to_string(),
+        ],
+    )
+    .expect("wire listener");
+
+    let out = dispatch_event(engine.as_mut(), realm, x_id, "click", "{}").expect("dispatch");
+    assert!(out.dispatched);
+    assert!(
+        out.default_prevented,
+        "preventDefault on a cancelable event must be reported"
+    );
+}
+
+#[test]
+fn dispatch_stop_propagation_halts_bubbling() {
+    let (mut engine, realm) = engine_and_realm();
+    let doc = doc_with_div_x();
+    let x_id = install_and_x_id(engine.as_mut(), realm, &doc);
+    run_scripts(
+        engine.as_mut(),
+        realm,
+        &[
+            "document.getElementById('x').addEventListener('click', function (e) { \
+             e.stopPropagation(); this.setAttribute('data-hit', '1'); }); \
+           document.body.addEventListener('click', function (e) { \
+             e.currentTarget.setAttribute('data-bubbled', '1'); });"
+                .to_string(),
+        ],
+    )
+    .expect("wire listeners");
+
+    let out = dispatch_event(engine.as_mut(), realm, x_id, "click", "{}").expect("dispatch");
+    let x = find_id(out.dom.document.root(), "x").expect("#x");
+    assert_eq!(x.attr("data-hit"), Some("1"), "target listener still ran");
+    let body = find_tag(out.dom.document.root(), "body").expect("body");
+    assert_eq!(
+        body.attr("data-bubbled"),
+        None,
+        "stopPropagation must prevent the ancestor listener"
+    );
+}
+
+#[test]
+fn dispatch_non_bubbling_event_stays_on_target() {
+    let (mut engine, realm) = engine_and_realm();
+    let doc = doc_with_div_x();
+    let x_id = install_and_x_id(engine.as_mut(), realm, &doc);
+    run_scripts(
+        engine.as_mut(),
+        realm,
+        &[
+            "document.getElementById('x').addEventListener('focus', function () { \
+             this.setAttribute('data-focused', '1'); }); \
+           document.body.addEventListener('focus', function (e) { \
+             e.currentTarget.setAttribute('data-bubbled', '1'); });"
+                .to_string(),
+        ],
+    )
+    .expect("wire listeners");
+
+    let out = dispatch_event(engine.as_mut(), realm, x_id, "focus", "{\"bubbles\":false}")
+        .expect("dispatch");
+    let x = find_id(out.dom.document.root(), "x").expect("#x");
+    assert_eq!(x.attr("data-focused"), Some("1"), "target listener ran");
+    let body = find_tag(out.dom.document.root(), "body").expect("body");
+    assert_eq!(
+        body.attr("data-bubbled"),
+        None,
+        "a non-bubbling event must not reach ancestors"
+    );
+}
+
+#[test]
+fn dispatch_carries_init_fields_to_listener() {
+    let (mut engine, realm) = engine_and_realm();
+    let doc = doc_with_div_x();
+    let x_id = install_and_x_id(engine.as_mut(), realm, &doc);
+    run_scripts(
+        engine.as_mut(),
+        realm,
+        &[
+            "document.getElementById('x').addEventListener('keydown', function (e) { \
+             this.setAttribute('data-key', String(e.key)); });"
+                .to_string(),
+        ],
+    )
+    .expect("wire listener");
+
+    let out = dispatch_event(
+        engine.as_mut(),
+        realm,
+        x_id,
+        "keydown",
+        "{\"key\":\"Enter\"}",
+    )
+    .expect("dispatch");
+    let x = find_id(out.dom.document.root(), "x").expect("#x");
+    assert_eq!(
+        x.attr("data-key"),
+        Some("Enter"),
+        "the init field reached the listener as e.key"
+    );
+}
+
+#[test]
+fn dispatch_to_unknown_node_is_a_noop() {
+    let (mut engine, realm) = engine_and_realm();
+    let doc = doc_with_div_x();
+    install_page(engine.as_mut(), realm, &doc, &env()).expect("install");
+    let out = dispatch_event(engine.as_mut(), realm, 999_999, "click", "{}").expect("dispatch");
+    assert!(!out.dispatched, "no such node");
+    assert!(!out.default_prevented);
+}
+
+// ---------------------------------------------------------------------------
+// Bounded virtual-clock event loop (M12c / ADR-0013): run_event_loop drains
+// timers one-per-eval so microtasks interleave (correct ordering), under caps
+// that guarantee termination on both axes (task count and virtual time).
+// ---------------------------------------------------------------------------
+
+/// `globalThis.order.join(",")` read out of the realm.
+fn order_str(engine: &mut dyn JsEngine, realm: RealmId) -> String {
+    match engine
+        .eval(realm, "globalThis.order.join(',')")
+        .expect("read order")
+    {
+        JsValue::Str(s) => s,
+        other => panic!("expected string, got {other:?}"),
+    }
+}
+
+/// A numeric global/expression read out of the realm.
+fn num_global(engine: &mut dyn JsEngine, realm: RealmId, expr: &str) -> f64 {
+    match engine.eval(realm, expr).expect("read number") {
+        JsValue::Number(n) => n,
+        other => panic!("expected number, got {other:?}"),
+    }
+}
+
+#[test]
+fn event_loop_orders_sync_then_microtask_then_macrotask() {
+    let (mut engine, realm) = engine_and_realm();
+    let doc = doc_with_div_x();
+    install_page(engine.as_mut(), realm, &doc, &env()).expect("install");
+    run_scripts(
+        engine.as_mut(),
+        realm,
+        &["globalThis.order = []; \
+           setTimeout(function () { globalThis.order.push('macro'); }, 0); \
+           Promise.resolve().then(function () { globalThis.order.push('micro'); }); \
+           globalThis.order.push('sync');"
+            .to_string()],
+    )
+    .expect("run");
+    // The per-eval job pump already ran the microtask; the timer has not fired.
+    assert_eq!(order_str(engine.as_mut(), realm), "sync,micro");
+
+    let stats = run_event_loop(engine.as_mut(), realm, EventLoopBudget::default()).expect("loop");
+    assert_eq!(stats.tasks_run, 1);
+    assert!(!stats.hit_task_cap);
+    assert_eq!(
+        order_str(engine.as_mut(), realm),
+        "sync,micro,macro",
+        "the macrotask runs only after sync code and all microtasks"
+    );
+}
+
+#[test]
+fn event_loop_caps_runaway_settimeout_recursion() {
+    let (mut engine, realm) = engine_and_realm();
+    let doc = doc_with_div_x();
+    install_page(engine.as_mut(), realm, &doc, &env()).expect("install");
+    run_scripts(
+        engine.as_mut(),
+        realm,
+        &[
+            "globalThis.n = 0; (function loop() { globalThis.n++; setTimeout(loop, 0); })();"
+                .to_string(),
+        ],
+    )
+    .expect("run");
+    // A 0-delay self-reschedule never advances the virtual clock; the task cap is
+    // what stops it (this is the loop that would otherwise hang the browser).
+    let budget = EventLoopBudget {
+        max_tasks: 50,
+        max_virtual_ms: 60_000,
+    };
+    let stats = run_event_loop(engine.as_mut(), realm, budget).expect("loop");
+    assert_eq!(stats.tasks_run, 50, "ran exactly the cap");
+    assert!(
+        stats.hit_task_cap,
+        "stopped on the task cap, not an empty queue"
+    );
+    // 1 initial sync call + 50 capped reschedules that ran.
+    assert_eq!(num_global(engine.as_mut(), realm, "globalThis.n"), 51.0);
+}
+
+#[test]
+fn event_loop_caps_setinterval_by_virtual_clock() {
+    let (mut engine, realm) = engine_and_realm();
+    let doc = doc_with_div_x();
+    install_page(engine.as_mut(), realm, &doc, &env()).expect("install");
+    run_scripts(
+        engine.as_mut(),
+        realm,
+        &["globalThis.n = 0; setInterval(function () { globalThis.n++; }, 1000);".to_string()],
+    )
+    .expect("run");
+    // A 5s virtual budget admits exactly five 1s ticks (due 1000..5000); the task
+    // cap is slack, so the clock is what bounds the interval.
+    let budget = EventLoopBudget {
+        max_tasks: 10_000,
+        max_virtual_ms: 5_000,
+    };
+    let stats = run_event_loop(engine.as_mut(), realm, budget).expect("loop");
+    assert_eq!(
+        stats.tasks_run, 5,
+        "interval ticks bounded by the virtual clock"
+    );
+    assert!(
+        !stats.hit_task_cap,
+        "stopped on the clock budget, not the task cap"
+    );
+    assert_eq!(num_global(engine.as_mut(), realm, "globalThis.n"), 5.0);
 }

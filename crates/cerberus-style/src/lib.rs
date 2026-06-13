@@ -5,7 +5,7 @@
 //! an adapter (`cerberus-css`) behind this trait, so it can be swapped or
 //! reimplemented without touching layout. Layout consumes only these types.
 
-use cerberus_dom::Document;
+use cerberus_dom::{Document, NodeId};
 use cerberus_types::{Color, FontStyle};
 
 /// CSS `display` (the subset we flow).
@@ -96,6 +96,10 @@ pub struct StyledNode {
     pub attrs: Vec<(String, String)>,
     pub style: ComputedStyle,
     pub children: Vec<StyledChild>,
+    /// The id of the DOM node this was styled from, so layout can tag its hit
+    /// boxes and event dispatch can correlate a rendered box back to the live
+    /// DOM / JS node (M12b).
+    pub node_id: NodeId,
 }
 
 impl StyledNode {

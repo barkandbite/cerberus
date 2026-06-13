@@ -1,6 +1,6 @@
 # ADR-0008: Page-script execution & the DOM bridge (snapshot/replay)
 
-- Status: Accepted
+- Status: Accepted (evolved by ADR-0012 — persistent realm & incremental sync)
 - Date: 2026-06-10
 - Deciders: bbarker@barkbite.org (directed), engineering
 
