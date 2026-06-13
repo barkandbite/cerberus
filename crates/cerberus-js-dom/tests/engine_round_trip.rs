@@ -8,9 +8,10 @@
 //! these tests also confirm the two prelude layers compose.
 
 use cerberus_dom::{Document, DocumentBuilder, NodeRef};
-use cerberus_js::{JsEngine, JsEngineFactory};
+use cerberus_js::{JsEngine, JsEngineFactory, JsValue};
 use cerberus_js_dom::{
-    dispatch_event, install_page, run_page_scripts, run_scripts, serialize_dom, PageEnv,
+    dispatch_event, install_page, run_event_loop, run_page_scripts, run_scripts, serialize_dom,
+    EventLoopBudget, PageEnv,
 };
 use cerberus_js_quickjs::QuickJsEngineFactory;
 use cerberus_types::RealmId;
@@ -174,8 +175,9 @@ fn console_log_is_captured() {
 fn speed_first_still_applies() {
     let (mut engine, realm) = engine_and_realm();
     let doc = doc_with_div_x();
-    // setTimeout with a long delay must still have fired by serialize time,
-    // because the QuickJS realm's speed-first prelude runs it immediately.
+    // A long-delay setTimeout still fires by serialize time: run_page_scripts
+    // drains the bounded event loop (ADR-0013) and virtual time ignores the
+    // 9999ms delay — speed-first, now correctly ordered.
     let scripts = vec![
         "setTimeout(function () { document.getElementById('x').textContent = 'timed'; }, 9999);"
             .to_string(),
@@ -186,7 +188,7 @@ fn speed_first_still_applies() {
     assert_eq!(
         x.text_content(),
         "timed",
-        "speed-first setTimeout should have fired immediately"
+        "the long-delay timer fired via the bounded loop (virtual time ignores the delay)"
     );
 }
 
@@ -825,4 +827,116 @@ fn dispatch_to_unknown_node_is_a_noop() {
     let out = dispatch_event(engine.as_mut(), realm, 999_999, "click", "{}").expect("dispatch");
     assert!(!out.dispatched, "no such node");
     assert!(!out.default_prevented);
+}
+
+// ---------------------------------------------------------------------------
+// Bounded virtual-clock event loop (M12c / ADR-0013): run_event_loop drains
+// timers one-per-eval so microtasks interleave (correct ordering), under caps
+// that guarantee termination on both axes (task count and virtual time).
+// ---------------------------------------------------------------------------
+
+/// `globalThis.order.join(",")` read out of the realm.
+fn order_str(engine: &mut dyn JsEngine, realm: RealmId) -> String {
+    match engine
+        .eval(realm, "globalThis.order.join(',')")
+        .expect("read order")
+    {
+        JsValue::Str(s) => s,
+        other => panic!("expected string, got {other:?}"),
+    }
+}
+
+/// A numeric global/expression read out of the realm.
+fn num_global(engine: &mut dyn JsEngine, realm: RealmId, expr: &str) -> f64 {
+    match engine.eval(realm, expr).expect("read number") {
+        JsValue::Number(n) => n,
+        other => panic!("expected number, got {other:?}"),
+    }
+}
+
+#[test]
+fn event_loop_orders_sync_then_microtask_then_macrotask() {
+    let (mut engine, realm) = engine_and_realm();
+    let doc = doc_with_div_x();
+    install_page(engine.as_mut(), realm, &doc, &env()).expect("install");
+    run_scripts(
+        engine.as_mut(),
+        realm,
+        &["globalThis.order = []; \
+           setTimeout(function () { globalThis.order.push('macro'); }, 0); \
+           Promise.resolve().then(function () { globalThis.order.push('micro'); }); \
+           globalThis.order.push('sync');"
+            .to_string()],
+    )
+    .expect("run");
+    // The per-eval job pump already ran the microtask; the timer has not fired.
+    assert_eq!(order_str(engine.as_mut(), realm), "sync,micro");
+
+    let stats = run_event_loop(engine.as_mut(), realm, EventLoopBudget::default()).expect("loop");
+    assert_eq!(stats.tasks_run, 1);
+    assert!(!stats.hit_task_cap);
+    assert_eq!(
+        order_str(engine.as_mut(), realm),
+        "sync,micro,macro",
+        "the macrotask runs only after sync code and all microtasks"
+    );
+}
+
+#[test]
+fn event_loop_caps_runaway_settimeout_recursion() {
+    let (mut engine, realm) = engine_and_realm();
+    let doc = doc_with_div_x();
+    install_page(engine.as_mut(), realm, &doc, &env()).expect("install");
+    run_scripts(
+        engine.as_mut(),
+        realm,
+        &[
+            "globalThis.n = 0; (function loop() { globalThis.n++; setTimeout(loop, 0); })();"
+                .to_string(),
+        ],
+    )
+    .expect("run");
+    // A 0-delay self-reschedule never advances the virtual clock; the task cap is
+    // what stops it (this is the loop that would otherwise hang the browser).
+    let budget = EventLoopBudget {
+        max_tasks: 50,
+        max_virtual_ms: 60_000,
+    };
+    let stats = run_event_loop(engine.as_mut(), realm, budget).expect("loop");
+    assert_eq!(stats.tasks_run, 50, "ran exactly the cap");
+    assert!(
+        stats.hit_task_cap,
+        "stopped on the task cap, not an empty queue"
+    );
+    // 1 initial sync call + 50 capped reschedules that ran.
+    assert_eq!(num_global(engine.as_mut(), realm, "globalThis.n"), 51.0);
+}
+
+#[test]
+fn event_loop_caps_setinterval_by_virtual_clock() {
+    let (mut engine, realm) = engine_and_realm();
+    let doc = doc_with_div_x();
+    install_page(engine.as_mut(), realm, &doc, &env()).expect("install");
+    run_scripts(
+        engine.as_mut(),
+        realm,
+        &["globalThis.n = 0; setInterval(function () { globalThis.n++; }, 1000);".to_string()],
+    )
+    .expect("run");
+    // A 5s virtual budget admits exactly five 1s ticks (due 1000..5000); the task
+    // cap is slack, so the clock is what bounds the interval.
+    let budget = EventLoopBudget {
+        max_tasks: 10_000,
+        max_virtual_ms: 5_000,
+    };
+    let stats = run_event_loop(engine.as_mut(), realm, budget).expect("loop");
+    assert_eq!(
+        stats.tasks_run, 5,
+        "interval ticks bounded by the virtual clock"
+    );
+    assert!(
+        !stats.hit_task_cap,
+        "stopped on the clock budget, not the task cap"
+    );
+    assert_eq!(num_global(engine.as_mut(), realm, "globalThis.n"), 5.0);
 }

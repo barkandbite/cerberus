@@ -18,7 +18,8 @@ use cerberus_headless::render_document;
 use cerberus_identity::{Head, HeadManager};
 use cerberus_image::ImageCodec;
 use cerberus_js_dom::{
-    dispatch_event, fire_load, install_page, run_page_scripts, serialize_dom, PageEnv, RebuiltDom,
+    dispatch_event, fire_load, install_page, run_event_loop, run_page_scripts, serialize_dom,
+    EventLoopBudget, PageEnv, RebuiltDom,
 };
 use cerberus_js_quickjs::QuickJsEngineFactory;
 use cerberus_layout::{
@@ -1480,6 +1481,9 @@ impl BrowserApp {
             return doc;
         }
         let _ = fire_load(engine, realm);
+        // Drain timers/microtasks the page scheduled, under the default caps
+        // (ADR-0013), so first-paint reflects deferred work and no page can hang.
+        let _ = run_event_loop(engine, realm, EventLoopBudget::default());
         match serialize_dom(engine, realm) {
             Ok(rebuilt) => {
                 let RebuiltDom { document, id_map } = rebuilt;
@@ -4349,6 +4353,40 @@ mod tests {
             attr_of_id(b.document.root(), "d", "data-hit").as_deref(),
             Some("1"),
             "the div's click handler ran via generic element dispatch"
+        );
+    }
+
+    /// The text content of the first element with `id` (depth-first).
+    fn text_of_id(node: NodeRef<'_>, id: &str) -> Option<String> {
+        if node.is_element() && node.attr("id") == Some(id) {
+            return Some(node.text_content());
+        }
+        node.children().find_map(|c| text_of_id(c, id))
+    }
+
+    #[test]
+    fn load_time_timer_fires_before_first_paint() {
+        // No interaction: the app's load path drains the bounded event loop
+        // (ADR-0013), so a setTimeout scheduled at load has already mutated the
+        // document by the time it is rendered.
+        let b = loaded(
+            vec![(
+                "https://site.test/",
+                Ok(page(
+                    "https://site.test/",
+                    200,
+                    None,
+                    "<div id='d'>old</div>\
+                     <script>setTimeout(function () { \
+                       document.getElementById('d').textContent = 'timed'; }, 5000);</script>",
+                )),
+            )],
+            "https://site.test/",
+        );
+        assert_eq!(
+            text_of_id(b.document.root(), "d").as_deref(),
+            Some("timed"),
+            "a load-time timer fired during the bounded event loop"
         );
     }
 

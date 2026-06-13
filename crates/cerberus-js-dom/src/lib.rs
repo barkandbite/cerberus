@@ -527,6 +527,7 @@ pub fn run_page_scripts(
     install_page(engine, realm, document, env)?;
     run_scripts(engine, realm, scripts)?;
     fire_load(engine, realm)?;
+    run_event_loop(engine, realm, EventLoopBudget::default())?;
     Ok(serialize_dom(engine, realm)?.document)
 }
 
@@ -602,6 +603,73 @@ pub fn fire_load(engine: &mut dyn JsEngine, realm: RealmId) -> Result<(), Bridge
     }
 }
 
+/// Caps that guarantee [`run_event_loop`] terminates (ADR-0013). A page is
+/// bounded on two axes because the pathological shapes escape different ones: a
+/// 0-delay self-rescheduling `setTimeout` never advances the virtual clock (so
+/// `max_tasks` stops it), while a `setInterval` advances it every tick (so
+/// `max_virtual_ms` stops it).
+#[derive(Clone, Copy, Debug)]
+pub struct EventLoopBudget {
+    /// Maximum macrotasks (timer/rAF/idle callbacks) to run in one drain.
+    pub max_tasks: u32,
+    /// Maximum virtual time, in ms, a task may be due at and still run.
+    pub max_virtual_ms: u64,
+}
+
+impl Default for EventLoopBudget {
+    fn default() -> Self {
+        Self {
+            max_tasks: 10_000,
+            max_virtual_ms: 60_000,
+        }
+    }
+}
+
+/// What [`run_event_loop`] did, for the timing HUD and tests.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct EventLoopStats {
+    /// Number of macrotasks actually run.
+    pub tasks_run: u32,
+    /// `true` if the drain stopped on [`EventLoopBudget::max_tasks`] rather than
+    /// emptying the queue — a page we deliberately stopped (it may still have
+    /// pending timers).
+    pub hit_task_cap: bool,
+}
+
+/// Drain the realm's macrotask queue (timers / rAF / idle) under `budget`,
+/// running **one task per `eval`** so the engine's post-eval job pump interleaves
+/// microtasks between macrotasks — the spec ordering (ADR-0013). Returns once the
+/// queue is empty within the virtual-clock budget, or the task cap trips.
+///
+/// Pure `eval` orchestration: it calls `__cerberusStepTimer` (installed by the
+/// engine's speed-first prelude). On an engine without it (e.g. the null engine)
+/// the stepper eval yields a non-number, so the loop is a safe no-op.
+pub fn run_event_loop(
+    engine: &mut dyn JsEngine,
+    realm: RealmId,
+    budget: EventLoopBudget,
+) -> Result<EventLoopStats, BridgeError> {
+    let step = format!("__cerberusStepTimer({})", budget.max_virtual_ms);
+    let mut tasks_run = 0u32;
+    while tasks_run < budget.max_tasks {
+        match engine.eval(realm, &step) {
+            Ok(JsValue::Number(n)) if n >= 1.0 => tasks_run += 1,
+            // Empty queue (0) / unexpected value / a stepper throw: stop cleanly.
+            Ok(_) | Err(JsError::Eval(_)) => {
+                return Ok(EventLoopStats {
+                    tasks_run,
+                    hit_task_cap: false,
+                })
+            }
+            Err(other) => return Err(BridgeError::Js(other)),
+        }
+    }
+    Ok(EventLoopStats {
+        tasks_run,
+        hit_task_cap: true,
+    })
+}
+
 /// Read the realm's **current** live document model back into a fresh Rust
 /// [`Document`] (plus the JS-id → [`NodeId`] map, see [`RebuiltDom`]), **without**
 /// resetting or re-running anything.
@@ -668,6 +736,9 @@ pub fn dispatch_event(
             )))
         }
     };
+    // A handler may have scheduled timers / microtasks (e.g. a debounced state
+    // update); drain them before reading the DOM back so the result reflects them.
+    run_event_loop(engine, realm, EventLoopBudget::default())?;
     let dom = serialize_dom(engine, realm)?;
     Ok(Dispatched {
         dispatched,
