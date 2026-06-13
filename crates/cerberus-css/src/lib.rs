@@ -113,6 +113,7 @@ impl CssEngine {
             attrs: node.attrs().to_vec(),
             style,
             children,
+            node_id: node.id(),
         }
     }
 }
