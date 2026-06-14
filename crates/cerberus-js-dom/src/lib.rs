@@ -778,6 +778,354 @@ fn parse_dispatch_result(s: &str) -> Result<(bool, bool), BridgeError> {
 }
 
 // ---------------------------------------------------------------------------
+// fetch() — enqueue + host-drain + resolve (ADR-0014)
+// ---------------------------------------------------------------------------
+
+/// One request a page script asked for via `fetch(input, init)`, drained out of
+/// the realm by [`take_fetches`].
+///
+/// `fetch()` never calls native code (the engine seam is eval-only): it pushes a
+/// descriptor like this onto a per-realm queue and returns a `Promise`. The host
+/// drains the queue, performs each request through a [`FetchClient`], and settles
+/// the Promise with [`resolve_fetch`] / [`reject_fetch`]. The `id` correlates the
+/// descriptor with its stashed resolver across that round-trip.
+///
+/// `headers` is the request header list in insertion order (the JS side
+/// normalizes a plain object / array-of-pairs / `Headers` into `[name, value]`
+/// strings). `body` is the request body as a UTF-8 text string (`""` when none);
+/// binary bodies are out of scope for v1.
+#[derive(Debug, Clone)]
+pub struct FetchRequest {
+    /// The per-realm monotonic id keying this request's pending Promise.
+    pub id: u64,
+    /// The request URL (`String(input)`, or `input.url` for a Request-like).
+    pub url: String,
+    /// The HTTP method, upper-cased (`"GET"` when none supplied).
+    pub method: String,
+    /// Request headers in insertion order, as `(name, value)` strings.
+    pub headers: Vec<(String, String)>,
+    /// The request body as a UTF-8 text string; empty when none.
+    pub body: String,
+}
+
+/// A response the host produced for a [`FetchRequest`], handed back to JS by
+/// [`resolve_fetch`] to settle the page's Promise with a `Response`.
+///
+/// The JS `Response` derives `ok` (`200..=299`) and `redirected` itself, so this
+/// carries no booleans — keeping it on the wire-JSON's integer-only diet (see
+/// [`mod@json`]). `body` is the response body as a UTF-8 text string (v1: `text()`
+/// returns it verbatim, `json()` `JSON.parse`s it).
+#[derive(Debug, Clone)]
+pub struct FetchResponse {
+    /// The HTTP status code (e.g. `200`, `404`).
+    pub status: u16,
+    /// The HTTP status text (e.g. `"OK"`); may be empty.
+    pub status_text: String,
+    /// The final response URL (after any redirects the client followed).
+    pub url: String,
+    /// Response headers in order, as `(name, value)` strings.
+    pub headers: Vec<(String, String)>,
+    /// The response body as a UTF-8 text string.
+    pub body: String,
+}
+
+/// The host's network seam: turn a [`FetchRequest`] into a [`FetchResponse`].
+///
+/// [`drive_fetches`] calls this once per drained request. An `Err(String)`
+/// rejects the page's Promise with a `TypeError` carrying that message (the
+/// browser's "network error" shape); an `Ok` resolves it with a `Response`. The
+/// implementor owns *all* policy — DNS, TLS, redirects, CORS, caching, timeouts —
+/// the bridge only marshals the request and response across the `eval` seam.
+pub trait FetchClient {
+    /// Perform `req`, returning the response or a network-error message.
+    fn fetch(&mut self, req: &FetchRequest) -> Result<FetchResponse, String>;
+}
+
+/// Caps that guarantee [`drive_fetches`] terminates even when `.then` callbacks
+/// keep issuing more `fetch`es.
+///
+/// The pump alternates "drain the event loop" with "drain the fetch queue", so a
+/// page that schedules a fresh request from every response would spin forever.
+/// `max_rounds` bounds how many drain rounds we make; `max_requests` bounds the
+/// total requests serviced across the whole pump. Either tripping sets
+/// [`FetchStats::hit_cap`].
+#[derive(Clone, Copy, Debug)]
+pub struct FetchBudget {
+    /// Maximum number of drain rounds (each round services one batch of the
+    /// queue, then re-runs the event loop).
+    pub max_rounds: u32,
+    /// Maximum total requests serviced across the whole pump.
+    pub max_requests: u32,
+}
+
+impl Default for FetchBudget {
+    fn default() -> Self {
+        Self {
+            max_rounds: 50,
+            max_requests: 1000,
+        }
+    }
+}
+
+/// What [`drive_fetches`] did, for diagnostics and tests.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct FetchStats {
+    /// Total requests serviced (resolved *or* rejected) across all rounds.
+    pub requests: u32,
+    /// Number of drain rounds that serviced at least one request.
+    pub rounds: u32,
+    /// `true` if a [`FetchBudget`] cap (rounds or requests) stopped the pump
+    /// rather than the queue draining naturally.
+    pub hit_cap: bool,
+}
+
+/// Drain the realm's pending `fetch` queue into Rust, returning the descriptors
+/// and clearing the queue.
+///
+/// Evals `__cerberusTakeFetches()` (which `JSON.stringify`s the queue then empties
+/// it) and parses the array of `{id,url,method,headers:[[n,v]…],body}` objects. An
+/// empty queue yields an empty `Vec`. A malformed entry is skipped rather than
+/// failing the whole drain — a single bad descriptor must not strand the rest.
+pub fn take_fetches(
+    engine: &mut dyn JsEngine,
+    realm: RealmId,
+) -> Result<Vec<FetchRequest>, BridgeError> {
+    let json = match engine.eval(realm, "__cerberusTakeFetches()")? {
+        JsValue::Str(s) => s,
+        other => {
+            return Err(BridgeError::Structure(format!(
+                "__cerberusTakeFetches did not return a string: {other:?}"
+            )))
+        }
+    };
+    let value = json::parse(&json).map_err(BridgeError::Json)?;
+    let items = value.as_array().ok_or_else(|| {
+        BridgeError::Structure("__cerberusTakeFetches did not return an array".to_string())
+    })?;
+
+    let mut out = Vec::with_capacity(items.len());
+    for item in items {
+        // A descriptor missing its id is unusable (we could never settle its
+        // Promise), so skip it; other fields fall back to sane defaults.
+        let id = match item.get("id").and_then(Json::as_u64) {
+            Some(id) => id,
+            None => continue,
+        };
+        let url = item
+            .get("url")
+            .and_then(Json::as_str)
+            .unwrap_or("")
+            .to_string();
+        let method = item
+            .get("method")
+            .and_then(Json::as_str)
+            .unwrap_or("GET")
+            .to_string();
+        let body = item
+            .get("body")
+            .and_then(Json::as_str)
+            .unwrap_or("")
+            .to_string();
+        out.push(FetchRequest {
+            id,
+            url,
+            method,
+            headers: decode_header_pairs(item.get("headers")),
+            body,
+        });
+    }
+    Ok(out)
+}
+
+/// Decode a wire `headers` value (`[[name, value], …]`) into a `(name, value)`
+/// list. Missing/garbage entries are skipped; a `None` field yields an empty list.
+fn decode_header_pairs(headers: Option<&Json>) -> Vec<(String, String)> {
+    let mut out = Vec::new();
+    if let Some(arr) = headers.and_then(Json::as_array) {
+        for pair in arr {
+            let Some(pair) = pair.as_array() else {
+                continue;
+            };
+            let name = pair.first().and_then(Json::as_str);
+            let value = pair.get(1).and_then(Json::as_str);
+            if let (Some(name), Some(value)) = (name, value) {
+                out.push((name.to_string(), value.to_string()));
+            }
+        }
+    }
+    out
+}
+
+/// Emit a `FetchResponse` as a JS object literal into `out`, in the wire shape
+/// `__cerberusResolveFetch` expects: `{status:<int>,statusText,url,headers:[[n,v]…],body}`.
+///
+/// Mirrors [`serialize_document`]'s emitter style — `status` as a bare integer,
+/// every string through [`json::write_json_string`], headers as an array of
+/// two-element arrays. No booleans cross (`ok`/`redirected` are computed in JS).
+fn write_response_literal(out: &mut String, resp: &FetchResponse) {
+    out.push_str("{\"status\":");
+    json::write_u64(out, resp.status as u64);
+    out.push_str(",\"statusText\":");
+    json::write_json_string(out, &resp.status_text);
+    out.push_str(",\"url\":");
+    json::write_json_string(out, &resp.url);
+    out.push_str(",\"headers\":[");
+    for (i, (name, value)) in resp.headers.iter().enumerate() {
+        if i > 0 {
+            out.push(',');
+        }
+        out.push('[');
+        json::write_json_string(out, name);
+        out.push(',');
+        json::write_json_string(out, value);
+        out.push(']');
+    }
+    out.push_str("],\"body\":");
+    json::write_json_string(out, &resp.body);
+    out.push('}');
+}
+
+/// Settle the pending Promise for `req_id` with `resp` (resolving it with a
+/// `Response`), via `__cerberusResolveFetch`.
+///
+/// Builds the response object literal ([`write_response_literal`]) and evals the
+/// settle call. Resolving schedules the page's `.then` microtasks, which the next
+/// [`run_event_loop`] in [`drive_fetches`] drains. An unknown id is a JS-side
+/// no-op; a script-level throw is swallowed (only a realm-level error propagates).
+pub fn resolve_fetch(
+    engine: &mut dyn JsEngine,
+    realm: RealmId,
+    req_id: u64,
+    resp: &FetchResponse,
+) -> Result<(), BridgeError> {
+    let mut call = String::from("__cerberusResolveFetch(");
+    json::write_u64(&mut call, req_id);
+    call.push_str(", ");
+    write_response_literal(&mut call, resp);
+    call.push(')');
+    match engine.eval(realm, &call) {
+        Ok(_) | Err(JsError::Eval(_)) => Ok(()),
+        Err(other) => Err(BridgeError::Js(other)),
+    }
+}
+
+/// Reject the pending Promise for `req_id` with a `TypeError(message)` (the
+/// browser's network-error shape), via `__cerberusRejectFetch`.
+///
+/// Rejecting schedules the page's `.catch`/rejection-`.then` microtasks, drained
+/// by the next [`run_event_loop`] in [`drive_fetches`]. An unknown id is a JS-side
+/// no-op; a script-level throw is swallowed (only a realm-level error propagates).
+pub fn reject_fetch(
+    engine: &mut dyn JsEngine,
+    realm: RealmId,
+    req_id: u64,
+    message: &str,
+) -> Result<(), BridgeError> {
+    let call = format!("__cerberusRejectFetch({}, {})", req_id, js_string(message));
+    match engine.eval(realm, &call) {
+        Ok(_) | Err(JsError::Eval(_)) => Ok(()),
+        Err(other) => Err(BridgeError::Js(other)),
+    }
+}
+
+/// Pump the realm's `fetch` queue to quiescence: drain the event loop, service
+/// every queued request through `client`, and repeat until no new requests
+/// appear — all under `loop_budget` (per-drain timer/microtask caps) and
+/// `fetch_budget` (round/request caps that guarantee termination).
+///
+/// Each round first [`run_event_loop`]s (so a `fetch` deferred behind a timer, or
+/// a `.then` from a previous round, lands in the queue), then [`take_fetches`]es
+/// and services the batch with [`resolve_fetch`] / [`reject_fetch`]. Servicing a
+/// response schedules more `.then` microtasks — and possibly more `fetch`es —
+/// which the *next* round's event-loop drain surfaces. The pump stops when the
+/// queue drains naturally, or a budget cap trips (setting [`FetchStats::hit_cap`];
+/// any requests still queued at the request cap are rejected with
+/// `"fetch budget exceeded"` so their Promises never dangle). A final
+/// [`run_event_loop`] drains the microtasks from the last batch of responses.
+pub fn drive_fetches(
+    engine: &mut dyn JsEngine,
+    realm: RealmId,
+    client: &mut dyn FetchClient,
+    loop_budget: EventLoopBudget,
+    fetch_budget: FetchBudget,
+) -> Result<FetchStats, BridgeError> {
+    let mut rounds = 0u32;
+    let mut requests = 0u32;
+    let mut hit_cap = false;
+
+    'pump: loop {
+        // Drain timers + microtasks so any pending/just-scheduled fetch enqueues.
+        run_event_loop(engine, realm, loop_budget)?;
+
+        if rounds >= fetch_budget.max_rounds {
+            hit_cap = true;
+            break;
+        }
+        let reqs = take_fetches(engine, realm)?;
+        if reqs.is_empty() {
+            break;
+        }
+        rounds += 1;
+
+        for req in reqs {
+            if requests >= fetch_budget.max_requests {
+                // Out of request budget: reject this and every remaining queued
+                // request so no Promise is left dangling, then stop the pump.
+                hit_cap = true;
+                reject_fetch(engine, realm, req.id, "fetch budget exceeded")?;
+                for rest in take_fetches(engine, realm)? {
+                    reject_fetch(engine, realm, rest.id, "fetch budget exceeded")?;
+                }
+                break 'pump;
+            }
+            requests += 1;
+            match client.fetch(&req) {
+                Ok(resp) => resolve_fetch(engine, realm, req.id, &resp)?,
+                Err(message) => reject_fetch(engine, realm, req.id, &message)?,
+            }
+        }
+    }
+
+    // Final drain: run the microtasks scheduled by the last batch of responses.
+    run_event_loop(engine, realm, loop_budget)?;
+    Ok(FetchStats {
+        requests,
+        rounds,
+        hit_cap,
+    })
+}
+
+/// Like [`run_page_scripts`], but with `fetch` support: after firing load it
+/// [`drive_fetches`]es the realm against `client` so the page's `fetch` calls (and
+/// the `.then` chains they unlock) run to quiescence before the DOM is read back.
+///
+/// Composition: [`install_page`] → [`run_scripts`] → [`fire_load`] →
+/// [`drive_fetches`] → [`serialize_dom`]. Uses default [`EventLoopBudget`] and
+/// [`FetchBudget`] caps. [`run_page_scripts`] is left untouched for callers that
+/// have no network seam (it runs the event loop but never drains fetches, so a
+/// page's `fetch` Promises simply never settle there).
+pub fn run_page_scripts_with_fetch(
+    engine: &mut dyn JsEngine,
+    realm: RealmId,
+    document: &Document,
+    scripts: &[String],
+    env: &PageEnv,
+    client: &mut dyn FetchClient,
+) -> Result<Document, BridgeError> {
+    install_page(engine, realm, document, env)?;
+    run_scripts(engine, realm, scripts)?;
+    fire_load(engine, realm)?;
+    drive_fetches(
+        engine,
+        realm,
+        client,
+        EventLoopBudget::default(),
+        FetchBudget::default(),
+    )?;
+    Ok(serialize_dom(engine, realm)?.document)
+}
+
+// ---------------------------------------------------------------------------
 // The JS document model
 // ---------------------------------------------------------------------------
 
@@ -1895,6 +2243,190 @@ pub const DOM_MODEL_PRELUDE: &str = r##"
       } catch (e) {
         return JSON.stringify({ dispatched: 0, defaultPrevented: 0 });
       }
+    };
+
+    // ---- fetch (enqueue + host-drain + resolve, ADR-0014) --------------
+    // fetch() does NOT call native code (the engine seam is eval-only). It
+    // pushes a request descriptor onto a per-realm queue and returns a real
+    // (native QuickJS) Promise whose resolve/reject are stashed under a
+    // monotonic id. The Rust host drains the queue via __cerberusTakeFetches,
+    // performs each request through a host FetchClient, and settles the Promise
+    // via __cerberusResolveFetch / __cerberusRejectFetch. Settling schedules the
+    // .then microtasks, which the bounded event loop drains; fetches scheduled
+    // from a .then surface on the host's next drain round (under caps). Every
+    // entry point is try/catch-guarded and never throws across the seam.
+    if (!Array.isArray(g.__cerberusFetchQueue)) g.__cerberusFetchQueue = [];
+    if (!g.__cerberusFetchPending) g.__cerberusFetchPending = Object.create(null);
+    if (typeof g.__cerberusFetchId !== "number") g.__cerberusFetchId = 1;
+
+    // ---- Headers (case-insensitive, minimal) ---------------------------
+    // Backed by an ordered array of [originalName, value]; lookups fold case.
+    // Constructed from a plain object, an array of [name,value] pairs, or
+    // another Headers (anything with .forEach). Used by Response.
+    function makeHeaders(init) {
+      var list = [];
+      function indexOf(name) {
+        var lc = String(name).toLowerCase();
+        for (var i = 0; i < list.length; i++) if (list[i][0].toLowerCase() === lc) return i;
+        return -1;
+      }
+      var h = {
+        append: function (name, value) { list.push([String(name), String(value)]); },
+        set: function (name, value) {
+          var i = indexOf(name);
+          if (i === -1) list.push([String(name), String(value)]);
+          else list[i] = [String(name), String(value)];
+        },
+        get: function (name) {
+          // The spec joins multiple same-name values with ", "; do likewise.
+          var lc = String(name).toLowerCase(), out = null;
+          for (var i = 0; i < list.length; i++) {
+            if (list[i][0].toLowerCase() === lc) out = (out === null) ? list[i][1] : out + ", " + list[i][1];
+          }
+          return out;
+        },
+        has: function (name) { return indexOf(name) !== -1; },
+        "delete": function (name) {
+          var lc = String(name).toLowerCase();
+          for (var i = list.length - 1; i >= 0; i--) if (list[i][0].toLowerCase() === lc) list.splice(i, 1);
+        },
+        forEach: function (cb, thisArg) {
+          for (var i = 0; i < list.length; i++) cb.call(thisArg, list[i][1], list[i][0], h);
+        },
+        entries: function () { return list.map(function (p) { return [p[0], p[1]]; }); },
+        keys: function () { return list.map(function (p) { return p[0]; }); },
+        values: function () { return list.map(function (p) { return p[1]; }); },
+        __pairs: function () { return list.map(function (p) { return [p[0], p[1]]; }); },
+      };
+      try {
+        if (init) {
+          if (typeof init.forEach === "function" && !Array.isArray(init)) {
+            init.forEach(function (v, k) { h.append(k, v); });
+          } else if (Array.isArray(init)) {
+            for (var i = 0; i < init.length; i++) {
+              var pair = init[i];
+              if (pair && pair.length >= 2) h.append(pair[0], pair[1]);
+            }
+          } else if (typeof init === "object") {
+            for (var k in init) {
+              if (Object.prototype.hasOwnProperty.call(init, k)) h.append(k, init[k]);
+            }
+          }
+        }
+      } catch (e) {}
+      return h;
+    }
+    g.Headers = function (init) { return makeHeaders(init); };
+
+    // ---- normalize an init.headers into [[name,value],...] -------------
+    function normalizeHeaders(init) {
+      var out = [];
+      try {
+        var hh = init && init.headers;
+        if (!hh) return out;
+        if (typeof hh.forEach === "function" && !Array.isArray(hh)) {
+          hh.forEach(function (v, k) { out.push([String(k), String(v)]); });
+        } else if (Array.isArray(hh)) {
+          for (var i = 0; i < hh.length; i++) {
+            var pair = hh[i];
+            if (pair && pair.length >= 2) out.push([String(pair[0]), String(pair[1])]);
+          }
+        } else if (typeof hh === "object") {
+          for (var k in hh) {
+            if (Object.prototype.hasOwnProperty.call(hh, k)) out.push([String(k), String(hh[k])]);
+          }
+        }
+      } catch (e) {}
+      return out;
+    }
+
+    // ---- Response factory (body is a UTF-8 text string in v1) ----------
+    function makeResponse(status, statusText, url, headerPairs, bodyText) {
+      status = status >>> 0;
+      var resp = {
+        ok: (status >= 200 && status <= 299),
+        status: status,
+        statusText: String(statusText == null ? "" : statusText),
+        url: String(url == null ? "" : url),
+        redirected: false,
+        type: "basic",
+        headers: makeHeaders(headerPairs || []),
+        bodyUsed: false,
+        _bodyText: String(bodyText == null ? "" : bodyText),
+        text: function () { return Promise.resolve(this._bodyText); },
+        json: function () {
+          var t = this._bodyText;
+          return new Promise(function (resolve, reject) {
+            try { resolve(JSON.parse(t)); } catch (e) { reject(e); }
+          });
+        },
+        clone: function () {
+          var c = makeResponse(this.status, this.statusText, this.url, this.headers.__pairs(), this._bodyText);
+          c.redirected = this.redirected;
+          c.type = this.type;
+          return c;
+        },
+      };
+      return resp;
+    }
+
+    g.fetch = function (input, init) {
+      try {
+        var url;
+        if (input && typeof input === "object" && input.url != null) url = String(input.url);
+        else url = String(input);
+        var method = (init && init.method) ? String(init.method).toUpperCase() : "GET";
+        var headers = normalizeHeaders(init);
+        var body = (init && init.body != null) ? String(init.body) : "";
+        var id = g.__cerberusFetchId++;
+        g.__cerberusFetchQueue.push({ id: id, url: url, method: method, headers: headers, body: body });
+        return new Promise(function (resolve, reject) {
+          g.__cerberusFetchPending[id] = { resolve: resolve, reject: reject };
+        });
+      } catch (e) {
+        // A malformed call still yields a rejected Promise (never throws sync).
+        return Promise.reject(new TypeError("fetch failed: " + String(e)));
+      }
+    };
+
+    // Drain the pending request queue as a JSON string, then CLEAR it. Each
+    // entry is {id:<int>,url,method,headers:[[n,v]...],body}. "[]" when empty.
+    g.__cerberusTakeFetches = function () {
+      try {
+        var q = g.__cerberusFetchQueue;
+        if (!Array.isArray(q) || q.length === 0) return "[]";
+        g.__cerberusFetchQueue = [];
+        return JSON.stringify(q);
+      } catch (e) {
+        return "[]";
+      }
+    };
+
+    // Resolve the Promise for `id` with a Response built from `resp` =
+    // {status:<int>,statusText,url,headers:[[n,v]...],body}. ok/redirected are
+    // computed here (the wire JSON carries no booleans). Unknown id is a no-op.
+    g.__cerberusResolveFetch = function (id, resp) {
+      try {
+        var entry = g.__cerberusFetchPending[id];
+        if (!entry) return;
+        delete g.__cerberusFetchPending[id];
+        resp = resp || {};
+        var response = makeResponse(
+          (typeof resp.status === "number") ? resp.status : 200,
+          resp.statusText, resp.url, resp.headers, resp.body
+        );
+        entry.resolve(response);
+      } catch (e) {}
+    };
+
+    // Reject the Promise for `id` with a TypeError(message). Unknown id no-op.
+    g.__cerberusRejectFetch = function (id, message) {
+      try {
+        var entry = g.__cerberusFetchPending[id];
+        if (!entry) return;
+        delete g.__cerberusFetchPending[id];
+        entry.reject(new TypeError(String(message)));
+      } catch (e) {}
     };
 
     // ---- serialize: JS tree -> wire JSON -------------------------------
