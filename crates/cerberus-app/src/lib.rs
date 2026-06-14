@@ -18,8 +18,9 @@ use cerberus_headless::render_document;
 use cerberus_identity::{Head, HeadManager};
 use cerberus_image::ImageCodec;
 use cerberus_js_dom::{
-    dispatch_event, fire_load, install_page, run_event_loop, run_page_scripts, serialize_dom,
-    set_node_value, EventLoopBudget, PageEnv, RebuiltDom,
+    dispatch_event, fire_load, install_page, reject_fetch, resolve_fetch, run_event_loop,
+    run_page_scripts, run_page_scripts_with_fetch, serialize_dom, set_node_value, take_fetches,
+    EventLoopBudget, FetchClient, FetchRequest, FetchResponse, PageEnv, RebuiltDom,
 };
 use cerberus_js_quickjs::QuickJsEngineFactory;
 use cerberus_layout::{
@@ -623,8 +624,34 @@ pub fn render(config: &RenderConfig) -> Result<RenderOutcome, AppError> {
             viewport: (config.viewport.w, config.viewport.h),
             user_agent: active_ua,
         };
-        document = run_page_scripts(engine, base_realm, &document, document.scripts(), &env)
-            .map_err(|e| AppError::Js(format!("{e:?}")))?;
+        // JS fetch() rides the page's subresource context (sealed jar + consent),
+        // performed synchronously here (the one-shot path already blocks).
+        let fetch_ctx = FetchContext {
+            instance: active_instance,
+            kind: FetchKind::Subresource {
+                first_party: first_party.clone(),
+            },
+        };
+        document = match &client {
+            Some(c) => {
+                let mut fc = SyncFetchClient {
+                    client: c,
+                    base: Some(url.clone()),
+                    ctx: fetch_ctx,
+                };
+                run_page_scripts_with_fetch(
+                    engine,
+                    base_realm,
+                    &document,
+                    document.scripts(),
+                    &env,
+                    &mut fc,
+                )
+                .map_err(|e| AppError::Js(format!("{e:?}")))?
+            }
+            None => run_page_scripts(engine, base_realm, &document, document.scripts(), &env)
+                .map_err(|e| AppError::Js(format!("{e:?}")))?,
+        };
     }
     let engine_name = engine.name().to_string();
     let realms_live = engine.realm_count();
@@ -780,6 +807,11 @@ enum Job {
         url: String,
         ctx: FetchContext,
     },
+    Fetch {
+        id: u64,
+        req: FetchRequest,
+        ctx: FetchContext,
+    },
 }
 
 /// A completed job (page navigation, or an image sub-resource).
@@ -794,6 +826,10 @@ enum Done {
         bytes: Result<Vec<u8>, String>,
         elapsed: Duration,
     },
+    Fetch {
+        id: u64,
+        result: Result<FetchResponse, String>,
+    },
 }
 
 /// Performs page + sub-resource loads off the UI thread. Abstracted so the load
@@ -803,6 +839,8 @@ trait PageLoader {
     fn request(&self, id: u64, url: String, ctx: FetchContext);
     /// Queue an image sub-resource fetch (absolute URL) in an identity context.
     fn request_subresource(&self, url: String, ctx: FetchContext);
+    /// Queue a JS `fetch` (absolute URL in `req.url`) in an identity context.
+    fn request_fetch(&self, id: u64, req: FetchRequest, ctx: FetchContext);
     /// Non-blocking poll for a completed job.
     fn try_recv(&mut self) -> Option<Done>;
     /// Receive a waker to notify the UI when a result is ready.
@@ -850,6 +888,10 @@ impl NetLoader {
                             elapsed: t.elapsed(),
                         }
                     }
+                    Job::Fetch { id, req, ctx } => {
+                        let result = perform_fetch(&client, &req.url, &req, &ctx);
+                        Done::Fetch { id, result }
+                    }
                 };
                 if out_tx.send(done).is_err() {
                     break;
@@ -875,6 +917,9 @@ impl PageLoader for NetLoader {
     }
     fn request_subresource(&self, url: String, ctx: FetchContext) {
         let _ = self.tx.send(Job::Sub { url, ctx });
+    }
+    fn request_fetch(&self, id: u64, req: FetchRequest, ctx: FetchContext) {
+        let _ = self.tx.send(Job::Fetch { id, req, ctx });
     }
     fn try_recv(&mut self) -> Option<Done> {
         self.rx.try_recv().ok()
@@ -907,6 +952,78 @@ fn fetch_bytes(client: &Router, url: &str, ctx: &FetchContext) -> Result<Vec<u8>
         return Err(format!("HTTP {}", resp.status));
     }
     Ok(resp.body)
+}
+
+/// Cap on a JS-`fetch` response body we keep as text (protects the RSS budget,
+/// per the image-decode-budget philosophy).
+const MAX_FETCH_BODY_BYTES: usize = 16 * 1024 * 1024;
+
+/// Perform one JS `fetch` (already-resolved absolute `abs_url`) through the
+/// privacy stack and shape it into a js-dom [`FetchResponse`]. Shared by the
+/// one-shot [`SyncFetchClient`] and the interactive worker (M12d / ADR-0014).
+fn perform_fetch(
+    client: &Router,
+    abs_url: &str,
+    req: &FetchRequest,
+    ctx: &FetchContext,
+) -> Result<FetchResponse, String> {
+    let parsed = parse_url(abs_url).map_err(|e| e.to_string())?;
+    let resp = client
+        .fetch_in(&parsed, &req.method, &req.headers, req.body.as_bytes(), ctx)
+        .map_err(|e| format!("{e:?}"))?;
+    if resp.body.len() > MAX_FETCH_BODY_BYTES {
+        return Err(format!(
+            "response body exceeds {MAX_FETCH_BODY_BYTES} bytes"
+        ));
+    }
+    Ok(FetchResponse {
+        status: resp.status,
+        status_text: reason_phrase(resp.status).to_string(),
+        url: abs_url.to_string(),
+        headers: resp.headers,
+        body: String::from_utf8_lossy(&resp.body).into_owned(),
+    })
+}
+
+/// A minimal HTTP reason phrase for `response.statusText` (empty for uncommon
+/// codes — pages rarely depend on it).
+fn reason_phrase(status: u16) -> &'static str {
+    match status {
+        200 => "OK",
+        201 => "Created",
+        204 => "No Content",
+        301 => "Moved Permanently",
+        302 => "Found",
+        304 => "Not Modified",
+        400 => "Bad Request",
+        401 => "Unauthorized",
+        403 => "Forbidden",
+        404 => "Not Found",
+        500 => "Internal Server Error",
+        502 => "Bad Gateway",
+        503 => "Service Unavailable",
+        _ => "",
+    }
+}
+
+/// A synchronous [`FetchClient`] over the network [`Router`], used by the
+/// one-shot [`render`] path (already synchronous). Relative request URLs resolve
+/// against `base` (the page URL). The interactive browser routes fetches through
+/// its worker instead (non-blocking; see `pump_fetches`).
+struct SyncFetchClient<'a> {
+    client: &'a Router,
+    base: Option<cerberus_url::Url>,
+    ctx: FetchContext,
+}
+
+impl FetchClient for SyncFetchClient<'_> {
+    fn fetch(&mut self, req: &FetchRequest) -> Result<FetchResponse, String> {
+        let abs = resolve_subresource(self.base.as_ref(), &req.url);
+        if !(abs.starts_with("http://") || abs.starts_with("https://")) {
+            return Err(format!("unsupported fetch URL: {abs}"));
+        }
+        perform_fetch(self.client, &abs, req, &self.ctx)
+    }
 }
 
 /// Synchronously fetch + decode every `<img>` in `document`, keyed by absolute
@@ -1445,6 +1562,8 @@ impl BrowserApp {
         self.styled = self.style_engine.style(&doc);
         self.timings.record("style", t.elapsed());
         self.document = doc;
+        // Dispatch any fetches the page scheduled at load to the worker (async).
+        self.pump_fetches();
     }
 
     /// Run the document's inline scripts against the active head's engine and
@@ -1519,11 +1638,14 @@ impl BrowserApp {
             );
         }
         self.status = status;
+        // Set the current URL *before* set_document so the page's scripts (and the
+        // fetch()es they schedule at load) resolve/consent-gate against the right
+        // first party (M12d).
+        self.current_url = parse_url(url).ok();
         self.set_document(parse_html(&String::from_utf8_lossy(body)));
         self.toolbar.url_text = url.to_string();
         self.toolbar.loading = false;
         self.insecure_prompt = None;
-        self.current_url = parse_url(url).ok();
 
         self.request_page_images();
         self.update_nav();
@@ -1605,6 +1727,115 @@ impl BrowserApp {
             };
         self.images.insert(url, state);
         true // a newly-decoded image changes layout — redraw
+    }
+
+    /// Drain the realm's JS-`fetch` queue and dispatch each request to the
+    /// network worker (async — results arrive in `poll` → `handle_fetch`). A
+    /// third-party fetch is consent-gated like an image subresource; a blocked
+    /// or unsupported one rejects its Promise. No-op without a scripted realm.
+    fn pump_fetches(&mut self) {
+        if self.node_to_js.is_empty() {
+            return;
+        }
+        let Some(first_party) = self.current_url.as_ref().and_then(first_party_of) else {
+            return;
+        };
+        let instance = self.heads.active().instance;
+        let realm = RealmId(self.heads.active().id.0);
+        let reqs = {
+            let engine = match self.heads.engine() {
+                Ok(engine) => engine,
+                Err(_) => return,
+            };
+            match take_fetches(engine, realm) {
+                Ok(reqs) => reqs,
+                Err(_) => return,
+            }
+        };
+        let mut rejected_sync = false;
+        for mut req in reqs {
+            // Resolve relative URLs against the page (like image subresources).
+            let abs = resolve_subresource(self.current_url.as_ref(), &req.url);
+            if !(abs.starts_with("http://") || abs.starts_with("https://")) {
+                self.reject_pending(req.id, "unsupported fetch URL");
+                rejected_sync = true;
+                continue;
+            }
+            // Consent gate: a third-party fetch needs an Allow rule.
+            if self.gate_subresource(&abs, &first_party) != Decision::Allow {
+                self.reject_pending(req.id, "blocked by consent policy");
+                rejected_sync = true;
+                continue;
+            }
+            req.url = abs;
+            let ctx = FetchContext {
+                instance,
+                kind: FetchKind::Subresource {
+                    first_party: first_party.clone(),
+                },
+            };
+            self.loader.request_fetch(req.id, req, ctx);
+        }
+        // Drain the `.catch` reactions of any synchronously-rejected fetch and
+        // reflect their DOM changes now (worker-resolved fetches drain later in
+        // handle_fetch instead).
+        if rejected_sync {
+            let realm = RealmId(self.heads.active().id.0);
+            if let Ok(engine) = self.heads.engine() {
+                let _ = run_event_loop(engine, realm, EventLoopBudget::default());
+            }
+            self.reconcile_realm();
+        }
+    }
+
+    /// Reject a pending JS-`fetch` Promise by id (best-effort).
+    fn reject_pending(&mut self, id: u64, message: &str) {
+        let realm = RealmId(self.heads.active().id.0);
+        if let Ok(engine) = self.heads.engine() {
+            let _ = reject_fetch(engine, realm, id, message);
+        }
+    }
+
+    /// A worker-delivered JS-`fetch` result: settle the Promise, drain the
+    /// resulting microtasks/timers, reconcile the mutated DOM, and dispatch any
+    /// newly-queued fetches. Returns true (redraw).
+    fn handle_fetch(&mut self, id: u64, result: Result<FetchResponse, String>) -> bool {
+        let realm = RealmId(self.heads.active().id.0);
+        {
+            let engine = match self.heads.engine() {
+                Ok(engine) => engine,
+                Err(_) => return false,
+            };
+            match &result {
+                Ok(resp) => {
+                    let _ = resolve_fetch(engine, realm, id, resp);
+                }
+                Err(message) => {
+                    let _ = reject_fetch(engine, realm, id, message);
+                }
+            }
+            let _ = run_event_loop(engine, realm, EventLoopBudget::default());
+        }
+        self.reconcile_realm();
+        self.pump_fetches();
+        true
+    }
+
+    /// Re-read the live realm into the rendered document + restyle, after async
+    /// work (a settled fetch) may have mutated it. Reuses the dispatch reconcile.
+    fn reconcile_realm(&mut self) {
+        let realm = RealmId(self.heads.active().id.0);
+        let dom = {
+            let engine = match self.heads.engine() {
+                Ok(engine) => engine,
+                Err(_) => return,
+            };
+            match serialize_dom(engine, realm) {
+                Ok(dom) => dom,
+                Err(_) => return,
+            }
+        };
+        self.reconcile_dispatched(dom);
     }
 
     /// Scan the current document for `<img>` sources and queue a background
@@ -1996,6 +2227,8 @@ impl BrowserApp {
             .record(format!("{event_type} handler"), t.elapsed());
         let prevented = dispatched.default_prevented;
         self.reconcile_dispatched(dispatched.dom);
+        // A handler may have called fetch(); dispatch it to the worker (async).
+        self.pump_fetches();
         Some(prevented)
     }
 
@@ -2341,6 +2574,7 @@ impl FrameApp for BrowserApp {
                     bytes,
                     elapsed,
                 } => self.handle_subresource(url, bytes, elapsed),
+                Done::Fetch { id, result } => self.handle_fetch(id, result),
             };
         }
         redraw
@@ -3749,6 +3983,7 @@ mod tests {
     struct FakeLoader {
         responses: HashMap<String, Result<FetchedPage, String>>,
         images: HashMap<String, Result<Vec<u8>, String>>,
+        fetches: HashMap<String, Result<FetchResponse, String>>,
         queue: RefCell<VecDeque<Done>>,
         /// Instances seen on page requests, in order (head-switch tests).
         seen_instances: Arc<Mutex<Vec<InstanceId>>>,
@@ -3762,6 +3997,7 @@ mod tests {
                     .map(|(u, r)| (u.to_string(), r))
                     .collect(),
                 images: HashMap::new(),
+                fetches: HashMap::new(),
                 queue: RefCell::new(VecDeque::new()),
                 seen_instances: Arc::new(Mutex::new(Vec::new())),
             }
@@ -3769,6 +4005,14 @@ mod tests {
 
         fn with_images(mut self, images: Vec<(&str, Result<Vec<u8>, String>)>) -> Self {
             self.images = images
+                .into_iter()
+                .map(|(u, r)| (u.to_string(), r))
+                .collect();
+            self
+        }
+
+        fn with_fetches(mut self, fetches: Vec<(&str, Result<FetchResponse, String>)>) -> Self {
+            self.fetches = fetches
                 .into_iter()
                 .map(|(u, r)| (u.to_string(), r))
                 .collect();
@@ -3801,6 +4045,17 @@ mod tests {
                 bytes,
                 elapsed: Duration::from_millis(0),
             });
+        }
+        fn request_fetch(&self, id: u64, req: FetchRequest, _ctx: FetchContext) {
+            // `req.url` is already absolute (resolved by `pump_fetches`).
+            let result = self
+                .fetches
+                .get(&req.url)
+                .cloned()
+                .unwrap_or_else(|| Err(format!("no canned fetch for {}", req.url)));
+            self.queue
+                .borrow_mut()
+                .push_back(Done::Fetch { id, result });
         }
         fn try_recv(&mut self) -> Option<Done> {
             self.queue.get_mut().pop_front()
@@ -4196,6 +4451,92 @@ mod tests {
         b.navigate(url);
         assert!(b.poll(), "page load drained");
         b
+    }
+
+    fn loaded_with_fetches(
+        responses: Vec<(&str, Result<FetchedPage, String>)>,
+        fetches: Vec<(&str, Result<FetchResponse, String>)>,
+        url: &str,
+    ) -> BrowserApp {
+        let loader = FakeLoader::new(responses).with_fetches(fetches);
+        let mut b = BrowserApp::with_loader(Box::new(loader));
+        b.navigate(url);
+        assert!(b.poll(), "page load + fetch cascade drained");
+        b
+    }
+
+    #[test]
+    fn js_fetch_loads_data_through_the_worker_and_rerenders() {
+        // A scripted page fetches JSON and renders a field from it: the fetch is
+        // routed to the (fake) worker, resolved in poll(), and the .then chain
+        // re-renders the DOM — all within the load poll.
+        let b = loaded_with_fetches(
+            vec![(
+                "https://site.test/",
+                Ok(page(
+                    "https://site.test/",
+                    200,
+                    None,
+                    "<div id='x'>loading</div>\
+                     <script>fetch('/api').then(function (r) { return r.json(); }) \
+                       .then(function (d) { document.getElementById('x').textContent = String(d.v); });</script>",
+                )),
+            )],
+            vec![(
+                "https://site.test/api",
+                Ok(FetchResponse {
+                    status: 200,
+                    status_text: "OK".into(),
+                    url: "https://site.test/api".into(),
+                    headers: vec![],
+                    body: "{\"v\":7}".into(),
+                }),
+            )],
+            "https://site.test/",
+        );
+        assert_eq!(
+            text_of_id(b.document.root(), "x").as_deref(),
+            Some("7"),
+            "fetch().json() data rendered after the worker resolved the Promise"
+        );
+    }
+
+    #[test]
+    fn third_party_js_fetch_is_blocked_by_consent() {
+        // A first-party page fetches a third-party URL with no Allow rule: the
+        // fetch is rejected by the consent default-deny (never reaching the canned
+        // response), and the script's .catch runs — JS fetch cannot bypass the
+        // gate.
+        let b = loaded_with_fetches(
+            vec![(
+                "https://site.test/",
+                Ok(page(
+                    "https://site.test/",
+                    200,
+                    None,
+                    "<div id='x'>start</div>\
+                     <script>fetch('https://tracker.evil/collect') \
+                       .then(function () { document.getElementById('x').textContent = 'leaked'; }) \
+                       .catch(function () { document.getElementById('x').textContent = 'blocked'; });</script>",
+                )),
+            )],
+            vec![(
+                "https://tracker.evil/collect",
+                Ok(FetchResponse {
+                    status: 200,
+                    status_text: "OK".into(),
+                    url: "https://tracker.evil/collect".into(),
+                    headers: vec![],
+                    body: "ok".into(),
+                }),
+            )],
+            "https://site.test/",
+        );
+        assert_eq!(
+            text_of_id(b.document.root(), "x").as_deref(),
+            Some("blocked"),
+            "third-party fetch is consent-blocked before the request, and .catch runs"
+        );
     }
 
     #[test]
