@@ -38,6 +38,23 @@ fn is_soft_block(status: u16) -> bool {
     matches!(status, 403 | 429 | 503)
 }
 
+/// Headers the privacy stack owns end-to-end: a `fetch()` caller may not set
+/// them (the sealed identity — UA ladder, sealed cookie jar — is the only source
+/// of truth, so the header and the script-visible identity can never disagree).
+/// `Content-Length` is owned by [`http1::send`], which derives it from the body.
+fn is_engine_owned_header(name: &str) -> bool {
+    name.eq_ignore_ascii_case("host")
+        || name.eq_ignore_ascii_case("user-agent")
+        || name.eq_ignore_ascii_case("cookie")
+        || name.eq_ignore_ascii_case("content-length")
+}
+
+/// Whether a redirect status re-issues the request as a bodyless `GET` (browser
+/// behavior): 301/302/303 do; 307/308 preserve the original method and body.
+fn downgrades_to_get(status: u16) -> bool {
+    matches!(status, 301..=303)
+}
+
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(15);
 const IO_TIMEOUT: Duration = Duration::from_secs(20);
 const MAX_REDIRECTS: u8 = 5;
@@ -162,7 +179,10 @@ impl HttpEngine {
     fn fetch_once(
         &self,
         url: &Url,
+        method: &str,
         user_agent: &str,
+        caller_headers: &[(String, String)],
+        body: &[u8],
         ctx: Option<&FetchContext>,
     ) -> Result<HttpResponse, NetError> {
         let https = match url.scheme.as_str() {
@@ -198,17 +218,26 @@ impl HttpEngine {
         if let Some(value) = cookie_value.as_deref() {
             extra_headers.push(("Cookie", value));
         }
+        // Caller headers (Content-Type, Accept, …) ride alongside, but the
+        // privacy stack owns Host/User-Agent/Cookie — drop any caller attempt
+        // to set those so the sealed identity can never be overridden.
+        for (k, v) in caller_headers {
+            if is_engine_owned_header(k) {
+                continue;
+            }
+            extra_headers.push((k.as_str(), v.as_str()));
+        }
 
         let path = full_path(url);
         let resp = http1::send(
             stream.as_mut(),
             &http1::Request {
-                method: "GET",
+                method,
                 host: &url.host,
                 path: &path,
                 user_agent,
                 headers: &extra_headers,
-                body: &[],
+                body,
             },
         )?;
 
@@ -236,15 +265,27 @@ impl HttpEngine {
     }
 
     /// Fetch with a fixed User-Agent, following redirects.
+    ///
+    /// Method/body are downgraded on redirect the way browsers do: a 301/302/303
+    /// is re-issued as a bodyless `GET` (caller body + `Content-Type` no longer
+    /// apply), while 307/308 preserve the original method and body verbatim.
     fn fetch_redirected(
         &self,
         url: &Url,
+        method: &str,
         user_agent: &str,
+        caller_headers: &[(String, String)],
+        body: &[u8],
         ctx: Option<&FetchContext>,
     ) -> Result<HttpResponse, NetError> {
         let mut current = url.clone();
+        // Owned hop state: a 301/302/303 rewrites it to a bodyless GET, so it
+        // must outlive the borrowed inputs.
+        let mut method = method.to_string();
+        let mut headers = caller_headers.to_vec();
+        let mut body = body.to_vec();
         for _ in 0..=MAX_REDIRECTS {
-            let resp = self.fetch_once(&current, user_agent, ctx)?;
+            let resp = self.fetch_once(&current, &method, user_agent, &headers, &body, ctx)?;
             if (300..400).contains(&resp.status) {
                 if let Some(location) = resp
                     .headers
@@ -253,6 +294,13 @@ impl HttpEngine {
                     .map(|(_, v)| v.clone())
                 {
                     current = resolve_location(&current, &location)?;
+                    if downgrades_to_get(resp.status) && !method.eq_ignore_ascii_case("GET") {
+                        method = "GET".to_string();
+                        body.clear();
+                        // The dropped body's Content-Type no longer describes
+                        // anything; drop it so we don't lie about a GET.
+                        headers.retain(|(k, _)| !k.eq_ignore_ascii_case("content-type"));
+                    }
                     continue;
                 }
             }
@@ -268,10 +316,30 @@ impl HttpEngine {
     /// and escalate one rung per soft block until a request is served. Network
     /// errors are *not* retried up the ladder — a different UA won't fix them.
     fn get_ctx(&self, url: &Url, ctx: Option<&FetchContext>) -> Result<HttpResponse, NetError> {
+        self.request_ctx(url, "GET", &[], &[], ctx)
+    }
+
+    /// The UA-ladder core, generalized over method/headers/body. `get_ctx` is the
+    /// bodyless-GET special case; `fetch_in` threads a method and body through.
+    fn request_ctx(
+        &self,
+        url: &Url,
+        method: &str,
+        caller_headers: &[(String, String)],
+        body: &[u8],
+        ctx: Option<&FetchContext>,
+    ) -> Result<HttpResponse, NetError> {
         let start = *self.ua_memo.lock().unwrap().get(&url.host).unwrap_or(&0);
         let mut last_blocked = None;
         for idx in start..self.user_agents.len() {
-            let resp = self.fetch_redirected(url, &self.user_agents[idx], ctx)?;
+            let resp = self.fetch_redirected(
+                url,
+                method,
+                &self.user_agents[idx],
+                caller_headers,
+                body,
+                ctx,
+            )?;
             if is_soft_block(resp.status) {
                 last_blocked = Some(resp);
                 continue;
@@ -293,6 +361,17 @@ impl HttpClient for HttpEngine {
 
     fn get_in(&self, url: &Url, ctx: &FetchContext) -> Result<HttpResponse, NetError> {
         self.get_ctx(url, Some(ctx))
+    }
+
+    fn fetch_in(
+        &self,
+        url: &Url,
+        method: &str,
+        headers: &[(String, String)],
+        body: &[u8],
+        ctx: &FetchContext,
+    ) -> Result<HttpResponse, NetError> {
+        self.request_ctx(url, method, headers, body, Some(ctx))
     }
 }
 
@@ -355,6 +434,23 @@ impl HttpClient for Router {
             BuiltinHttpClient.get(url)
         } else {
             self.engine.get_in(url, ctx)
+        }
+    }
+
+    fn fetch_in(
+        &self,
+        url: &Url,
+        method: &str,
+        headers: &[(String, String)],
+        body: &[u8],
+        ctx: &FetchContext,
+    ) -> Result<HttpResponse, NetError> {
+        if url.is_builtin() {
+            // Built-in `cerberus:` pages are GET-only; the trait default rejects
+            // anything else (and ignores caller headers for the GET path).
+            BuiltinHttpClient.fetch_in(url, method, headers, body, ctx)
+        } else {
+            self.engine.fetch_in(url, method, headers, body, ctx)
         }
     }
 }
@@ -592,6 +688,171 @@ mod tests {
         assert_eq!(seen.len(), 2, "captured: {seen:?}");
         assert!(seen[0].1.starts_with("a=1"));
         assert!(seen[1].1.starts_with("b=2"));
+    }
+
+    // ---- fetch_in: arbitrary methods through the privacy stack ----
+
+    /// Read a request's header block *and* its declared `Content-Length` body
+    /// (the bodyless [`read_request`] stops at the header terminator).
+    fn read_full_request(stream: &mut std::net::TcpStream) -> String {
+        let head = read_request(stream);
+        let len = head
+            .split("\r\n")
+            .find_map(|line| {
+                let (k, v) = line.split_once(':')?;
+                k.eq_ignore_ascii_case("content-length")
+                    .then(|| v.trim().parse::<usize>().ok())
+                    .flatten()
+            })
+            .unwrap_or(0);
+        let mut body = vec![0u8; len];
+        if len > 0 {
+            stream.read_exact(&mut body).unwrap();
+        }
+        head + &String::from_utf8_lossy(&body)
+    }
+
+    #[test]
+    fn fetch_in_get_matches_get_in() {
+        // A bodyless GET through `fetch_in` must be indistinguishable on the wire
+        // (and in the response) from `get_in`: same privacy stack, no body.
+        fn serve() -> (u16, std::thread::JoinHandle<String>) {
+            let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+            let port = listener.local_addr().unwrap().port();
+            let handle = std::thread::spawn(move || {
+                let (mut s, _) = listener.accept().unwrap();
+                let req = read_full_request(&mut s);
+                s.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok")
+                    .unwrap();
+                req
+            });
+            (port, handle)
+        }
+
+        let ctx = FetchContext {
+            instance: InstanceId::from_u64_pair(0, 1),
+            kind: FetchKind::Navigation,
+        };
+
+        let (port_a, server_a) = serve();
+        let engine_a = HttpEngine::new(Box::new(NoTls), Box::new(LoopbackDns));
+        let url_a = cerberus_url::parse(&format!("http://127.0.0.1:{port_a}/p")).unwrap();
+        let via_get = engine_a.get_in(&url_a, &ctx).unwrap();
+        let req_get = server_a.join().unwrap();
+
+        let (port_b, server_b) = serve();
+        let engine_b = HttpEngine::new(Box::new(NoTls), Box::new(LoopbackDns));
+        let url_b = cerberus_url::parse(&format!("http://127.0.0.1:{port_b}/p")).unwrap();
+        let via_fetch = engine_b.fetch_in(&url_b, "GET", &[], &[], &ctx).unwrap();
+        let req_fetch = server_b.join().unwrap();
+
+        assert_eq!(via_get.status, via_fetch.status);
+        assert_eq!(via_get.body, via_fetch.body);
+        // Same request line and no body on either path (port differs by design).
+        assert!(req_get.starts_with("GET /p HTTP/1.1\r\n"), "{req_get:?}");
+        assert!(
+            req_fetch.starts_with("GET /p HTTP/1.1\r\n"),
+            "{req_fetch:?}"
+        );
+        assert!(!req_fetch.contains("Content-Length:"), "{req_fetch:?}");
+    }
+
+    #[test]
+    fn fetch_in_post_sends_body_and_merges_caller_headers_but_not_owned_ones() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+
+        let server = std::thread::spawn(move || {
+            let (mut s, _) = listener.accept().unwrap();
+            let req = read_full_request(&mut s);
+            s.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok")
+                .unwrap();
+            req
+        });
+
+        // Pre-seed a cookie so we can prove the sealed jar (not the caller) owns
+        // `Cookie`, and try to override Host/User-Agent/Cookie from the caller.
+        let jar = Arc::new(RecordingJar::default());
+        jar.seen
+            .lock()
+            .unwrap()
+            .push(("http://x".into(), "sealed=1".into()));
+        let engine =
+            HttpEngine::with_jar(Box::new(NoTls), Box::new(LoopbackDns), Some(jar.clone()));
+        let url = cerberus_url::parse(&format!("http://127.0.0.1:{port}/submit")).unwrap();
+        let ctx = FetchContext {
+            instance: InstanceId::from_u64_pair(0, 1),
+            kind: FetchKind::Navigation,
+        };
+        let headers = vec![
+            ("Content-Type".to_string(), "application/json".to_string()),
+            // These must all be dropped — the privacy stack owns them.
+            ("User-Agent".to_string(), "EvilUA/9".to_string()),
+            ("Host".to_string(), "evil.example".to_string()),
+            ("Cookie".to_string(), "spoof=1".to_string()),
+        ];
+        let body = br#"{"k":"v"}"#;
+        let resp = engine.fetch_in(&url, "POST", &headers, body, &ctx).unwrap();
+        let req = server.join().unwrap();
+
+        assert_eq!(resp.status, 200);
+        // Method + body landed on the wire.
+        assert!(req.starts_with("POST /submit HTTP/1.1\r\n"), "{req:?}");
+        assert!(req.contains(r#"{"k":"v"}"#), "body missing: {req:?}");
+        // http1::send derived Content-Length from the body.
+        assert!(
+            req.contains(&format!("Content-Length: {}\r\n", body.len())),
+            "{req:?}"
+        );
+        // Caller's Content-Type rode alongside.
+        assert!(
+            req.contains("Content-Type: application/json\r\n"),
+            "{req:?}"
+        );
+        // The privacy stack still owns Host/User-Agent, and the sealed jar owns
+        // Cookie — the caller's attempts to set any of them were dropped.
+        assert!(req.contains("Host: 127.0.0.1\r\n"), "{req:?}");
+        assert!(req.contains("User-Agent: Cerberus/0.0\r\n"), "{req:?}");
+        assert!(!req.contains("EvilUA/9"), "spoofed UA leaked: {req:?}");
+        assert!(
+            !req.contains("evil.example"),
+            "spoofed Host leaked: {req:?}"
+        );
+        assert!(req.contains("Cookie: sealed=1\r\n"), "{req:?}");
+        assert!(!req.contains("spoof=1"), "spoofed Cookie leaked: {req:?}");
+    }
+
+    #[test]
+    fn fetch_in_captures_set_cookie_into_the_jar() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let server = std::thread::spawn(move || {
+            let (mut s, _) = listener.accept().unwrap();
+            let _ = read_full_request(&mut s);
+            s.write_all(
+                b"HTTP/1.1 200 OK\r\nSet-Cookie: sid=abc; Path=/\r\n\
+                  Content-Length: 2\r\nConnection: close\r\n\r\nok",
+            )
+            .unwrap();
+        });
+
+        let jar = Arc::new(RecordingJar::default());
+        let engine =
+            HttpEngine::with_jar(Box::new(NoTls), Box::new(LoopbackDns), Some(jar.clone()));
+        let url = cerberus_url::parse(&format!("http://127.0.0.1:{port}/api")).unwrap();
+        let ctx = FetchContext {
+            instance: InstanceId::from_u64_pair(0, 1),
+            kind: FetchKind::Navigation,
+        };
+        let resp = engine
+            .fetch_in(&url, "POST", &[], b"payload", &ctx)
+            .unwrap();
+        server.join().unwrap();
+
+        assert_eq!(resp.status, 200);
+        let seen = jar.seen.lock().unwrap();
+        assert_eq!(seen.len(), 1, "captured: {seen:?}");
+        assert!(seen[0].1.starts_with("sid=abc"), "{seen:?}");
     }
 
     #[test]
