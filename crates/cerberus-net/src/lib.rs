@@ -105,6 +105,33 @@ pub trait HttpClient: Send + Sync {
         let _ = ctx;
         self.get(url)
     }
+
+    /// Perform an arbitrary-method request (for JS `fetch()`), inside an
+    /// identity context. The privacy stack still owns `Host`, `User-Agent`, and
+    /// `Cookie`; caller `headers` (e.g. `Content-Type`, `Accept`) are merged in
+    /// addition and may not override those.
+    ///
+    /// The default impl only knows how to do a bodyless GET — it delegates to
+    /// [`get_in`](Self::get_in) (ignoring caller `headers`) — so simple
+    /// implementations (the built-in pages, tests) keep compiling. Only the
+    /// real engine honors arbitrary methods, bodies, and caller headers.
+    fn fetch_in(
+        &self,
+        url: &Url,
+        method: &str,
+        headers: &[(String, String)],
+        body: &[u8],
+        ctx: &FetchContext,
+    ) -> Result<HttpResponse, NetError> {
+        if method.eq_ignore_ascii_case("GET") && body.is_empty() {
+            let _ = headers;
+            self.get_in(url, ctx)
+        } else {
+            Err(NetError::Unsupported(format!(
+                "{method} requests are not supported by this client"
+            )))
+        }
+    }
 }
 
 /// A fully-buffered HTTP response.
