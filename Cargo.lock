@@ -259,6 +259,7 @@ dependencies = [
  "cerberus-js-dom",
  "cerberus-js-quickjs",
  "cerberus-layout",
+ "cerberus-mirror",
  "cerberus-net",
  "cerberus-paint",
  "cerberus-shell",

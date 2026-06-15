@@ -8,6 +8,8 @@
 //! identities → sealed storage → (built-in) fetch → parse → layout → paint →
 //! present, with the consent and farbling seams exercised along the way.
 
+pub mod mirror;
+
 use cerberus_consent::{ConsentEvent, ConsentPolicy, Decision, DefaultDenyPolicy};
 use cerberus_crypto::Secret;
 use cerberus_crypto_rustcrypto::{Argon2idKdf, XChaCha20Poly1305Aead};
