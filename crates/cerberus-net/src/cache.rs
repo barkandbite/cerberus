@@ -1,24 +1,43 @@
-//! A small HTTP response cache, **partitioned by `InstanceId`**.
+//! A small HTTP response cache, **partitioned by `InstanceId`** for privacy,
+//! with **content-addressed body interning** for memory.
 //!
 //! A cache shared across identities would be a cross-site/cross-identity tracking
-//! vector (cache-timing), so entries are sealed per instance just like cookies.
+//! vector (cache-timing), so *entries* are sealed per instance just like cookies
+//! (ADR-0006): one identity never sees another's hit/miss. But identical response
+//! *bytes* cached by several instances of the same site need not be stored more
+//! than once — so bodies are interned in a content-addressed pool shared across
+//! instances (`Arc<[u8]>`, deduped by content hash, weak-referenced so a body
+//! frees when its last entry drops). N instances caching identical content cost
+//! one body allocation, while per-instance hit/miss behavior is unchanged
+//! (ADR-0016).
+//!
 //! Conservative policy: only `200` responses with an explicit `Cache-Control:
 //! max-age` are stored, and never when `no-store`/`no-cache` is present.
 
 use crate::HttpResponse;
 use cerberus_types::InstanceId;
 use std::collections::HashMap;
+use std::hash::{Hash, Hasher};
+use std::sync::{Arc, Weak};
 use std::time::{Duration, Instant};
 
 struct Entry {
-    response: HttpResponse,
+    status: u16,
+    headers: Vec<(String, String)>,
+    /// Shared with any other instance's entry that cached identical bytes.
+    body: Arc<[u8]>,
     expires: Instant,
 }
 
-/// An in-memory, per-instance response cache. (On-disk caching is later work.)
+/// An in-memory, per-instance response cache with shared body interning.
+/// (On-disk caching is later work.)
 #[derive(Default)]
 pub struct HttpCache {
     entries: HashMap<(InstanceId, String), Entry>,
+    /// Content-addressed body pool: `content-hash -> live body allocations`.
+    /// Weak, so a body frees when its last [`Entry`] drops; dead weaks are pruned
+    /// lazily on the next intern of the same hash (ADR-0016).
+    bodies: HashMap<u64, Vec<Weak<[u8]>>>,
 }
 
 impl HttpCache {
@@ -33,11 +52,17 @@ impl HttpCache {
         if Instant::now() >= entry.expires {
             None
         } else {
-            Some(entry.response.clone())
+            Some(HttpResponse {
+                status: entry.status,
+                headers: entry.headers.clone(),
+                body: entry.body.to_vec(),
+            })
         }
     }
 
-    /// Store `response` for `(instance, url)` if its headers permit caching.
+    /// Store `response` for `(instance, url)` if its headers permit caching. The
+    /// body is interned, so an identical body already cached (by any instance) is
+    /// stored only once.
     pub fn store(&mut self, instance: InstanceId, url: &str, response: &HttpResponse) {
         if response.status != 200 {
             return;
@@ -57,20 +82,49 @@ impl HttpCache {
         // Never store Set-Cookie: a cookie write must happen exactly once, at
         // capture time in the engine — replaying one from cache would re-apply
         // stale cookies (and would persist them if the cache ever goes on disk).
-        let mut response = response.clone();
-        response
+        let headers: Vec<(String, String)> = response
             .headers
-            .retain(|(k, _)| !k.eq_ignore_ascii_case("set-cookie"));
+            .iter()
+            .filter(|(k, _)| !k.eq_ignore_ascii_case("set-cookie"))
+            .cloned()
+            .collect();
+        let body = self.intern_body(&response.body);
         self.entries.insert(
             (instance, url.to_string()),
             Entry {
-                response,
+                status: response.status,
+                headers,
+                body,
                 expires: Instant::now() + Duration::from_secs(max_age),
             },
         );
     }
 
-    /// Drop all entries for an instance (e.g. on identity reset).
+    /// Return a shared handle to `bytes`, reusing an existing identical body
+    /// (cached by any instance) so it is stored once. Prunes freed weak refs.
+    fn intern_body(&mut self, bytes: &[u8]) -> Arc<[u8]> {
+        let bucket = self.bodies.entry(body_hash(bytes)).or_default();
+        let mut found: Option<Arc<[u8]>> = None;
+        // Single pass: drop dead weaks, and adopt the first live identical body.
+        bucket.retain(|weak| match weak.upgrade() {
+            Some(arc) => {
+                if found.is_none() && *arc == *bytes {
+                    found = Some(arc.clone());
+                }
+                true
+            }
+            None => false,
+        });
+        if let Some(arc) = found {
+            return arc;
+        }
+        let arc: Arc<[u8]> = Arc::from(bytes);
+        bucket.push(Arc::downgrade(&arc));
+        arc
+    }
+
+    /// Drop all entries for an instance (e.g. on identity reset). Interned bodies
+    /// they held free here if no other instance still references them.
     pub fn clear_instance(&mut self, instance: InstanceId) {
         self.entries.retain(|(i, _), _| *i != instance);
     }
@@ -84,6 +138,23 @@ impl HttpCache {
     pub fn is_empty(&self) -> bool {
         self.entries.is_empty()
     }
+
+    /// Number of distinct body allocations currently live — the dedup invariant
+    /// hook (ADR-0016): identical bodies across instances count once.
+    #[cfg(test)]
+    fn distinct_bodies(&self) -> usize {
+        self.bodies
+            .values()
+            .flat_map(|bucket| bucket.iter())
+            .filter(|w| w.strong_count() > 0)
+            .count()
+    }
+}
+
+fn body_hash(bytes: &[u8]) -> u64 {
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    bytes.hash(&mut h);
+    h.finish()
 }
 
 fn parse_max_age(cache_control: &str) -> Option<u64> {
@@ -97,12 +168,16 @@ fn parse_max_age(cache_control: &str) -> Option<u64> {
 mod tests {
     use super::*;
 
-    fn resp(cache_control: &str) -> HttpResponse {
+    fn resp_body(cache_control: &str, body: &[u8]) -> HttpResponse {
         HttpResponse {
             status: 200,
             headers: vec![("Cache-Control".to_string(), cache_control.to_string())],
-            body: b"hi".to_vec(),
+            body: body.to_vec(),
         }
+    }
+
+    fn resp(cache_control: &str) -> HttpResponse {
+        resp_body(cache_control, b"hi")
     }
 
     fn a() -> InstanceId {
@@ -144,5 +219,35 @@ mod tests {
         c.clear_instance(a());
         assert!(c.get(a(), "https://x/").is_none());
         assert!(c.get(b(), "https://x/").is_some());
+    }
+
+    #[test]
+    fn identical_bodies_are_interned_once_across_instances() {
+        let mut c = HttpCache::new();
+        // Same body cached by two instances: two sealed entries, one allocation.
+        c.store(a(), "https://x/", &resp_body("max-age=60", b"shared-bytes"));
+        c.store(b(), "https://x/", &resp_body("max-age=60", b"shared-bytes"));
+        assert_eq!(c.len(), 2, "per-instance entries are independent");
+        assert_eq!(c.distinct_bodies(), 1, "but the body is stored once");
+        assert_eq!(c.get(a(), "https://x/").unwrap().body, b"shared-bytes");
+        assert_eq!(c.get(b(), "https://x/").unwrap().body, b"shared-bytes");
+
+        // A different body is a distinct allocation.
+        c.store(a(), "https://y/", &resp_body("max-age=60", b"other-bytes"));
+        assert_eq!(c.distinct_bodies(), 2);
+    }
+
+    #[test]
+    fn interned_body_frees_when_last_entry_drops() {
+        let mut c = HttpCache::new();
+        c.store(a(), "https://x/", &resp_body("max-age=60", b"bytes"));
+        c.store(b(), "https://x/", &resp_body("max-age=60", b"bytes"));
+        assert_eq!(c.distinct_bodies(), 1);
+        c.clear_instance(a());
+        // b still holds it.
+        assert_eq!(c.distinct_bodies(), 1);
+        c.clear_instance(b());
+        // No entry references it now — the allocation is freed (weak is dead).
+        assert_eq!(c.distinct_bodies(), 0);
     }
 }
