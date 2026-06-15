@@ -14,7 +14,7 @@ use std::num::NonZeroU32;
 use std::rc::Rc;
 use std::sync::Arc;
 
-use cerberus_shell::{FrameApp, Waker};
+use cerberus_shell::{FrameApp, MultiSurfaceApp, Waker};
 use cerberus_types::Size;
 use winit::application::ApplicationHandler;
 use winit::event::{ElementState, KeyEvent, MouseButton, WindowEvent};
@@ -221,6 +221,167 @@ pub fn run(app: impl FrameApp + 'static, fullscreen: bool) -> Result<(), WinitEr
         .app
         .set_waker(Arc::new(ProxyWaker(event_loop.create_proxy())));
 
+    event_loop
+        .run_app(&mut state)
+        .map_err(|e| WinitError::EventLoop(e.to_string()))?;
+
+    match state.error.take() {
+        Some(err) => Err(err),
+        None => Ok(()),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Multi-window: drive a `MultiSurfaceApp` across N OS windows (ADR-0017/0018).
+// ---------------------------------------------------------------------------
+
+/// One window + its drawing surface, tagged with the app's window index.
+struct WindowSlot {
+    window: Rc<Window>,
+    surface: WinitSurface,
+}
+
+/// Drives a [`MultiSurfaceApp`] across N windows. Window slots are created in
+/// app-index order, so `slots[idx]` is the surface for app window `idx`.
+struct MultiState<A: MultiSurfaceApp> {
+    app: A,
+    slots: Vec<WindowSlot>,
+    cursors: Vec<(f64, f64)>,
+    error: Option<WinitError>,
+}
+
+impl<A: MultiSurfaceApp> MultiState<A> {
+    fn idx_of(&self, id: WindowId) -> Option<usize> {
+        self.slots.iter().position(|s| s.window.id() == id)
+    }
+
+    fn request_redraw(&self, idx: usize) {
+        if let Some(slot) = self.slots.get(idx) {
+            slot.window.request_redraw();
+        }
+    }
+
+    fn redraw(&mut self, idx: usize) {
+        let Some(slot) = self.slots.get(idx) else {
+            return;
+        };
+        let window = slot.window.clone();
+        let size = window.inner_size();
+        let (w, h) = (size.width.max(1), size.height.max(1));
+
+        // Render before borrowing the surface (disjoint field borrows).
+        let frame = self.app.render(idx, Size::new(w, h));
+
+        let Some(slot) = self.slots.get_mut(idx) else {
+            return;
+        };
+        let (Some(nw), Some(nh)) = (NonZeroU32::new(w), NonZeroU32::new(h)) else {
+            return;
+        };
+        if slot.surface.resize(nw, nh).is_err() {
+            return;
+        }
+        let Ok(mut buffer) = slot.surface.buffer_mut() else {
+            return;
+        };
+        for (dst, px) in buffer.iter_mut().zip(frame.rgba.chunks_exact(4)) {
+            *dst = (px[0] as u32) << 16 | (px[1] as u32) << 8 | px[2] as u32;
+        }
+        let _ = buffer.present();
+    }
+}
+
+impl<A: MultiSurfaceApp> ApplicationHandler for MultiState<A> {
+    fn resumed(&mut self, event_loop: &ActiveEventLoop) {
+        if !self.slots.is_empty() {
+            return;
+        }
+        let count = self.app.window_count();
+        for idx in 0..count {
+            let attrs = Window::default_attributes().with_title(self.app.title(idx));
+            let window = match event_loop.create_window(attrs) {
+                Ok(w) => Rc::new(w),
+                Err(e) => {
+                    self.error = Some(WinitError::Surface(e.to_string()));
+                    event_loop.exit();
+                    return;
+                }
+            };
+            let surface = match softbuffer::Context::new(window.clone())
+                .and_then(|ctx| softbuffer::Surface::new(&ctx, window.clone()))
+            {
+                Ok(s) => s,
+                Err(e) => {
+                    self.error = Some(WinitError::Surface(e.to_string()));
+                    event_loop.exit();
+                    return;
+                }
+            };
+            self.slots.push(WindowSlot { window, surface });
+        }
+        self.cursors = vec![(0.0, 0.0); self.slots.len()];
+        for idx in 0..self.slots.len() {
+            self.request_redraw(idx);
+        }
+    }
+
+    fn window_event(&mut self, event_loop: &ActiveEventLoop, id: WindowId, event: WindowEvent) {
+        let Some(idx) = self.idx_of(id) else {
+            return;
+        };
+        match event {
+            // Closing any window tears the whole mirror group down.
+            WindowEvent::CloseRequested => event_loop.exit(),
+            WindowEvent::Resized(_) => self.request_redraw(idx),
+            WindowEvent::CursorMoved { position, .. } => {
+                if let Some(c) = self.cursors.get_mut(idx) {
+                    *c = (position.x, position.y);
+                }
+            }
+            WindowEvent::MouseInput { state, button, .. } => {
+                if state == ElementState::Pressed && button == MouseButton::Left {
+                    let (x, y) = self.cursors.get(idx).copied().unwrap_or((0.0, 0.0));
+                    for w in self.app.pointer_down(idx, x as i32, y as i32) {
+                        self.request_redraw(w);
+                    }
+                }
+            }
+            // Raising a follower window is its chance to catch up to the master.
+            WindowEvent::Focused(true) => {
+                for w in self.app.focus(idx) {
+                    self.request_redraw(w);
+                }
+            }
+            WindowEvent::KeyboardInput { event, .. } => {
+                if event.state == ElementState::Pressed {
+                    if let Some(text) = event.text {
+                        for c in text.chars() {
+                            for w in self.app.text_input(idx, c) {
+                                self.request_redraw(w);
+                            }
+                        }
+                    }
+                }
+            }
+            WindowEvent::RedrawRequested => self.redraw(idx),
+            _ => {}
+        }
+    }
+}
+
+/// Run a [`MultiSurfaceApp`] in N OS windows until one is closed. Requires a
+/// display server; the multi-surface driving logic itself is exercised
+/// headlessly in `cerberus-app`'s `MirrorShell` tests.
+pub fn run_multi(app: impl MultiSurfaceApp + 'static) -> Result<(), WinitError> {
+    let event_loop = EventLoop::new().map_err(|e| WinitError::EventLoop(e.to_string()))?;
+    event_loop.set_control_flow(ControlFlow::Wait);
+
+    let mut state = MultiState {
+        app,
+        slots: Vec::new(),
+        cursors: Vec::new(),
+        error: None,
+    };
     event_loop
         .run_app(&mut state)
         .map_err(|e| WinitError::EventLoop(e.to_string()))?;
