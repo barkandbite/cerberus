@@ -26,6 +26,7 @@ impl RustlsProvider {
     /// Build a provider trusting the operating system's root store instead of
     /// the bundled set. Not the default — useful behind a TLS-inspecting
     /// corporate/egress proxy whose CA is installed system-wide. Linux path.
+    #[cfg(target_os = "linux")]
     pub fn with_system_roots() -> std::io::Result<Self> {
         use rustls::pki_types::pem::PemObject;
         use rustls::pki_types::CertificateDer;
@@ -38,6 +39,19 @@ impl RustlsProvider {
             let _ = roots.add(cert);
         }
         Ok(Self::from_roots(roots))
+    }
+
+    /// `--system-roots` reads the OS trust store; only the Linux PEM-bundle path
+    /// is implemented today. On other platforms this returns a clear error so the
+    /// CLI can tell the user to omit the flag — the default bundled Mozilla roots
+    /// ([`RustlsProvider::new`]) work everywhere. A native store reader (e.g.
+    /// `rustls-native-certs` / SChannel / Security.framework) is a deferred
+    /// follow-up (ADR-0015).
+    #[cfg(not(target_os = "linux"))]
+    pub fn with_system_roots() -> std::io::Result<Self> {
+        Err(std::io::Error::other(
+            "--system-roots is only supported on Linux; omit it to use the bundled Mozilla roots",
+        ))
     }
 
     fn from_roots(roots: RootCertStore) -> Self {
