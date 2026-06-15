@@ -392,6 +392,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "cerberus-mirror"
+version = "0.0.0"
+dependencies = [
+ "cerberus-dom",
+ "cerberus-js",
+ "cerberus-js-dom",
+ "cerberus-js-quickjs",
+ "cerberus-types",
+]
+
+[[package]]
 name = "cerberus-net"
 version = "0.0.0"
 dependencies = [
