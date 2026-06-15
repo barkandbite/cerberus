@@ -103,6 +103,33 @@ pub trait FrameApp {
     fn backspace(&mut self) -> bool;
 }
 
+/// An application that drives **multiple** surfaces (windows) at once — the
+/// shape `cerberus-shell-winit::run_multi` renders. Window `0` is the master the
+/// user drives; the rest mirror it and catch up when focused. Each input method
+/// returns the window indices needing a redraw — driving the master leaves
+/// followers to catch up lazily on [`focus`](MultiSurfaceApp::focus).
+pub trait MultiSurfaceApp {
+    /// How many windows to open.
+    fn window_count(&self) -> usize;
+
+    /// Title for window `idx`.
+    fn title(&self, idx: usize) -> String;
+
+    /// Render window `idx` at `size`.
+    fn render(&mut self, idx: usize, size: Size) -> Framebuffer;
+
+    /// Pointer press at device coordinates in window `idx`. Returns the windows
+    /// that need redrawing.
+    fn pointer_down(&mut self, idx: usize, x: i32, y: i32) -> Vec<usize>;
+
+    /// A typed character into window `idx`. Returns the windows to redraw.
+    fn text_input(&mut self, idx: usize, c: char) -> Vec<usize>;
+
+    /// Window `idx` was raised/focused — a chance to catch it up. Returns the
+    /// windows to redraw.
+    fn focus(&mut self, idx: usize) -> Vec<usize>;
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

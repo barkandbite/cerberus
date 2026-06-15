@@ -11,13 +11,19 @@
 
 use std::sync::Arc;
 
+use cerberus_css::CssEngine;
 use cerberus_dom::{parse_html, Document};
 use cerberus_identity::HeadManager;
 use cerberus_js::JsEngineFactory;
 use cerberus_js_quickjs::QuickJsEngineFactory;
+use cerberus_layout::{BlockLayout, ElementBox, LayoutEngine, NoForms, NoImages};
 use cerberus_mirror::{MirrorError, MirrorGroup, PageSource};
 use cerberus_net::{BuiltinHttpClient, FetchContext, FetchKind, HttpClient};
-use cerberus_types::InstanceId;
+use cerberus_paint::{Framebuffer, Rasterizer};
+use cerberus_shell::MultiSurfaceApp;
+use cerberus_style::StyleEngine;
+use cerberus_text::TextEngine;
+use cerberus_types::{Color, InstanceId, Rect, Size};
 use cerberus_url::parse as parse_url;
 
 /// A [`PageSource`] over the app's synchronous load path.
@@ -90,6 +96,125 @@ pub fn mirror_group_from_heads(
     MirrorGroup::new(engine, source, members, viewport, user_agent)
 }
 
+/// Drives a [`MirrorGroup`] across N surfaces (ADR-0017/0018): renders each
+/// instance's page and turns clicks on the **master** window into broadcast
+/// actions. Window 0 is the master; the rest mirror it and catch up when
+/// [`focus`](MultiSurfaceApp::focus)ed. Implements [`MultiSurfaceApp`] so
+/// `cerberus-shell-winit::run_multi` can place it in N OS windows.
+pub struct MirrorShell {
+    group: MirrorGroup,
+    style: CssEngine,
+    text: TextEngine,
+    background: Color,
+    /// Hit boxes from the master's last render, for click → target mapping.
+    master_elements: Vec<ElementBox>,
+}
+
+impl MirrorShell {
+    /// Wrap a built group (e.g. from [`mirror_group_from_heads`]).
+    pub fn new(group: MirrorGroup) -> Self {
+        Self {
+            group,
+            style: CssEngine::new(),
+            text: TextEngine::new(),
+            background: Color::WHITE,
+            master_elements: Vec::new(),
+        }
+    }
+
+    /// The driven group (read-only).
+    pub fn group(&self) -> &MirrorGroup {
+        &self.group
+    }
+
+    /// How many profiles are being driven — the count the toolbar badge shows.
+    pub fn driven_count(&self) -> usize {
+        self.group.instances().len()
+    }
+
+    /// Navigate every window to `url` (recorded on the master, replayed on each
+    /// follower when it next catches up).
+    pub fn navigate(&mut self, url: &str) -> Result<(), MirrorError> {
+        self.group
+            .act(cerberus_mirror::Action::Navigate(url.to_string()))
+    }
+
+    /// Render instance `idx`'s current document, keeping the master's hit boxes.
+    fn render_instance(&mut self, idx: usize, size: Size) -> Framebuffer {
+        let mut fb = Framebuffer::new(size);
+        fb.clear(self.background);
+        let Some(instance) = self.group.instance(idx) else {
+            return fb;
+        };
+        let styled = self.style.style(instance.document());
+        let mut layout = BlockLayout::default();
+        let laid = layout.layout(&styled, size, &self.text, &NoImages, &NoForms);
+        self.text.rasterize(&laid.display, &mut fb);
+        if idx == self.group.master_index() {
+            self.master_elements = laid.elements;
+        }
+        fb
+    }
+}
+
+impl MultiSurfaceApp for MirrorShell {
+    fn window_count(&self) -> usize {
+        self.group.instances().len()
+    }
+
+    fn title(&self, idx: usize) -> String {
+        match self.group.instance(idx) {
+            Some(instance) => format!("Cerberus — {}", instance.label()),
+            None => "Cerberus".to_string(),
+        }
+    }
+
+    fn render(&mut self, idx: usize, size: Size) -> Framebuffer {
+        self.render_instance(idx, size)
+    }
+
+    fn pointer_down(&mut self, idx: usize, x: i32, y: i32) -> Vec<usize> {
+        // Only the master is driven directly; followers mirror it.
+        if idx != self.group.master_index() {
+            return Vec::new();
+        }
+        // Innermost element under the point → the most specific target.
+        let target = {
+            let doc = self.group.master().document();
+            self.master_elements
+                .iter()
+                .filter(|e| rect_contains(e.rect, x, y))
+                .min_by_key(|e| u64::from(e.rect.w) * u64::from(e.rect.h))
+                .and_then(|e| cerberus_mirror::describe(doc, e.node))
+        };
+        match target {
+            Some(t) => {
+                let _ = self.group.act(cerberus_mirror::Action::Click(t));
+                vec![self.group.master_index()]
+            }
+            None => Vec::new(),
+        }
+    }
+
+    fn text_input(&mut self, _idx: usize, _c: char) -> Vec<usize> {
+        // Typed-text and autofill driving arrive with the autofill phase
+        // (ADR-0019); clicks already broadcast through `pointer_down`.
+        Vec::new()
+    }
+
+    fn focus(&mut self, idx: usize) -> Vec<usize> {
+        match self.group.focus(idx) {
+            Ok(()) => vec![idx],
+            Err(_) => Vec::new(),
+        }
+    }
+}
+
+/// Whether device point `(x, y)` is inside `r`.
+fn rect_contains(r: Rect, x: i32, y: i32) -> bool {
+    x >= r.x && y >= r.y && x < r.x + r.w as i32 && y < r.y + r.h as i32
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -140,5 +265,67 @@ mod tests {
         assert_eq!(master_text, follower_text, "follower converged");
         assert!(group.live_realms() <= 1, "at most one live realm");
         assert_eq!(group.instance(1).unwrap().cursor(), group.log().len());
+    }
+
+    #[test]
+    fn shell_drives_master_clicks_and_catches_up_followers() {
+        let heads = two_identities();
+        let group = mirror_group_from_heads(
+            &heads,
+            Box::new(AppPageSource::builtin_only()),
+            (800, 600),
+            "ua",
+        )
+        .unwrap();
+        let mut shell = MirrorShell::new(group);
+        assert_eq!(shell.window_count(), 2);
+        assert_eq!(shell.driven_count(), 2);
+        assert!(shell.title(0).contains("work"));
+
+        shell.navigate("cerberus:about").unwrap();
+        assert_eq!(shell.group().log().len(), 1);
+
+        let size = Size::new(800, 600);
+        let fb = shell.render(0, size);
+        assert!(fb.pixel(0, 0).is_some());
+
+        // Some master click lands on a page element and broadcasts an action.
+        let before = shell.group().log().len();
+        let mut acted = false;
+        'scan: for gy in (0..600).step_by(15) {
+            for gx in (0..800).step_by(15) {
+                if !shell.pointer_down(0, gx, gy).is_empty() {
+                    acted = true;
+                    break 'scan;
+                }
+            }
+        }
+        assert!(acted, "a master click should hit an element and broadcast");
+        assert!(shell.group().log().len() > before);
+
+        // Followers are not driven directly.
+        assert!(shell.pointer_down(1, 5, 5).is_empty());
+
+        // Focusing the follower catches it up to the master.
+        assert_eq!(shell.focus(1), vec![1usize]);
+        assert_eq!(
+            shell.group().instance(1).unwrap().cursor(),
+            shell.group().log().len()
+        );
+    }
+
+    #[test]
+    fn rect_contains_edges() {
+        let r = Rect {
+            x: 10,
+            y: 10,
+            w: 100,
+            h: 50,
+        };
+        assert!(rect_contains(r, 10, 10));
+        assert!(rect_contains(r, 109, 59));
+        assert!(!rect_contains(r, 9, 10));
+        assert!(!rect_contains(r, 110, 10));
+        assert!(!rect_contains(r, 10, 60));
     }
 }
