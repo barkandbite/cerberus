@@ -78,6 +78,7 @@ that names concrete adapters and wires them together via dependency injection.
 | `cerberus-shell` | Platform surface + `FrameApp` seam | `PlatformSurface`, `FrameApp` | none |
 | `cerberus-shell-winit` | Windowing adapter (windowed/fullscreen) | drives `FrameApp` | winit, softbuffer (ADR-0004) |
 | `cerberus-headless` | Render-to-PPM/PNG, automation | — | none (PNG at M2) |
+| `cerberus-sysmem` | Resident-memory probe (procfs / Win32 working set) | — | none (FFI adapter, ADR-0015) |
 | `cerberus-app` | Composition root + CLI + memory gate | — | none |
 
 \* The required `CookieStore` trait is realized as the `StorageEnvironment` /

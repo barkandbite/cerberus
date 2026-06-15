@@ -3482,32 +3482,10 @@ pub fn head_switch_rss(switches: usize) -> Option<(u64, u64)> {
     Some((before, after))
 }
 
-/// Resident set size in kilobytes. Linux reads `VmRSS` from `/proc/self/status`;
-/// other platforms return `None` for now (a native probe — Win32
-/// `GetProcessMemoryInfo` / mach `task_info` — is a deferred follow-up, see
-/// ADR-0015), and the `mem-gate` command degrades gracefully by skipping the
-/// budget assertion.
-#[cfg(target_os = "linux")]
-pub fn resident_set_kb() -> Option<u64> {
-    let status = std::fs::read_to_string("/proc/self/status").ok()?;
-    for line in status.lines() {
-        if let Some(rest) = line.strip_prefix("VmRSS:") {
-            return rest
-                .split_whitespace()
-                .next()
-                .and_then(|n| n.parse::<u64>().ok());
-        }
-    }
-    None
-}
-
-/// See the Linux implementation. Non-Linux platforms have no procfs; a native
-/// RSS probe is deferred (ADR-0015), so this returns `None` and the mem-gate
-/// skips enforcement.
-#[cfg(not(target_os = "linux"))]
-pub fn resident_set_kb() -> Option<u64> {
-    None
-}
+/// Process resident set size in kilobytes, via the [`cerberus_sysmem`] adapter
+/// (procfs on Linux, the Win32 working set on Windows, `None` elsewhere —
+/// ADR-0015). `mem-gate` degrades gracefully when this is `None`.
+pub use cerberus_sysmem::resident_set_kb;
 
 #[cfg(test)]
 mod tests {

@@ -1,0 +1,14 @@
+[package]
+publish = false
+name = "cerberus-sysmem"
+description = "Resident-memory probe behind a cross-platform seam (procfs / Win32)."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]

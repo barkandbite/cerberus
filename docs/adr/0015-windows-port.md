@@ -50,16 +50,22 @@ build; change nothing in the core.** No new dependencies; no `unsafe` added.
 macOS is explicitly out of scope for this increment; the same `cfg(not(linux))`
 arms already compile there, so it is the same two follow-ups when we add it.
 
+## Resolved after the fact
+
+- **Native Windows RSS** for `mem-gate` — implemented as option (b): a
+  **no-dependency** `cerberus-sysmem` adapter crate wrapping Win32
+  `GetProcessMemoryInfo` (the process working set), with the single `unsafe` FFI
+  isolated and reviewed there (PLAN §7). No third-party crate, so no ADR-0003
+  sign-off was needed. The Windows memory-budget gate now enforces (the CI
+  `mem-gate` step runs on both OSes). macOS reuses the adapter's `None` arm until
+  a `task_info` probe is added.
+
 ## Deferred (need owner sign-off — ADR-0003 governs dependencies)
 
-- **Native Windows/macOS RSS** for `mem-gate`. Options: (a) the `memory-stats`
-  crate — safe, cross-platform, but pulls the `windows-sys` binding tree; (b) a
-  no-dependency `cerberus-sysmem` **adapter crate** with the unsafe `Win32`/mach
-  FFI isolated there (per PLAN §7, unsafe is allowed and reviewed in adapter
-  crates); (c) leave it degraded. Until decided, the Windows budget gate is
-  skipped (the Linux gate still enforces 64 MB).
-- **Windows `--system-roots`** via `rustls-native-certs` (SChannel) — another
-  dependency, deferred behind the same approval.
+- **Windows `--system-roots`** via `rustls-native-certs` (SChannel) — a new
+  dependency, deferred behind owner approval. The default bundled Mozilla roots
+  work on Windows today, so this only affects the niche TLS-inspecting-proxy
+  flag.
 
 ## Consequences
 

@@ -265,6 +265,7 @@ dependencies = [
  "cerberus-shell-winit",
  "cerberus-storage",
  "cerberus-style",
+ "cerberus-sysmem",
  "cerberus-text",
  "cerberus-tls-rustls",
  "cerberus-types",
@@ -439,6 +440,10 @@ dependencies = [
  "cerberus-dom",
  "cerberus-types",
 ]
+
+[[package]]
+name = "cerberus-sysmem"
+version = "0.0.0"
 
 [[package]]
 name = "cerberus-text"

@@ -46,11 +46,11 @@ jobs:
       - name: Test
         run: cargo test --workspace --locked
 
-      # Memory regression gate (PLAN.md "Memory budget"). RSS is read from procfs,
-      # so it is Linux-only today; other platforms degrade gracefully (the gate
-      # skips), so we only assert it where it is meaningful (ADR-0015).
+      # Memory regression gate (PLAN.md "Memory budget"). RSS now reads on Linux
+      # (procfs) and Windows (Win32 working set, via the cerberus-sysmem adapter),
+      # so the gate enforces on both (ADR-0015); platforms without a probe degrade
+      # gracefully (the command skips its assertion).
       - name: Memory gate (idle RSS + head-switch leak check)
-        if: runner.os == 'Linux'
         run: cargo run -q -p cerberus-app --release --locked -- mem-gate --budget-mb 64 --switches 25
 
       # Pipeline benchmark (PLAN §9 / M9). Cross-platform — a regression gate

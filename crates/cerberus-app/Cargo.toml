@@ -43,6 +43,7 @@ cerberus-js-dom = { path = "../cerberus-js-dom" }
 cerberus-identity = { path = "../cerberus-identity" }
 cerberus-shell = { path = "../cerberus-shell" }
 cerberus-headless = { path = "../cerberus-headless" }
+cerberus-sysmem = { path = "../cerberus-sysmem" }
 
 [dev-dependencies]
 # Dev-only: generates PNG fixtures for the image-pipeline tests. Production
