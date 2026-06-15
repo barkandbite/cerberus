@@ -57,3 +57,14 @@ jobs:
       # against order-of-magnitude slips, not a microbench.
       - name: Benchmark gate
         run: cargo run -q -p cerberus-app --release --locked -- bench --assert-total-ms 500
+
+      # Publish the Windows binary as a downloadable artifact. The release build
+      # already happened in the bench step above, so this just collects the .exe —
+      # a testable binary without needing a native Windows box (ADR-0015).
+      - name: Upload Windows binary
+        if: runner.os == 'Windows'
+        uses: actions/upload-artifact@v4
+        with:
+          name: cerberus-windows-x86_64
+          path: target/release/cerberus-app.exe
+          if-no-files-found: error
