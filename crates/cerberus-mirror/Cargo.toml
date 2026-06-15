@@ -19,3 +19,10 @@ cerberus-js-dom = { path = "../cerberus-js-dom" }
 
 [dev-dependencies]
 cerberus-js-quickjs = { path = "../cerberus-js-quickjs" }
+# Render-stack crates are test-only: they prove each mirror window paints its
+# own session independently, without coupling the pure model to the paint path.
+cerberus-css = { path = "../cerberus-css" }
+cerberus-style = { path = "../cerberus-style" }
+cerberus-layout = { path = "../cerberus-layout" }
+cerberus-headless = { path = "../cerberus-headless" }
+cerberus-paint = { path = "../cerberus-paint" }
