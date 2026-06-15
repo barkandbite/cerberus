@@ -208,6 +208,12 @@ impl MultiSurfaceApp for MirrorShell {
             Err(_) => Vec::new(),
         }
     }
+
+    fn surface_hidden(&mut self, idx: usize) {
+        // A hidden window's instance can drop its resident DOM until shown again
+        // — the memory win that keeps thousands of profiles cheap (ADR-0017).
+        let _ = self.group.release(idx);
+    }
 }
 
 /// Whether device point `(x, y)` is inside `r`.

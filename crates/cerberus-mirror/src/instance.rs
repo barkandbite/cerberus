@@ -94,4 +94,13 @@ impl MirrorInstance {
         let node = resolve(&self.doc, &Target::Id(id.to_string()))?;
         text_content_of(&self.doc, node)
     }
+
+    /// Drop this instance's resident DOM and node map, keeping only its cursor,
+    /// URL, and identity. Used when an instance is dormant (hidden/minimized) so
+    /// resident memory does not grow with the profile count — a later focus
+    /// re-materializes it from the action log via catch-up.
+    pub(crate) fn release(&mut self) {
+        self.doc = parse_html("");
+        self.node_to_js = HashMap::new();
+    }
 }

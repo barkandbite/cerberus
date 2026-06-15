@@ -352,6 +352,8 @@ impl<A: MultiSurfaceApp> ApplicationHandler for MultiState<A> {
                     self.request_redraw(w);
                 }
             }
+            // Hidden/minimized: let the app release that instance's memory.
+            WindowEvent::Occluded(true) => self.app.surface_hidden(idx),
             WindowEvent::KeyboardInput { event, .. } => {
                 if event.state == ElementState::Pressed {
                     if let Some(text) = event.text {
