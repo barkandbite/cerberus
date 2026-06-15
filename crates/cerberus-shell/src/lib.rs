@@ -128,6 +128,12 @@ pub trait MultiSurfaceApp {
     /// Window `idx` was raised/focused — a chance to catch it up. Returns the
     /// windows to redraw.
     fn focus(&mut self, idx: usize) -> Vec<usize>;
+
+    /// Window `idx` was hidden/occluded/minimized — a chance to release its
+    /// resident memory (it re-materializes when shown again). Default: no-op.
+    fn surface_hidden(&mut self, idx: usize) {
+        let _ = idx;
+    }
 }
 
 #[cfg(test)]

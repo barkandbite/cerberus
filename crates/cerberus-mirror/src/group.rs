@@ -114,6 +114,32 @@ impl MirrorGroup {
         self.instances.iter().filter(|i| i.live).count()
     }
 
+    /// Release the resident DOM + node map of every **non-live** instance,
+    /// keeping only its cursor, URL, and identity. Resident memory then stays
+    /// ~one live document no matter how many profiles the group holds (the
+    /// N-can-be-thousands case) — focusing a released instance re-materializes
+    /// it via catch-up. Safe to call any time; the live instance is untouched.
+    pub fn release_dormant(&mut self) {
+        for instance in &mut self.instances {
+            if !instance.live {
+                instance.release();
+            }
+        }
+    }
+
+    /// Release one instance's resident DOM (no-op if it is the live one, which
+    /// must keep its DOM to render and dispatch).
+    pub fn release(&mut self, idx: usize) -> Result<(), MirrorError> {
+        let instance = self
+            .instances
+            .get_mut(idx)
+            .ok_or(MirrorError::NoSuchInstance(idx))?;
+        if !instance.live {
+            instance.release();
+        }
+        Ok(())
+    }
+
     // --- driving ---------------------------------------------------------
 
     /// Apply `action` to the master and record it for followers.

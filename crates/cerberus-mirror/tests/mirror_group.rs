@@ -192,3 +192,30 @@ fn follower_without_target_flags_divergence() {
     // The master, meanwhile, stayed converged.
     assert_eq!(g.master().text_of_id("out").as_deref(), Some("clicked"));
 }
+
+#[test]
+fn dormant_instances_release_dom_and_rematerialize_on_focus() {
+    let seen = Rc::new(RefCell::new(Vec::new()));
+    let (mut g, _master, _follower) = group(true, seen);
+
+    g.act(Action::Navigate(URL.into())).unwrap();
+    g.act(Action::Click(Target::Id("btn".into()))).unwrap();
+    g.focus(1).unwrap(); // follower live; master now dormant
+
+    // Drop every dormant instance's resident DOM (the N-can-be-2000 case).
+    g.release_dormant();
+    assert!(
+        g.master().text_of_id("out").is_none(),
+        "released dormant master holds no resident DOM"
+    );
+    assert_eq!(
+        g.instance(1).unwrap().text_of_id("out").as_deref(),
+        Some("clicked"),
+        "the live, focused instance keeps its DOM"
+    );
+
+    // Re-focusing the released master rebuilds it from the log — converged.
+    g.focus(0).unwrap();
+    assert_eq!(g.master().text_of_id("out").as_deref(), Some("clicked"));
+    assert!(g.live_realms() <= 1);
+}
