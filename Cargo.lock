@@ -395,10 +395,15 @@ dependencies = [
 name = "cerberus-mirror"
 version = "0.0.0"
 dependencies = [
+ "cerberus-css",
  "cerberus-dom",
+ "cerberus-headless",
  "cerberus-js",
  "cerberus-js-dom",
  "cerberus-js-quickjs",
+ "cerberus-layout",
+ "cerberus-paint",
+ "cerberus-style",
  "cerberus-types",
 ]
 
