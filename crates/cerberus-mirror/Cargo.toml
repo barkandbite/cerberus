@@ -1,0 +1,21 @@
+[package]
+publish = false
+name = "cerberus-mirror"
+description = "Concurrent multi-window mirror groups: one master window drives N sealed-session followers of the same site, reconciled to the ≤1-live-engine invariant via a semantic action log and lazy per-focus catch-up (ADR-0017)."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+cerberus-types = { path = "../cerberus-types" }
+cerberus-dom = { path = "../cerberus-dom" }
+cerberus-js = { path = "../cerberus-js" }
+cerberus-js-dom = { path = "../cerberus-js-dom" }
+
+[dev-dependencies]
+cerberus-js-quickjs = { path = "../cerberus-js-quickjs" }
