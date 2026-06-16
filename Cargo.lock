@@ -276,6 +276,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "cerberus-autofill"
+version = "0.0.0"
+dependencies = [
+ "cerberus-dom",
+]
+
+[[package]]
 name = "cerberus-consent"
 version = "0.0.0"
 dependencies = [
