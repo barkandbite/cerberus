@@ -832,6 +832,9 @@ pub fn render(config: &RenderConfig) -> Result<RenderOutcome, AppError> {
     })
 }
 
+/// Vault key under which each identity's autofill `Profile` is sealed.
+const AUTOFILL_PROFILE_KEY: &str = "autofill.profile";
+
 /// Build a multi-window **mirror shell** (the `run --mirror` entry, ADR-0018):
 /// every identity in the profile becomes a driven window over the shared privacy
 /// stack (sealed per-instance cookies, consent, proxy). The first identity is the
@@ -889,7 +892,26 @@ pub fn build_mirror_shell(
         Arc::new(network_client(options.system_roots, Some(jar), proxy));
     let source = Box::new(mirror::AppPageSource::new(client));
     let manager = HeadManager::new(heads, Box::new(QuickJsEngineFactory));
-    let group = mirror::mirror_group_from_heads(&manager, source, (1280, 800), DEFAULT_USER_AGENT)?;
+
+    // Load any vault-sealed autofill profiles (empty if the vault is locked), so
+    // one master Fill fills every window from its own profile.
+    let mut profiles = HashMap::new();
+    {
+        let mut env = storage.locked();
+        for head in manager.heads() {
+            if let Ok(Some(bytes)) = env.load_blob(head.instance, AUTOFILL_PROFILE_KEY) {
+                if let Some(p) = cerberus_autofill::Profile::from_bytes(&bytes) {
+                    profiles.insert(head.instance, p);
+                }
+            }
+        }
+    }
+
+    let mut group =
+        mirror::mirror_group_from_heads(&manager, source, (1280, 800), DEFAULT_USER_AGENT)?;
+    if !profiles.is_empty() {
+        group.set_fill_provider(Box::new(mirror::ProfileFillProvider::new(profiles)));
+    }
     Ok(mirror::MirrorShell::new(group))
 }
 
