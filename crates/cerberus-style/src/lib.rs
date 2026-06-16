@@ -14,6 +14,10 @@ pub enum Display {
     Block,
     Inline,
     ListItem,
+    /// Flex container (single-axis v1).
+    Flex,
+    /// Grid container (explicit tracks v1).
+    Grid,
     /// Not rendered at all.
     None,
 }
@@ -36,6 +40,46 @@ pub enum TextAlign {
     Right,
 }
 
+/// CSS `flex-direction` (v1: the two main axes).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub enum FlexDirection {
+    #[default]
+    Row,
+    Column,
+}
+
+/// CSS `justify-content` — main-axis distribution of items/free space.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub enum JustifyContent {
+    #[default]
+    Start,
+    Center,
+    End,
+    SpaceBetween,
+    SpaceAround,
+}
+
+/// CSS `align-items` — cross-axis alignment.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub enum AlignItems {
+    Start,
+    Center,
+    End,
+    #[default]
+    Stretch,
+}
+
+/// A grid track size (one column/row in `grid-template-columns`/`-rows`).
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum Track {
+    /// A fixed length in CSS pixels.
+    Px(u32),
+    /// A share of the leftover space (`fr`).
+    Fr(f32),
+    /// Content-sized (v1: treated as one `fr`).
+    Auto,
+}
+
 /// The computed style applied to one element (after the cascade).
 #[derive(Clone, Debug, PartialEq)]
 pub struct ComputedStyle {
@@ -55,6 +99,16 @@ pub struct ComputedStyle {
     pub visibility: Visibility,
     /// `opacity` in `[0.0, 1.0]`, composited in paint. Not inherited.
     pub opacity: f32,
+    /// Flex/grid container properties (meaningful only when `display` is
+    /// `Flex`/`Grid`); reset per element.
+    pub flex_direction: FlexDirection,
+    pub flex_wrap: bool,
+    pub justify_content: JustifyContent,
+    pub align_items: AlignItems,
+    /// `gap` between flex items / grid tracks, in CSS pixels.
+    pub gap: u32,
+    pub grid_template_columns: Vec<Track>,
+    pub grid_template_rows: Vec<Track>,
 }
 
 impl ComputedStyle {
@@ -74,6 +128,13 @@ impl ComputedStyle {
             preformatted: false,
             visibility: Visibility::Visible,
             opacity: 1.0,
+            flex_direction: FlexDirection::Row,
+            flex_wrap: false,
+            justify_content: JustifyContent::Start,
+            align_items: AlignItems::Stretch,
+            gap: 0,
+            grid_template_columns: Vec::new(),
+            grid_template_rows: Vec::new(),
         }
     }
 
@@ -95,6 +156,13 @@ impl ComputedStyle {
             margin_top: 0,
             margin_bottom: 0,
             margin_left: 0,
+            flex_direction: FlexDirection::Row,
+            flex_wrap: false,
+            justify_content: JustifyContent::Start,
+            align_items: AlignItems::Stretch,
+            gap: 0,
+            grid_template_columns: Vec::new(),
+            grid_template_rows: Vec::new(),
         }
     }
 }

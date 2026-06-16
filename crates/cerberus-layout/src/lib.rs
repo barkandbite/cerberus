@@ -362,7 +362,11 @@ impl<'a> Ctx<'a> {
             self.cur_link_node = Some(node.node_id);
         }
 
-        let is_block = matches!(style.display, Display::Block | Display::ListItem);
+        // F0: flex/grid containers flow as blocks until their layout lands (F1/F2).
+        let is_block = matches!(
+            style.display,
+            Display::Block | Display::ListItem | Display::Flex | Display::Grid
+        );
         let saved_left = self.left;
         let (bg_index, bg_start_y) = (self.display.items.len(), self.y);
 
