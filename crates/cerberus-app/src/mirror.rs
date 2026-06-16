@@ -9,15 +9,17 @@
 //! [`FetchContext`] tagged with the instance, so every profile fetches under its
 //! *own* session while the group runs the single shared engine (ADR-0017).
 
+use std::collections::HashMap;
 use std::sync::Arc;
 
+use cerberus_autofill::{fill_plan, Profile};
 use cerberus_css::CssEngine;
-use cerberus_dom::{parse_html, Document};
+use cerberus_dom::{parse_html, Document, NodeId};
 use cerberus_identity::HeadManager;
 use cerberus_js::JsEngineFactory;
 use cerberus_js_quickjs::QuickJsEngineFactory;
 use cerberus_layout::{BlockLayout, ElementBox, LayoutEngine, NoForms, NoImages};
-use cerberus_mirror::{MirrorError, MirrorGroup, PageSource};
+use cerberus_mirror::{FillKind, FillProvider, MirrorError, MirrorGroup, PageSource};
 use cerberus_net::{BuiltinHttpClient, FetchContext, FetchKind, HttpClient};
 use cerberus_paint::{Framebuffer, Rasterizer};
 use cerberus_shell::MultiSurfaceApp;
@@ -94,6 +96,29 @@ pub fn mirror_group_from_heads(
         .instantiate()
         .map_err(MirrorError::Engine)?;
     MirrorGroup::new(engine, source, members, viewport, user_agent)
+}
+
+/// Maps each identity to its autofill [`Profile`] for a [`MirrorGroup`], so one
+/// master `Fill` fills every window from its **own** profile. Built from the
+/// vault-loaded profiles when entering mirror mode.
+pub struct ProfileFillProvider {
+    profiles: HashMap<InstanceId, Profile>,
+}
+
+impl ProfileFillProvider {
+    /// Wrap a per-identity profile map.
+    pub fn new(profiles: HashMap<InstanceId, Profile>) -> Self {
+        Self { profiles }
+    }
+}
+
+impl FillProvider for ProfileFillProvider {
+    fn fills(&self, instance: InstanceId, kind: FillKind, doc: &Document) -> Vec<(NodeId, String)> {
+        match self.profiles.get(&instance) {
+            Some(profile) => fill_plan(doc, profile, kind),
+            None => Vec::new(),
+        }
+    }
 }
 
 /// Drives a [`MirrorGroup`] across N surfaces (ADR-0017/0018): renders each
@@ -244,6 +269,28 @@ mod tests {
             ),
         ];
         HeadManager::new(list, Box::new(QuickJsEngineFactory))
+    }
+
+    #[test]
+    fn profile_fill_provider_maps_per_identity() {
+        use cerberus_autofill::Login;
+        let inst = InstanceId::from_u64_pair(0, 1);
+        let other = InstanceId::from_u64_pair(0, 2);
+        let mut profiles = HashMap::new();
+        profiles.insert(
+            inst,
+            Profile {
+                login: Login {
+                    username: "ada".into(),
+                    password: "pw".into(),
+                },
+                ..Profile::default()
+            },
+        );
+        let provider = ProfileFillProvider::new(profiles);
+        let doc = parse_html("<input id=\"u\" name=\"username\">");
+        assert_eq!(provider.fills(inst, FillKind::Login, &doc).len(), 1);
+        assert!(provider.fills(other, FillKind::All, &doc).is_empty());
     }
 
     #[test]
