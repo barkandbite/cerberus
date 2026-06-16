@@ -1,23 +1,29 @@
 name: Release
 
-# Tag-triggered (unlike the manual-only CI): pushing a `v*` tag builds the
-# release binaries on Linux + Windows, runs the same mem/bench gates, and
-# publishes them on a GitHub Release. Runs only on tags, so the Actions budget
-# is respected.
+# Publishes Linux + Windows release binaries on a GitHub Release. Triggers on a
+# `v*` tag push, or manually ("Run workflow" / API) with a tag input — the latter
+# also creates the tag, so a release can be cut without direct tag-push rights.
+# Runs only on demand, so the Actions budget is respected.
 on:
   push:
     tags:
       - "v*"
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Release tag to create/publish (e.g. v0.0.1)"
+        required: true
+        default: v0.0.1
 
 permissions:
-  contents: write # create the release + upload assets
+  contents: write # create the tag/release + upload assets
 
 env:
   CARGO_TERM_COLOR: always
 
 jobs:
-  release:
-    name: ${{ matrix.os }} release binary
+  build:
+    name: ${{ matrix.os }} build
     strategy:
       fail-fast: false
       matrix:
@@ -36,7 +42,7 @@ jobs:
       - name: Install pinned toolchain
         run: rustup show
 
-      # Reproducible path remap (docs/REPRODUCIBLE.md); deny warnings.
+      # Reproducible path remap (docs/REPRODUCIBLE.md); warnings are errors.
       - name: Build release binary
         run: cargo build --release --locked -p cerberus-app
         env:
@@ -54,9 +60,29 @@ jobs:
           mkdir -p dist
           cp "target/release/${{ matrix.bin }}" "dist/${{ matrix.asset }}"
 
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.asset }}
+          path: dist/${{ matrix.asset }}
+          if-no-files-found: error
+
+  publish:
+    name: Publish GitHub Release
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
       - name: Publish to GitHub Release
         uses: softprops/action-gh-release@v2
         with:
-          files: dist/${{ matrix.asset }}
+          tag_name: ${{ github.event.inputs.tag || github.ref_name }}
+          name: ${{ github.event.inputs.tag || github.ref_name }}
           body_path: CHANGELOG.md
+          files: dist/*
           fail_on_unmatched_files: true
