@@ -23,6 +23,7 @@ fn main() -> ExitCode {
         "mem-gate" => cmd_mem_gate(rest),
         "bench" => cmd_bench(rest),
         "cookies" => cmd_cookies(rest),
+        "identities" => cmd_identities(rest),
         "version" | "--version" | "-V" => {
             println!("cerberus {}", env!("CARGO_PKG_VERSION"));
             ExitCode::SUCCESS
@@ -42,11 +43,31 @@ fn main() -> ExitCode {
 #[cfg(feature = "windowing")]
 fn cmd_run(args: &[String]) -> ExitCode {
     let fullscreen = has_flag(args, "--fullscreen");
-    let app = cerberus_app::BrowserApp::with_config(cerberus_app::AppOptions {
+    let opts = cerberus_app::AppOptions {
         system_roots: has_flag(args, "--system-roots"),
         data_dir: flag(args, "--data-dir").map(std::path::PathBuf::from),
         proxy: flag(args, "--proxy"),
-    });
+    };
+    // Multi-window mirror mode: every profile identity gets its own window, all
+    // driven from the master (ADR-0017/0018).
+    if has_flag(args, "--mirror") {
+        let shell = match cerberus_app::build_mirror_shell(opts) {
+            Ok(shell) => shell,
+            Err(e) => {
+                eprintln!("could not build the mirror group: {e}");
+                return ExitCode::FAILURE;
+            }
+        };
+        return match cerberus_shell_winit::run_multi(shell) {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(e) => {
+                eprintln!("could not open windows: {e}");
+                eprintln!("(a display server is required; use `render` for headless output)");
+                ExitCode::FAILURE
+            }
+        };
+    }
+    let app = cerberus_app::BrowserApp::with_config(opts);
     match cerberus_shell_winit::run(app, fullscreen) {
         Ok(()) => ExitCode::SUCCESS,
         Err(e) => {
@@ -243,6 +264,30 @@ fn cmd_cookies(args: &[String]) -> ExitCode {
     }
 }
 
+/// `identities` — list, add (`--add <label>`), or remove (`--remove <index>`)
+/// a persistent profile's sealed identities. A profile holds arbitrary N; the
+/// mirror driver (`run --mirror`) drives every one of them.
+fn cmd_identities(args: &[String]) -> ExitCode {
+    let Some(dir) = flag(args, "--data-dir") else {
+        eprintln!("identities: --data-dir <DIR> is required");
+        return ExitCode::FAILURE;
+    };
+    let add = flag(args, "--add");
+    let remove = flag(args, "--remove").and_then(|s| s.parse::<usize>().ok());
+    match cerberus_app::identities_admin(&dir, add.as_deref(), remove) {
+        Ok(lines) => {
+            for line in lines {
+                println!("{line}");
+            }
+            ExitCode::SUCCESS
+        }
+        Err(e) => {
+            eprintln!("identities: {e}");
+            ExitCode::FAILURE
+        }
+    }
+}
+
 fn print_usage() {
     println!(
         "cerberus — a privacy-first, memory-lean browser (M0 scaffold)\n\n\
@@ -254,10 +299,12 @@ fn print_usage() {
          \x20 mem-gate   Render and assert resident memory within budget\n\
          \x20 bench      Time the render pipeline stages (see --assert-total-ms)\n\
          \x20 cookies    Inspect/retune a profile's cookie dispositions (--data-dir)\n\
+         \x20 identities Manage a profile's identities (--data-dir; --add/--remove)\n\
          \x20 version    Print the version\n\
          \x20 help       Print this help\n\n\
          RUN OPTIONS:\n\
          \x20 --fullscreen        start borderless-fullscreen (F11 toggles)\n\
+         \x20 --mirror            drive every profile identity in its own window\n\
          \x20 --system-roots      trust the OS cert store (TLS-inspecting proxies)\n\
          \x20 --data-dir <DIR>    persistent profile (cookies, vault, heads);\n\
          \x20                     omit for fully-ephemeral (default)\n\

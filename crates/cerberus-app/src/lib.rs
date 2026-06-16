@@ -257,22 +257,28 @@ fn open_profile_storage(dir: &Path) -> std::io::Result<StorageEnvironment> {
     StorageEnvironment::load(dir, Box::new(vault))
 }
 
+/// Mint a fresh head: a random sealed instance id + farbling seed for `label`,
+/// with head id derived from `index`. Per-profile unlinkability.
+fn mint_head(label: &str, index: u64) -> Head {
+    let instance_bytes: [u8; 16] = random_bytes(16).try_into().expect("16 random bytes");
+    let seed_bytes: [u8; 8] = random_bytes(8).try_into().expect("8 random bytes");
+    Head::new(
+        HeadId::from_u64_pair(0, index),
+        InstanceId(cerberus_types::Id128::from_bytes(instance_bytes)),
+        label,
+        u64::from_le_bytes(seed_bytes),
+    )
+}
+
 /// A profile's heads: random instance ids + farbling seeds minted on first
 /// run (per-profile unlinkability), persisted in a human-auditable text file.
+/// The three labels are only the first-run default — a profile may hold any
+/// number of identities (see [`identities_admin`]).
 fn fresh_profile_heads() -> Vec<Head> {
     ["work", "personal", "throwaway"]
         .iter()
         .enumerate()
-        .map(|(i, label)| {
-            let instance_bytes: [u8; 16] = random_bytes(16).try_into().expect("16 random bytes");
-            let seed_bytes: [u8; 8] = random_bytes(8).try_into().expect("8 random bytes");
-            Head::new(
-                HeadId::from_u64_pair(0, i as u64 + 1),
-                InstanceId(cerberus_types::Id128::from_bytes(instance_bytes)),
-                *label,
-                u64::from_le_bytes(seed_bytes),
-            )
-        })
+        .map(|(i, label)| mint_head(label, i as u64 + 1))
         .collect()
 }
 
@@ -323,6 +329,54 @@ fn save_heads(dir: &Path, heads: &[Head], active: usize) -> std::io::Result<()> 
         ));
     }
     atomic_write(&dir.join(HEADS_FILE), out.as_bytes())
+}
+
+/// Headless identities admin (the `identities` CLI): list, add, or remove a
+/// profile's sealed identities, persisted in `heads.txt`. A profile holds
+/// arbitrary N identities — the 3-head default is just the first run, and the
+/// mirror driver (`--mirror`) drives every identity the profile has.
+pub fn identities_admin(
+    dir: &str,
+    add: Option<&str>,
+    remove: Option<usize>,
+) -> Result<Vec<String>, String> {
+    let path = Path::new(dir);
+    std::fs::create_dir_all(path).map_err(|e| e.to_string())?;
+    let (mut heads, mut active, created) = match load_heads(path) {
+        Some((heads, active)) => (heads, active, false),
+        None => (fresh_profile_heads(), 0, true),
+    };
+    if let Some(label) = add {
+        let label = label.trim();
+        if label.is_empty() {
+            return Err("identity label must not be empty".into());
+        }
+        let index = heads.len() as u64 + 1;
+        heads.push(mint_head(label, index));
+    }
+    if let Some(idx) = remove {
+        if idx >= heads.len() {
+            return Err(format!("no identity at index {idx}"));
+        }
+        if heads.len() == 1 {
+            return Err("cannot remove the last identity".into());
+        }
+        heads.remove(idx);
+        if active >= heads.len() {
+            active = heads.len() - 1;
+        }
+    }
+    if created || add.is_some() || remove.is_some() {
+        save_heads(path, &heads, active).map_err(|e| e.to_string())?;
+    }
+    Ok(heads
+        .iter()
+        .enumerate()
+        .map(|(i, h)| {
+            let marker = if i == active { "*" } else { " " };
+            format!("{marker} [{i}] {} ({})", h.label, h.instance)
+        })
+        .collect())
 }
 
 /// The active head's sealed instance for a profile dir (or the first default
@@ -776,6 +830,67 @@ pub fn render(config: &RenderConfig) -> Result<RenderOutcome, AppError> {
         },
         framebuffer: surface.last_frame().cloned().unwrap_or(framebuffer),
     })
+}
+
+/// Build a multi-window **mirror shell** (the `run --mirror` entry, ADR-0018):
+/// every identity in the profile becomes a driven window over the shared privacy
+/// stack (sealed per-instance cookies, consent, proxy). The first identity is the
+/// master; the rest mirror it and catch up when focused. Reuses the same
+/// storage/consent/jar setup as the interactive browser, but drives the group
+/// through the synchronous network client (mirror catch-up is synchronous).
+pub fn build_mirror_shell(
+    options: AppOptions,
+) -> Result<mirror::MirrorShell, cerberus_mirror::MirrorError> {
+    install_psl();
+    let (env, data_dir) = match &options.data_dir {
+        Some(dir) => match open_profile_storage(dir) {
+            Ok(env) => (env, Some(dir.clone())),
+            Err(e) => {
+                eprintln!(
+                    "cerberus: cannot open profile {}: {e}; running ephemeral",
+                    dir.display()
+                );
+                (StorageEnvironment::with_no_vault(), None)
+            }
+        },
+        None => (StorageEnvironment::with_no_vault(), None),
+    };
+    let storage = Arc::new(Mutex::new(env));
+    let mut policy = DefaultDenyPolicy::new(true);
+    if let Some(dir) = &data_dir {
+        if let Ok(text) = std::fs::read_to_string(dir.join(CONSENT_RULES_FILE)) {
+            policy.load_rules(&text);
+        }
+    }
+    let consent = Arc::new(Mutex::new(policy));
+    let cookie_policy = Arc::new(Mutex::new(load_cookie_policy(data_dir.as_deref())));
+    let pending: Arc<Mutex<Vec<ConsentEvent>>> = Arc::new(Mutex::new(Vec::new()));
+    let jar: Arc<dyn CookieJar> = Arc::new(SealedJar {
+        storage: storage.clone(),
+        policy: consent.clone(),
+        cookies: cookie_policy.clone(),
+        events: pending,
+    });
+    let heads = match &data_dir {
+        Some(dir) => load_heads(dir).map(|(h, _active)| h).unwrap_or_else(|| {
+            let h = fresh_profile_heads();
+            if let Err(e) = save_heads(dir, &h, 0) {
+                eprintln!("cerberus: cannot save heads: {e}");
+            }
+            h
+        }),
+        None => default_heads(),
+    };
+    let proxy = options
+        .proxy
+        .as_deref()
+        .map(|p| parse_proxy(p).unwrap_or_else(|e| panic!("invalid --proxy {p:?}: {e:?}")));
+    let client: Arc<dyn HttpClient> =
+        Arc::new(network_client(options.system_roots, Some(jar), proxy));
+    let source = Box::new(mirror::AppPageSource::new(client));
+    let manager = HeadManager::new(heads, Box::new(QuickJsEngineFactory));
+    let group = mirror::mirror_group_from_heads(&manager, source, (1280, 800), DEFAULT_USER_AGENT)?;
+    Ok(mirror::MirrorShell::new(group))
 }
 
 /// An interactive, single-page browser: one toolbar over one page, with a
