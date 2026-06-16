@@ -13,7 +13,8 @@ pub use color::parse_color;
 
 use cerberus_dom::{Document, NodeRef};
 use cerberus_style::{
-    ComputedStyle, Display, StyleEngine, StyledChild, StyledDom, StyledNode, TextAlign, Visibility,
+    AlignItems, ComputedStyle, Display, FlexDirection, JustifyContent, StyleEngine, StyledChild,
+    StyledDom, StyledNode, TextAlign, Track, Visibility,
 };
 use cerberus_types::Color;
 use parser::{
@@ -289,6 +290,41 @@ fn apply_declarations(
                     style.opacity = o;
                 }
             }
+            "flex-direction" => {
+                style.flex_direction = match v.to_ascii_lowercase().as_str() {
+                    "column" | "column-reverse" => FlexDirection::Column,
+                    _ => FlexDirection::Row,
+                }
+            }
+            "flex-wrap" => style.flex_wrap = v.to_ascii_lowercase().starts_with("wrap"),
+            "justify-content" => {
+                style.justify_content = match v.to_ascii_lowercase().as_str() {
+                    "center" => JustifyContent::Center,
+                    "flex-end" | "end" | "right" => JustifyContent::End,
+                    "space-between" => JustifyContent::SpaceBetween,
+                    "space-around" | "space-evenly" => JustifyContent::SpaceAround,
+                    _ => JustifyContent::Start,
+                }
+            }
+            "align-items" => {
+                style.align_items = match v.to_ascii_lowercase().as_str() {
+                    "center" => AlignItems::Center,
+                    "flex-end" | "end" => AlignItems::End,
+                    "flex-start" | "start" => AlignItems::Start,
+                    _ => AlignItems::Stretch,
+                }
+            }
+            "gap" | "grid-gap" | "column-gap" | "row-gap" => {
+                if let Some(g) = parse_len(v, style.font_size as f32) {
+                    style.gap = g.max(0) as u32;
+                }
+            }
+            "grid-template-columns" => {
+                style.grid_template_columns = parse_tracks(v, style.font_size as f32);
+            }
+            "grid-template-rows" => {
+                style.grid_template_rows = parse_tracks(v, style.font_size as f32);
+            }
             // Still ignored (no compositor/timeline): animation*, transition*,
             // transform, and everything else.
             _ => {}
@@ -324,12 +360,89 @@ fn parse_display(v: &str) -> Option<Display> {
     Some(match v.trim().to_ascii_lowercase().as_str() {
         "none" => Display::None,
         "list-item" => Display::ListItem,
-        "inline" | "inline-block" | "inline-flex" | "inline-grid" | "contents" => Display::Inline,
-        "block" | "flex" | "grid" | "table" | "table-row" | "table-cell" | "flow-root" => {
-            Display::Block
-        }
+        "inline" | "inline-block" | "contents" => Display::Inline,
+        "flex" | "inline-flex" => Display::Flex,
+        "grid" | "inline-grid" => Display::Grid,
+        "block" | "table" | "table-row" | "table-cell" | "flow-root" => Display::Block,
         _ => return None,
     })
+}
+
+/// Parse a `grid-template-columns`/`-rows` track list (px / fr / auto / repeat()).
+fn parse_tracks(v: &str, em_base: f32) -> Vec<Track> {
+    let v = v.trim();
+    if v.is_empty() || v.eq_ignore_ascii_case("none") {
+        return Vec::new();
+    }
+    let mut tracks = Vec::new();
+    for tok in split_top(v) {
+        expand_track(&tok, em_base, &mut tracks);
+    }
+    tracks
+}
+
+/// Split on top-level whitespace, keeping `repeat(…)` groups (which contain
+/// spaces) intact.
+fn split_top(v: &str) -> Vec<String> {
+    let mut toks = Vec::new();
+    let mut depth = 0i32;
+    let mut cur = String::new();
+    for c in v.chars() {
+        match c {
+            '(' => {
+                depth += 1;
+                cur.push(c);
+            }
+            ')' => {
+                depth -= 1;
+                cur.push(c);
+            }
+            c if c.is_whitespace() && depth == 0 => {
+                if !cur.is_empty() {
+                    toks.push(std::mem::take(&mut cur));
+                }
+            }
+            c => cur.push(c),
+        }
+    }
+    if !cur.is_empty() {
+        toks.push(cur);
+    }
+    toks
+}
+
+/// Expand one track token (`200px`, `1fr`, `auto`, or `repeat(N, …)`) into `out`.
+fn expand_track(tok: &str, em_base: f32, out: &mut Vec<Track>) {
+    let t = tok.trim().to_ascii_lowercase();
+    if let Some(inner) = t.strip_prefix("repeat(").and_then(|s| s.strip_suffix(')')) {
+        let mut parts = inner.splitn(2, ',');
+        if let (Some(n), Some(group_src)) = (parts.next(), parts.next()) {
+            if let Ok(count) = n.trim().parse::<usize>() {
+                let mut group = Vec::new();
+                for sub in group_src.split_whitespace() {
+                    expand_track(sub, em_base, &mut group);
+                }
+                for _ in 0..count.min(1000) {
+                    out.extend(group.iter().copied());
+                }
+            }
+        }
+        return;
+    }
+    if let Some(fr) = t.strip_suffix("fr") {
+        if let Ok(n) = fr.trim().parse::<f32>() {
+            out.push(Track::Fr(n.max(0.0)));
+            return;
+        }
+    }
+    if t == "auto" || t == "min-content" || t == "max-content" {
+        out.push(Track::Auto);
+        return;
+    }
+    match parse_len(tok, em_base) {
+        Some(px) => out.push(Track::Px(px.max(0) as u32)),
+        None => out.push(Track::Auto),
+    }
 }
 
 fn apply_font_shorthand(style: &mut ComputedStyle, v: &str, parent_font_size: u32) {
@@ -479,6 +592,32 @@ mod tests {
         assert_eq!(
             first(&dom.root, "p").unwrap().style.visibility,
             Visibility::Hidden
+        );
+    }
+
+    #[test]
+    fn flex_and_grid_parse() {
+        let html = "<div style='display:flex; flex-direction:column; \
+                    justify-content:space-between; align-items:center; gap:8px'>x</div>\
+                    <section style='display:grid; \
+                    grid-template-columns: 100px 1fr repeat(2, 2fr)'>y</section>";
+        let dom = CssEngine::new().style(&parse_html(html));
+        let d = first(&dom.root, "div").unwrap();
+        assert_eq!(d.style.display, Display::Flex);
+        assert_eq!(d.style.flex_direction, FlexDirection::Column);
+        assert_eq!(d.style.justify_content, JustifyContent::SpaceBetween);
+        assert_eq!(d.style.align_items, AlignItems::Center);
+        assert_eq!(d.style.gap, 8);
+        let g = first(&dom.root, "section").unwrap();
+        assert_eq!(g.style.display, Display::Grid);
+        assert_eq!(
+            g.style.grid_template_columns,
+            vec![
+                Track::Px(100),
+                Track::Fr(1.0),
+                Track::Fr(2.0),
+                Track::Fr(2.0)
+            ]
         );
     }
 

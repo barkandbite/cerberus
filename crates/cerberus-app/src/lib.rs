@@ -2666,6 +2666,8 @@ fn computed_css(s: &cerberus_style::ComputedStyle) -> Vec<(String, String)> {
         cerberus_style::Display::Block => "block",
         cerberus_style::Display::Inline => "inline",
         cerberus_style::Display::ListItem => "list-item",
+        cerberus_style::Display::Flex => "flex",
+        cerberus_style::Display::Grid => "grid",
         cerberus_style::Display::None => "none",
     };
     let text_align = match s.text_align {
