@@ -210,6 +210,10 @@ struct Ctx<'a> {
     /// The `NodeId` of the enclosing `<a>` while flowing its inline content, so
     /// each link piece can carry it into a hit box for event dispatch (M12b).
     cur_link_node: Option<NodeId>,
+    /// Effective `opacity: 0` from this element or an ancestor — its whole
+    /// subtree is suppressed from paint (the opacity group). `visibility:hidden`
+    /// is handled per element via the computed style.
+    opacity_hidden: bool,
 }
 
 impl<'a> Ctx<'a> {
@@ -238,6 +242,7 @@ impl<'a> Ctx<'a> {
             line: Vec::new(),
             line_align: TextAlign::Left,
             cur_link_node: None,
+            opacity_hidden: false,
         }
     }
 
@@ -274,6 +279,7 @@ impl<'a> Ctx<'a> {
             line: Vec::new(),
             line_align: TextAlign::Left,
             cur_link_node: None,
+            opacity_hidden: false,
         }
     }
 
@@ -282,6 +288,12 @@ impl<'a> Ctx<'a> {
         if style.display == Display::None {
             return;
         }
+        // `opacity: 0` (here or inherited via the group) and `visibility: hidden`
+        // suppress this element's own paint; children are judged by their own
+        // computed style (visibility inherits, so they are hidden unless they
+        // override it).
+        let subtree_hidden = self.opacity_hidden || style.opacity == 0.0;
+        let visible = !subtree_hidden && style.visibility == cerberus_style::Visibility::Visible;
         match node.tag.as_str() {
             "br" => {
                 self.line_break(style.font_size.max(1));
@@ -289,31 +301,45 @@ impl<'a> Ctx<'a> {
             }
             "hr" => {
                 self.flush_line();
-                self.rule();
+                if visible {
+                    self.rule();
+                }
                 return;
             }
             "img" => {
-                self.image(node, in_link);
+                if visible {
+                    self.image(node, in_link);
+                }
                 return;
             }
             "input" => {
-                self.form_input(node);
+                if visible {
+                    self.form_input(node);
+                }
                 return;
             }
             "button" => {
-                self.form_button(node);
+                if visible {
+                    self.form_button(node);
+                }
                 return;
             }
             "textarea" => {
-                self.form_textarea(node);
+                if visible {
+                    self.form_textarea(node);
+                }
                 return;
             }
             "select" => {
-                self.form_select(node);
+                if visible {
+                    self.form_select(node);
+                }
                 return;
             }
             "table" => {
-                self.table(node);
+                if visible {
+                    self.table(node);
+                }
                 return;
             }
             // Options are rendered by their <select>; loose ones never flow.
@@ -346,22 +372,29 @@ impl<'a> Ctx<'a> {
             self.line_align = style.text_align;
             self.left += style.margin_left;
             self.x = self.left;
-            if style.display == Display::ListItem {
+            if visible && style.display == Display::ListItem {
                 self.add_run("\u{2022}", style, None);
                 self.x += space_width(self.shaper, style.font_size.max(1)) as i32;
             }
         }
 
+        let saved_opacity_hidden = self.opacity_hidden;
+        self.opacity_hidden = subtree_hidden;
         for child in &node.children {
             match child {
-                StyledChild::Text(t) => self.add_text(t, style, href),
+                StyledChild::Text(t) => {
+                    if visible {
+                        self.add_text(t, style, href);
+                    }
+                }
                 StyledChild::Element(e) => self.walk(e, href),
             }
         }
+        self.opacity_hidden = saved_opacity_hidden;
 
         if is_block {
             self.flush_line();
-            if let Some(color) = style.background {
+            if let Some(color) = style.background.filter(|_| visible) {
                 let h = (self.y - bg_start_y).max(0) as u32;
                 if h > 0 {
                     self.display.items.insert(
@@ -1221,10 +1254,21 @@ mod tests {
     }
 
     #[test]
-    fn opacity_zero_still_renders() {
-        // Speed-first: content hidden behind a fade-in shows anyway.
-        let laid = lay("<p style='opacity:0'>fade-in text</p>", 400);
-        assert!(!glyph_ys(&laid).is_empty(), "opacity is ignored");
+    fn opacity_zero_and_visibility_hidden_are_not_painted() {
+        // opacity:0 and visibility:hidden suppress this element's paint.
+        assert!(glyph_ys(&lay("<p style='opacity:0'>fade-in text</p>", 400)).is_empty());
+        assert!(glyph_ys(&lay("<p style='visibility:hidden'>x</p>", 400)).is_empty());
+        // A visible child of a visibility:hidden parent still shows.
+        let laid = lay(
+            "<div style='visibility:hidden'>hide<span style='visibility:visible'>show</span></div>",
+            400,
+        );
+        assert!(
+            !glyph_ys(&laid).is_empty(),
+            "visible child overrides hidden parent"
+        );
+        // Partial opacity (>0) still paints (composited, not skipped).
+        assert!(!glyph_ys(&lay("<p style='opacity:0.5'>x</p>", 400)).is_empty());
     }
 
     #[test]
