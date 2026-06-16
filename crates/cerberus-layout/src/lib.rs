@@ -15,7 +15,7 @@ use cerberus_dom::NodeId;
 use cerberus_paint::{DecodedImage, DisplayItem, DisplayList, GlyphBox, TextShaper};
 use cerberus_style::{
     AlignItems, ComputedStyle, Display, FlexDirection, JustifyContent, StyledChild, StyledDom,
-    StyledNode, TextAlign,
+    StyledNode, TextAlign, Track,
 };
 use cerberus_types::{Color, FontStyle, Point, Rect, Size};
 use std::sync::Arc;
@@ -370,17 +370,22 @@ impl<'a> Ctx<'a> {
             self.cur_link_node = Some(node.node_id);
         }
 
-        // Flex container (F1): lay items along the main axis. Grid still flows as
-        // a block until F2.
-        if style.display == Display::Flex {
-            self.flex_layout(node);
-            self.cur_link_node = saved_link_node;
-            return;
+        // Flex/grid containers lay their items out and return; everything else
+        // falls through to block/inline flow.
+        match style.display {
+            Display::Flex => {
+                self.flex_layout(node);
+                self.cur_link_node = saved_link_node;
+                return;
+            }
+            Display::Grid => {
+                self.grid_layout(node);
+                self.cur_link_node = saved_link_node;
+                return;
+            }
+            _ => {}
         }
-        let is_block = matches!(
-            style.display,
-            Display::Block | Display::ListItem | Display::Grid
-        );
+        let is_block = matches!(style.display, Display::Block | Display::ListItem);
         let saved_left = self.left;
         let (bg_index, bg_start_y) = (self.display.items.len(), self.y);
 
@@ -1108,6 +1113,122 @@ impl<'a> Ctx<'a> {
         self.y = y;
     }
 
+    /// Lay out a grid container (explicit tracks v1): `grid-template-columns`
+    /// (Px fixed; Fr/Auto share the leftover) defines the columns; children are
+    /// placed row-major into cells with `gap`; each row's height is its tallest
+    /// cell. `grid-template-rows` and auto-placement/spanning are not modeled —
+    /// rows are content-sized.
+    fn grid_layout(&mut self, node: &StyledNode) {
+        self.flush_line();
+        let left = self.left;
+        let right = self.right.max(left + 1);
+        let start_y = self.y;
+        let gap = node.style.gap as i32;
+        let bg_index = self.display.items.len();
+
+        let cols = &node.style.grid_template_columns;
+        let ncols = cols.len().max(1);
+        let avail = (right - left).max(1);
+
+        // Resolve column widths.
+        let widths: Vec<i32> = if cols.is_empty() {
+            vec![avail]
+        } else {
+            let total_gap = gap * (ncols as i32 - 1).max(0);
+            let space = (avail - total_gap).max(ncols as i32);
+            let mut fixed = 0i32;
+            let mut fr_total = 0f32;
+            for t in cols {
+                match t {
+                    Track::Px(p) => fixed += *p as i32,
+                    Track::Fr(f) => fr_total += f.max(0.0),
+                    Track::Auto => fr_total += 1.0,
+                }
+            }
+            let leftover = (space - fixed).max(0) as f32;
+            cols.iter()
+                .map(|t| match t {
+                    Track::Px(p) => (*p as i32).max(1),
+                    Track::Fr(f) if fr_total > 0.0 => {
+                        (leftover * f.max(0.0) / fr_total).floor().max(1.0) as i32
+                    }
+                    Track::Auto if fr_total > 0.0 => (leftover / fr_total).floor().max(1.0) as i32,
+                    _ => 1,
+                })
+                .collect()
+        };
+
+        let mut col_x = Vec::with_capacity(widths.len());
+        let mut cx = left;
+        for &w in &widths {
+            col_x.push(cx);
+            cx += w + gap;
+        }
+
+        let items: Vec<&StyledNode> = node
+            .children
+            .iter()
+            .filter_map(|c| match c {
+                StyledChild::Element(e) if e.style.display != Display::None => Some(e),
+                _ => None,
+            })
+            .collect();
+
+        let mut y = start_y;
+        let mut start = 0;
+        while start < items.len() {
+            let end = (start + ncols).min(items.len());
+            let mut row_h = 0;
+            let mut laid: Vec<Ctx<'a>> = Vec::new();
+            for (col, it) in items[start..end].iter().enumerate() {
+                let x0 = col_x[col];
+                let w = widths[col];
+                let mut sub = Ctx::sub(
+                    x0,
+                    x0 + w,
+                    y,
+                    self.shaper,
+                    self.images,
+                    self.forms,
+                    self.field_id,
+                );
+                sub.walk(it, None);
+                sub.flush_line();
+                self.field_id = sub.field_id;
+                row_h = row_h.max((sub.y - y).max(1));
+                laid.push(sub);
+            }
+            for sub in laid {
+                self.merge_sub(sub, 0);
+            }
+            y += row_h + gap;
+            start = end;
+        }
+        self.y = if items.is_empty() {
+            start_y
+        } else {
+            (y - gap).max(start_y)
+        };
+
+        let h = (self.y - start_y).max(0) as u32;
+        if h > 0 {
+            if let Some(color) = node.style.background {
+                self.display.items.insert(
+                    bg_index,
+                    DisplayItem::Rect {
+                        rect: Rect::new(left, start_y, (right - left).max(0) as u32, h),
+                        color,
+                    },
+                );
+            }
+            self.elements.push(ElementBox {
+                rect: Rect::new(left, start_y, (right - left).max(0) as u32, h),
+                node: node.node_id,
+            });
+        }
+        self.x = self.left;
+    }
+
     /// Lay out a `<table>` as an equal-width grid.
     ///
     /// Rows are the `<tr>`s directly under the table plus those inside
@@ -1498,6 +1619,28 @@ mod tests {
             center_x > start_x,
             "justify-center x {center_x} should exceed start x {start_x}"
         );
+    }
+
+    #[test]
+    fn grid_two_columns_side_by_side() {
+        let grid = lay(
+            "<div style='display:grid; grid-template-columns:1fr 1fr'>\
+             <div>AAAA</div><div>BBBB</div></div>",
+            800,
+        );
+        assert_eq!(distinct(&glyph_ys(&grid)), 1, "two cells on one row");
+        let xs = glyph_xs(&grid);
+        assert!(xs.iter().max() > xs.iter().min(), "cells side by side");
+    }
+
+    #[test]
+    fn grid_one_column_stacks() {
+        let grid = lay(
+            "<div style='display:grid; grid-template-columns:1fr'>\
+             <div>A</div><div>B</div></div>",
+            800,
+        );
+        assert!(distinct(&glyph_ys(&grid)) >= 2, "one column -> two rows");
     }
 
     fn total_glyphs(laid: &LaidOut) -> usize {
