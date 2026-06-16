@@ -243,7 +243,7 @@ dependencies = [
 
 [[package]]
 name = "cerberus-app"
-version = "0.0.0"
+version = "0.0.1"
 dependencies = [
  "cerberus-autofill",
  "cerberus-consent",
@@ -278,28 +278,28 @@ dependencies = [
 
 [[package]]
 name = "cerberus-autofill"
-version = "0.0.0"
+version = "0.0.1"
 dependencies = [
  "cerberus-dom",
 ]
 
 [[package]]
 name = "cerberus-consent"
-version = "0.0.0"
+version = "0.0.1"
 dependencies = [
  "cerberus-types",
 ]
 
 [[package]]
 name = "cerberus-crypto"
-version = "0.0.0"
+version = "0.0.1"
 dependencies = [
  "zeroize",
 ]
 
 [[package]]
 name = "cerberus-crypto-rustcrypto"
-version = "0.0.0"
+version = "0.0.1"
 dependencies = [
  "argon2",
  "cerberus-crypto",
@@ -308,7 +308,7 @@ dependencies = [
 
 [[package]]
 name = "cerberus-css"
-version = "0.0.0"
+version = "0.0.1"
 dependencies = [
  "cerberus-dom",
  "cerberus-style",
@@ -317,22 +317,22 @@ dependencies = [
 
 [[package]]
 name = "cerberus-dns-doh"
-version = "0.0.0"
+version = "0.0.1"
 dependencies = [
  "cerberus-net",
 ]
 
 [[package]]
 name = "cerberus-dom"
-version = "0.0.0"
+version = "0.0.1"
 
 [[package]]
 name = "cerberus-farbling"
-version = "0.0.0"
+version = "0.0.1"
 
 [[package]]
 name = "cerberus-headless"
-version = "0.0.0"
+version = "0.0.1"
 dependencies = [
  "cerberus-css",
  "cerberus-dom",
@@ -345,7 +345,7 @@ dependencies = [
 
 [[package]]
 name = "cerberus-identity"
-version = "0.0.0"
+version = "0.0.1"
 dependencies = [
  "cerberus-farbling",
  "cerberus-js",
@@ -354,7 +354,7 @@ dependencies = [
 
 [[package]]
 name = "cerberus-image"
-version = "0.0.0"
+version = "0.0.1"
 dependencies = [
  "cerberus-paint",
  "cerberus-types",
@@ -364,14 +364,14 @@ dependencies = [
 
 [[package]]
 name = "cerberus-js"
-version = "0.0.0"
+version = "0.0.1"
 dependencies = [
  "cerberus-types",
 ]
 
 [[package]]
 name = "cerberus-js-dom"
-version = "0.0.0"
+version = "0.0.1"
 dependencies = [
  "cerberus-dom",
  "cerberus-farbling",
@@ -382,7 +382,7 @@ dependencies = [
 
 [[package]]
 name = "cerberus-js-quickjs"
-version = "0.0.0"
+version = "0.0.1"
 dependencies = [
  "cerberus-js",
  "cerberus-types",
@@ -391,7 +391,7 @@ dependencies = [
 
 [[package]]
 name = "cerberus-layout"
-version = "0.0.0"
+version = "0.0.1"
 dependencies = [
  "cerberus-css",
  "cerberus-dom",
@@ -402,7 +402,7 @@ dependencies = [
 
 [[package]]
 name = "cerberus-mirror"
-version = "0.0.0"
+version = "0.0.1"
 dependencies = [
  "cerberus-autofill",
  "cerberus-css",
@@ -419,7 +419,7 @@ dependencies = [
 
 [[package]]
 name = "cerberus-net"
-version = "0.0.0"
+version = "0.0.1"
 dependencies = [
  "cerberus-types",
  "cerberus-url",
@@ -428,14 +428,14 @@ dependencies = [
 
 [[package]]
 name = "cerberus-paint"
-version = "0.0.0"
+version = "0.0.1"
 dependencies = [
  "cerberus-types",
 ]
 
 [[package]]
 name = "cerberus-shell"
-version = "0.0.0"
+version = "0.0.1"
 dependencies = [
  "cerberus-paint",
  "cerberus-types",
@@ -443,7 +443,7 @@ dependencies = [
 
 [[package]]
 name = "cerberus-shell-winit"
-version = "0.0.0"
+version = "0.0.1"
 dependencies = [
  "cerberus-paint",
  "cerberus-shell",
@@ -454,7 +454,7 @@ dependencies = [
 
 [[package]]
 name = "cerberus-storage"
-version = "0.0.0"
+version = "0.0.1"
 dependencies = [
  "cerberus-crypto",
  "cerberus-types",
@@ -462,7 +462,7 @@ dependencies = [
 
 [[package]]
 name = "cerberus-style"
-version = "0.0.0"
+version = "0.0.1"
 dependencies = [
  "cerberus-dom",
  "cerberus-types",
@@ -470,11 +470,11 @@ dependencies = [
 
 [[package]]
 name = "cerberus-sysmem"
-version = "0.0.0"
+version = "0.0.1"
 
 [[package]]
 name = "cerberus-text"
-version = "0.0.0"
+version = "0.0.1"
 dependencies = [
  "ab_glyph",
  "cerberus-paint",
@@ -483,7 +483,7 @@ dependencies = [
 
 [[package]]
 name = "cerberus-tls-rustls"
-version = "0.0.0"
+version = "0.0.1"
 dependencies = [
  "cerberus-net",
  "rustls",
@@ -492,11 +492,11 @@ dependencies = [
 
 [[package]]
 name = "cerberus-types"
-version = "0.0.0"
+version = "0.0.1"
 
 [[package]]
 name = "cerberus-ui"
-version = "0.0.0"
+version = "0.0.1"
 dependencies = [
  "cerberus-paint",
  "cerberus-types",
@@ -504,7 +504,7 @@ dependencies = [
 
 [[package]]
 name = "cerberus-url"
-version = "0.0.0"
+version = "0.0.1"
 dependencies = [
  "cerberus-types",
 ]

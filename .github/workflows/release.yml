@@ -1,0 +1,62 @@
+name: Release
+
+# Tag-triggered (unlike the manual-only CI): pushing a `v*` tag builds the
+# release binaries on Linux + Windows, runs the same mem/bench gates, and
+# publishes them on a GitHub Release. Runs only on tags, so the Actions budget
+# is respected.
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write # create the release + upload assets
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  release:
+    name: ${{ matrix.os }} release binary
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            bin: cerberus-app
+            asset: cerberus-linux-x86_64
+          - os: windows-latest
+            bin: cerberus-app.exe
+            asset: cerberus-windows-x86_64.exe
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+
+      # Toolchain pinned in rust-toolchain.toml (MSVC host on Windows).
+      - name: Install pinned toolchain
+        run: rustup show
+
+      # Reproducible path remap (docs/REPRODUCIBLE.md); deny warnings.
+      - name: Build release binary
+        run: cargo build --release --locked -p cerberus-app
+        env:
+          RUSTFLAGS: "--remap-path-prefix=${{ github.workspace }}=/cerberus -D warnings"
+
+      - name: Memory gate
+        run: cargo run -q -p cerberus-app --release --locked -- mem-gate --budget-mb 64 --switches 25
+
+      - name: Benchmark gate
+        run: cargo run -q -p cerberus-app --release --locked -- bench --assert-total-ms 500
+
+      - name: Stage asset
+        shell: bash
+        run: |
+          mkdir -p dist
+          cp "target/release/${{ matrix.bin }}" "dist/${{ matrix.asset }}"
+
+      - name: Publish to GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/${{ matrix.asset }}
+          body_path: CHANGELOG.md
+          fail_on_unmatched_files: true
