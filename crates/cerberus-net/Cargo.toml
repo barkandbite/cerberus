@@ -14,3 +14,8 @@ workspace = true
 [dependencies]
 cerberus-types = { path = "../cerberus-types" }
 cerberus-url = { path = "../cerberus-url" }
+
+# Pure-Rust DEFLATE/zlib inflate for gzip/deflate response bodies (ADR-0020).
+# Already in the tree (transitive via the image decoder); promoted to a direct,
+# wrapped dependency. No `unsafe` in the inflate path we use.
+miniz_oxide = "0.8"

@@ -26,7 +26,7 @@ pub fn send(stream: &mut dyn ReadWrite, req: &Request<'_>) -> Result<HttpRespons
     // (no per-user locale entropy); it matches the script-visible
     // `navigator.language`/`languages` so the header and the DOM agree.
     let mut head = format!(
-        "{} {} HTTP/1.1\r\nHost: {}\r\nUser-Agent: {}\r\nAccept: */*\r\nAccept-Language: en-US,en;q=0.9\r\nAccept-Encoding: identity\r\nConnection: close\r\n",
+        "{} {} HTTP/1.1\r\nHost: {}\r\nUser-Agent: {}\r\nAccept: */*\r\nAccept-Language: en-US,en;q=0.9\r\nAccept-Encoding: gzip, deflate\r\nConnection: close\r\n",
         req.method, req.path, req.host, req.user_agent
     );
     for (k, v) in req.headers {
@@ -88,6 +88,12 @@ fn parse_response(raw: &[u8]) -> Result<HttpResponse, NetError> {
         .map(|v| v.to_ascii_lowercase().contains("chunked"))
         .unwrap_or(false);
     let body = if chunked { dechunk(&body)? } else { body };
+    // Decode the body per Content-Encoding (gzip/deflate); identity / absent
+    // pass through (ADR-0020).
+    let body = match header(&headers, "content-encoding") {
+        Some(enc) if !enc.is_empty() => crate::decompress::decode(enc, body)?,
+        _ => body,
+    };
 
     Ok(HttpResponse {
         status,
