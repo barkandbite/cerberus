@@ -10,6 +10,20 @@
 
 pub mod mirror;
 
+/// Lock a `Mutex`, recovering the guard if a previous holder panicked and
+/// poisoned it instead of propagating the panic — one poisoned critical
+/// section must not sink the whole browser session.
+trait LockRecover<T> {
+    fn locked(&self) -> std::sync::MutexGuard<'_, T>;
+}
+
+impl<T> LockRecover<T> for std::sync::Mutex<T> {
+    fn locked(&self) -> std::sync::MutexGuard<'_, T> {
+        self.lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+}
+
 use cerberus_consent::{ConsentEvent, ConsentPolicy, Decision, DefaultDenyPolicy};
 use cerberus_crypto::Secret;
 use cerberus_crypto_rustcrypto::{Argon2idKdf, XChaCha20Poly1305Aead};
@@ -432,15 +446,14 @@ impl CookieJar for SealedJar {
         if origin.is_third_party_to(first_party) {
             let decision = self
                 .policy
-                .lock()
-                .unwrap()
+                .locked()
                 .evaluate(instance, &origin, first_party)
                 .decision;
             if decision != Decision::Allow {
                 return None;
             }
         }
-        let mut env = self.storage.lock().unwrap();
+        let mut env = self.storage.locked();
         let mut store = env.instance(instance);
         let cookies = store.cookies_for_request(&origin, first_party);
         if cookies.is_empty() {
@@ -465,8 +478,7 @@ impl CookieJar for SealedJar {
         };
         let outcome = self
             .policy
-            .lock()
-            .unwrap()
+            .locked()
             .evaluate(instance, &origin, first_party);
         let group = match outcome.decision {
             Decision::Allow => Group::Active,
@@ -477,20 +489,19 @@ impl CookieJar for SealedJar {
             Decision::Prompt => Group::Quarantined,
         };
         if let Some(event) = outcome.event {
-            self.events.lock().unwrap().push(event);
+            self.events.locked().push(event);
         }
         // For an accepted (Active) cookie, the user's disposition decides its
         // lifetime/persistence (Block drops it entirely). Quarantined cookies
         // keep the default until the user releases them.
         let disposition = if group == Group::Active {
             self.cookies
-                .lock()
-                .unwrap()
+                .locked()
                 .resolve(&first_party.site(), &cookie.name)
         } else {
             CookieDisposition::Allow
         };
-        let mut env = self.storage.lock().unwrap();
+        let mut env = self.storage.locked();
         let _ = env
             .instance(instance)
             .set_cookie_with(first_party, cookie, group, disposition);
@@ -569,8 +580,7 @@ pub fn render(config: &RenderConfig) -> Result<RenderOutcome, AppError> {
     // would get): the same policy object that enforces this page below.
     let third_party = Origin::new("https", "ads.tracker.net", None);
     let third_party_decision = consent
-        .lock()
-        .unwrap()
+        .locked()
         .evaluate(active_instance, &third_party, &first_party)
         .decision;
 
@@ -697,7 +707,7 @@ pub fn render(config: &RenderConfig) -> Result<RenderOutcome, AppError> {
     // Cookies now resident for this page's site — captured from the real
     // responses through the sealed jar (zero for builtin/cookieless pages).
     let active_cookies = {
-        let mut env = storage.lock().unwrap();
+        let mut env = storage.locked();
         let count = env
             .instance(active_instance)
             .cookies_for_request(&first_party, &first_party)
@@ -898,7 +908,7 @@ impl NetLoader {
                 if out_tx.send(done).is_err() {
                     break;
                 }
-                if let Some(w) = worker_waker.lock().unwrap().clone() {
+                if let Some(w) = worker_waker.locked().clone() {
                     w.wake();
                 }
             }
@@ -927,7 +937,7 @@ impl PageLoader for NetLoader {
         self.rx.try_recv().ok()
     }
     fn set_waker(&mut self, waker: Arc<dyn Waker>) {
-        *self.waker.lock().unwrap() = Some(waker);
+        *self.waker.locked() = Some(waker);
     }
 }
 
@@ -1077,8 +1087,7 @@ fn fetch_images_sync(
             .and_then(|u| u.origin())
             .is_some_and(|origin| {
                 policy
-                    .lock()
-                    .unwrap()
+                    .locked()
                     .evaluate(ctx.instance, &origin, first_party)
                     .decision
                     == Decision::Allow
@@ -1884,12 +1893,7 @@ impl BrowserApp {
     /// values masked unless revealed).
     fn cookie_rows(&self) -> Vec<(String, String, CookieRow)> {
         let instance = self.heads.active().instance;
-        let mut views = self
-            .storage
-            .lock()
-            .unwrap()
-            .instance(instance)
-            .cookie_views();
+        let mut views = self.storage.locked().instance(instance).cookie_views();
         views.sort_by(|a, b| (&a.fp_site, &a.name).cmp(&(&b.fp_site, &b.name)));
         views
             .into_iter()
@@ -1919,7 +1923,7 @@ impl BrowserApp {
     /// Persist the cookie policy (and any cookie changes) to the profile.
     fn save_cookie_policy(&mut self) {
         if let Some(dir) = &self.data_dir {
-            let text = self.cookie_policy.lock().unwrap().serialize();
+            let text = self.cookie_policy.locked().serialize();
             if let Err(e) = atomic_write(&dir.join(COOKIES_POLICY_FILE), text.as_bytes()) {
                 eprintln!("cerberus: cannot save cookie policy: {e}");
             }
@@ -1943,8 +1947,8 @@ impl BrowserApp {
                 }
             }
             CookieAction::CycleGlobal => {
-                let next = self.cookie_policy.lock().unwrap().global().cycle();
-                self.cookie_policy.lock().unwrap().set_global(next);
+                let next = self.cookie_policy.locked().global().cycle();
+                self.cookie_policy.locked().set_global(next);
                 self.save_cookie_policy();
             }
             CookieAction::Reveal(i) => {
@@ -1958,29 +1962,22 @@ impl BrowserApp {
             CookieAction::Delete(i) => {
                 if let Some((site, name, _)) = rows.get(i) {
                     self.storage
-                        .lock()
-                        .unwrap()
+                        .locked()
                         .instance(instance)
                         .delete_cookie(site, name);
-                    self.cookie_policy.lock().unwrap().set_override(
-                        site,
-                        name,
-                        CookieDisposition::Block,
-                    );
+                    self.cookie_policy
+                        .locked()
+                        .set_override(site, name, CookieDisposition::Block);
                     self.save_cookie_policy();
                 }
             }
             CookieAction::Cycle(i) => {
                 if let Some((site, name, _)) = rows.get(i).cloned() {
-                    let current = self.cookie_policy.lock().unwrap().resolve(&site, &name);
+                    let current = self.cookie_policy.locked().resolve(&site, &name);
                     let next = current.cycle();
-                    self.cookie_policy
-                        .lock()
-                        .unwrap()
-                        .set_override(&site, &name, next);
+                    self.cookie_policy.locked().set_override(&site, &name, next);
                     self.storage
-                        .lock()
-                        .unwrap()
+                        .locked()
                         .instance(instance)
                         .set_disposition(&site, &name, next);
                     self.save_cookie_policy();
@@ -2004,13 +2001,9 @@ impl BrowserApp {
         let secs: u64 = buf.parse().unwrap_or(DEFAULT_TIMED_SECS);
         let d = CookieDisposition::Timed(secs);
         let instance = self.heads.active().instance;
-        self.cookie_policy
-            .lock()
-            .unwrap()
-            .set_override(&site, &name, d);
+        self.cookie_policy.locked().set_override(&site, &name, d);
         self.storage
-            .lock()
-            .unwrap()
+            .locked()
             .instance(instance)
             .set_disposition(&site, &name, d);
         self.save_cookie_policy();
@@ -2025,8 +2018,7 @@ impl BrowserApp {
         let instance = self.heads.active().instance;
         let outcome = self
             .consent
-            .lock()
-            .unwrap()
+            .locked()
             .evaluate(instance, &origin, first_party);
         if let Some(event) = outcome.event {
             self.queue_consent_prompt(event);
@@ -2055,7 +2047,7 @@ impl BrowserApp {
         match action {
             BannerAction::Allow | BannerAction::Deny => {
                 let allow = action == BannerAction::Allow;
-                self.consent.lock().unwrap().add_rule(
+                self.consent.locked().add_rule(
                     event.instance,
                     &event.request,
                     &event.first_party,
@@ -2077,7 +2069,7 @@ impl BrowserApp {
         let allowed_site = event.request.site();
         // Quarantined cookies whose domain belongs to the allowed site.
         {
-            let mut env = self.storage.lock().unwrap();
+            let mut env = self.storage.locked();
             let mut store = env.instance(event.instance);
             let names: Vec<String> = store
                 .quarantined_cookies(&event.first_party)
@@ -2112,7 +2104,7 @@ impl BrowserApp {
     /// Persist the standing consent rules into the profile (if any).
     fn save_consent_rules(&self) {
         let Some(dir) = &self.data_dir else { return };
-        let text = self.consent.lock().unwrap().serialize_rules();
+        let text = self.consent.locked().serialize_rules();
         if let Err(e) = atomic_write(&dir.join(CONSENT_RULES_FILE), text.as_bytes()) {
             eprintln!("cerberus: cannot save consent rules: {e}");
         }
@@ -2413,7 +2405,7 @@ impl BrowserApp {
         }
         let pass = Secret::from_passphrase(&self.vault_input);
         self.vault_input.clear();
-        let result = self.storage.lock().unwrap().unlock_vault(&pass);
+        let result = self.storage.locked().unlock_vault(&pass);
         self.vault_msg = Some(match result {
             Ok(()) => "vault unlocked".to_string(),
             Err(_) if self.data_dir.is_none() => {
@@ -2431,7 +2423,7 @@ impl BrowserApp {
         let Some(dir) = self.data_dir.clone() else {
             return;
         };
-        let mut env = self.storage.lock().unwrap();
+        let mut env = self.storage.locked();
         if env.needs_save() {
             if let Err(e) = env.save(&dir) {
                 eprintln!("cerberus: cannot persist profile: {e}");
@@ -2558,8 +2550,7 @@ impl FrameApp for BrowserApp {
     fn poll(&mut self) -> bool {
         let mut redraw = false;
         // Worker-side consent events (cookie capture) surface in the banner.
-        let drained: Vec<ConsentEvent> =
-            std::mem::take(self.pending_consent.lock().unwrap().as_mut());
+        let drained: Vec<ConsentEvent> = std::mem::take(self.pending_consent.locked().as_mut());
         for event in drained {
             self.queue_consent_prompt(event);
             redraw = true;
@@ -2662,7 +2653,7 @@ impl FrameApp for BrowserApp {
             self.insecure_button = Some(paint_insecure_button(&mut fb, &self.text));
         }
         if self.settings_open {
-            let vault_locked = self.storage.lock().unwrap().vault_locked();
+            let vault_locked = self.storage.locked().vault_locked();
             paint_settings_overlay(
                 &mut fb,
                 size,
@@ -2675,7 +2666,7 @@ impl FrameApp for BrowserApp {
             );
         }
         if self.cookie_manager_open {
-            let global = self.cookie_policy.lock().unwrap().global().label();
+            let global = self.cookie_policy.locked().global().label();
             let rows: Vec<CookieRow> = self.cookie_rows().into_iter().map(|(_, _, r)| r).collect();
             self.text.rasterize(
                 &CookieManager::paint(size, &self.text, &global, &rows, self.cookie_scroll),
@@ -3619,12 +3610,11 @@ mod tests {
         jar.set_cookie(instance, &tracker, &fp, "uid=xyz");
         assert_eq!(jar.cookie_header(instance, &tracker, &fp), None);
         assert!(env
-            .lock()
-            .unwrap()
+            .locked()
             .instance(instance)
             .quarantined_names(&fp)
             .is_empty());
-        assert_eq!(events.lock().unwrap().len(), 1);
+        assert_eq!(events.locked().len(), 1);
     }
 
     #[test]
@@ -3649,30 +3639,23 @@ mod tests {
         let site = fp.site();
 
         // Global default Block → first-party cookie is dropped on capture.
-        cookies.lock().unwrap().set_global(CookieDisposition::Block);
+        cookies.locked().set_global(CookieDisposition::Block);
         jar.set_cookie(instance, &url, &fp, "a=1; Secure");
-        assert!(env
-            .lock()
-            .unwrap()
-            .instance(instance)
-            .cookie_views()
-            .is_empty());
+        assert!(env.locked().instance(instance).cookie_views().is_empty());
 
         // A per-cookie Timed override wins over the global Block.
         cookies
-            .lock()
-            .unwrap()
+            .locked()
             .set_override(&site, "b", CookieDisposition::Timed(120));
         jar.set_cookie(instance, &url, &fp, "b=2; Secure");
-        let views = env.lock().unwrap().instance(instance).cookie_views();
+        let views = env.locked().instance(instance).cookie_views();
         assert_eq!(views.len(), 1);
         assert_eq!(views[0].name, "b");
         assert_eq!(views[0].disposition, CookieDisposition::Timed(120));
 
         // Allow-once: attached on the first request, gone on the second.
         cookies
-            .lock()
-            .unwrap()
+            .locked()
             .set_override(&site, "c", CookieDisposition::AllowOnce);
         jar.set_cookie(instance, &url, &fp, "c=3; Secure");
         let h1 = jar.cookie_header(instance, &url, &fp).unwrap();
@@ -3771,8 +3754,7 @@ mod tests {
         let inst = app.heads.active().instance;
         let fp = Origin::new("https", "example.com", None);
         app.storage
-            .lock()
-            .unwrap()
+            .locked()
             .instance(inst)
             .set_cookie(
                 &fp,
@@ -3793,8 +3775,7 @@ mod tests {
         app.apply_cookie_action(CookieAction::Cycle(0));
         assert_eq!(
             app.cookie_policy
-                .lock()
-                .unwrap()
+                .locked()
                 .resolve("https://example.com", "sid"),
             CookieDisposition::Session
         );
@@ -3808,8 +3789,7 @@ mod tests {
         app.commit_ttl_edit();
         assert_eq!(
             app.cookie_policy
-                .lock()
-                .unwrap()
+                .locked()
                 .resolve("https://example.com", "sid"),
             CookieDisposition::Timed(90)
         );
@@ -3819,8 +3799,7 @@ mod tests {
         assert!(app.cookie_rows().is_empty());
         assert_eq!(
             app.cookie_policy
-                .lock()
-                .unwrap()
+                .locked()
                 .resolve("https://example.com", "sid"),
             CookieDisposition::Block
         );
@@ -3828,7 +3807,7 @@ mod tests {
         // Global default cycles without panicking.
         app.apply_cookie_action(CookieAction::CycleGlobal);
         assert_ne!(
-            app.cookie_policy.lock().unwrap().global(),
+            app.cookie_policy.locked().global(),
             CookieDisposition::Allow
         );
         // Close.
@@ -3960,7 +3939,7 @@ mod tests {
         // The network worker was handed two *different* sealed instances —
         // the fetch path itself is what isolates the heads (the per-instance
         // cache means head B's load cannot be served from head A's entry).
-        let seen = seen.lock().unwrap();
+        let seen = seen.locked();
         assert_eq!(seen.len(), 2, "two page loads requested");
         assert_eq!(seen[0], first_instance);
         assert_ne!(seen[1], seen[0]);
@@ -4014,7 +3993,7 @@ mod tests {
 
     impl PageLoader for FakeLoader {
         fn request(&self, id: u64, url: String, ctx: FetchContext) {
-            self.seen_instances.lock().unwrap().push(ctx.instance);
+            self.seen_instances.locked().push(ctx.instance);
             let result = self
                 .responses
                 .get(&url)
