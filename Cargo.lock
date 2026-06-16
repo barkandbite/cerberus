@@ -414,6 +414,7 @@ version = "0.0.0"
 dependencies = [
  "cerberus-types",
  "cerberus-url",
+ "miniz_oxide",
 ]
 
 [[package]]

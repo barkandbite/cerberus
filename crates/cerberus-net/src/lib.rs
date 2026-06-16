@@ -17,6 +17,7 @@ use std::net::IpAddr;
 pub mod http1;
 
 mod cache;
+mod decompress;
 mod engine;
 pub use cache::HttpCache;
 pub use engine::{parse_proxy, HttpEngine, ProxyConfig, Router, DEFAULT_USER_AGENT};
