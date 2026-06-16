@@ -2650,6 +2650,87 @@ impl Drop for BrowserApp {
     }
 }
 
+/// Render a `Color` the way `getComputedStyle` reports it.
+fn css_color(c: Color) -> String {
+    if c.a == 255 {
+        format!("rgb({}, {}, {})", c.r, c.g, c.b)
+    } else {
+        format!("rgba({}, {}, {}, {})", c.r, c.g, c.b, c.a as f32 / 255.0)
+    }
+}
+
+/// Serialize the computed style we track to the CSS strings `getComputedStyle`
+/// exposes (ADR-0021).
+fn computed_css(s: &cerberus_style::ComputedStyle) -> Vec<(String, String)> {
+    let display = match s.display {
+        cerberus_style::Display::Block => "block",
+        cerberus_style::Display::Inline => "inline",
+        cerberus_style::Display::ListItem => "list-item",
+        cerberus_style::Display::None => "none",
+    };
+    let text_align = match s.text_align {
+        cerberus_style::TextAlign::Left => "left",
+        cerberus_style::TextAlign::Center => "center",
+        cerberus_style::TextAlign::Right => "right",
+    };
+    let visibility = match s.visibility {
+        cerberus_style::Visibility::Visible => "visible",
+        cerberus_style::Visibility::Hidden => "hidden",
+    };
+    vec![
+        ("color".to_string(), css_color(s.color)),
+        (
+            "background-color".to_string(),
+            s.background
+                .map_or_else(|| "rgba(0, 0, 0, 0)".to_string(), css_color),
+        ),
+        ("font-size".to_string(), format!("{}px", s.font_size)),
+        (
+            "font-weight".to_string(),
+            (if s.font.bold { "700" } else { "400" }).to_string(),
+        ),
+        (
+            "font-style".to_string(),
+            (if s.font.italic { "italic" } else { "normal" }).to_string(),
+        ),
+        ("text-align".to_string(), text_align.to_string()),
+        ("display".to_string(), display.to_string()),
+        ("visibility".to_string(), visibility.to_string()),
+        ("opacity".to_string(), format!("{}", s.opacity)),
+        ("margin-top".to_string(), format!("{}px", s.margin_top)),
+        (
+            "margin-bottom".to_string(),
+            format!("{}px", s.margin_bottom),
+        ),
+        ("margin-left".to_string(), format!("{}px", s.margin_left)),
+    ]
+}
+
+/// Collect `(js-id, computed-css)` for every styled element that has a live
+/// realm node, so `getComputedStyle` reflects the cascade (ADR-0021).
+fn collect_computed(
+    styled: &cerberus_style::StyledDom,
+    node_to_js: &HashMap<NodeId, u64>,
+) -> Vec<(u64, Vec<(String, String)>)> {
+    fn rec(
+        n: &cerberus_style::StyledNode,
+        map: &HashMap<NodeId, u64>,
+        out: &mut Vec<(u64, Vec<(String, String)>)>,
+    ) {
+        if let Some(&js) = map.get(&n.node_id) {
+            out.push((js, computed_css(&n.style)));
+        }
+        for c in &n.children {
+            if let cerberus_style::StyledChild::Element(e) = c {
+                rec(e, map, out);
+            }
+        }
+    }
+    let mut out = Vec::new();
+    rec(&styled.root, node_to_js, &mut out);
+    out
+}
+
 impl FrameApp for BrowserApp {
     fn title(&self) -> String {
         match &self.page_title {
@@ -2766,8 +2847,10 @@ impl FrameApp for BrowserApp {
         // (ADR-0021); no-op for script-less pages.
         if !geometry.is_empty() {
             let realm = RealmId(self.heads.active().id.0);
+            let styles = collect_computed(&self.styled, &self.node_to_js);
             if let Ok(engine) = self.heads.engine() {
                 let _ = cerberus_js_dom::set_geometry(engine, realm, &geometry);
+                let _ = cerberus_js_dom::set_computed_styles(engine, realm, &styles);
             }
         }
 
