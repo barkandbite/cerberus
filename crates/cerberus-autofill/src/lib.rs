@@ -52,6 +52,100 @@ pub struct Profile {
     pub card: Card,
 }
 
+impl Profile {
+    /// Serialize to a versioned, length-prefixed byte blob (no serde) for
+    /// vault-sealed storage in the app layer.
+    pub fn to_bytes(&self) -> Vec<u8> {
+        let mut out = vec![1u8]; // format version
+        for field in [
+            &self.login.username,
+            &self.login.password,
+            &self.address.full_name,
+            &self.address.line1,
+            &self.address.line2,
+            &self.address.city,
+            &self.address.region,
+            &self.address.postal,
+            &self.address.country,
+            &self.address.phone,
+            &self.address.email,
+            &self.card.holder,
+            &self.card.number,
+            &self.card.exp_month,
+            &self.card.exp_year,
+            &self.card.cvv,
+        ] {
+            put_str(&mut out, field);
+        }
+        out
+    }
+
+    /// Parse a blob produced by [`to_bytes`](Profile::to_bytes); `None` if it is
+    /// malformed or a future version.
+    pub fn from_bytes(bytes: &[u8]) -> Option<Profile> {
+        let mut p = bytes;
+        if get_u8(&mut p)? != 1 {
+            return None;
+        }
+        let mut fields = Vec::with_capacity(16);
+        for _ in 0..16 {
+            fields.push(get_str(&mut p)?);
+        }
+        let mut it = fields.into_iter();
+        let mut next = || it.next().unwrap_or_default();
+        Some(Profile {
+            login: Login {
+                username: next(),
+                password: next(),
+            },
+            address: Address {
+                full_name: next(),
+                line1: next(),
+                line2: next(),
+                city: next(),
+                region: next(),
+                postal: next(),
+                country: next(),
+                phone: next(),
+                email: next(),
+            },
+            card: Card {
+                holder: next(),
+                number: next(),
+                exp_month: next(),
+                exp_year: next(),
+                cvv: next(),
+            },
+        })
+    }
+}
+
+fn put_str(out: &mut Vec<u8>, s: &str) {
+    let b = s.as_bytes();
+    out.extend_from_slice(&(b.len() as u32).to_le_bytes());
+    out.extend_from_slice(b);
+}
+
+fn get_u8(p: &mut &[u8]) -> Option<u8> {
+    let (first, rest) = p.split_first()?;
+    *p = rest;
+    Some(*first)
+}
+
+fn get_str(p: &mut &[u8]) -> Option<String> {
+    if p.len() < 4 {
+        return None;
+    }
+    let len = u32::from_le_bytes([p[0], p[1], p[2], p[3]]) as usize;
+    let rest = &p[4..];
+    if rest.len() < len {
+        return None;
+    }
+    let s = std::str::from_utf8(&rest[..len]).ok()?.to_string();
+    *p = &rest[len..];
+    Some(s)
+}
+
 /// Which kind of value a detected form field wants.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum FieldKind {
@@ -298,6 +392,16 @@ mod tests {
         }
         let nid = find(doc.root(), id)?;
         plan.iter().find(|(n, _)| *n == nid).map(|(_, v)| v.clone())
+    }
+
+    #[test]
+    fn profile_bytes_round_trip() {
+        let p = profile();
+        assert_eq!(Profile::from_bytes(&p.to_bytes()), Some(p));
+        // Malformed / wrong-version blobs decode to None, never panic.
+        assert_eq!(Profile::from_bytes(&[]), None);
+        assert_eq!(Profile::from_bytes(&[1, 0, 0]), None);
+        assert_eq!(Profile::from_bytes(&[2, 0, 0, 0, 0]), None);
     }
 
     #[test]
