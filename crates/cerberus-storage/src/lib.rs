@@ -210,6 +210,26 @@ impl StorageEnvironment {
         self.vault.unlock(passphrase)
     }
 
+    /// Seal an arbitrary per-instance blob in the vault (e.g. an autofill
+    /// profile), keyed by `(instance, key)`. Errors if the vault is locked.
+    pub fn store_blob(
+        &mut self,
+        instance: InstanceId,
+        key: &str,
+        plaintext: &[u8],
+    ) -> Result<(), StorageError> {
+        self.vault.store(instance, key, plaintext)
+    }
+
+    /// Open a per-instance vault blob, or `None` if absent. Errors if locked.
+    pub fn load_blob(
+        &mut self,
+        instance: InstanceId,
+        key: &str,
+    ) -> Result<Option<Vec<u8>>, StorageError> {
+        self.vault.load(instance, key)
+    }
+
     /// Load an environment from `dir` (layout: `instances/<id>/cookies.bin` +
     /// `vault.bin`), backed by `vault`. Missing files mean a fresh profile.
     /// Expired cookies are dropped at load. The vault's ciphertext blobs load
@@ -939,6 +959,20 @@ mod tests {
         let mut c = Cookie::host(name, value, "example.com");
         c.expires = Some(crate::cookie::unix_now() + 3600);
         c
+    }
+
+    #[test]
+    fn vault_blob_round_trips() {
+        let mut env = StorageEnvironment::new(fresh_vault());
+        env.unlock_vault(&Secret::from_passphrase("correct horse"))
+            .unwrap();
+        let inst = InstanceId::from_u64_pair(0, 7);
+        assert_eq!(env.load_blob(inst, "autofill.profile").unwrap(), None);
+        env.store_blob(inst, "autofill.profile", b"hello").unwrap();
+        assert_eq!(
+            env.load_blob(inst, "autofill.profile").unwrap().as_deref(),
+            Some(&b"hello"[..])
+        );
     }
 
     #[test]
