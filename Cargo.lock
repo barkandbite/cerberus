@@ -245,6 +245,7 @@ dependencies = [
 name = "cerberus-app"
 version = "0.0.0"
 dependencies = [
+ "cerberus-autofill",
  "cerberus-consent",
  "cerberus-crypto",
  "cerberus-crypto-rustcrypto",
