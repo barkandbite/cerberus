@@ -56,7 +56,7 @@ mod json;
 
 use cerberus_dom::{Document, DocumentBuilder, NodeId, NodeRef};
 use cerberus_js::{JsEngine, JsError, JsValue};
-use cerberus_types::RealmId;
+use cerberus_types::{RealmId, Rect};
 use json::Json;
 use std::collections::HashMap;
 use std::fmt;
@@ -716,6 +716,68 @@ pub fn set_node_value(
     value: &str,
 ) -> Result<(), BridgeError> {
     let call = format!("__cerberusSetValue({}, {})", node_id, js_string(value));
+    match engine.eval(realm, &call) {
+        Ok(_) | Err(JsError::Eval(_)) => Ok(()),
+        Err(other) => Err(BridgeError::Js(other)),
+    }
+}
+
+/// Push layout geometry — device-pixel boxes keyed by JS node id — into the live
+/// realm so `getBoundingClientRect` returns real rects (ADR-0021). Call after
+/// layout; a missing node is a safe no-op. Empty input is a no-op.
+pub fn set_geometry(
+    engine: &mut dyn JsEngine,
+    realm: RealmId,
+    boxes: &[(u64, Rect)],
+) -> Result<(), BridgeError> {
+    if boxes.is_empty() {
+        return Ok(());
+    }
+    let mut json = String::from("{");
+    for (i, (id, r)) in boxes.iter().enumerate() {
+        if i > 0 {
+            json.push(',');
+        }
+        json.push_str(&format!(
+            "\"{id}\":{{\"x\":{},\"y\":{},\"w\":{},\"h\":{}}}",
+            r.x, r.y, r.w, r.h
+        ));
+    }
+    json.push('}');
+    let call = format!("__cerberusSetGeometry({json})");
+    match engine.eval(realm, &call) {
+        Ok(_) | Err(JsError::Eval(_)) => Ok(()),
+        Err(other) => Err(BridgeError::Js(other)),
+    }
+}
+
+/// Push cascaded computed styles — `property → value` maps keyed by JS node id —
+/// into the live realm so `getComputedStyle` reflects the cascade, not just
+/// inline declarations (ADR-0021). Empty input is a no-op.
+pub fn set_computed_styles(
+    engine: &mut dyn JsEngine,
+    realm: RealmId,
+    styles: &[(u64, Vec<(String, String)>)],
+) -> Result<(), BridgeError> {
+    if styles.is_empty() {
+        return Ok(());
+    }
+    let mut json = String::from("{");
+    for (i, (id, props)) in styles.iter().enumerate() {
+        if i > 0 {
+            json.push(',');
+        }
+        json.push_str(&format!("\"{id}\":{{"));
+        for (j, (k, v)) in props.iter().enumerate() {
+            if j > 0 {
+                json.push(',');
+            }
+            json.push_str(&format!("{}:{}", js_string(k), js_string(v)));
+        }
+        json.push('}');
+    }
+    json.push('}');
+    let call = format!("__cerberusSetComputedStyles({json})");
     match engine.eval(realm, &call) {
         Ok(_) | Err(JsError::Eval(_)) => Ok(()),
         Err(other) => Err(BridgeError::Js(other)),
@@ -1739,7 +1801,11 @@ pub const DOM_MODEL_PRELUDE: &str = r##"
     };
 
     ELEMENT_PROTO.getBoundingClientRect = function () {
-      return { x: 0, y: 0, top: 0, left: 0, right: 0, bottom: 0, width: 0, height: 0 };
+      var g = this.__geometry || { x: 0, y: 0, w: 0, h: 0 };
+      return {
+        x: g.x, y: g.y, top: g.y, left: g.x,
+        right: g.x + g.w, bottom: g.y + g.h, width: g.w, height: g.h,
+      };
     };
 
     // Inert event listener registry on elements (dispatch not yet driven by
@@ -2047,6 +2113,11 @@ pub const DOM_MODEL_PRELUDE: &str = r##"
     window.getComputedStyle = function (el) {
       var decls = Object.create(null);
       if (el && el.__type === ELEMENT_NODE) {
+        // Cascaded computed values pushed from the layout engine (Rust) first,
+        // then inline `style=` declarations, which win.
+        if (el.__computedStyles) {
+          for (var ck in el.__computedStyles) decls[ck] = el.__computedStyles[ck];
+        }
         var inline = getAttr(el, "style");
         if (inline) {
           inline.split(";").forEach(function (d) {
@@ -2067,10 +2138,27 @@ pub const DOM_MODEL_PRELUDE: &str = r##"
       });
     };
 
-    // ---- matchMedia (never matches — we don't honor media queries) -----
+    // ---- matchMedia (honors width/height/orientation vs the viewport) ---
+    function __cerberusEvalMedia(query, w, h) {
+      return String(query).split(",").some(function (branch) {
+        var re = /\(([a-z-]+)\s*:\s*([^)]+)\)/g, m, ok = true, any = false;
+        while ((m = re.exec(branch)) !== null) {
+          any = true;
+          var name = m[1], val = m[2].trim(), px = parseInt(val, 10) || 0;
+          if (name === "min-width") ok = ok && w >= px;
+          else if (name === "max-width") ok = ok && w <= px;
+          else if (name === "min-height") ok = ok && h >= px;
+          else if (name === "max-height") ok = ok && h <= px;
+          else if (name === "orientation") ok = ok && (val === "portrait" ? h >= w : w > h);
+        }
+        return any && ok;
+      });
+    }
     window.matchMedia = function (q) {
+      var env = globalThis.__CERBERUS_ENV__ || { width: 0, height: 0 };
       return {
-        matches: false, media: String(q), onchange: null,
+        matches: __cerberusEvalMedia(q, env.width | 0, env.height | 0),
+        media: String(q), onchange: null,
         addListener: function () {}, removeListener: function () {},
         addEventListener: function () {}, removeEventListener: function () {},
         dispatchEvent: function () { return false; },
@@ -2174,6 +2262,28 @@ pub const DOM_MODEL_PRELUDE: &str = r##"
       try {
         var n = byId[nodeId];
         if (n) n.value = String(value);
+      } catch (e) {}
+    };
+
+    // Layout geometry pushed from Rust after layout, keyed by JS node id, so
+    // getBoundingClientRect returns real boxes (ADR-0021).
+    g.__cerberusSetGeometry = function (geom) {
+      try {
+        for (var gid in geom) {
+          var gn = byId[gid];
+          if (gn) gn.__geometry = geom[gid];
+        }
+      } catch (e) {}
+    };
+
+    // Cascaded computed styles pushed from Rust, keyed by JS node id, so
+    // getComputedStyle reflects the cascade, not just inline (ADR-0021).
+    g.__cerberusSetComputedStyles = function (styles) {
+      try {
+        for (var sid in styles) {
+          var sn = byId[sid];
+          if (sn) sn.__computedStyles = styles[sid];
+        }
       } catch (e) {}
     };
 
