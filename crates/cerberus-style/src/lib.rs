@@ -18,6 +18,15 @@ pub enum Display {
     None,
 }
 
+/// CSS `visibility`. A hidden element still occupies layout space but is not
+/// painted (unlike `display: none`). Inherited.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub enum Visibility {
+    #[default]
+    Visible,
+    Hidden,
+}
+
 /// CSS `text-align`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
 pub enum TextAlign {
@@ -42,6 +51,10 @@ pub struct ComputedStyle {
     pub margin_left: i32,
     /// Preserve whitespace/newlines (`<pre>`); otherwise collapse + wrap.
     pub preformatted: bool,
+    /// `visibility: hidden` — laid out but not painted. Inherited.
+    pub visibility: Visibility,
+    /// `opacity` in `[0.0, 1.0]`, composited in paint. Not inherited.
+    pub opacity: f32,
 }
 
 impl ComputedStyle {
@@ -59,6 +72,8 @@ impl ComputedStyle {
             margin_bottom: 0,
             margin_left: 0,
             preformatted: false,
+            visibility: Visibility::Visible,
+            opacity: 1.0,
         }
     }
 
@@ -72,9 +87,11 @@ impl ComputedStyle {
             text_align: self.text_align,
             underline: self.underline,
             preformatted: self.preformatted,
+            visibility: self.visibility,
             // Reset per element:
             display: Display::Inline,
             background: None,
+            opacity: 1.0,
             margin_top: 0,
             margin_bottom: 0,
             margin_left: 0,

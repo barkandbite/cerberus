@@ -1,11 +1,10 @@
 //! Our CSS engine (`CssEngine: StyleEngine`): parse the UA + author stylesheets,
 //! run the cascade, and produce a `StyledDom`. Bootstrapped — no dependencies.
 //!
-//! **Speed-first / raw render (per product directive):** properties that exist
-//! only to *delay* or *animate* the appearance of content — `opacity`,
-//! `animation*`, `transition*`, `transform`, `visibility` — are deliberately
-//! **ignored**. Content that a site hides behind a fade/scroll-in is therefore
-//! shown immediately, at full visibility.
+//! `visibility` and `opacity` are honored (a hidden element is laid out but not
+//! painted; a transparent one is composited). Time-based effects —
+//! `animation*`, `transition*`, `transform` — are still ignored (no
+//! compositor/timeline), so content they would reveal renders immediately.
 
 mod color;
 mod parser;
@@ -14,10 +13,14 @@ pub use color::parse_color;
 
 use cerberus_dom::{Document, NodeRef};
 use cerberus_style::{
-    ComputedStyle, Display, StyleEngine, StyledChild, StyledDom, StyledNode, TextAlign,
+    ComputedStyle, Display, StyleEngine, StyledChild, StyledDom, StyledNode, TextAlign, Visibility,
 };
 use cerberus_types::Color;
-use parser::{parse_declaration_block, parse_stylesheet, ElemRef, Specificity, Stylesheet};
+use parser::{
+    parse_declaration_block, parse_stylesheet, ElemRef, MediaContext, SiblingRef, Specificity,
+    Stylesheet,
+};
+use std::rc::Rc;
 
 /// A matched rule during the cascade: (origin, specificity, source-order, decls).
 type MatchedRule<'a> = (u8, Specificity, usize, &'a Vec<(String, String)>);
@@ -48,19 +51,29 @@ i, em, cite, var { font-style: italic; }
 /// CSS engine built on our parser + cascade.
 pub struct CssEngine {
     ua: Stylesheet,
+    media: MediaContext,
 }
 
 impl CssEngine {
-    /// Build an engine with the bundled UA stylesheet parsed.
+    /// Build an engine with the bundled UA stylesheet parsed, for a default
+    /// desktop viewport (used where `@media` width does not matter).
     pub fn new() -> Self {
+        Self::with_media(1280, 800)
+    }
+
+    /// Build an engine that evaluates `@media` queries against `width`×`height`.
+    pub fn with_media(width: u32, height: u32) -> Self {
         Self {
             ua: parse_stylesheet(UA_CSS),
+            media: MediaContext { width, height },
         }
     }
 
     fn build(
         &self,
         node: NodeRef<'_>,
+        siblings: Rc<[SiblingRef]>,
+        index: usize,
         parent: &ComputedStyle,
         path: &mut Vec<ElemRef>,
         author: &Stylesheet,
@@ -72,19 +85,27 @@ impl CssEngine {
             parent.inherit()
         };
 
-        path.push(elem_ref(node));
+        path.push(ElemRef {
+            siblings: siblings.clone(),
+            index,
+        });
 
         if !is_root {
-            // Collect matching declarations: (origin, specificity, source-order).
+            // Collect matching declarations: (origin, specificity, source-order),
+            // honoring @media against the engine's viewport.
             let mut matched: Vec<MatchedRule<'_>> = Vec::new();
             for (order, rule) in self.ua.rules.iter().enumerate() {
-                if let Some(spec) = rule.matches(path) {
-                    matched.push((0, spec, order, &rule.declarations));
+                if rule.applies(self.media) {
+                    if let Some(spec) = rule.matches(path) {
+                        matched.push((0, spec, order, &rule.declarations));
+                    }
                 }
             }
             for (order, rule) in author.rules.iter().enumerate() {
-                if let Some(spec) = rule.matches(path) {
-                    matched.push((1, spec, order, &rule.declarations));
+                if rule.applies(self.media) {
+                    if let Some(spec) = rule.matches(path) {
+                        matched.push((1, spec, order, &rule.declarations));
+                    }
                 }
             }
             matched.sort_by(|a, b| (a.0, a.1, a.2).cmp(&(b.0, b.1, b.2)));
@@ -99,11 +120,31 @@ impl CssEngine {
             }
         }
 
+        // The element children, reduced for sibling / :nth-child matching, shared
+        // across this level via `Rc` so the cascade stays O(n).
+        let child_siblings: Rc<[SiblingRef]> = node
+            .children()
+            .filter(|c| c.is_element())
+            .map(sibling_ref)
+            .collect::<Vec<_>>()
+            .into();
+        let mut elem_index = 0usize;
         let children = node
             .children()
             .map(|child| match child.text() {
                 Some(t) => StyledChild::Text(t.to_string()),
-                None => StyledChild::Element(self.build(child, &style, path, author)),
+                None => {
+                    let styled = self.build(
+                        child,
+                        child_siblings.clone(),
+                        elem_index,
+                        &style,
+                        path,
+                        author,
+                    );
+                    elem_index += 1;
+                    StyledChild::Element(styled)
+                }
             })
             .collect();
 
@@ -128,19 +169,29 @@ impl StyleEngine for CssEngine {
     fn style(&self, doc: &Document) -> StyledDom {
         let author = parse_stylesheet(&collect_author_css(doc.root()));
         let mut path = Vec::new();
-        let root = self.build(doc.root(), &ComputedStyle::initial(), &mut path, &author);
-        StyledDom { root }
+        let root = doc.root();
+        let root_siblings: Rc<[SiblingRef]> = vec![sibling_ref(root)].into();
+        let styled = self.build(
+            root,
+            root_siblings,
+            0,
+            &ComputedStyle::initial(),
+            &mut path,
+            &author,
+        );
+        StyledDom { root: styled }
     }
 }
 
-fn elem_ref(node: NodeRef<'_>) -> ElemRef {
-    ElemRef {
+fn sibling_ref(node: NodeRef<'_>) -> SiblingRef {
+    SiblingRef {
         tag: node.tag().to_string(),
         id: node.attr("id").map(str::to_string),
         classes: node
             .attr("class")
             .map(|c| c.split_whitespace().map(str::to_string).collect())
             .unwrap_or_default(),
+        attrs: node.attrs().to_vec(),
     }
 }
 
@@ -226,8 +277,20 @@ fn apply_declarations(
                 }
             }
             "white-space" => style.preformatted = v.to_ascii_lowercase().starts_with("pre"),
-            // Deliberately ignored (speed-first / raw render): opacity, animation*,
-            // transition*, transform, visibility, and everything else.
+            "visibility" => {
+                style.visibility = match v.to_ascii_lowercase().as_str() {
+                    "hidden" | "collapse" => Visibility::Hidden,
+                    "visible" => Visibility::Visible,
+                    _ => style.visibility,
+                }
+            }
+            "opacity" => {
+                if let Some(o) = parse_opacity(v) {
+                    style.opacity = o;
+                }
+            }
+            // Still ignored (no compositor/timeline): animation*, transition*,
+            // transform, and everything else.
             _ => {}
         }
     }
@@ -243,6 +306,18 @@ fn is_bold(v: &str) -> bool {
         return true;
     }
     v.parse::<u32>().map(|n| n >= 600).unwrap_or(false)
+}
+
+fn parse_opacity(v: &str) -> Option<f32> {
+    let v = v.trim();
+    if let Some(p) = v.strip_suffix('%') {
+        return p
+            .trim()
+            .parse::<f32>()
+            .ok()
+            .map(|n| (n / 100.0).clamp(0.0, 1.0));
+    }
+    v.parse::<f32>().ok().map(|n| n.clamp(0.0, 1.0))
 }
 
 fn parse_display(v: &str) -> Option<Display> {
@@ -389,12 +464,64 @@ mod tests {
     }
 
     #[test]
-    fn opacity_and_animation_are_ignored_for_raw_render() {
-        // Content hidden behind a fade/scroll-in still renders normally.
-        let html = "<p style='opacity:0; animation: fade 3s; transition: all 2s'>visible</p>";
+    fn opacity_honored_animation_ignored() {
+        let html = "<p style='opacity:0; animation: fade 3s; transition: all 2s'>x</p>";
         let dom = CssEngine::new().style(&parse_html(html));
         let p = first(&dom.root, "p").unwrap();
-        // We simply never read opacity/animation; the element is a normal block.
+        assert_eq!(p.style.opacity, 0.0, "opacity is now read");
+        // animation/transition remain ignored — still a normal block.
         assert_eq!(p.style.display, Display::Block);
+    }
+
+    #[test]
+    fn visibility_hidden_is_computed() {
+        let dom = CssEngine::new().style(&parse_html("<p style='visibility:hidden'>x</p>"));
+        assert_eq!(
+            first(&dom.root, "p").unwrap().style.visibility,
+            Visibility::Hidden
+        );
+    }
+
+    #[test]
+    fn combinators_pseudos_and_attrs_cascade() {
+        // Child combinator, :nth-child, and an attribute selector through the
+        // full cascade (author CSS + DOM).
+        let html = "<style>\
+            ul > li:nth-child(2) { color: #ff0000 }\
+            input[type=\"text\"] { color: #00ff00 }\
+            </style>\
+            <ul><li>a</li><li>b</li></ul><input type='text'>";
+        let dom = CssEngine::new().style(&parse_html(html));
+        // The second <li> is red; the first is not.
+        let ul = first(&dom.root, "ul").unwrap();
+        let lis: Vec<_> = ul
+            .children
+            .iter()
+            .filter_map(|c| match c {
+                StyledChild::Element(e) if e.tag == "li" => Some(e),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(lis[0].style.color, Color::BLACK);
+        assert_eq!(lis[1].style.color, Color::rgb(0xff, 0, 0));
+        // The text input is green via the attribute selector.
+        assert_eq!(
+            first(&dom.root, "input").unwrap().style.color,
+            Color::rgb(0, 0xff, 0)
+        );
+    }
+
+    #[test]
+    fn media_query_respects_viewport() {
+        let html = "<style>@media (max-width: 600px) { p { color: #ff0000 } }</style><p>x</p>";
+        // Narrow viewport: the rule applies.
+        let narrow = CssEngine::with_media(480, 800).style(&parse_html(html));
+        assert_eq!(
+            first(&narrow.root, "p").unwrap().style.color,
+            Color::rgb(0xff, 0, 0)
+        );
+        // Wide viewport: it does not.
+        let wide = CssEngine::with_media(1200, 800).style(&parse_html(html));
+        assert_eq!(first(&wide.root, "p").unwrap().style.color, Color::BLACK);
     }
 }
