@@ -2717,6 +2717,18 @@ impl FrameApp for BrowserApp {
         };
         self.timings.record("layout+paint", t.elapsed());
 
+        // Capture element geometry in content (viewport) coordinates for
+        // getBoundingClientRect, before the boxes are offset into window space
+        // for click hit-testing below. Scripted pages only (ADR-0021).
+        let geometry: Vec<(u64, Rect)> = if self.node_to_js.is_empty() {
+            Vec::new()
+        } else {
+            laid.elements
+                .iter()
+                .filter_map(|e| self.node_to_js.get(&e.node).map(|&js| (js, e.rect)))
+                .collect()
+        };
+
         // Record link hit-boxes in window coordinates for click handling.
         self.links = laid
             .links
@@ -2749,6 +2761,15 @@ impl FrameApp for BrowserApp {
                 e
             })
             .collect();
+
+        // Make getBoundingClientRect reflect this layout in the live realm
+        // (ADR-0021); no-op for script-less pages.
+        if !geometry.is_empty() {
+            let realm = RealmId(self.heads.active().id.0);
+            if let Ok(engine) = self.heads.engine() {
+                let _ = cerberus_js_dom::set_geometry(engine, realm, &geometry);
+            }
+        }
 
         // Draw a caret at the end of the focused text field's value. The field's
         // own value is already painted by layout into `page`; we just add the bar.
