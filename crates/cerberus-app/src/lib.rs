@@ -379,6 +379,119 @@ pub fn identities_admin(
         .collect())
 }
 
+/// Headless autofill-profile administration (`cerberus-app profile`): show — or,
+/// with `set` (`key=value;…`), update — the identity at `identity`'s autofill
+/// profile, sealed in the encrypted vault. The vault is unlocked with
+/// `passphrase` (a wrong one fails here). Secrets are redacted in the output.
+pub fn profile_admin(
+    dir: &str,
+    identity: usize,
+    set: Option<&str>,
+    passphrase: &str,
+) -> Result<Vec<String>, String> {
+    let path = Path::new(dir);
+    std::fs::create_dir_all(path).map_err(|e| e.to_string())?;
+    let heads = load_heads(path)
+        .map(|(h, _)| h)
+        .unwrap_or_else(default_heads);
+    let head = heads
+        .get(identity)
+        .ok_or_else(|| format!("no identity at index {identity}"))?;
+    let instance = head.instance;
+
+    let mut env = open_profile_storage(path).map_err(|e| e.to_string())?;
+    env.unlock_vault(&Secret::from_passphrase(passphrase))
+        .map_err(|e| format!("vault unlock failed: {e:?}"))?;
+
+    let load = |env: &mut StorageEnvironment| {
+        env.load_blob(instance, AUTOFILL_PROFILE_KEY)
+            .ok()
+            .flatten()
+            .and_then(|b| cerberus_autofill::Profile::from_bytes(&b))
+            .unwrap_or_default()
+    };
+
+    if let Some(spec) = set {
+        let mut profile = load(&mut env);
+        apply_profile_fields(&mut profile, spec)?;
+        env.store_blob(instance, AUTOFILL_PROFILE_KEY, &profile.to_bytes())
+            .map_err(|e| format!("{e:?}"))?;
+        env.save(path).map_err(|e| e.to_string())?;
+    }
+
+    Ok(profile_lines(identity, &head.label, &load(&mut env)))
+}
+
+/// Apply a `key=value;key=value` spec to a profile (used by `profile --set`).
+fn apply_profile_fields(p: &mut cerberus_autofill::Profile, spec: &str) -> Result<(), String> {
+    for pair in spec.split(';') {
+        let pair = pair.trim();
+        if pair.is_empty() {
+            continue;
+        }
+        let (k, v) = pair
+            .split_once('=')
+            .ok_or_else(|| format!("bad field {pair:?} (want key=value)"))?;
+        let v = v.to_string();
+        match k.trim() {
+            "login.username" => p.login.username = v,
+            "login.password" => p.login.password = v,
+            "address.full_name" => p.address.full_name = v,
+            "address.line1" => p.address.line1 = v,
+            "address.line2" => p.address.line2 = v,
+            "address.city" => p.address.city = v,
+            "address.region" => p.address.region = v,
+            "address.postal" => p.address.postal = v,
+            "address.country" => p.address.country = v,
+            "address.phone" => p.address.phone = v,
+            "address.email" => p.address.email = v,
+            "card.holder" => p.card.holder = v,
+            "card.number" => p.card.number = v,
+            "card.exp_month" => p.card.exp_month = v,
+            "card.exp_year" => p.card.exp_year = v,
+            "card.cvv" => p.card.cvv = v,
+            other => return Err(format!("unknown field {other:?}")),
+        }
+    }
+    Ok(())
+}
+
+/// Render a profile for display, redacting password/card secrets.
+fn profile_lines(identity: usize, label: &str, p: &cerberus_autofill::Profile) -> Vec<String> {
+    let redact = |s: &str| {
+        if s.is_empty() {
+            String::new()
+        } else {
+            "•".repeat(s.chars().count().min(8))
+        }
+    };
+    let card = {
+        let digits: String = p.card.number.chars().filter(char::is_ascii_digit).collect();
+        if digits.len() > 4 {
+            format!("•••• {}", &digits[digits.len() - 4..])
+        } else {
+            redact(&p.card.number)
+        }
+    };
+    vec![
+        format!("identity [{identity}] {label}"),
+        format!("  login.username   : {}", p.login.username),
+        format!("  login.password   : {}", redact(&p.login.password)),
+        format!("  address.full_name: {}", p.address.full_name),
+        format!("  address.line1    : {}", p.address.line1),
+        format!("  address.city     : {}", p.address.city),
+        format!("  address.postal   : {}", p.address.postal),
+        format!("  address.country  : {}", p.address.country),
+        format!("  address.email    : {}", p.address.email),
+        format!("  card.number      : {card}"),
+        format!(
+            "  card.exp         : {}/{}",
+            p.card.exp_month, p.card.exp_year
+        ),
+        format!("  card.cvv         : {}", redact(&p.card.cvv)),
+    ]
+}
+
 /// The active head's sealed instance for a profile dir (or the first default
 /// head when there's no `heads.txt`).
 fn profile_active_instance(dir: &Path) -> InstanceId {

@@ -24,6 +24,7 @@ fn main() -> ExitCode {
         "bench" => cmd_bench(rest),
         "cookies" => cmd_cookies(rest),
         "identities" => cmd_identities(rest),
+        "profile" => cmd_profile(rest),
         "version" | "--version" | "-V" => {
             println!("cerberus {}", env!("CARGO_PKG_VERSION"));
             ExitCode::SUCCESS
@@ -288,6 +289,37 @@ fn cmd_identities(args: &[String]) -> ExitCode {
     }
 }
 
+/// `profile` — show, or with `--set "key=value;…"`, update an identity's autofill
+/// profile (login/address/card), sealed in the encrypted vault. The vault
+/// passphrase comes from `CERBERUS_VAULT_PASS` (never an argument, to keep it out
+/// of shell history).
+fn cmd_profile(args: &[String]) -> ExitCode {
+    let Some(dir) = flag(args, "--data-dir") else {
+        eprintln!("profile: --data-dir <DIR> is required");
+        return ExitCode::FAILURE;
+    };
+    let identity = flag(args, "--identity")
+        .and_then(|s| s.parse::<usize>().ok())
+        .unwrap_or(0);
+    let set = flag(args, "--set");
+    let Ok(passphrase) = std::env::var("CERBERUS_VAULT_PASS") else {
+        eprintln!("profile: set CERBERUS_VAULT_PASS to the vault passphrase");
+        return ExitCode::FAILURE;
+    };
+    match cerberus_app::profile_admin(&dir, identity, set.as_deref(), &passphrase) {
+        Ok(lines) => {
+            for line in lines {
+                println!("{line}");
+            }
+            ExitCode::SUCCESS
+        }
+        Err(e) => {
+            eprintln!("profile: {e}");
+            ExitCode::FAILURE
+        }
+    }
+}
+
 fn print_usage() {
     println!(
         "cerberus — a privacy-first, memory-lean browser (M0 scaffold)\n\n\
@@ -300,6 +332,8 @@ fn print_usage() {
          \x20 bench      Time the render pipeline stages (see --assert-total-ms)\n\
          \x20 cookies    Inspect/retune a profile's cookie dispositions (--data-dir)\n\
          \x20 identities Manage a profile's identities (--data-dir; --add/--remove)\n\
+         \x20 profile    Show/set an identity's autofill profile (--data-dir;\n\
+         \x20            --identity N; --set \"key=value;...\"; CERBERUS_VAULT_PASS)\n\
          \x20 version    Print the version\n\
          \x20 help       Print this help\n\n\
          RUN OPTIONS:\n\
