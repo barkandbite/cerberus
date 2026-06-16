@@ -16,6 +16,7 @@ cerberus-types = { path = "../cerberus-types" }
 cerberus-dom = { path = "../cerberus-dom" }
 cerberus-js = { path = "../cerberus-js" }
 cerberus-js-dom = { path = "../cerberus-js-dom" }
+cerberus-autofill = { path = "../cerberus-autofill" }
 
 [dev-dependencies]
 cerberus-js-quickjs = { path = "../cerberus-js-quickjs" }

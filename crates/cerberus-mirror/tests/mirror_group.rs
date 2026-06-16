@@ -6,10 +6,10 @@
 use std::cell::RefCell;
 use std::rc::Rc;
 
-use cerberus_dom::{parse_html, Document};
+use cerberus_dom::{parse_html, Document, NodeId, NodeRef};
 use cerberus_js::JsEngineFactory;
 use cerberus_js_quickjs::QuickJsEngineFactory;
-use cerberus_mirror::{Action, MirrorGroup, PageSource, Target};
+use cerberus_mirror::{Action, FillKind, FillProvider, MirrorGroup, PageSource, Target};
 use cerberus_types::InstanceId;
 
 const UA: &str = "Mozilla/5.0 (X11; Linux x86_64) Cerberus/0.0";
@@ -217,5 +217,77 @@ fn dormant_instances_release_dom_and_rematerialize_on_focus() {
     // Re-focusing the released master rebuilds it from the log — converged.
     g.focus(0).unwrap();
     assert_eq!(g.master().text_of_id("out").as_deref(), Some("clicked"));
+    assert!(g.live_realms() <= 1);
+}
+
+/// A login form whose `input` event mirrors the typed value into #out, so a
+/// test can observe what each window actually filled.
+struct FillForm;
+
+impl PageSource for FillForm {
+    fn load(&self, _instance: InstanceId, _url: &str) -> Result<Document, String> {
+        Ok(parse_html(
+            "<html><body><input id=\"user\"><div id=\"out\">empty</div>\
+             <script>document.getElementById('user').addEventListener('input',function(e){\
+             document.getElementById('out').textContent=e.target.value;});</script>\
+             </body></html>",
+        ))
+    }
+}
+
+/// Fills #user with a value derived from the *instance*, so each window proves
+/// it filled its own profile.
+struct PerProfileFill {
+    master: InstanceId,
+}
+
+impl FillProvider for PerProfileFill {
+    fn fills(
+        &self,
+        instance: InstanceId,
+        _kind: FillKind,
+        doc: &Document,
+    ) -> Vec<(NodeId, String)> {
+        fn find(n: NodeRef<'_>, id: &str) -> Option<NodeId> {
+            if n.attr("id") == Some(id) {
+                Some(n.id())
+            } else {
+                n.children().find_map(|c| find(c, id))
+            }
+        }
+        let value = if instance == self.master {
+            "master-user"
+        } else {
+            "follower-user"
+        };
+        find(doc.root(), "user")
+            .map(|nid| vec![(nid, value.to_string())])
+            .unwrap_or_default()
+    }
+}
+
+#[test]
+fn fill_uses_each_windows_own_profile() {
+    let master = InstanceId::from_u64_pair(0, 1);
+    let follower = InstanceId::from_u64_pair(0, 2);
+    let engine = QuickJsEngineFactory.instantiate().unwrap();
+    let members = vec![
+        (master, "master".to_string()),
+        (follower, "follower".to_string()),
+    ];
+    let mut g = MirrorGroup::new(engine, Box::new(FillForm), members, (1024, 768), UA).unwrap();
+    g.set_fill_provider(Box::new(PerProfileFill { master }));
+
+    // One master "fill" gesture, recorded once.
+    g.act(Action::Navigate(URL.into())).unwrap();
+    g.act(Action::Fill(FillKind::All)).unwrap();
+    assert_eq!(g.master().text_of_id("out").as_deref(), Some("master-user"));
+
+    // The follower replays the same Fill but with ITS OWN profile.
+    g.focus(1).unwrap();
+    assert_eq!(
+        g.instance(1).unwrap().text_of_id("out").as_deref(),
+        Some("follower-user")
+    );
     assert!(g.live_realms() <= 1);
 }

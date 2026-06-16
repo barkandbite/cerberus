@@ -39,7 +39,8 @@ mod resolve;
 mod source;
 
 pub use action::{Action, ActionLog, Target};
-pub use group::MirrorGroup;
+pub use cerberus_autofill::FillKind;
+pub use group::{FillProvider, MirrorGroup};
 pub use instance::{Divergence, MirrorInstance};
 pub use resolve::{describe, invert_id_map, resolve, text_content_of};
 pub use source::PageSource;
