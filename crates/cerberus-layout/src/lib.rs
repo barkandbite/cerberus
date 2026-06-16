@@ -13,7 +13,10 @@
 
 use cerberus_dom::NodeId;
 use cerberus_paint::{DecodedImage, DisplayItem, DisplayList, GlyphBox, TextShaper};
-use cerberus_style::{ComputedStyle, Display, StyledChild, StyledDom, StyledNode, TextAlign};
+use cerberus_style::{
+    AlignItems, ComputedStyle, Display, FlexDirection, JustifyContent, StyledChild, StyledDom,
+    StyledNode, TextAlign,
+};
 use cerberus_types::{Color, FontStyle, Point, Rect, Size};
 use std::sync::Arc;
 
@@ -203,6 +206,9 @@ struct Ctx<'a> {
     left: i32,
     x: i32,
     y: i32,
+    /// The farthest right the inline cursor has reached — the content's intrinsic
+    /// width, used to size flex/grid items.
+    max_x: i32,
     /// Tallest content on the current line (text or image), in pixels.
     line_h: i32,
     line: Vec<LinePiece>,
@@ -238,6 +244,7 @@ impl<'a> Ctx<'a> {
             left: margin,
             x: margin,
             y: margin,
+            max_x: margin,
             line_h: 0,
             line: Vec::new(),
             line_align: TextAlign::Left,
@@ -275,6 +282,7 @@ impl<'a> Ctx<'a> {
             left,
             x: left,
             y,
+            max_x: left,
             line_h: 0,
             line: Vec::new(),
             line_align: TextAlign::Left,
@@ -362,10 +370,16 @@ impl<'a> Ctx<'a> {
             self.cur_link_node = Some(node.node_id);
         }
 
-        // F0: flex/grid containers flow as blocks until their layout lands (F1/F2).
+        // Flex container (F1): lay items along the main axis. Grid still flows as
+        // a block until F2.
+        if style.display == Display::Flex {
+            self.flex_layout(node);
+            self.cur_link_node = saved_link_node;
+            return;
+        }
         let is_block = matches!(
             style.display,
-            Display::Block | Display::ListItem | Display::Flex | Display::Grid
+            Display::Block | Display::ListItem | Display::Grid
         );
         let saved_left = self.left;
         let (bg_index, bg_start_y) = (self.display.items.len(), self.y);
@@ -501,6 +515,7 @@ impl<'a> Ctx<'a> {
             link_node: self.cur_link_node,
         });
         self.x += w as i32;
+        self.max_x = self.max_x.max(self.x);
         self.line_h = self.line_h.max(line_height(px));
     }
 
@@ -795,6 +810,7 @@ impl<'a> Ctx<'a> {
 
     fn advance_box(&mut self, w: u32, h: u32) {
         self.x += w as i32;
+        self.max_x = self.max_x.max(self.x);
         self.line_h = self.line_h.max(h as i32);
     }
 
@@ -861,6 +877,235 @@ impl<'a> Ctx<'a> {
             color: Color::rgb(0xCC, 0xCC, 0xCC),
         });
         self.y += 8;
+    }
+
+    /// Intrinsic content width of `node`: lay it into an effectively unbounded
+    /// sub-context and read how far the inline cursor reached. Used to size flex
+    /// items (and grid `auto` tracks).
+    fn measure_intrinsic_width(&self, node: &StyledNode) -> i32 {
+        let mut sub = Ctx::sub(
+            0,
+            1_000_000,
+            0,
+            self.shaper,
+            self.images,
+            self.forms,
+            self.field_id,
+        );
+        sub.walk(node, None);
+        sub.flush_line();
+        sub.max_x.max(1)
+    }
+
+    /// Merge a finished sub-context's output into this one, shifting it down by
+    /// `dy` (cross-axis alignment). All sub items are already in absolute coords.
+    fn merge_sub(&mut self, sub: Ctx<'a>, dy: i32) {
+        for mut item in sub.display.items {
+            if dy != 0 {
+                match &mut item {
+                    DisplayItem::Rect { rect, .. } => rect.y += dy,
+                    DisplayItem::Glyphs { origin, .. } => origin.y += dy,
+                    DisplayItem::Image { rect, .. } => rect.y += dy,
+                }
+            }
+            self.display.items.push(item);
+        }
+        for mut l in sub.links {
+            l.rect.y += dy;
+            self.links.push(l);
+        }
+        for mut f in sub.fields {
+            f.rect.y += dy;
+            self.fields.push(f);
+        }
+        for mut e in sub.elements {
+            e.rect.y += dy;
+            self.elements.push(e);
+        }
+    }
+
+    /// Lay out a flex container (single-axis v1): row/column, `gap`,
+    /// `justify-content`, `align-items`, and wrap. Items are content-sized
+    /// (intrinsic width, clamped to the container); a row that overflows shrinks
+    /// to fit unless `flex-wrap` wraps it.
+    fn flex_layout(&mut self, node: &StyledNode) {
+        self.flush_line();
+        let left = self.left;
+        let right = self.right.max(left + 1);
+        let start_y = self.y;
+        let gap = node.style.gap as i32;
+        let bg_index = self.display.items.len();
+
+        let items: Vec<&StyledNode> = node
+            .children
+            .iter()
+            .filter_map(|c| match c {
+                StyledChild::Element(e) if e.style.display != Display::None => Some(e),
+                _ => None,
+            })
+            .collect();
+
+        if !items.is_empty() {
+            match node.style.flex_direction {
+                FlexDirection::Row => self.flex_row(&items, left, right, gap, start_y, &node.style),
+                FlexDirection::Column => self.flex_column(&items, left, right, gap, start_y),
+            }
+        }
+
+        let h = (self.y - start_y).max(0) as u32;
+        if h > 0 {
+            if let Some(color) = node.style.background {
+                self.display.items.insert(
+                    bg_index,
+                    DisplayItem::Rect {
+                        rect: Rect::new(left, start_y, (right - left).max(0) as u32, h),
+                        color,
+                    },
+                );
+            }
+            self.elements.push(ElementBox {
+                rect: Rect::new(left, start_y, (right - left).max(0) as u32, h),
+                node: node.node_id,
+            });
+        }
+        self.x = self.left;
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn flex_row(
+        &mut self,
+        items: &[&StyledNode],
+        left: i32,
+        right: i32,
+        gap: i32,
+        start_y: i32,
+        style: &ComputedStyle,
+    ) {
+        let avail = (right - left).max(1);
+        let mut widths: Vec<i32> = items
+            .iter()
+            .map(|it| self.measure_intrinsic_width(it).clamp(1, avail))
+            .collect();
+
+        // Group into lines (wrap) or a single shrink-to-fit line.
+        let lines: Vec<Vec<usize>> = if style.flex_wrap {
+            let mut lines = Vec::new();
+            let mut cur: Vec<usize> = Vec::new();
+            let mut used = 0;
+            for (i, &w) in widths.iter().enumerate() {
+                let add = if cur.is_empty() { w } else { gap + w };
+                if !cur.is_empty() && used + add > avail {
+                    lines.push(std::mem::take(&mut cur));
+                    used = w;
+                } else {
+                    used += add;
+                }
+                cur.push(i);
+            }
+            if !cur.is_empty() {
+                lines.push(cur);
+            }
+            lines
+        } else {
+            let content: i32 = widths.iter().sum();
+            let gaps = gap * (items.len() as i32 - 1).max(0);
+            if content + gaps > avail && content > 0 {
+                let budget = (avail - gaps).max(items.len() as i32);
+                let scale = budget as f32 / content as f32;
+                for w in widths.iter_mut() {
+                    *w = ((*w as f32) * scale).floor().max(1.0) as i32;
+                }
+            }
+            vec![(0..items.len()).collect()]
+        };
+
+        let mut y = start_y;
+        for line in &lines {
+            let count = line.len() as i32;
+            let content: i32 = line.iter().map(|&i| widths[i]).sum();
+            let free = (avail - content - gap * (count - 1).max(0)).max(0);
+            let (mut x, eff_gap) = match style.justify_content {
+                JustifyContent::Start => (left, gap),
+                JustifyContent::Center => (left + free / 2, gap),
+                JustifyContent::End => (left + free, gap),
+                JustifyContent::SpaceBetween => (
+                    left,
+                    if count > 1 {
+                        gap + free / (count - 1)
+                    } else {
+                        gap
+                    },
+                ),
+                JustifyContent::SpaceAround => {
+                    let around = if count > 0 { free / count } else { 0 };
+                    (left + around / 2, gap + around)
+                }
+            };
+
+            let mut laid: Vec<(Ctx<'a>, i32)> = Vec::new();
+            let mut row_h = 0;
+            for &i in line {
+                let w = widths[i];
+                let mut sub = Ctx::sub(
+                    x,
+                    x + w,
+                    y,
+                    self.shaper,
+                    self.images,
+                    self.forms,
+                    self.field_id,
+                );
+                sub.walk(items[i], None);
+                sub.flush_line();
+                self.field_id = sub.field_id;
+                let h = (sub.y - y).max(1);
+                row_h = row_h.max(h);
+                laid.push((sub, h));
+                x += w + eff_gap;
+            }
+            for (sub, h) in laid {
+                let dy = match style.align_items {
+                    AlignItems::Start | AlignItems::Stretch => 0,
+                    AlignItems::Center => (row_h - h) / 2,
+                    AlignItems::End => row_h - h,
+                };
+                self.merge_sub(sub, dy);
+            }
+            y += row_h + gap;
+        }
+        self.y = (y - gap).max(start_y);
+    }
+
+    fn flex_column(
+        &mut self,
+        items: &[&StyledNode],
+        left: i32,
+        right: i32,
+        gap: i32,
+        start_y: i32,
+    ) {
+        let mut y = start_y;
+        for (idx, it) in items.iter().enumerate() {
+            if idx > 0 {
+                y += gap;
+            }
+            let mut sub = Ctx::sub(
+                left,
+                right,
+                y,
+                self.shaper,
+                self.images,
+                self.forms,
+                self.field_id,
+            );
+            sub.walk(it, None);
+            sub.flush_line();
+            self.field_id = sub.field_id;
+            let h = (sub.y - y).max(1);
+            self.merge_sub(sub, 0);
+            y += h;
+        }
+        self.y = y;
     }
 
     /// Lay out a `<table>` as an equal-width grid.
@@ -1222,6 +1467,37 @@ mod tests {
             .iter()
             .filter(|i| matches!(i, DisplayItem::Rect { .. }))
             .count()
+    }
+
+    #[test]
+    fn flex_row_lays_items_on_one_row() {
+        let block = lay("<div><div>AAAA</div><div>BBBB</div></div>", 800);
+        let flex = lay(
+            "<div style='display:flex'><div>AAAA</div><div>BBBB</div></div>",
+            800,
+        );
+        // Block: the two inner divs stack -> glyphs span at least two rows.
+        assert!(distinct(&glyph_ys(&block)) >= 2);
+        // Flex row: both items share a single row.
+        assert_eq!(distinct(&glyph_ys(&flex)), 1);
+        // ...and the second item is placed to the right of the first.
+        let xs = glyph_xs(&flex);
+        assert!(xs.iter().max() > xs.iter().min());
+    }
+
+    #[test]
+    fn flex_justify_center_shifts_items_right() {
+        let start = lay("<div style='display:flex'><div>AA</div></div>", 800);
+        let center = lay(
+            "<div style='display:flex; justify-content:center'><div>AA</div></div>",
+            800,
+        );
+        let start_x = *glyph_xs(&start).iter().min().unwrap();
+        let center_x = *glyph_xs(&center).iter().min().unwrap();
+        assert!(
+            center_x > start_x,
+            "justify-center x {center_x} should exceed start x {start_x}"
+        );
     }
 
     fn total_glyphs(laid: &LaidOut) -> usize {
