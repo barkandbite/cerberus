@@ -19,11 +19,23 @@ use cerberus_js_dom::{
 };
 use cerberus_types::{InstanceId, RealmId};
 
+use cerberus_autofill::FillKind;
+use cerberus_dom::{Document, NodeId};
+
 use crate::action::{Action, ActionLog, Target};
 use crate::instance::{Divergence, MirrorInstance};
 use crate::resolve::{invert_id_map, resolve};
 use crate::source::PageSource;
 use crate::MirrorError;
+
+/// Resolves what to autofill in a given instance's document. The app wires an
+/// implementation mapping each identity to its profile (via `cerberus-autofill`),
+/// so a single master [`Action::Fill`] fills every window with its **own**
+/// credentials.
+pub trait FillProvider {
+    /// The `(NodeId, value)` pairs to set for `kind` in `instance`'s `doc`.
+    fn fills(&self, instance: InstanceId, kind: FillKind, doc: &Document) -> Vec<(NodeId, String)>;
+}
 
 /// A set of mirrored windows of one site driven from a single master.
 ///
@@ -39,6 +51,7 @@ pub struct MirrorGroup {
     focused_idx: usize,
     viewport: (u32, u32),
     user_agent: String,
+    fill_provider: Option<Box<dyn FillProvider>>,
 }
 
 impl MirrorGroup {
@@ -69,6 +82,7 @@ impl MirrorGroup {
             focused_idx: 0,
             viewport,
             user_agent: user_agent.into(),
+            fill_provider: None,
         })
     }
 
@@ -140,6 +154,12 @@ impl MirrorGroup {
         Ok(())
     }
 
+    /// Install the autofill provider that resolves each instance's profile data
+    /// for [`Action::Fill`].
+    pub fn set_fill_provider(&mut self, provider: Box<dyn FillProvider>) {
+        self.fill_provider = Some(provider);
+    }
+
     // --- driving ---------------------------------------------------------
 
     /// Apply `action` to the master and record it for followers.
@@ -150,19 +170,26 @@ impl MirrorGroup {
     pub fn act(&mut self, action: Action) -> Result<(), MirrorError> {
         let master = self.master_idx;
         self.focus(master)?;
-        match &action {
-            Action::Navigate(url) => {
-                let url = url.clone();
-                self.navigate_instance(master, &url)?;
-            }
-            Action::Scroll { .. } => {} // no DOM effect; record only
-            Action::Click(_) | Action::Input { .. } | Action::Submit(_) => {
-                self.apply_interaction(master, &action)?;
-            }
-        }
+        self.apply_logged(master, &action)?;
         self.log.push(action);
         self.instances[master].cursor = self.log.len();
         Ok(())
+    }
+
+    /// Apply one logged action to instance `idx`'s live realm — shared by the
+    /// master (`act`) and follower catch-up.
+    fn apply_logged(&mut self, idx: usize, action: &Action) -> Result<(), MirrorError> {
+        match action {
+            Action::Navigate(url) => {
+                let url = url.clone();
+                self.navigate_instance(idx, &url)
+            }
+            Action::Fill(kind) => self.apply_fill(idx, *kind),
+            Action::Scroll { .. } => Ok(()), // no DOM effect; record only
+            Action::Click(_) | Action::Input { .. } | Action::Submit(_) => {
+                self.apply_interaction(idx, action)
+            }
+        }
     }
 
     /// Make instance `idx` the live, focused window, converged to the master.
@@ -214,7 +241,7 @@ impl MirrorGroup {
             self.navigate_instance(idx, &url)?;
             for i in (nav_pos + 1)..head {
                 let action = self.log.actions()[i].clone();
-                self.apply_interaction(idx, &action)?;
+                self.apply_logged(idx, &action)?;
                 if self.instances[idx].diverged.is_some() {
                     break; // stop replaying once out of lockstep
                 }
@@ -255,7 +282,7 @@ impl MirrorGroup {
             Action::Click(t) => ("click", None, t),
             Action::Input { target, text } => ("input", Some(text.as_str()), target),
             Action::Submit(t) => ("submit", None, t),
-            Action::Navigate(_) | Action::Scroll { .. } => return Ok(()),
+            Action::Navigate(_) | Action::Scroll { .. } | Action::Fill(_) => return Ok(()),
         };
 
         // Resolve target -> live JS-model id, releasing the borrow before any
@@ -292,6 +319,41 @@ impl MirrorGroup {
                 reason: "target node was not present in the live realm".to_string(),
                 action: action.clone(),
             });
+        }
+        Ok(())
+    }
+
+    /// Autofill instance `idx`'s form fields for `kind` from its **own** profile
+    /// (via the [`FillProvider`]): set each detected field's value and fire
+    /// `input`. Fill-only — no submit. No-op without a provider or matches.
+    fn apply_fill(&mut self, idx: usize, kind: FillKind) -> Result<(), MirrorError> {
+        let realm = self.realm_of(idx);
+        let fills: Vec<(u64, String)> = {
+            let Some(provider) = self.fill_provider.as_deref() else {
+                return Ok(());
+            };
+            let inst = &self.instances[idx];
+            provider
+                .fills(inst.id, kind, &inst.doc)
+                .into_iter()
+                .filter_map(|(node, value)| inst.node_to_js.get(&node).map(|&js| (js, value)))
+                .collect()
+        };
+        if fills.is_empty() {
+            return Ok(());
+        }
+        let mut last_dom = None;
+        {
+            let engine = &mut *self.engine;
+            for (js, value) in &fills {
+                set_node_value(engine, realm, *js, value)?;
+                last_dom = Some(dispatch_event(engine, realm, *js, "input", "{}")?.dom);
+            }
+        }
+        if let Some(dom) = last_dom {
+            let inst = &mut self.instances[idx];
+            inst.doc = dom.document;
+            inst.node_to_js = invert_id_map(&dom.id_map);
         }
         Ok(())
     }

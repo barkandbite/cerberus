@@ -49,6 +49,10 @@ pub enum Action {
     },
     /// Submit the target form (fires a `submit` event).
     Submit(Target),
+    /// Autofill the page's form fields of this category. Each window fills its
+    /// **own** profile (resolved per instance by the group's `FillProvider`), so
+    /// one master gesture fills every window with its own credentials.
+    Fill(cerberus_autofill::FillKind),
     /// Scroll to a position. Recorded for fidelity; it mutates no DOM, so a
     /// follower stores it without a realm round-trip.
     Scroll {
