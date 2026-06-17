@@ -6,6 +6,11 @@ browser is pre-1.0; this is the first tagged preview.
 ## [Unreleased]
 
 ### Fixed
+- **Address bar: caret + select-all on focus.** Clicking the URL box now selects
+  the whole address (highlighted) so the next keystroke replaces it — the
+  browser convention — and a caret marks the insertion point while editing.
+  (A steady caret for now; blinking, click-to-position, and drag/double-click
+  selection need richer mouse/timer events from the shell and are a follow-up.)
 - **Toolbar and cookie-manager button labels are centered.** Glyphs were drawn at
   a fixed corner offset, so the `< > R X` / `S` / head-chip labels and the cookie
   inspector's close/scroll/chip buttons looked misaligned. They're now centered

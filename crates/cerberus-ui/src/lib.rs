@@ -63,6 +63,9 @@ pub struct Toolbar {
     pub url_text: String,
     /// Whether the URL box has keyboard focus.
     pub url_focused: bool,
+    /// Whether the whole URL is selected (select-all on focus): the next typed
+    /// character or Backspace replaces it, like a browser's address bar.
+    pub url_selected: bool,
     /// Whether Back is enabled.
     pub can_back: bool,
     /// Whether Forward is enabled.
@@ -79,6 +82,7 @@ impl Toolbar {
         Self {
             url_text: String::new(),
             url_focused: false,
+            url_selected: false,
             can_back: false,
             can_forward: false,
             loading: false,
@@ -152,23 +156,48 @@ impl Toolbar {
         }
     }
 
-    /// Append a character to the URL box (only when focused).
+    /// Focus the URL box and select all of it, so the next keystroke replaces the
+    /// current address — the address-bar convention browsers use on click/focus.
+    pub fn focus_url(&mut self) {
+        self.url_focused = true;
+        self.url_selected = true;
+    }
+
+    /// Remove focus (and any selection) from the URL box.
+    pub fn blur_url(&mut self) {
+        self.url_focused = false;
+        self.url_selected = false;
+    }
+
+    /// Append a character to the URL box (only when focused). If the box is in
+    /// the select-all state, the character replaces the whole URL.
     pub fn type_char(&mut self, c: char) {
         if self.url_focused && !c.is_control() {
+            if self.url_selected {
+                self.url_text.clear();
+                self.url_selected = false;
+            }
             self.url_text.push(c);
         }
     }
 
-    /// Delete the last character of the URL box (only when focused).
+    /// Delete from the URL box (only when focused). With the whole URL selected,
+    /// the first Backspace clears it; otherwise it deletes the last character.
     pub fn backspace(&mut self) {
         if self.url_focused {
-            self.url_text.pop();
+            if self.url_selected {
+                self.url_text.clear();
+                self.url_selected = false;
+            } else {
+                self.url_text.pop();
+            }
         }
     }
 
     /// Submit the URL box, producing a [`ToolbarAction::Navigate`].
     pub fn submit_url(&mut self) -> ToolbarAction {
         self.url_focused = false;
+        self.url_selected = false;
         ToolbarAction::Navigate(self.url_text.clone())
     }
 
@@ -190,32 +219,69 @@ impl Toolbar {
         for (control, rect) in self.layout(window) {
             let (bg, label, enabled) = self.style(control);
             list.push(DisplayItem::Rect { rect, color: bg });
-            if !label.is_empty() {
-                let color = if enabled {
-                    Color::rgb(0x20, 0x20, 0x20)
-                } else {
-                    Color::rgb(0xA0, 0xA0, 0xA0)
-                };
-                let glyphs = shaper.shape(&label, LABEL_PX);
-                let text_w: i32 = glyphs.iter().map(|g| g.advance as i32).sum();
-                // Vertically centre the label in the control; centre it
-                // horizontally too, except the URL box, whose text is left-aligned
-                // with a small inset. `max(0)` keeps an over-wide label (a long
-                // head name) from starting left of the control.
-                let y = rect.y + (rect.h as i32 - LABEL_PX as i32) / 2;
-                let x = match control {
-                    Control::UrlBox => rect.x + 6,
-                    _ => rect.x + ((rect.w as i32 - text_w) / 2).max(0),
-                };
-                list.push(DisplayItem::Glyphs {
-                    origin: Point::new(x, y),
-                    glyphs,
-                    color,
-                    style: FontStyle::REGULAR,
-                });
+            if label.is_empty() {
+                continue;
+            }
+            let color = if enabled {
+                Color::rgb(0x20, 0x20, 0x20)
+            } else {
+                Color::rgb(0xA0, 0xA0, 0xA0)
+            };
+            // The URL box is left-aligned and shows a caret/selection; every other
+            // control centres its label.
+            match control {
+                Control::UrlBox => self.paint_url_box(&mut list, shaper, rect, &label, color),
+                _ => push_centered(&mut list, shaper, rect, &label, LABEL_PX, color),
             }
         }
         list
+    }
+
+    /// Paint the URL box label plus, when focused, a caret at the end of the text
+    /// and (right after focusing) a select-all highlight behind it.
+    fn paint_url_box(
+        &self,
+        list: &mut DisplayList,
+        shaper: &dyn TextShaper,
+        rect: Rect,
+        label: &str,
+        color: Color,
+    ) {
+        let y = rect.y + (rect.h as i32 - LABEL_PX as i32) / 2;
+        let tx = rect.x + 6;
+        // Width of the actually-typed text (not the placeholder), for the caret
+        // and the selection highlight.
+        let text_w: i32 = shaper
+            .shape(&self.url_text, LABEL_PX)
+            .iter()
+            .map(|g| g.advance as i32)
+            .sum();
+        // Select-all highlight behind the text, shown right after focusing.
+        if self.url_focused && self.url_selected && !self.url_text.is_empty() {
+            list.push(DisplayItem::Rect {
+                rect: Rect::new(
+                    tx,
+                    rect.y + 4,
+                    text_w.max(0) as u32,
+                    rect.h.saturating_sub(8),
+                ),
+                color: Color::rgb(0xB5, 0xD0, 0xF5),
+            });
+        }
+        list.push(DisplayItem::Glyphs {
+            origin: Point::new(tx, y),
+            glyphs: shaper.shape(label, LABEL_PX),
+            color,
+            style: FontStyle::REGULAR,
+        });
+        // Caret at the end of the text once the selection is cleared (or the box
+        // is empty); while all is selected the highlight stands in for it.
+        if self.url_focused && (!self.url_selected || self.url_text.is_empty()) {
+            list.push(DisplayItem::Rect {
+                rect: Rect::new(tx + text_w, y, 1, LABEL_PX),
+                color: Color::rgb(0x20, 0x20, 0x20),
+            });
+        }
     }
 
     /// Background color, label, and enabled-state for a control.
@@ -473,6 +539,54 @@ mod tests {
             .filter(|i| matches!(i, DisplayItem::Rect { .. }))
             .count();
         assert!(rects >= 9, "got {rects} rects");
+    }
+
+    #[test]
+    fn url_focus_selects_all_and_first_keystroke_replaces() {
+        let mut t = Toolbar::new("work");
+        t.url_text = "cerberus:home".into();
+        t.focus_url();
+        assert!(t.url_focused && t.url_selected);
+        t.type_char('a'); // replaces the selected URL
+        assert_eq!(t.url_text, "a");
+        assert!(!t.url_selected);
+        t.type_char('b'); // then appends normally
+        assert_eq!(t.url_text, "ab");
+    }
+
+    #[test]
+    fn url_backspace_clears_whole_selection_then_deletes() {
+        let mut t = Toolbar::new("work");
+        t.url_text = "abc".into();
+        t.focus_url();
+        t.backspace(); // selected -> clear all
+        assert_eq!(t.url_text, "");
+        assert!(!t.url_selected);
+        t.url_text = "xy".into();
+        t.backspace(); // not selected -> delete last
+        assert_eq!(t.url_text, "x");
+    }
+
+    #[test]
+    fn url_blur_drops_focus_and_selection() {
+        let mut t = Toolbar::new("work");
+        t.focus_url();
+        t.blur_url();
+        assert!(!t.url_focused && !t.url_selected);
+    }
+
+    #[test]
+    fn focused_url_box_paints_a_caret() {
+        let mut t = Toolbar::new("work");
+        t.focus_url();
+        t.url_selected = false; // editing state: caret should show
+        t.url_text = "ab".into();
+        let before = Toolbar::new("work")
+            .paint(window(), &MonoShaper)
+            .items
+            .len();
+        let after = t.paint(window(), &MonoShaper).items.len();
+        assert!(after > before, "focused box should add a caret rect");
     }
 }
 

@@ -1746,7 +1746,7 @@ impl BrowserApp {
     fn start_load(&mut self, url: &str) {
         self.insecure_prompt = None;
         self.insecure_button = None;
-        self.toolbar.url_focused = false;
+        self.toolbar.blur_url();
         // New page: reset the performance table and stamp the clock (M11).
         self.timings.begin_navigation();
         // Drop the previous page's images: the store only ever holds the
@@ -2438,7 +2438,7 @@ impl BrowserApp {
         match field.kind {
             FieldKind::Text | FieldKind::Textarea => {
                 self.focused_field = Some(field.id);
-                self.toolbar.url_focused = false;
+                self.toolbar.blur_url();
             }
             FieldKind::Checkbox => {
                 let now = !self.forms.checked(field.id);
@@ -2771,7 +2771,7 @@ impl BrowserApp {
                 true
             }
             ToolbarAction::FocusUrl => {
-                self.toolbar.url_focused = true;
+                self.toolbar.focus_url();
                 true
             }
             ToolbarAction::Navigate(url) => {
@@ -3166,7 +3166,7 @@ impl FrameApp for BrowserApp {
         }
         let action = self.toolbar.hit_test(self.last_size, x, y);
         if action == ToolbarAction::None && self.toolbar.url_focused {
-            self.toolbar.url_focused = false;
+            self.toolbar.blur_url();
             return true;
         }
         self.handle(action)
