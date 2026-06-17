@@ -26,6 +26,15 @@ pub enum DisplayItem {
         rect: Rect,
         image: Arc<DecodedImage>,
     },
+    /// An anti-aliased, round-capped line segment of the given stroke width.
+    /// Vector UI (icons) is built from these, so it scales crisply with
+    /// [`DisplayList::scaled`].
+    Line {
+        a: Point,
+        b: Point,
+        width: u32,
+        color: Color,
+    },
 }
 
 /// A flat, ordered list of paint primitives produced by layout.
@@ -67,6 +76,12 @@ impl DisplayList {
                 DisplayItem::Image { rect, image } => DisplayItem::Image {
                     rect: sr(*rect),
                     image: image.clone(),
+                },
+                DisplayItem::Line { a, b, width, color } => DisplayItem::Line {
+                    a: Point::new(si(a.x), si(a.y)),
+                    b: Point::new(si(b.x), si(b.y)),
+                    width: su(*width),
+                    color: *color,
                 },
                 DisplayItem::Glyphs {
                     origin,
@@ -297,6 +312,8 @@ impl Rasterizer for BoxRasterizer {
                 DisplayItem::Image { rect, .. } => {
                     target.fill_rect(*rect, Color::rgb(192, 192, 192));
                 }
+                // The placeholder rasterizer doesn't draw vector lines.
+                DisplayItem::Line { .. } => {}
             }
         }
     }

@@ -83,6 +83,38 @@ impl TextEngine {
             }
         }
     }
+
+    /// Draw an anti-aliased, round-capped line of stroke `width` from `a` to `b`.
+    /// Coverage is the distance from each pixel centre to the segment, so curves
+    /// built from many short segments (icons) read smoothly.
+    fn draw_line(&self, a: Point, b: Point, width: u32, color: Color, target: &mut Framebuffer) {
+        let (ax, ay) = (a.x as f32, a.y as f32);
+        let (bx, by) = (b.x as f32, b.y as f32);
+        let half = (width.max(1) as f32) / 2.0;
+        let pad = half + 1.0;
+        let x0 = (ax.min(bx) - pad).floor() as i32;
+        let x1 = (ax.max(bx) + pad).ceil() as i32;
+        let y0 = (ay.min(by) - pad).floor() as i32;
+        let y1 = (ay.max(by) + pad).ceil() as i32;
+        let (dx, dy) = (bx - ax, by - ay);
+        let len2 = dx * dx + dy * dy;
+        for py in y0..=y1 {
+            for px in x0..=x1 {
+                let (pxf, pyf) = (px as f32 + 0.5, py as f32 + 0.5);
+                let t = if len2 > 0.0 {
+                    (((pxf - ax) * dx + (pyf - ay) * dy) / len2).clamp(0.0, 1.0)
+                } else {
+                    0.0
+                };
+                let (cx, cy) = (ax + t * dx, ay + t * dy);
+                let dist = ((pxf - cx).powi(2) + (pyf - cy).powi(2)).sqrt();
+                let cov = (half + 0.5 - dist).clamp(0.0, 1.0);
+                if cov > 0.0 {
+                    target.blend_pixel(px, py, color, cov);
+                }
+            }
+        }
+    }
 }
 
 impl Default for TextEngine {
@@ -123,6 +155,9 @@ impl Rasterizer for TextEngine {
                     color,
                     style,
                 } => self.draw_run(*origin, glyphs, *color, *style, target),
+                DisplayItem::Line { a, b, width, color } => {
+                    self.draw_line(*a, *b, *width, *color, target)
+                }
             }
         }
     }

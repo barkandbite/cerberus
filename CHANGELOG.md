@@ -6,6 +6,9 @@ browser is pre-1.0; this is the first tagged preview.
 ## [Unreleased]
 
 ### Changed
+- **Toolbar icons.** Reload is a circular arrow and Settings is a gear, drawn as
+  crisp anti-aliased vector strokes (a new `DisplayItem::Line` that scales with
+  the display list) instead of the letters `R`/`S`.
 - **HiDPI rendering is now crisp.** The shell previously rendered at logical size
   and bitmap-upscaled to the physical surface (soft text at >1×). The app now
   lays out in logical pixels and paints at physical resolution via a scaled

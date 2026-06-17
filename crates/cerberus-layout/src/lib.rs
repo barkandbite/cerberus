@@ -956,6 +956,10 @@ impl<'a> Ctx<'a> {
                     DisplayItem::Rect { rect, .. } => rect.y += dy,
                     DisplayItem::Glyphs { origin, .. } => origin.y += dy,
                     DisplayItem::Image { rect, .. } => rect.y += dy,
+                    DisplayItem::Line { a, b, .. } => {
+                        a.y += dy;
+                        b.y += dy;
+                    }
                 }
             }
             self.display.items.push(item);

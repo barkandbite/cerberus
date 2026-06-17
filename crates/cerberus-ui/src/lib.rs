@@ -223,10 +223,19 @@ impl Toolbar {
             } else {
                 Color::rgb(0xA0, 0xA0, 0xA0)
             };
-            // The URL box is a text field (own background, caret, selection); every
-            // other control is a button drawn through the shared primitive.
+            // The URL box is a text field (own background, caret, selection);
+            // Reload/Settings are vector icons; every other control is a labelled
+            // button. All share the same button chrome.
             match control {
                 Control::UrlBox => self.paint_url_box(&mut list, shaper, rect, bg, &label, text),
+                Control::Reload => {
+                    draw_button(&mut list, shaper, rect, "", bg, text, LABEL_PX);
+                    push_reload_icon(&mut list, rect, text);
+                }
+                Control::Settings => {
+                    draw_button(&mut list, shaper, rect, "", bg, text, LABEL_PX);
+                    push_gear_icon(&mut list, rect, text);
+                }
                 _ => draw_button(&mut list, shaper, rect, &label, bg, text, LABEL_PX),
             }
         }
@@ -538,6 +547,19 @@ mod tests {
             .filter(|i| matches!(i, DisplayItem::Rect { .. }))
             .count();
         assert!(rects >= 9, "got {rects} rects");
+    }
+
+    #[test]
+    fn reload_and_settings_render_as_vector_icons() {
+        let t = Toolbar::new("work");
+        let list = t.paint(window(), &MonoShaper);
+        let lines = list
+            .items
+            .iter()
+            .filter(|i| matches!(i, DisplayItem::Line { .. }))
+            .count();
+        // The circular-arrow and gear are built from many short segments.
+        assert!(lines > 20, "reload + gear emit line segments; got {lines}");
     }
 
     #[test]
@@ -880,6 +902,100 @@ fn chip_fill(token: &str) -> Color {
         "session" => Color::rgb(0xFD, 0xEF, 0xC8),
         "block" => Color::rgb(0xF6, 0xCF, 0xCF),
         _ => Color::rgb(0xE4, 0xE4, 0xE4),
+    }
+}
+
+/// Push a stroked circular-arrow ("reload") icon centred in `rect`, built from
+/// short line segments so it scales crisply.
+fn push_reload_icon(list: &mut DisplayList, rect: Rect, color: Color) {
+    use std::f32::consts::PI;
+    let cx = rect.x as f32 + rect.w as f32 / 2.0;
+    let cy = rect.y as f32 + rect.h as f32 / 2.0;
+    let r = ((rect.w.min(rect.h) as f32) / 2.0 - 5.0).max(5.0);
+    let w = (rect.w / 16).max(2);
+    let pt = |ang: f32| {
+        Point::new(
+            (cx + r * ang.cos()).round() as i32,
+            (cy + r * ang.sin()).round() as i32,
+        )
+    };
+    // A near-full circle with a small gap at the top for the arrowhead.
+    let gap = 0.42_f32;
+    let start = -PI / 2.0 + gap;
+    let sweep = 2.0 * PI - 2.0 * gap;
+    let n = 26;
+    let mut prev = pt(start);
+    for i in 1..=n {
+        let p = pt(start + sweep * (i as f32 / n as f32));
+        list.push(DisplayItem::Line {
+            a: prev,
+            b: p,
+            width: w,
+            color,
+        });
+        prev = p;
+    }
+    // Arrowhead at the arc's end, two short barbs along the (clockwise) tangent.
+    let end = start + sweep;
+    let tip = pt(end);
+    let tangent = (-end.sin(), end.cos());
+    let rev = (-tangent.0, -tangent.1);
+    let bl = (r * 0.62).max(4.0);
+    for s in [0.55_f32, -0.55] {
+        let (rx, ry) = (
+            rev.0 * s.cos() - rev.1 * s.sin(),
+            rev.0 * s.sin() + rev.1 * s.cos(),
+        );
+        list.push(DisplayItem::Line {
+            a: tip,
+            b: Point::new(
+                (tip.x as f32 + bl * rx).round() as i32,
+                (tip.y as f32 + bl * ry).round() as i32,
+            ),
+            width: w,
+            color,
+        });
+    }
+}
+
+/// Push a stroked gear ("settings") icon centred in `rect`: a rim, eight radial
+/// teeth, and a hub — all line segments, so it scales crisply.
+fn push_gear_icon(list: &mut DisplayList, rect: Rect, color: Color) {
+    use std::f32::consts::PI;
+    let cx = rect.x as f32 + rect.w as f32 / 2.0;
+    let cy = rect.y as f32 + rect.h as f32 / 2.0;
+    let r = ((rect.w.min(rect.h) as f32) / 2.0 - 8.0).max(3.0);
+    let w = (rect.w / 16).max(2);
+    let pt = |ang: f32, rad: f32| {
+        Point::new(
+            (cx + rad * ang.cos()).round() as i32,
+            (cy + rad * ang.sin()).round() as i32,
+        )
+    };
+    let ring = |list: &mut DisplayList, rad: f32, segs: usize| {
+        let mut prev = pt(0.0, rad);
+        for i in 1..=segs {
+            let p = pt(2.0 * PI * (i as f32 / segs as f32), rad);
+            list.push(DisplayItem::Line {
+                a: prev,
+                b: p,
+                width: w,
+                color,
+            });
+            prev = p;
+        }
+    };
+    ring(list, r, 20); // rim
+    ring(list, r * 0.42, 12); // hub
+    let tlen = r * 0.5;
+    for i in 0..8 {
+        let ang = 2.0 * PI * (i as f32 / 8.0);
+        list.push(DisplayItem::Line {
+            a: pt(ang, r),
+            b: pt(ang, r + tlen),
+            width: w + 1,
+            color,
+        });
     }
 }
 
