@@ -240,6 +240,91 @@ fn point_in(rect: Rect, x: i32, y: i32) -> bool {
     x >= rect.x && y >= rect.y && x < rect.x + rect.w as i32 && y < rect.y + rect.h as i32
 }
 
+/// Height of the driven-profiles badge, in device pixels.
+const BADGE_H: u32 = 24;
+/// Inner horizontal padding of the badge pill.
+const BADGE_PAD: i32 = 8;
+/// Margin from the window's top-right corner.
+const BADGE_MARGIN: i32 = 8;
+/// Badge label text size.
+const BADGE_PX: u32 = 14;
+/// Diameter of the badge's status dot.
+const BADGE_DOT: u32 = 8;
+
+/// A small overlay badge for a mirror **master** window — the owner's "N
+/// profiles being driven" indicator, e.g. "23 profiles being driven · github.com".
+///
+/// The mirror has no toolbar, so this is composited over the page's top-right
+/// corner. Pure like the rest of this crate: it lays itself out for a window
+/// size, paints into a [`DisplayList`], and reports whether a point hits it (a
+/// click that should open the identities panel).
+pub struct DrivenBadge;
+
+impl DrivenBadge {
+    /// The badge label for a driven `count` on `site` (a host); `site` may be
+    /// empty (e.g. built-in pages), in which case it is omitted.
+    pub fn label(count: usize, site: &str) -> String {
+        let noun = if count == 1 { "profile" } else { "profiles" };
+        if site.is_empty() {
+            format!("{count} {noun} being driven")
+        } else {
+            format!("{count} {noun} being driven · {site}")
+        }
+    }
+
+    /// The badge rectangle, right-anchored to the window's top-right corner and
+    /// sized to its label (measured with `shaper`).
+    pub fn rect(window: Size, count: usize, site: &str, shaper: &dyn TextShaper) -> Rect {
+        let text_w: i32 = shaper
+            .shape(&Self::label(count, site), BADGE_PX)
+            .iter()
+            .map(|g| g.advance as i32)
+            .sum();
+        let w = (BADGE_PAD + BADGE_DOT as i32 + BADGE_PAD + text_w + BADGE_PAD).max(1) as u32;
+        let x = (window.w as i32 - BADGE_MARGIN - w as i32).max(BADGE_MARGIN);
+        Rect::new(x, BADGE_MARGIN, w, BADGE_H)
+    }
+
+    /// Paint the badge into its own display list (composited after the page).
+    pub fn paint(window: Size, count: usize, site: &str, shaper: &dyn TextShaper) -> DisplayList {
+        let mut list = DisplayList::new();
+        let rect = Self::rect(window, count, site, shaper);
+        list.push(DisplayItem::Rect {
+            rect,
+            color: Color::rgb(0x1E, 0x40, 0x80),
+        });
+        // A status dot at the left edge.
+        let dot_y = rect.y + (BADGE_H as i32 - BADGE_DOT as i32) / 2;
+        list.push(DisplayItem::Rect {
+            rect: Rect::new(rect.x + BADGE_PAD, dot_y, BADGE_DOT, BADGE_DOT),
+            color: Color::rgb(0x6C, 0xE0, 0x8A),
+        });
+        let glyphs = shaper.shape(&Self::label(count, site), BADGE_PX);
+        list.push(DisplayItem::Glyphs {
+            origin: Point::new(
+                rect.x + BADGE_PAD + BADGE_DOT as i32 + BADGE_PAD,
+                rect.y + (BADGE_H as i32 - BADGE_PX as i32) / 2,
+            ),
+            glyphs,
+            color: Color::WHITE,
+            style: FontStyle::REGULAR,
+        });
+        list
+    }
+
+    /// Whether `(x, y)` falls on the badge — a click that should open the panel.
+    pub fn hit_test(
+        window: Size,
+        count: usize,
+        site: &str,
+        shaper: &dyn TextShaper,
+        x: i32,
+        y: i32,
+    ) -> bool {
+        point_in(Self::rect(window, count, site, shaper), x, y)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -247,6 +332,62 @@ mod tests {
 
     fn window() -> Size {
         Size::new(800, 600)
+    }
+
+    #[test]
+    fn driven_badge_pluralizes_and_includes_site() {
+        assert_eq!(
+            DrivenBadge::label(1, "github.com"),
+            "1 profile being driven · github.com"
+        );
+        assert_eq!(
+            DrivenBadge::label(23, "github.com"),
+            "23 profiles being driven · github.com"
+        );
+        // A built-in page (no host) omits the site suffix.
+        assert_eq!(DrivenBadge::label(2, ""), "2 profiles being driven");
+    }
+
+    #[test]
+    fn driven_badge_anchors_top_right_and_is_hittable() {
+        let w = window();
+        let rect = DrivenBadge::rect(w, 23, "github.com", &MonoShaper);
+        // Right-anchored within the window, at the top margin.
+        assert_eq!(rect.y, BADGE_MARGIN);
+        assert!(rect.x > 0 && rect.x + rect.w as i32 <= w.w as i32);
+        // A point at the badge's center hits; a far-away point does not.
+        let (cx, cy) = (rect.x + rect.w as i32 / 2, rect.y + rect.h as i32 / 2);
+        assert!(DrivenBadge::hit_test(
+            w,
+            23,
+            "github.com",
+            &MonoShaper,
+            cx,
+            cy
+        ));
+        assert!(!DrivenBadge::hit_test(
+            w,
+            23,
+            "github.com",
+            &MonoShaper,
+            5,
+            300
+        ));
+
+        // Paint emits the pill, the dot, and the label glyphs.
+        let list = DrivenBadge::paint(w, 23, "github.com", &MonoShaper);
+        let rects = list
+            .items
+            .iter()
+            .filter(|i| matches!(i, DisplayItem::Rect { .. }))
+            .count();
+        let glyphs = list
+            .items
+            .iter()
+            .filter(|i| matches!(i, DisplayItem::Glyphs { .. }))
+            .count();
+        assert_eq!(rects, 2, "pill + status dot");
+        assert_eq!(glyphs, 1, "the label");
     }
 
     #[test]

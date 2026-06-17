@@ -28,6 +28,7 @@ use cerberus_shell::MultiSurfaceApp;
 use cerberus_style::StyleEngine;
 use cerberus_text::TextEngine;
 use cerberus_types::{Color, InstanceId, Rect, Size};
+use cerberus_ui::DrivenBadge;
 use cerberus_url::parse as parse_url;
 
 /// A [`PageSource`] over the app's synchronous load path.
@@ -173,6 +174,18 @@ impl MirrorShell {
         self.group.instances().len()
     }
 
+    /// The host of the master's current page — the "site" the badge names. Empty
+    /// for built-in pages (no host) or before the first navigation.
+    pub fn driven_site(&self) -> String {
+        self.group
+            .master()
+            .url()
+            .and_then(|u| parse_url(u).ok())
+            .map(|p| p.host)
+            .filter(|h| !h.is_empty())
+            .unwrap_or_default()
+    }
+
     /// Navigate every window to `url` (recorded on the master, replayed on each
     /// follower when it next catches up).
     pub fn navigate(&mut self, url: &str) -> Result<(), MirrorError> {
@@ -194,6 +207,10 @@ impl MirrorShell {
         if idx == self.group.master_index() {
             self.master_elements = laid.elements;
             self.master_fields = laid.fields;
+            // Overlay the owner's "N profiles being driven" badge on the master.
+            let badge =
+                DrivenBadge::paint(size, self.driven_count(), &self.driven_site(), &self.text);
+            self.text.rasterize(&badge, &mut fb);
         }
         fb
     }
@@ -557,6 +574,34 @@ mod tests {
             "the follower typed the same value in its own session"
         );
         assert!(shell.group().live_realms() <= 1);
+    }
+
+    #[test]
+    fn driven_site_reports_master_host_and_master_render_composites_badge() {
+        let master = InstanceId::from_u64_pair(0, 1);
+        let follower = InstanceId::from_u64_pair(0, 2);
+        let engine = QuickJsEngineFactory.instantiate().unwrap();
+        let members = vec![
+            (master, "work".to_string()),
+            (follower, "personal".to_string()),
+        ];
+        let group =
+            MirrorGroup::new(engine, Box::new(InputPage), members, (800, 600), "ua").unwrap();
+        let mut shell = MirrorShell::new(group);
+
+        assert_eq!(shell.driven_count(), 2);
+        assert_eq!(
+            shell.driven_site(),
+            "",
+            "no site before the first navigation"
+        );
+
+        shell.navigate("https://app.test/").unwrap();
+        assert_eq!(shell.driven_site(), "app.test");
+
+        // The master render composites the badge overlay without panicking.
+        let fb = shell.render(0, Size::new(800, 600));
+        assert!(fb.pixel(0, 0).is_some());
     }
 
     #[test]
