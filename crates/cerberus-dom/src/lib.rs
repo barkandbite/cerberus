@@ -57,6 +57,13 @@ impl Document {
         }
     }
 
+    /// A cursor at the node with arena id `id`, or `None` if it is out of range.
+    /// Lets callers that already hold a [`NodeId`] (e.g. layout hit boxes) read a
+    /// node's tag and attributes without re-walking the tree from the root.
+    pub fn node(&self, id: NodeId) -> Option<NodeRef<'_>> {
+        ((id as usize) < self.nodes.len()).then_some(NodeRef { doc: self, id })
+    }
+
     /// Inline `<script>` sources (elements without a `src` attribute), in
     /// document order. The text is the raw script body, undecoded — it is *not*
     /// part of the render tree and never appears in [`NodeRef::text_content`].

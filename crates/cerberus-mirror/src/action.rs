@@ -81,6 +81,16 @@ impl ActionLog {
         self.actions.push(action);
     }
 
+    /// Replace the most recent action, or append if the log is empty. Used to
+    /// coalesce a run of consecutive same-target [`Action::Input`] keystrokes
+    /// into a single entry, so per-character typing does not bloat catch-up.
+    pub fn replace_last(&mut self, action: Action) {
+        match self.actions.last_mut() {
+            Some(last) => *last = action,
+            None => self.actions.push(action),
+        }
+    }
+
     /// The number of actions recorded — the head cursor.
     pub fn len(&self) -> usize {
         self.actions.len()

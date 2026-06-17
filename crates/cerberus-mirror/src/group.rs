@@ -171,7 +171,24 @@ impl MirrorGroup {
         let master = self.master_idx;
         self.focus(master)?;
         self.apply_logged(master, &action)?;
-        self.log.push(action);
+        // Coalesce a run of keystrokes into one log entry: if this is an `Input`
+        // to the same target as the trailing action, replace it instead of
+        // appending. Each keystroke already carries the whole field value, so a
+        // follower replaying the single coalesced entry converges identically —
+        // and per-character typing does not grow the log (catch-up stays cheap).
+        let coalesce = if let Action::Input { target, .. } = &action {
+            matches!(
+                self.log.actions().last(),
+                Some(Action::Input { target: prev, .. }) if prev == target
+            )
+        } else {
+            false
+        };
+        if coalesce {
+            self.log.replace_last(action);
+        } else {
+            self.log.push(action);
+        }
         self.instances[master].cursor = self.log.len();
         Ok(())
     }
