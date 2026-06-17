@@ -45,7 +45,8 @@ button labels, and selects the whole address on focus.
   a fixed corner offset, so the `< > R X` / `S` / head-chip labels and the cookie
   inspector's close/scroll/chip buttons looked misaligned. They're now centered
   in their boxes (a shared `push_centered` helper), and the close/delete glyph is
-  a proper `×`.
+  a proper `×`. Buttons also gain a standard 1px border (affordance, a shade
+  darker than the fill) and the URL box is bordered like a text field.
 - **HiDPI scaling: the UI is no longer tiny on high-DPI displays.** The window
   shell ignored the OS scale factor, so at 200% the toolbar and fonts were drawn
   at half their intended on-screen size. The shell now renders in logical pixels

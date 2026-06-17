@@ -245,6 +245,7 @@ impl Toolbar {
         color: Color,
     ) {
         list.push(DisplayItem::Rect { rect, color: bg });
+        stroke_rect(list, rect, darken(bg)); // input-field border
         let y = rect.y + (rect.h as i32 - LABEL_PX as i32) / 2;
         let tx = rect.x + 6;
         // Width of the actually-typed text (not the placeholder), for the caret
@@ -832,9 +833,42 @@ fn draw_button(
     px: u32,
 ) {
     list.push(DisplayItem::Rect { rect, color: fill });
+    // A 1px border, a shade darker than the fill, gives a standard button edge
+    // (affordance) and keeps a light chip visible on a light background.
+    stroke_rect(list, rect, darken(fill));
     if !label.is_empty() {
         push_centered(list, shaper, rect, label, px, text);
     }
+}
+
+/// A shade darker than `c` (~80%), for button/field borders.
+fn darken(c: Color) -> Color {
+    let s = |v: u8| (v as u32 * 80 / 100) as u8;
+    Color::rgb(s(c.r), s(c.g), s(c.b))
+}
+
+/// Draw a 1px border just inside `rect` as four thin filled rects.
+fn stroke_rect(list: &mut DisplayList, rect: Rect, color: Color) {
+    if rect.w == 0 || rect.h == 0 {
+        return;
+    }
+    let (w, h) = (rect.w, rect.h);
+    list.push(DisplayItem::Rect {
+        rect: Rect::new(rect.x, rect.y, w, 1),
+        color,
+    });
+    list.push(DisplayItem::Rect {
+        rect: Rect::new(rect.x, rect.y + h as i32 - 1, w, 1),
+        color,
+    });
+    list.push(DisplayItem::Rect {
+        rect: Rect::new(rect.x, rect.y, 1, h),
+        color,
+    });
+    list.push(DisplayItem::Rect {
+        rect: Rect::new(rect.x + w as i32 - 1, rect.y, 1, h),
+        color,
+    });
 }
 
 /// Background colour for a cookie-disposition chip, by its token, so the state
