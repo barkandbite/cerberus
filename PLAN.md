@@ -263,7 +263,8 @@ scaffold (they assert structural guarantees, not feature behavior):
 
 258 tests pass; `fmt`, `clippy -D warnings`, `cargo deny check`, the memory
 gate (idle + head-switch), and the benchmark gate are green. Network hygiene:
-DoH-only resolution (Quad9), no telemetry, and with `--proxy` a single
+DoH-first resolution (Quad9 → Cloudflare → Google, with the OS resolver only as
+a last-resort fallback — ADR-0027), no telemetry, and with `--proxy` a single
 CONNECT-tunneled egress with no local target resolution at all.
 
 ---
@@ -282,7 +283,8 @@ CONNECT-tunneled egress with no local target resolution at all.
   (single-page; Back/Forward walk history). Identity switching and vault unlock
   live behind the head switcher / Settings. Implemented in `cerberus-ui`.
 - **Networking (M1, complete)** → rustls + `ring` + bundled `webpki-roots`
-  (`TlsProvider`); **Quad9** DoH, DoH-only (`DnsResolver`); https-first →
+  (`TlsProvider`); multi-DoH (Quad9 → Cloudflare → Google) + OS last-resort
+  fallback (`DnsResolver`, ADR-0027); https-first →
   user-risk-prompt → block for plaintext `http`; background-thread windowed
   loads (worker + event-loop `Waker`); per-instance HTTP cache (ADR-0006). Fetch
   path **live-verified**; the load state machine (upgrade/prompt/cache/Stop) is

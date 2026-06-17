@@ -23,7 +23,10 @@ redirect logic, and the cache are ours.
 - **`cerberus-tls-rustls`** (new adapter): `TlsProvider` via rustls. No rustls
   type crosses the boundary (returns `Box<dyn ReadWrite>`).
 - **`cerberus-dns-doh`** (new adapter): `DnsResolver` via DoH (RFC 8484 wire
-  format), reusing `http1` over a `TlsProvider`. DoH-only, no plaintext fallback.
+  format), reusing `http1` over a `TlsProvider`. Originally DoH-only; **amended by
+  ADR-0027** to a multi-DoH chain (Quad9 → Cloudflare → Google) with an OS
+  `getaddrinfo` last-resort fallback, so a blocked resolver no longer kills all
+  browsing.
 
 ### Owner decisions (2026-06-09)
 
@@ -45,7 +48,8 @@ cache add **no** dependencies.
 
 - **Cache is partitioned per `InstanceId`** (a shared HTTP cache is a cross-site
   tracking vector — sealed like cookies). Honors `Cache-Control: max-age/no-store`.
-- DoH-only resolution; no plaintext DNS ever.
+- DoH-first resolution across multiple providers; the OS resolver is a
+  last-resort fallback used only when every DoH endpoint is unreachable (ADR-0027).
 - Fixed UA; `Accept-Encoding: identity` for now.
 - `RustlsProvider::with_system_roots()` is a **non-default** option for users
   behind a TLS-inspecting corporate/egress proxy (whose CA is installed

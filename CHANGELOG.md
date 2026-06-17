@@ -3,6 +3,21 @@
 All notable changes to Cerberus are recorded here. Versions are small while the
 browser is pre-1.0; this is the first tagged preview.
 
+## [Unreleased]
+
+### Fixed
+- **Pages no longer fail to load when DNS-over-HTTPS is blocked.** Resolution was
+  DoH-only against a single Quad9 endpoint with no fallback, so a network that
+  blocked or mangled the DoH connection (e.g. a middlebox answering the DoH POST
+  with HTTP 505) failed *every* page. Resolution is now an ordered chain —
+  **Quad9 → Cloudflare → Google DoH, then the OS resolver as a last resort** —
+  so a blocked resolver no longer kills all browsing. Encrypted resolvers are
+  tried first; the system resolver runs only if all DoH endpoints are unreachable
+  (ADR-0027).
+- **DNS failures are reported accurately**, not as the misleading "this site
+  doesn't support HTTPS" prompt — switching to plaintext http can't fix a name
+  that never resolved.
+
 ## [0.0.2] — 2026-06-17
 
 Preview fix release: the desktop binary now opens the browser when launched,

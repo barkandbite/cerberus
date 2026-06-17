@@ -45,8 +45,8 @@ use cerberus_layout::{
     LinkBox, NoForms, NoImages,
 };
 use cerberus_net::{
-    parse_proxy, BuiltinHttpClient, CookieJar, FetchContext, FetchKind, HttpCache, HttpClient,
-    HttpResponse, ProxyConfig, Router, DEFAULT_USER_AGENT,
+    parse_proxy, BuiltinHttpClient, CookieJar, FallbackResolver, FetchContext, FetchKind,
+    HttpCache, HttpClient, HttpResponse, ProxyConfig, Router, SystemResolver, DEFAULT_USER_AGENT,
 };
 use cerberus_paint::{
     DecodedImage, DisplayItem, DisplayList, Framebuffer, ImageDecoder, Rasterizer, TextShaper,
@@ -575,12 +575,18 @@ pub fn network_client(
             RustlsProvider::new()
         }
     };
-    Router::with_options(
-        Box::new(provider()),
+    // Multi-DoH then a system fallback (ADR-0006): try the encrypted resolvers
+    // in order, and only if every one is unreachable fall back to the OS
+    // resolver — so a network that blocks or mangles our DoH (e.g. answers the
+    // POST with HTTP 505) can still browse. The system path is the only one that
+    // exposes lookups to the local network, hence it is tried last.
+    let dns = FallbackResolver::new(vec![
         Box::new(DohResolver::quad9(Box::new(provider()))),
-        jar,
-        proxy,
-    )
+        Box::new(DohResolver::cloudflare(Box::new(provider()))),
+        Box::new(DohResolver::google(Box::new(provider()))),
+        Box::new(SystemResolver),
+    ]);
+    Router::with_options(Box::new(provider()), Box::new(dns), jar, proxy)
 }
 
 /// The cookie seam over sealed storage: attaches only what
@@ -1960,13 +1966,24 @@ impl BrowserApp {
                 )
             }
             Err(err) => match http_fallback {
-                Some(http_url) => {
-                    // The https upgrade failed; offer the plaintext risk prompt.
+                // The https upgrade failed at the connection/cert layer; http may
+                // still serve the page, so offer the plaintext risk prompt. A DNS
+                // failure is different — the name didn't resolve, so http can't
+                // help either — report the real cause instead of the misleading
+                // "doesn't support HTTPS" prompt.
+                Some(http_url) if !is_dns_failure(&err) => {
                     self.toolbar.loading = false;
                     self.set_document(insecure_prompt_document(&http_url, &err));
                     self.insecure_prompt = Some(http_url);
                 }
-                None => self.show_error(&requested_url, &err),
+                _ => {
+                    let msg = if is_dns_failure(&err) {
+                        format!("This site's address could not be resolved (DNS). {err}")
+                    } else {
+                        err
+                    };
+                    self.show_error(&requested_url, &msg);
+                }
             },
         }
         true
@@ -3247,6 +3264,15 @@ fn first_party_of(url: &cerberus_url::Url) -> Option<Origin> {
             .as_ref()
             .map(|o| Origin::new(url.scheme.clone(), o.clone(), None))
     })
+}
+
+/// Whether a fetch-error string (the `Debug` of a `NetError`, as stringified by
+/// `fetch_page`) is a DNS-resolution failure. Switching an https upgrade to
+/// plaintext http can't fix a name that never resolved, so these are reported
+/// with their real cause rather than the misleading "doesn't support HTTPS"
+/// prompt.
+fn is_dns_failure(err: &str) -> bool {
+    err.starts_with("Dns(")
 }
 
 fn error_document(url: &str, message: &str) -> Document {
@@ -4664,6 +4690,29 @@ mod tests {
         assert_eq!(b.status(), 200);
         assert!(b.document.root().text_content().contains("Plain"));
         assert!(b.insecure_prompt.is_none());
+    }
+
+    #[test]
+    fn browser_dns_failure_during_upgrade_reports_cause_not_https_prompt() {
+        // A DNS failure (the name never resolved) must NOT be misreported as the
+        // site lacking HTTPS — switching to plaintext can't help — so we show the
+        // real cause and offer no insecure prompt.
+        let mut b = fake_app(vec![(
+            "https://nx.test/",
+            Err("Dns(\"system DNS: no records for nx.test\")".to_string()),
+        )]);
+        b.navigate("http://nx.test/");
+        assert!(b.poll());
+        assert!(
+            b.insecure_prompt.is_none(),
+            "a DNS failure must not offer the plaintext prompt"
+        );
+        let text = b.document.root().text_content();
+        assert!(text.contains("Cannot load page"), "got {text:?}");
+        assert!(
+            !text.contains("doesn't support HTTPS"),
+            "DNS failure misreported as no-HTTPS: {text:?}"
+        );
     }
 
     #[test]
