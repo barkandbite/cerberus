@@ -1121,7 +1121,7 @@ struct NetLoader {
     tx: Sender<Job>,
     rx: Receiver<Done>,
     waker: Arc<Mutex<Option<Arc<dyn Waker>>>>,
-    _worker: JoinHandle<()>,
+    _workers: Vec<JoinHandle<()>>,
 }
 
 impl NetLoader {
@@ -1133,49 +1133,70 @@ impl NetLoader {
         let (req_tx, req_rx) = std::sync::mpsc::channel::<Job>();
         let (out_tx, out_rx) = std::sync::mpsc::channel::<Done>();
         let waker: Arc<Mutex<Option<Arc<dyn Waker>>>> = Arc::new(Mutex::new(None));
-        let worker_waker = waker.clone();
 
-        let worker = std::thread::spawn(move || {
-            // Build the network client (rustls config) once, on the worker.
-            let client = network_client(system_roots, jar, proxy);
-            while let Ok(job) = req_rx.recv() {
-                let done = match job {
-                    Job::Page { id, url, ctx } => {
-                        let result = fetch_page(&client, &url, &ctx);
-                        Done::Page {
-                            id,
-                            requested_url: url,
-                            result,
+        // A small pool of workers shares one job queue, so a page's many
+        // subresources fetch concurrently instead of one-at-a-time (a single
+        // worker made image-heavy pages crawl). Each worker owns its client
+        // (rustls config) and dequeues under a short-held lock, then fetches
+        // unlocked — so a burst of queued jobs runs in parallel.
+        const WORKERS: usize = 4;
+        let req_rx = Arc::new(Mutex::new(req_rx));
+        let workers = (0..WORKERS)
+            .map(|_| {
+                let req_rx = req_rx.clone();
+                let out_tx = out_tx.clone();
+                let worker_waker = waker.clone();
+                let jar = jar.clone();
+                let proxy = proxy.clone();
+                std::thread::spawn(move || {
+                    let client = network_client(system_roots, jar, proxy);
+                    loop {
+                        // Hold the lock only for the dequeue (released at the `;`),
+                        // then fetch unlocked so other workers proceed in parallel.
+                        let job = req_rx.locked().recv();
+                        let job = match job {
+                            Ok(job) => job,
+                            Err(_) => break, // all senders dropped
+                        };
+                        let done = match job {
+                            Job::Page { id, url, ctx } => {
+                                let result = fetch_page(&client, &url, &ctx);
+                                Done::Page {
+                                    id,
+                                    requested_url: url,
+                                    result,
+                                }
+                            }
+                            Job::Sub { url, ctx } => {
+                                let t = std::time::Instant::now();
+                                let bytes = fetch_bytes(&client, &url, &ctx);
+                                Done::Sub {
+                                    url,
+                                    bytes,
+                                    elapsed: t.elapsed(),
+                                }
+                            }
+                            Job::Fetch { id, req, ctx } => {
+                                let result = perform_fetch(&client, &req.url, &req, &ctx);
+                                Done::Fetch { id, result }
+                            }
+                        };
+                        if out_tx.send(done).is_err() {
+                            break;
+                        }
+                        if let Some(w) = worker_waker.locked().clone() {
+                            w.wake();
                         }
                     }
-                    Job::Sub { url, ctx } => {
-                        let t = std::time::Instant::now();
-                        let bytes = fetch_bytes(&client, &url, &ctx);
-                        Done::Sub {
-                            url,
-                            bytes,
-                            elapsed: t.elapsed(),
-                        }
-                    }
-                    Job::Fetch { id, req, ctx } => {
-                        let result = perform_fetch(&client, &req.url, &req, &ctx);
-                        Done::Fetch { id, result }
-                    }
-                };
-                if out_tx.send(done).is_err() {
-                    break;
-                }
-                if let Some(w) = worker_waker.locked().clone() {
-                    w.wake();
-                }
-            }
-        });
+                })
+            })
+            .collect();
 
         Self {
             tx: req_tx,
             rx: out_rx,
             waker,
-            _worker: worker,
+            _workers: workers,
         }
     }
 }

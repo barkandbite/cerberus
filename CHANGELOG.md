@@ -19,6 +19,12 @@ browser is pre-1.0; this is the first tagged preview.
   glance. `Timed`/`Allow-once` remain in the engine (CLI/programmatic) but are
   out of the everyday cycle.
 
+### Performance
+- **Subresources load in parallel.** Page subresources (images, …) were fetched
+  one-at-a-time on a single worker thread, so image-heavy pages crawled (Walmart's
+  subresources took ~6.8 s). A small worker pool (4) now fetches them concurrently
+  off a shared queue; memory stays within the gate (~15 MB).
+
 ### Fixed
 - **Named HTML entities render correctly.** `&copy;`, `&mdash;`, `&eacute;`, … were
   shown literally (only `&amp;`/`&lt;`/`&gt;`/`&quot;`/`&nbsp;` + numeric refs were
