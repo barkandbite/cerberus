@@ -2701,12 +2701,40 @@ impl BrowserApp {
 
     fn navigate(&mut self, input: &str) {
         let url = normalize_url(input);
+        // Same-document navigation — only the #fragment differs from the page
+        // we're on (an in-page anchor like `#maincontent`). Record history and
+        // update the address bar, but DON'T refetch the page. (Scrolling to the
+        // anchor is a future enhancement; for now the page simply stays put.)
+        let same_document = self.is_same_document(&url);
         if !self.history.is_empty() {
             self.history.truncate(self.index + 1);
         }
         self.history.push(url.clone());
         self.index = self.history.len() - 1;
-        self.start_load(&url);
+        if same_document {
+            self.current_url = parse_url(&url).ok();
+            self.toolbar.url_text = url.clone();
+            self.toolbar.blur_url();
+            self.update_nav();
+        } else {
+            self.start_load(&url);
+        }
+    }
+
+    /// Whether `url` targets the current document, differing only by its
+    /// `#fragment` (an in-page anchor) — which needs no network refetch.
+    fn is_same_document(&self, url: &str) -> bool {
+        let (Some(current), Ok(next)) = (self.current_url.as_ref(), parse_url(url)) else {
+            return false;
+        };
+        let norm = |p: &str| if p.is_empty() { "/" } else { p }.to_string();
+        next.fragment.is_some()
+            && next.scheme == current.scheme
+            && next.host == current.host
+            && next.port == current.port
+            && next.opaque == current.opaque
+            && norm(&next.path) == norm(&current.path)
+            && next.query == current.query
     }
 
     fn back(&mut self) -> bool {
@@ -4214,7 +4242,7 @@ mod tests {
     }
 
     #[test]
-    fn cookie_inspector_cycles_deletes_and_edits_ttl() {
+    fn cookie_inspector_cycles_and_deletes() {
         let mut app = fake_app(vec![(
             "cerberus:home",
             Ok(page("cerberus:home", 200, None, "<p>hi</p>")),
@@ -4239,7 +4267,7 @@ mod tests {
         app.apply_cookie_action(CookieAction::Reveal(0));
         assert!(app.cookie_rows()[0].2.primary.contains("sid=v"));
 
-        // Cycle: Allow → Session.
+        // The chip is now a clear three-state cycle: Allow → Session → Block.
         app.apply_cookie_action(CookieAction::Cycle(0));
         assert_eq!(
             app.cookie_policy
@@ -4247,20 +4275,7 @@ mod tests {
                 .resolve("https://example.com", "sid"),
             CookieDisposition::Session
         );
-        // Cycle again: Session → Timed(default), which opens the TTL editor.
-        app.apply_cookie_action(CookieAction::Cycle(0));
-        assert!(app.cookie_ttl_edit.is_some());
-        // Type a new TTL and commit.
-        if let Some((_, _, buf)) = &mut app.cookie_ttl_edit {
-            *buf = "90".to_string();
-        }
-        app.commit_ttl_edit();
-        assert_eq!(
-            app.cookie_policy
-                .locked()
-                .resolve("https://example.com", "sid"),
-            CookieDisposition::Timed(90)
-        );
+        assert_eq!(app.cookie_rows().len(), 1, "session keeps the cookie");
 
         // Delete removes the cookie and records a Block override.
         app.apply_cookie_action(CookieAction::Delete(0));
@@ -4713,6 +4728,27 @@ mod tests {
             !text.contains("doesn't support HTTPS"),
             "DNS failure misreported as no-HTTPS: {text:?}"
         );
+    }
+
+    #[test]
+    fn fragment_navigation_does_not_refetch() {
+        let mut b = fake_app(vec![(
+            "https://ex.test/",
+            Ok(page("https://ex.test/", 200, None, "<h1>Home</h1>")),
+        )]);
+        b.navigate("https://ex.test/");
+        assert!(b.poll());
+        let before = b.document.root().text_content();
+        // In-page anchor: same document, only the #fragment differs.
+        b.navigate("https://ex.test/#section");
+        assert!(b.pending.is_none(), "fragment nav must not start a fetch");
+        assert_eq!(b.toolbar.url_text, "https://ex.test/#section");
+        assert_eq!(
+            b.document.root().text_content(),
+            before,
+            "document is unchanged by a fragment navigation"
+        );
+        assert!(b.toolbar.can_back, "fragment nav still records history");
     }
 
     #[test]

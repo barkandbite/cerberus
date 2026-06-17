@@ -14,6 +14,14 @@ browser is pre-1.0; this is the first tagged preview.
   out of the everyday cycle.
 
 ### Fixed
+- **Named HTML entities render correctly.** `&copy;`, `&mdash;`, `&eacute;`, … were
+  shown literally (only `&amp;`/`&lt;`/`&gt;`/`&quot;`/`&nbsp;` + numeric refs were
+  decoded). The decoder now covers the common named set (symbols, punctuation,
+  accented Latin); numeric refs (`&#169;`, `&#x2764;`) handle the long tail.
+- **In-page `#fragment` links no longer reload the page.** Clicking an anchor like
+  `#maincontent` refetched the whole document (it would sit on "Loading…");
+  same-document fragment navigation now just records history and updates the
+  address bar without a network round-trip.
 - **All buttons now align consistently.** Button labels were hand-placed per call
   site, so they drifted out of their boxes — most visibly the consent banner,
   whose `Allow`/`Deny`/`×` labels rendered *below* their chips. Every button
