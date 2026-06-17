@@ -33,6 +33,7 @@ use cerberus_dom::{parse_html, Document, DocumentBuilder, NodeId, NodeRef};
 use cerberus_headless::render_document;
 use cerberus_identity::{Head, HeadManager};
 use cerberus_image::ImageCodec;
+use cerberus_js::JsEngineFactory;
 use cerberus_js_dom::{
     dispatch_event, fire_load, install_page, reject_fetch, resolve_fetch, run_event_loop,
     run_page_scripts, run_page_scripts_with_fetch, serialize_dom, set_node_value, take_fetches,
@@ -3831,6 +3832,73 @@ pub fn head_switch_rss(switches: usize) -> Option<(u64, u64)> {
     Some((before, after))
 }
 
+/// Result of [`mirror_bench`]: the large-N mirror-group gate (E3/ADR-0026).
+pub struct MirrorBench {
+    /// How many sealed instances the group held.
+    pub instances: usize,
+    /// Time to focus every instance once from cold (each rebuilds from the log).
+    pub cold_sweep_ms: f64,
+    /// Time to re-focus every instance — converged, resident snapshots are
+    /// reused without a rebuild (E2), so this should be far below the cold sweep.
+    pub warm_sweep_ms: f64,
+    /// Resident set after dropping dormant snapshots, or `None` off-procfs.
+    pub peak_rss_kb: Option<u64>,
+}
+
+/// Large-N mirror-group benchmark/gate (E3/ADR-0026): build a group of `n`
+/// sealed instances over a built-in page, drive a fixed action, then sweep focus
+/// across every instance twice — cold (each rebuilds) and warm (each reuses its
+/// converged snapshot) — and read resident memory after releasing the dormant
+/// snapshots. Guards the catch-up perf (E1/E2) and the bounded-memory model that
+/// keeps thousands of profiles affordable (PLAN §1).
+pub fn mirror_bench(n: usize) -> Result<MirrorBench, String> {
+    let members: Vec<(InstanceId, String)> = (0..n)
+        .map(|i| (InstanceId::from_u64_pair(0, i as u64 + 1), format!("id{i}")))
+        .collect();
+    let engine = QuickJsEngineFactory
+        .instantiate()
+        .map_err(|e| format!("{e:?}"))?;
+    let mut group = cerberus_mirror::MirrorGroup::new(
+        engine,
+        Box::new(mirror::AppPageSource::builtin_only()),
+        members,
+        (1280, 800),
+        DEFAULT_USER_AGENT,
+    )
+    .map_err(|e| e.to_string())?;
+
+    group
+        .act(cerberus_mirror::Action::Navigate("cerberus:about".into()))
+        .map_err(|e| e.to_string())?;
+
+    // Cold sweep: the first focus of each instance rebuilds it from the log.
+    let t = Instant::now();
+    for i in 0..n {
+        group.focus(i).map_err(|e| e.to_string())?;
+    }
+    let cold_sweep_ms = t.elapsed().as_secs_f64() * 1000.0;
+
+    // Warm sweep: every instance is now a converged, resident snapshot, so
+    // re-focusing reuses it without a realm rebuild or page reload (E2).
+    let t = Instant::now();
+    for i in 0..n {
+        group.focus(i).map_err(|e| e.to_string())?;
+    }
+    let warm_sweep_ms = t.elapsed().as_secs_f64() * 1000.0;
+
+    // Drop dormant snapshots — the model that keeps resident memory ~one live
+    // document regardless of N.
+    group.release_dormant();
+    let peak_rss_kb = resident_set_kb();
+
+    Ok(MirrorBench {
+        instances: n,
+        cold_sweep_ms,
+        warm_sweep_ms,
+        peak_rss_kb,
+    })
+}
+
 /// Process resident set size in kilobytes, via the [`cerberus_sysmem`] adapter
 /// (procfs on Linux, the Win32 working set on Windows, `None` elsewhere —
 /// ADR-0015). `mem-gate` degrades gracefully when this is `None`.
@@ -3839,6 +3907,24 @@ pub use cerberus_sysmem::resident_set_kb;
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn mirror_bench_drives_many_instances_within_budget() {
+        // A modest N keeps the test fast; the CLI gate uses 256/1024.
+        let bench = mirror_bench(8).expect("mirror-bench runs");
+        assert_eq!(bench.instances, 8);
+        // Both sweeps completed; the warm sweep reuses converged snapshots, so it
+        // is no slower than the cold sweep (E2) — allow slack for timer noise.
+        assert!(bench.warm_sweep_ms <= bench.cold_sweep_ms + 5.0);
+        // Resident memory after releasing dormant snapshots is well within budget.
+        if let Some(kb) = bench.peak_rss_kb {
+            assert!(
+                kb as f64 / 1024.0 <= 64.0,
+                "resident {:.1} MB exceeds the 64 MB budget",
+                kb as f64 / 1024.0
+            );
+        }
+    }
 
     #[test]
     fn renders_builtin_home_end_to_end() {

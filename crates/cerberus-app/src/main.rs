@@ -22,6 +22,7 @@ fn main() -> ExitCode {
         "render" => cmd_render(rest),
         "mem-gate" => cmd_mem_gate(rest),
         "bench" => cmd_bench(rest),
+        "mirror-bench" => cmd_mirror_bench(rest),
         "cookies" => cmd_cookies(rest),
         "identities" => cmd_identities(rest),
         "profile" => cmd_profile(rest),
@@ -238,6 +239,53 @@ fn cmd_bench(args: &[String]) -> ExitCode {
     ExitCode::SUCCESS
 }
 
+/// `mirror-bench` — the large-N mirror-group gate (E3/ADR-0026): build a group of
+/// N sealed instances, sweep focus across all of them (cold then warm), and
+/// assert resident memory after releasing dormant snapshots stays within budget.
+fn cmd_mirror_bench(args: &[String]) -> ExitCode {
+    let n: usize = flag(args, "--instances")
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(256);
+    let budget_mb: f64 = flag(args, "--budget-mb")
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(64.0);
+
+    let bench = match cerberus_app::mirror_bench(n) {
+        Ok(b) => b,
+        Err(e) => {
+            eprintln!("mirror-bench failed: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    println!("mirror-bench ({} instances):", bench.instances);
+    println!(
+        "  cold focus sweep : {:>8.2} ms ({:.3} ms/instance)",
+        bench.cold_sweep_ms,
+        bench.cold_sweep_ms / n.max(1) as f64
+    );
+    println!(
+        "  warm focus sweep : {:>8.2} ms (re-focus reuses converged snapshots)",
+        bench.warm_sweep_ms
+    );
+    match bench.peak_rss_kb {
+        Some(kb) => {
+            let mb = kb as f64 / 1024.0;
+            println!("  resident (after release_dormant): {mb:.1} MB");
+            if mb > budget_mb {
+                eprintln!(
+                    "mirror-bench FAIL: resident {mb:.1} MB > budget {budget_mb:.1} MB (N={n})"
+                );
+                return ExitCode::FAILURE;
+            }
+            println!("mirror-bench PASS: resident {mb:.1} MB <= budget {budget_mb:.1} MB (N={n})");
+        }
+        None => {
+            println!("  resident memory unavailable on this platform; skipping budget check");
+        }
+    }
+    ExitCode::SUCCESS
+}
+
 /// `cookies` — inspect and retune the per-cookie disposition policy of a
 /// persistent profile, headlessly.
 fn cmd_cookies(args: &[String]) -> ExitCode {
@@ -330,6 +378,7 @@ fn print_usage() {
          \x20 render     Render a page to PPM and print a summary (headless)\n\
          \x20 mem-gate   Render and assert resident memory within budget\n\
          \x20 bench      Time the render pipeline stages (see --assert-total-ms)\n\
+         \x20 mirror-bench  Large-N mirror gate: focus-sweep N instances, assert RSS\n\
          \x20 cookies    Inspect/retune a profile's cookie dispositions (--data-dir)\n\
          \x20 identities Manage a profile's identities (--data-dir; --add/--remove)\n\
          \x20 profile    Show/set an identity's autofill profile (--data-dir;\n\
@@ -357,7 +406,10 @@ fn print_usage() {
          \x20 (--out extension selects the format: .ppm, .png, or .pdf)\n\n\
          MEM-GATE OPTIONS:\n\
          \x20 --budget-mb <MB>     default: 64\n\
-         \x20 --switches <N>       also assert RSS within +10% after N head switches"
+         \x20 --switches <N>       also assert RSS within +10% after N head switches\n\n\
+         MIRROR-BENCH OPTIONS:\n\
+         \x20 --instances <N>      number of sealed instances to drive (default: 256)\n\
+         \x20 --budget-mb <MB>     resident budget after releasing dormant (default: 64)"
     );
 }
 
