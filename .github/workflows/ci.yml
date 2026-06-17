@@ -58,6 +58,12 @@ jobs:
       - name: Benchmark gate
         run: cargo run -q -p cerberus-app --release --locked -- bench --assert-total-ms 500
 
+      # Large-N mirror gate (ADR-0026): focus-sweep N sealed instances and assert
+      # resident memory after releasing dormant snapshots stays within budget —
+      # the proof the mirror's "N can be thousands" model stays memory-bounded.
+      - name: Mirror-group memory gate (large N)
+        run: cargo run -q -p cerberus-app --release --locked -- mirror-bench --instances 256 --budget-mb 64
+
       # Publish the Windows binary as a downloadable artifact. The release build
       # already happened in the bench step above, so this just collects the .exe —
       # a testable binary without needing a native Windows box (ADR-0015).
