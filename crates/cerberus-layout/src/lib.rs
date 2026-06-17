@@ -220,6 +220,10 @@ struct Ctx<'a> {
     /// subtree is suppressed from paint (the opacity group). `visibility:hidden`
     /// is handled per element via the computed style.
     opacity_hidden: bool,
+    /// A reusable scratch context for intrinsic-width measurement, kept across
+    /// items so flex/grid sizing does not allocate a fresh `Ctx` (with its five
+    /// output buffers) per item per render. Created lazily, cleared between uses.
+    scratch: Option<Box<Ctx<'a>>>,
 }
 
 impl<'a> Ctx<'a> {
@@ -250,6 +254,7 @@ impl<'a> Ctx<'a> {
             line_align: TextAlign::Left,
             cur_link_node: None,
             opacity_hidden: false,
+            scratch: None,
         }
     }
 
@@ -288,6 +293,7 @@ impl<'a> Ctx<'a> {
             line_align: TextAlign::Left,
             cur_link_node: None,
             opacity_hidden: false,
+            scratch: None,
         }
     }
 
@@ -849,7 +855,11 @@ impl<'a> Ctx<'a> {
             TextAlign::Center => available / 2,
             TextAlign::Right => available,
         };
-        for piece in std::mem::take(&mut self.line) {
+        // Drain through a moved-out buffer so the line `Vec`'s capacity is kept
+        // for the next line instead of being dropped each commit (`mem::take`
+        // would leave a zero-capacity `Vec`).
+        let mut line = std::mem::take(&mut self.line);
+        for piece in line.drain(..) {
             let x = piece.x + offset;
             self.display.push(DisplayItem::Glyphs {
                 origin: Point::new(x, piece.y),
@@ -874,6 +884,7 @@ impl<'a> Ctx<'a> {
                 self.links.push(LinkBox { rect, href });
             }
         }
+        self.line = line;
     }
 
     fn rule(&mut self) {
@@ -884,22 +895,56 @@ impl<'a> Ctx<'a> {
         self.y += 8;
     }
 
+    /// Reset this context to the measure-only state of a fresh
+    /// `Ctx::sub(0, 1_000_000, 0, …)` while **retaining** the allocated buffers,
+    /// so a reused scratch measures identically to a freshly built one. The
+    /// shaper/images/forms references and the nested `scratch` are left intact.
+    fn reset_for_measure(&mut self, field_id: u32) {
+        self.display.items.clear();
+        self.links.clear();
+        self.fields.clear();
+        self.elements.clear();
+        self.field_id = field_id;
+        self.left0 = 0;
+        self.right = 1_000_000;
+        self.left = 0;
+        self.x = 0;
+        self.y = 0;
+        self.max_x = 0;
+        self.line_h = 0;
+        self.line.clear();
+        self.line_align = TextAlign::Left;
+        self.cur_link_node = None;
+        self.opacity_hidden = false;
+    }
+
     /// Intrinsic content width of `node`: lay it into an effectively unbounded
     /// sub-context and read how far the inline cursor reached. Used to size flex
     /// items (and grid `auto` tracks).
-    fn measure_intrinsic_width(&self, node: &StyledNode) -> i32 {
-        let mut sub = Ctx::sub(
-            0,
-            1_000_000,
-            0,
-            self.shaper,
-            self.images,
-            self.forms,
-            self.field_id,
-        );
-        sub.walk(node, None);
-        sub.flush_line();
-        sub.max_x.max(1)
+    ///
+    /// Reuses a single scratch [`Ctx`] across items (cleared, not dropped) so a
+    /// flex/grid page does not allocate a fresh context and its five output
+    /// buffers per item on every render — the dominant layout allocation, and a
+    /// cost paid on every mirror render too.
+    fn measure_intrinsic_width(&mut self, node: &StyledNode) -> i32 {
+        let field_id = self.field_id;
+        let mut scratch = self.scratch.take().unwrap_or_else(|| {
+            Box::new(Ctx::sub(
+                0,
+                1_000_000,
+                0,
+                self.shaper,
+                self.images,
+                self.forms,
+                field_id,
+            ))
+        });
+        scratch.reset_for_measure(field_id);
+        scratch.walk(node, None);
+        scratch.flush_line();
+        let width = scratch.max_x.max(1);
+        self.scratch = Some(scratch);
+        width
     }
 
     /// Merge a finished sub-context's output into this one, shifting it down by
