@@ -3,7 +3,11 @@
 All notable changes to Cerberus are recorded here. Versions are small while the
 browser is pre-1.0; this is the first tagged preview.
 
-## [Unreleased]
+## [0.0.3] — 2026-06-17
+
+Fixes from field testing on Windows: the browser now works on networks that
+interfere with DNS-over-HTTPS, respects the display scale factor, centers its
+button labels, and selects the whole address on focus.
 
 ### Fixed
 - **Address bar: caret + select-all on focus.** Clicking the URL box now selects
