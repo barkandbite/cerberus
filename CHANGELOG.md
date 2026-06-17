@@ -3,6 +3,16 @@
 All notable changes to Cerberus are recorded here. Versions are small while the
 browser is pre-1.0; this is the first tagged preview.
 
+## [Unreleased]
+
+### Fixed
+- **All buttons now align consistently.** Button labels were hand-placed per call
+  site, so they drifted out of their boxes — most visibly the consent banner,
+  whose `Allow`/`Deny`/`×` labels rendered *below* their chips. Every button
+  (toolbar, consent banner, cookie manager) now draws through one
+  `draw_button` primitive that centers the label, so this class of misalignment
+  can't recur (ADR-0028). Close/delete use a proper `×`.
+
 ## [0.0.3] — 2026-06-17
 
 Fixes from field testing on Windows: the browser now works on networks that

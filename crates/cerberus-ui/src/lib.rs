@@ -218,35 +218,33 @@ impl Toolbar {
 
         for (control, rect) in self.layout(window) {
             let (bg, label, enabled) = self.style(control);
-            list.push(DisplayItem::Rect { rect, color: bg });
-            if label.is_empty() {
-                continue;
-            }
-            let color = if enabled {
+            let text = if enabled {
                 Color::rgb(0x20, 0x20, 0x20)
             } else {
                 Color::rgb(0xA0, 0xA0, 0xA0)
             };
-            // The URL box is left-aligned and shows a caret/selection; every other
-            // control centres its label.
+            // The URL box is a text field (own background, caret, selection); every
+            // other control is a button drawn through the shared primitive.
             match control {
-                Control::UrlBox => self.paint_url_box(&mut list, shaper, rect, &label, color),
-                _ => push_centered(&mut list, shaper, rect, &label, LABEL_PX, color),
+                Control::UrlBox => self.paint_url_box(&mut list, shaper, rect, bg, &label, text),
+                _ => draw_button(&mut list, shaper, rect, &label, bg, text, LABEL_PX),
             }
         }
         list
     }
 
-    /// Paint the URL box label plus, when focused, a caret at the end of the text
-    /// and (right after focusing) a select-all highlight behind it.
+    /// Paint the URL box: its background, label, a caret when focused, and a
+    /// select-all highlight right after focusing.
     fn paint_url_box(
         &self,
         list: &mut DisplayList,
         shaper: &dyn TextShaper,
         rect: Rect,
+        bg: Color,
         label: &str,
         color: Color,
     ) {
+        list.push(DisplayItem::Rect { rect, color: bg });
         let y = rect.y + (rect.h as i32 - LABEL_PX as i32) / 2;
         let tx = rect.x + 6;
         // Width of the actually-typed text (not the placeholder), for the caret
@@ -693,16 +691,10 @@ impl ConsentBanner {
             let (fill, label) = match action {
                 BannerAction::Allow => (Color::rgb(0xD9, 0xEF, 0xD9), "Allow"),
                 BannerAction::Deny => (Color::rgb(0xF3, 0xD9, 0xD9), "Deny"),
-                BannerAction::Dismiss => (Color::rgb(0xE8, 0xE8, 0xE8), "x"),
+                BannerAction::Dismiss => (Color::rgb(0xE8, 0xE8, 0xE8), "×"),
                 BannerAction::None => continue,
             };
-            list.push(DisplayItem::Rect { rect, color: fill });
-            list.push(DisplayItem::Glyphs {
-                origin: Point::new(rect.x + 6, rect.y + 15),
-                glyphs: shaper.shape(label, 12),
-                color: Color::BLACK,
-                style: FontStyle::REGULAR,
-            });
+            draw_button(&mut list, shaper, rect, label, fill, Color::BLACK, 12);
         }
         list
     }
@@ -824,6 +816,25 @@ fn push_centered(
         color,
         style: FontStyle::REGULAR,
     });
+}
+
+/// Standard button chrome: a filled rect with its label centred on both axes.
+/// This is the single place button alignment is defined, so every button across
+/// the UI (toolbar, consent banner, cookie manager) stays consistent instead of
+/// each call site hand-placing a label that drifts out of its box.
+fn draw_button(
+    list: &mut DisplayList,
+    shaper: &dyn TextShaper,
+    rect: Rect,
+    label: &str,
+    fill: Color,
+    text: Color,
+    px: u32,
+) {
+    list.push(DisplayItem::Rect { rect, color: fill });
+    if !label.is_empty() {
+        push_centered(list, shaper, rect, label, px, text);
+    }
 }
 
 impl CookieManager {
@@ -959,11 +970,15 @@ impl CookieManager {
         });
         // Close button.
         let close = Self::close_rect(window);
-        list.push(DisplayItem::Rect {
-            rect: close,
-            color: Color::rgb(0xE0, 0xE0, 0xE0),
-        });
-        push_centered(&mut list, shaper, close, "×", 13, Color::BLACK);
+        draw_button(
+            &mut list,
+            shaper,
+            close,
+            "×",
+            Color::rgb(0xE0, 0xE0, 0xE0),
+            Color::BLACK,
+            13,
+        );
         // Global default chip.
         list.push(DisplayItem::Glyphs {
             origin: Point::new(p.x + 12, p.y + 63),
@@ -972,11 +987,15 @@ impl CookieManager {
             style: FontStyle::REGULAR,
         });
         let gchip = Self::global_chip_rect(window);
-        list.push(DisplayItem::Rect {
-            rect: gchip,
-            color: Color::rgb(0xD9, 0xE7, 0xF7),
-        });
-        push_centered(&mut list, shaper, gchip, global_chip, 12, Color::BLACK);
+        draw_button(
+            &mut list,
+            shaper,
+            gchip,
+            global_chip,
+            Color::rgb(0xD9, 0xE7, 0xF7),
+            Color::BLACK,
+            12,
+        );
         // Rows.
         let visible = Self::visible_rows(window);
         for vis_i in 0..visible {
@@ -1002,30 +1021,48 @@ impl CookieManager {
                 style: FontStyle::REGULAR,
             });
             // reveal (eye), chip, delete (x)
-            list.push(DisplayItem::Rect {
-                rect: reveal,
-                color: Color::rgb(0xE8, 0xE8, 0xE8),
-            });
-            push_centered(&mut list, shaper, reveal, "o", 12, Color::BLACK);
-            list.push(DisplayItem::Rect {
-                rect: chip,
-                color: Color::rgb(0xD9, 0xEF, 0xD9),
-            });
-            push_centered(&mut list, shaper, chip, &row.chip, 12, Color::BLACK);
-            list.push(DisplayItem::Rect {
-                rect: delete,
-                color: Color::rgb(0xF3, 0xD9, 0xD9),
-            });
-            push_centered(&mut list, shaper, delete, "×", 12, Color::BLACK);
+            draw_button(
+                &mut list,
+                shaper,
+                reveal,
+                "o",
+                Color::rgb(0xE8, 0xE8, 0xE8),
+                Color::BLACK,
+                12,
+            );
+            draw_button(
+                &mut list,
+                shaper,
+                chip,
+                &row.chip,
+                Color::rgb(0xD9, 0xEF, 0xD9),
+                Color::BLACK,
+                12,
+            );
+            draw_button(
+                &mut list,
+                shaper,
+                delete,
+                "×",
+                Color::rgb(0xF3, 0xD9, 0xD9),
+                Color::BLACK,
+                12,
+            );
         }
         // Scroll affordances.
         let (up, down) = Self::scroll_rects(window);
+        // ^ / v are plain ASCII the bundled font definitely has; geometric
+        // triangles (U+25B2/BC) are not in Roboto and would render as tofu.
         for (r, glyph) in [(up, "^"), (down, "v")] {
-            list.push(DisplayItem::Rect {
-                rect: r,
-                color: Color::rgb(0xE0, 0xE0, 0xE0),
-            });
-            push_centered(&mut list, shaper, r, glyph, 12, Color::BLACK);
+            draw_button(
+                &mut list,
+                shaper,
+                r,
+                glyph,
+                Color::rgb(0xE0, 0xE0, 0xE0),
+                Color::BLACK,
+                12,
+            );
         }
         list
     }
