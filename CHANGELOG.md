@@ -3,7 +3,10 @@
 All notable changes to Cerberus are recorded here. Versions are small while the
 browser is pre-1.0; this is the first tagged preview.
 
-## [Unreleased]
+## [0.0.2] — 2026-06-17
+
+Preview fix release: the desktop binary now opens the browser when launched,
+and carries the multi-identity UX + efficiency arc.
 
 ### Fixed
 - **Double-clicking the desktop binary now opens the browser.** With no arguments
