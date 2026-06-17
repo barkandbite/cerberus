@@ -6,6 +6,12 @@ browser is pre-1.0; this is the first tagged preview.
 ## [Unreleased]
 
 ### Changed
+- **HiDPI rendering is now crisp.** The shell previously rendered at logical size
+  and bitmap-upscaled to the physical surface (soft text at >1×). The app now
+  lays out in logical pixels and paints at physical resolution via a scaled
+  display list — glyphs are **re-outlined** at the larger size — so text is sharp
+  at 200%. Hit-testing stays in logical pixels (`DisplayList::scaled`,
+  `FrameApp::set_scale_factor`).
 - **Cookie manager is legible.** The per-cookie chip cycled through five
   unexplained states; it's now a clear three-state control — **allow / session /
   block** — with a legend ("allow = keep · session = forget on close · block =

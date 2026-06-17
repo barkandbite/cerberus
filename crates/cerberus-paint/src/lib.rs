@@ -44,6 +44,54 @@ impl DisplayList {
     pub fn push(&mut self, item: DisplayItem) {
         self.items.push(item);
     }
+
+    /// A copy with every coordinate, size, and glyph pixel-size multiplied by
+    /// `scale`. Glyph runs are re-scaled (`px` + `advance`), so the rasterizer
+    /// re-outlines them at the larger size — **crisp**, not a bitmap upscale.
+    /// Used to paint a logical-pixel UI onto a HiDPI (physical-pixel) surface.
+    pub fn scaled(&self, scale: f32) -> DisplayList {
+        if (scale - 1.0).abs() < f32::EPSILON {
+            return self.clone();
+        }
+        let si = |v: i32| (v as f32 * scale).round() as i32;
+        let su = |v: u32| (v as f32 * scale).round() as u32;
+        let sr = |r: Rect| Rect::new(si(r.x), si(r.y), su(r.w), su(r.h));
+        let items = self
+            .items
+            .iter()
+            .map(|item| match item {
+                DisplayItem::Rect { rect, color } => DisplayItem::Rect {
+                    rect: sr(*rect),
+                    color: *color,
+                },
+                DisplayItem::Image { rect, image } => DisplayItem::Image {
+                    rect: sr(*rect),
+                    image: image.clone(),
+                },
+                DisplayItem::Glyphs {
+                    origin,
+                    glyphs,
+                    color,
+                    style,
+                } => DisplayItem::Glyphs {
+                    origin: Point::new(si(origin.x), si(origin.y)),
+                    glyphs: glyphs
+                        .iter()
+                        .map(|g| GlyphBox {
+                            advance: su(g.advance),
+                            w: su(g.w),
+                            h: su(g.h),
+                            id: g.id,
+                            px: su(g.px).max(1),
+                        })
+                        .collect(),
+                    color: *color,
+                    style: *style,
+                },
+            })
+            .collect();
+        DisplayList { items }
+    }
 }
 
 /// A shaped glyph: enough for both the placeholder box rasterizer (uses `w`/`h`)
@@ -266,6 +314,45 @@ mod tests {
         assert_eq!(fb.pixel(0, 0), Some(Color::BLACK));
         assert_eq!(fb.pixel(3, 3), Some(Color::WHITE));
         assert_eq!(fb.pixel(4, 4), None);
+    }
+
+    #[test]
+    fn scaled_multiplies_geometry_and_glyph_pixels() {
+        let mut list = DisplayList::new();
+        list.push(DisplayItem::Rect {
+            rect: Rect::new(3, 4, 10, 20),
+            color: Color::BLACK,
+        });
+        list.push(DisplayItem::Glyphs {
+            origin: Point::new(5, 6),
+            glyphs: vec![GlyphBox {
+                advance: 8,
+                w: 0,
+                h: 0,
+                id: 42,
+                px: 16,
+            }],
+            color: Color::BLACK,
+            style: FontStyle::REGULAR,
+        });
+        let s = list.scaled(2.0);
+        match &s.items[0] {
+            DisplayItem::Rect { rect, .. } => {
+                assert_eq!((rect.x, rect.y, rect.w, rect.h), (6, 8, 20, 40));
+            }
+            _ => panic!("expected rect"),
+        }
+        match &s.items[1] {
+            DisplayItem::Glyphs { origin, glyphs, .. } => {
+                assert_eq!((origin.x, origin.y), (10, 12));
+                assert_eq!(glyphs[0].px, 32);
+                assert_eq!(glyphs[0].advance, 16);
+                assert_eq!(glyphs[0].id, 42, "glyph id is preserved (re-outlined)");
+            }
+            _ => panic!("expected glyphs"),
+        }
+        // Scale 1.0 is an identity copy.
+        assert_eq!(list.scaled(1.0).items.len(), 2);
     }
 
     #[test]

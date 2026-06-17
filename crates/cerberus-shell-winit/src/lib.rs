@@ -11,10 +11,11 @@
 //! leaves fullscreen; other text goes to the app's URL box.
 //!
 //! HiDPI: the OS reports the surface in physical pixels plus a scale factor
-//! (e.g. 2.0 at 200%). We render the [`FrameApp`] in *logical* pixels
-//! (`physical / scale`) so the toolbar and fonts keep their intended on-screen
-//! size, then upscale the frame onto the physical surface and divide pointer
-//! coordinates by the scale. The app itself stays scale-agnostic.
+//! (e.g. 2.0 at 200%). We hand the [`FrameApp`] the scale and the physical size;
+//! it lays out in logical pixels and paints *crisp* at physical resolution
+//! (re-outlined glyphs, not a bitmap upscale), so `blit_scaled` is a 1:1 copy.
+//! Pointer coordinates are divided by the scale back into the app's logical
+//! space. (The multi-window mirror path still renders logical + upscales.)
 
 use std::num::NonZeroU32;
 use std::rc::Rc;
@@ -100,13 +101,13 @@ impl<A: FrameApp> State<A> {
         };
         let size = window.inner_size();
         let (pw, ph) = (size.width.max(1), size.height.max(1));
-        // Lay out/paint in logical pixels, then upscale to the physical surface.
+        // Hand the app the scale factor; it lays out in logical pixels and paints
+        // crisp at the physical size, so no upscaling of the result is needed.
         let scale = window.scale_factor().max(1.0);
-        let lw = ((pw as f64 / scale).round() as u32).max(1);
-        let lh = ((ph as f64 / scale).round() as u32).max(1);
+        self.app.set_scale_factor(scale as f32);
 
         // Render before borrowing the surface (disjoint field borrows).
-        let frame = self.app.render_frame(Size::new(lw, lh));
+        let frame = self.app.render_frame(Size::new(pw, ph));
 
         let Some(surface) = self.surface.as_mut() else {
             return;
@@ -120,6 +121,7 @@ impl<A: FrameApp> State<A> {
         let Ok(mut buffer) = surface.buffer_mut() else {
             return;
         };
+        // `frame` is already physical-sized; blit_scaled is a 1:1 copy here.
         blit_scaled(&frame, &mut buffer, pw, ph);
         let _ = buffer.present();
     }

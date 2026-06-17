@@ -81,6 +81,11 @@ pub trait FrameApp {
     /// Receive a waker the app can hand to background workers. Default: ignored.
     fn set_waker(&mut self, _waker: std::sync::Arc<dyn Waker>) {}
 
+    /// Tell the app the display's HiDPI scale factor (physical / logical pixels,
+    /// e.g. 2.0 at 200%). The app lays out in logical pixels and scales its paint
+    /// up so the surface renders crisp. Default: ignored (scale 1.0).
+    fn set_scale_factor(&mut self, _scale: f32) {}
+
     /// Advance background work (e.g. drain a network worker) when the loop is
     /// woken; return true if a redraw is needed. Default: nothing to do.
     fn poll(&mut self) -> bool {

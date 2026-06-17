@@ -1544,6 +1544,8 @@ pub struct BrowserApp {
     settings_open: bool,
     background: Color,
     last_size: Size,
+    /// HiDPI scale factor (physical ÷ logical px). 1.0 unless the shell sets it.
+    scale: f32,
     /// Consent policy shared with the worker-side cookie jar.
     consent: Arc<Mutex<DefaultDenyPolicy>>,
     /// Per-cookie disposition policy, shared with the worker's `SealedJar`.
@@ -1708,6 +1710,7 @@ impl BrowserApp {
             settings_open: false,
             background: Color::WHITE,
             last_size: Size::new(800, 600),
+            scale: 1.0,
             consent: Arc::new(Mutex::new(DefaultDenyPolicy::new(true))),
             cookie_policy: Arc::new(Mutex::new(CookiePolicy::new())),
             pending_consent: Arc::new(Mutex::new(Vec::new())),
@@ -2623,7 +2626,7 @@ impl BrowserApp {
     /// line of that, which is exact for the single-line editing we support today
     /// (newlines can't be typed — Enter submits). The caret is always clamped
     /// inside the box.
-    fn paint_caret(&self, page: &mut Framebuffer, origin: Point) {
+    fn paint_caret(&self, page: &mut Framebuffer, origin: Point, scale: f32) {
         let Some(id) = self.focused_field else {
             return;
         };
@@ -2661,7 +2664,7 @@ impl BrowserApp {
             rect: Rect::new(caret_x, ly + FIELD_PAD, 1, px),
             color: Color::rgb(0x22, 0x22, 0x22),
         });
-        self.text.rasterize(&list, page);
+        self.text.rasterize(&list.scaled(scale), page);
     }
 
     /// Attempt a vault unlock with the passphrase typed into the settings
@@ -2926,6 +2929,10 @@ impl FrameApp for BrowserApp {
         self.loader.set_waker(waker);
     }
 
+    fn set_scale_factor(&mut self, scale: f32) {
+        self.scale = scale.max(1.0);
+    }
+
     fn poll(&mut self) -> bool {
         let mut redraw = false;
         // Worker-side consent events (cookie capture) surface in the banner.
@@ -2953,13 +2960,24 @@ impl FrameApp for BrowserApp {
     }
 
     fn render_frame(&mut self, size: Size) -> Framebuffer {
-        self.last_size = size;
+        // `size` is the physical surface. Lay out and hit-test in *logical*
+        // pixels (physical / scale) and scale the paint up, so a HiDPI display
+        // renders crisp (re-outlined glyphs) rather than a bitmap upscale. At
+        // scale 1.0 (the default, and all tests) this is the identity.
+        let scale = self.scale;
+        let logical = Size::new(
+            ((size.w as f32 / scale).round() as u32).max(1),
+            ((size.h as f32 / scale).round() as u32).max(1),
+        );
+        self.last_size = logical;
+        let si = |v: i32| (v as f32 * scale).round() as i32;
+        let su = |v: u32| ((v as f32 * scale).round() as u32).max(1);
         let banner_h = if self.consent_prompts.is_empty() {
             0
         } else {
             BANNER_HEIGHT
         };
-        let mut content = self.toolbar.content_size(size);
+        let mut content = self.toolbar.content_size(logical);
         content.h = content.h.saturating_sub(banner_h);
         let mut origin = self.toolbar.content_origin();
         origin.y += banner_h as i32;
@@ -2974,9 +2992,9 @@ impl FrameApp for BrowserApp {
             };
             let mut layout = BlockLayout::default();
             let laid = layout.layout(&self.styled, content, &self.text, &provider, &self.forms);
-            let mut page = Framebuffer::new(content);
+            let mut page = Framebuffer::new(Size::new(su(content.w), su(content.h)));
             page.clear(self.background);
-            self.text.rasterize(&laid.display, &mut page);
+            self.text.rasterize(&laid.display.scaled(scale), &mut page);
             (laid, page)
         };
         self.timings.record("layout+paint", t.elapsed());
@@ -3039,43 +3057,47 @@ impl FrameApp for BrowserApp {
 
         // Draw a caret at the end of the focused text field's value. The field's
         // own value is already painted by layout into `page`; we just add the bar.
-        self.paint_caret(&mut page, origin);
+        self.paint_caret(&mut page, origin, scale);
 
         let mut fb = Framebuffer::new(size);
         fb.clear(self.background);
-        fb.blit(origin, &page);
-        self.text
-            .rasterize(&self.toolbar.paint(size, &self.text), &mut fb);
+        fb.blit(Point::new(si(origin.x), si(origin.y)), &page);
+        self.text.rasterize(
+            &self.toolbar.paint(logical, &self.text).scaled(scale),
+            &mut fb,
+        );
         if let Some(event) = self.consent_prompts.first() {
             let banner = ConsentBanner::new(event.request.site(), self.consent_prompts.len() - 1);
             self.text
-                .rasterize(&banner.paint(size, &self.text), &mut fb);
+                .rasterize(&banner.paint(logical, &self.text).scaled(scale), &mut fb);
         }
         if self.insecure_prompt.is_some() {
-            self.insecure_button = Some(paint_insecure_button(&mut fb, &self.text));
+            self.insecure_button = Some(paint_insecure_button(&mut fb, &self.text, scale));
         }
         if self.settings_open {
             let vault_locked = self.storage.locked().vault_locked();
             paint_settings_overlay(
                 &mut fb,
-                size,
+                logical,
                 &self.text,
                 &self.text,
                 vault_locked,
                 self.vault_input.chars().count(),
                 self.vault_msg.as_deref(),
                 self.hud_on,
+                scale,
             );
         }
         if self.cookie_manager_open {
             let global = self.cookie_policy.locked().global().label();
             let rows: Vec<CookieRow> = self.cookie_rows().into_iter().map(|(_, _, r)| r).collect();
             self.text.rasterize(
-                &CookieManager::paint(size, &self.text, &global, &rows, self.cookie_scroll),
+                &CookieManager::paint(logical, &self.text, &global, &rows, self.cookie_scroll)
+                    .scaled(scale),
                 &mut fb,
             );
             if let Some((_, _, buf)) = &self.cookie_ttl_edit {
-                let p = CookieManager::panel_rect(size);
+                let p = CookieManager::panel_rect(logical);
                 let mut list = DisplayList::new();
                 list.push(DisplayItem::Glyphs {
                     origin: Point::new(p.x + 12, p.y + p.h as i32 - 14),
@@ -3085,14 +3107,16 @@ impl FrameApp for BrowserApp {
                     color: Color::rgb(0x20, 0x40, 0x70),
                     style: FontStyle::REGULAR,
                 });
-                self.text.rasterize(&list, &mut fb);
+                self.text.rasterize(&list.scaled(scale), &mut fb);
             }
         }
         // Performance HUD on top of everything, when enabled (M11).
         if self.hud_on {
             let rows = self.timings.display_rows();
-            self.text
-                .rasterize(&PerfHud::paint(size, &self.text, &rows), &mut fb);
+            self.text.rasterize(
+                &PerfHud::paint(logical, &self.text, &rows).scaled(scale),
+                &mut fb,
+            );
         }
         fb
     }
@@ -3597,7 +3621,9 @@ fn hex_digit(n: u8) -> char {
 
 /// Paint the "Load anyway (insecure)" button into the content area; return its
 /// hit rect.
-fn paint_insecure_button(fb: &mut Framebuffer, text: &TextEngine) -> Rect {
+fn paint_insecure_button(fb: &mut Framebuffer, text: &TextEngine, scale: f32) -> Rect {
+    // `rect` is logical (returned for hit-testing, which works in logical px);
+    // the painted list is scaled to the physical surface.
     let rect = Rect::new(12, cerberus_ui::TOOLBAR_HEIGHT as i32 + 96, 240, 32);
     let mut list = DisplayList::new();
     list.push(DisplayItem::Rect {
@@ -3610,7 +3636,7 @@ fn paint_insecure_button(fb: &mut Framebuffer, text: &TextEngine) -> Rect {
         color: Color::WHITE,
         style: FontStyle::REGULAR,
     });
-    text.rasterize(&list, fb);
+    text.rasterize(&list.scaled(scale), fb);
     rect
 }
 
@@ -3646,6 +3672,7 @@ fn paint_settings_overlay(
     input_chars: usize,
     vault_msg: Option<&str>,
     hud_on: bool,
+    scale: f32,
 ) {
     let panel = settings_panel_rect(size);
     let (px, py, pw, ph) = (panel.x, panel.y, panel.w, panel.h);
@@ -3737,7 +3764,7 @@ fn paint_settings_overlay(
         color: Color::rgb(0x20, 0x40, 0x70),
         style: FontStyle::REGULAR,
     });
-    raster.rasterize(&list, fb);
+    raster.rasterize(&list.scaled(scale), fb);
 }
 
 /// One pipeline-stage benchmark result.
