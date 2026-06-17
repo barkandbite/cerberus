@@ -5,6 +5,14 @@ browser is pre-1.0; this is the first tagged preview.
 
 ## [Unreleased]
 
+### Fixed
+- **Double-clicking the desktop binary now opens the browser.** With no arguments
+  the binary defaulted to the headless `render` command, so launching the `.exe`
+  from a file manager just flashed a console and wrote `cerberus-home.ppm` then
+  exited. A desktop (windowing) build now defaults to `run` (opens the window); a
+  headless build still defaults to `render`. Run any subcommand explicitly to
+  override (e.g. `cerberus render`, `cerberus run --mirror`).
+
 ### Added
 - **Drivable mirror typing**: clicking a text field on the master captures it as
   the typing focus; keystrokes route to every sealed window as one coalesced

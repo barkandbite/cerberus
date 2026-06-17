@@ -1,7 +1,12 @@
 //! Cerberus command-line entry point.
 //!
+//! With **no arguments** (e.g. double-clicking the .exe) a desktop build opens
+//! the browser window (`run`); a headless build renders the default page
+//! (`render`). See `default_command`.
+//!
 //! Subcommands (argument parsing is hand-rolled — no `clap` until approved):
-//!   render    Render a page to a PPM file and print a summary.
+//!   run       Open the browser in a window (desktop build).
+//!   render    Render a page to a PPM file and print a summary (headless).
 //!   mem-gate  Render, then assert resident memory is within budget (CI gate).
 //!   version   Print the version.
 //!   help      Print usage.
@@ -14,7 +19,10 @@ fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
     let (command, rest) = match args.split_first() {
         Some((cmd, rest)) => (cmd.as_str(), rest),
-        None => ("render", &[][..]),
+        // No arguments — e.g. double-clicking the .exe in a file manager. A
+        // desktop (windowing) build opens the browser window, which is what that
+        // gesture means to a user; a headless build renders the default page.
+        None => (default_command(), &[][..]),
     };
 
     match command {
@@ -370,9 +378,10 @@ fn cmd_profile(args: &[String]) -> ExitCode {
 
 fn print_usage() {
     println!(
-        "cerberus — a privacy-first, memory-lean browser (M0 scaffold)\n\n\
+        "cerberus — a privacy-first, memory-lean browser\n\n\
          USAGE:\n\
-         \x20 cerberus <command> [options]\n\n\
+         \x20 cerberus <command> [options]\n\
+         \x20 cerberus                  (no command: opens the browser on a desktop build)\n\n\
          COMMANDS:\n\
          \x20 run        Open the browser in a window (needs a display)\n\
          \x20 render     Render a page to PPM and print a summary (headless)\n\
@@ -411,6 +420,19 @@ fn print_usage() {
          \x20 --instances <N>      number of sealed instances to drive (default: 256)\n\
          \x20 --budget-mb <MB>     resident budget after releasing dormant (default: 64)"
     );
+}
+
+/// The command used when the binary is launched with no arguments. A desktop
+/// (windowing) build opens the browser — what double-clicking the .exe is meant
+/// to do — while a headless build (`--no-default-features`) renders the default
+/// page. Previously this was always `render`, so double-clicking the desktop
+/// binary only flashed a console and wrote a `.ppm`.
+const fn default_command() -> &'static str {
+    if cfg!(feature = "windowing") {
+        "run"
+    } else {
+        "render"
+    }
 }
 
 /// Read `--key value` from args.
