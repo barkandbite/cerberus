@@ -6,6 +6,11 @@ browser is pre-1.0; this is the first tagged preview.
 ## [Unreleased]
 
 ### Fixed
+- **Toolbar and cookie-manager button labels are centered.** Glyphs were drawn at
+  a fixed corner offset, so the `< > R X` / `S` / head-chip labels and the cookie
+  inspector's close/scroll/chip buttons looked misaligned. They're now centered
+  in their boxes (a shared `push_centered` helper), and the close/delete glyph is
+  a proper `×`.
 - **HiDPI scaling: the UI is no longer tiny on high-DPI displays.** The window
   shell ignored the OS scale factor, so at 200% the toolbar and fonts were drawn
   at half their intended on-screen size. The shell now renders in logical pixels

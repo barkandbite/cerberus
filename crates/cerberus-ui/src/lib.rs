@@ -197,8 +197,18 @@ impl Toolbar {
                     Color::rgb(0xA0, 0xA0, 0xA0)
                 };
                 let glyphs = shaper.shape(&label, LABEL_PX);
+                let text_w: i32 = glyphs.iter().map(|g| g.advance as i32).sum();
+                // Vertically centre the label in the control; centre it
+                // horizontally too, except the URL box, whose text is left-aligned
+                // with a small inset. `max(0)` keeps an over-wide label (a long
+                // head name) from starting left of the control.
+                let y = rect.y + (rect.h as i32 - LABEL_PX as i32) / 2;
+                let x = match control {
+                    Control::UrlBox => rect.x + 6,
+                    _ => rect.x + ((rect.w as i32 - text_w) / 2).max(0),
+                };
                 list.push(DisplayItem::Glyphs {
-                    origin: Point::new(rect.x + 6, rect.y + 6),
+                    origin: Point::new(x, y),
                     glyphs,
                     color,
                     style: FontStyle::REGULAR,
@@ -679,6 +689,29 @@ const COOKIE_BTN_W: u32 = 22;
 const COOKIE_LIST_TOP: i32 = 84; // panel-local y where rows begin
 const COOKIE_LIST_BOTTOM_PAD: u32 = 40;
 
+/// Push `text`, centred horizontally and vertically, inside `rect`. Keeps the
+/// square buttons and chips legible — their glyphs sit in the middle instead of
+/// at a fixed corner offset (which read as "misaligned").
+fn push_centered(
+    list: &mut DisplayList,
+    shaper: &dyn TextShaper,
+    rect: Rect,
+    text: &str,
+    px: u32,
+    color: Color,
+) {
+    let glyphs = shaper.shape(text, px);
+    let text_w: i32 = glyphs.iter().map(|g| g.advance as i32).sum();
+    let x = rect.x + ((rect.w as i32 - text_w) / 2).max(0);
+    let y = rect.y + (rect.h as i32 - px as i32) / 2;
+    list.push(DisplayItem::Glyphs {
+        origin: Point::new(x, y),
+        glyphs,
+        color,
+        style: FontStyle::REGULAR,
+    });
+}
+
 impl CookieManager {
     /// The inspector panel rect (centered, 74% of the window).
     pub fn panel_rect(window: Size) -> Rect {
@@ -816,12 +849,7 @@ impl CookieManager {
             rect: close,
             color: Color::rgb(0xE0, 0xE0, 0xE0),
         });
-        list.push(DisplayItem::Glyphs {
-            origin: Point::new(close.x + 6, close.y + 15),
-            glyphs: shaper.shape("x", 13),
-            color: Color::BLACK,
-            style: FontStyle::REGULAR,
-        });
+        push_centered(&mut list, shaper, close, "×", 13, Color::BLACK);
         // Global default chip.
         list.push(DisplayItem::Glyphs {
             origin: Point::new(p.x + 12, p.y + 63),
@@ -834,12 +862,7 @@ impl CookieManager {
             rect: gchip,
             color: Color::rgb(0xD9, 0xE7, 0xF7),
         });
-        list.push(DisplayItem::Glyphs {
-            origin: Point::new(gchip.x + 6, gchip.y + 15),
-            glyphs: shaper.shape(global_chip, 12),
-            color: Color::BLACK,
-            style: FontStyle::REGULAR,
-        });
+        push_centered(&mut list, shaper, gchip, global_chip, 12, Color::BLACK);
         // Rows.
         let visible = Self::visible_rows(window);
         for vis_i in 0..visible {
@@ -869,32 +892,17 @@ impl CookieManager {
                 rect: reveal,
                 color: Color::rgb(0xE8, 0xE8, 0xE8),
             });
-            list.push(DisplayItem::Glyphs {
-                origin: Point::new(reveal.x + 5, reveal.y + 15),
-                glyphs: shaper.shape("o", 12),
-                color: Color::BLACK,
-                style: FontStyle::REGULAR,
-            });
+            push_centered(&mut list, shaper, reveal, "o", 12, Color::BLACK);
             list.push(DisplayItem::Rect {
                 rect: chip,
                 color: Color::rgb(0xD9, 0xEF, 0xD9),
             });
-            list.push(DisplayItem::Glyphs {
-                origin: Point::new(chip.x + 5, chip.y + 15),
-                glyphs: shaper.shape(&row.chip, 12),
-                color: Color::BLACK,
-                style: FontStyle::REGULAR,
-            });
+            push_centered(&mut list, shaper, chip, &row.chip, 12, Color::BLACK);
             list.push(DisplayItem::Rect {
                 rect: delete,
                 color: Color::rgb(0xF3, 0xD9, 0xD9),
             });
-            list.push(DisplayItem::Glyphs {
-                origin: Point::new(delete.x + 6, delete.y + 15),
-                glyphs: shaper.shape("x", 12),
-                color: Color::BLACK,
-                style: FontStyle::REGULAR,
-            });
+            push_centered(&mut list, shaper, delete, "×", 12, Color::BLACK);
         }
         // Scroll affordances.
         let (up, down) = Self::scroll_rects(window);
@@ -903,12 +911,7 @@ impl CookieManager {
                 rect: r,
                 color: Color::rgb(0xE0, 0xE0, 0xE0),
             });
-            list.push(DisplayItem::Glyphs {
-                origin: Point::new(r.x + 6, r.y + 15),
-                glyphs: shaper.shape(glyph, 12),
-                color: Color::BLACK,
-                style: FontStyle::REGULAR,
-            });
+            push_centered(&mut list, shaper, r, glyph, 12, Color::BLACK);
         }
         list
     }
