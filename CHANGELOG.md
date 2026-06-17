@@ -6,6 +6,12 @@ browser is pre-1.0; this is the first tagged preview.
 ## [Unreleased]
 
 ### Fixed
+- **HiDPI scaling: the UI is no longer tiny on high-DPI displays.** The window
+  shell ignored the OS scale factor, so at 200% the toolbar and fonts were drawn
+  at half their intended on-screen size. The shell now renders in logical pixels
+  (`physical ÷ scale`) and upscales to the physical surface, and maps pointer
+  coordinates back through the scale. (Native crisp glyph rendering at >1× is a
+  tracked follow-up; this fixes the size.)
 - **Pages no longer fail to load when DNS-over-HTTPS is blocked.** Resolution was
   DoH-only against a single Quad9 endpoint with no fallback, so a network that
   blocked or mangled the DoH connection (e.g. a middlebox answering the DoH POST
