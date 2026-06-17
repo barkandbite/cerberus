@@ -220,6 +220,41 @@ fn dormant_instances_release_dom_and_rematerialize_on_focus() {
     assert!(g.live_realms() <= 1);
 }
 
+#[test]
+fn refocusing_a_converged_instance_reuses_its_snapshot() {
+    let seen = Rc::new(RefCell::new(Vec::new()));
+    let (mut g, _master, follower) = group(true, seen.clone());
+
+    g.act(Action::Navigate(URL.into())).unwrap();
+    g.act(Action::Click(Target::Id("btn".into()))).unwrap();
+
+    // How many times the follower's own session was loaded from the source.
+    let loads = || seen.borrow().iter().filter(|(i, _)| *i == follower).count();
+
+    // First focus builds the follower once (one page load for its session).
+    g.focus(1).unwrap();
+    assert_eq!(loads(), 1, "follower built once on first focus");
+    assert_eq!(g.instance(1).unwrap().cursor(), g.log().len());
+
+    // Switching away and back reuses the resident, converged snapshot — no realm
+    // rebuild and no second page load (E2).
+    g.focus(0).unwrap();
+    g.focus(1).unwrap();
+    assert_eq!(loads(), 1, "re-focus reused the snapshot, no rebuild");
+    assert_eq!(g.instance(1).unwrap().cursor(), g.log().len());
+    assert!(g.live_realms() <= 1);
+
+    // Releasing the dormant snapshot forces a rebuild on the next focus.
+    g.focus(0).unwrap();
+    g.release_dormant();
+    g.focus(1).unwrap();
+    assert_eq!(loads(), 2, "a released snapshot rebuilds from the log");
+    assert_eq!(
+        g.instance(1).unwrap().text_of_id("out").as_deref(),
+        Some("clicked")
+    );
+}
+
 /// A login form whose `input` event mirrors the typed value into #out, so a
 /// test can observe what each window actually filled.
 struct FillForm;

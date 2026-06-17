@@ -35,6 +35,10 @@ pub struct MirrorInstance {
     pub(crate) doc: Document,
     pub(crate) node_to_js: HashMap<NodeId, u64>,
     pub(crate) live: bool,
+    /// Whether this instance's resident DOM has been dropped (dormant). A
+    /// released instance must rebuild via catch-up on its next focus; a resident
+    /// one that is already converged can be re-viewed without any rebuild.
+    pub(crate) released: bool,
     pub(crate) diverged: Option<Divergence>,
 }
 
@@ -49,6 +53,7 @@ impl MirrorInstance {
             doc: parse_html(""),
             node_to_js: HashMap::new(),
             live: false,
+            released: false,
             diverged: None,
         }
     }
@@ -102,5 +107,6 @@ impl MirrorInstance {
     pub(crate) fn release(&mut self) {
         self.doc = parse_html("");
         self.node_to_js = HashMap::new();
+        self.released = true;
     }
 }
