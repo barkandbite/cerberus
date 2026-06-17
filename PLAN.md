@@ -1,11 +1,17 @@
 # Cerberus — Plan
 
-> **Status: all milestones (M0–M9) complete.**
-> The plan below is retained as the architectural reference; every milestone
-> in [§6](#6-milestones) has shipped, the decision log lives in
-> [§10](#10-decisions), and the delivery details are in the ADRs
-> ([index](docs/adr/README.md)). The standing decision directive resolved the
-> remaining sign-offs with the ADRs' recommended defaults (noted per item).
+> **Status: milestones M0–M11 complete; the M12+ arc has shipped.**
+> Since the v1 spine (M0–M9) and the transparency wave (M10–M11), the M12+ work
+> landed: events + a bounded virtual-clock event loop, `fetch`, the
+> layout-measurement JS bridge, CSS selectors/`@media`/visibility/opacity,
+> flexbox + grid v1, gzip/deflate, content-addressed cache interning, a Windows
+> port, and **concurrent multi-window mirror groups + autofill** — tagged as the
+> **0.0.1** preview. A follow-on **multi-identity UX + efficiency** arc then added
+> drivable mirror typing, the "N profiles being driven" badge, the
+> converged-snapshot refocus skip, and the large-N `mirror-bench` gate
+> (ADR-0024–0026). The plan below is retained as the architectural reference; the
+> decision log lives in [§10](#10-decisions), per-feature detail in the ADRs
+> ([index](docs/adr/README.md)), and the release notes in [CHANGELOG](CHANGELOG.md).
 
 Cerberus is a privacy-first, memory-lean web browser written from the ground up
 in Rust. The differentiator is the **privacy model** — sealed per-instance
@@ -170,7 +176,8 @@ when those targets are added).
 
 ## 6. Milestones
 
-M0–M9 (the v1 spine) complete; M10–M11 (the post-v1 transparency wave) added:
+M0–M9 (the v1 spine) complete; M10–M11 (the post-v1 transparency wave) and the
+M12+ arc (rows below the table) have shipped:
 
 | # | Name | Exit criteria | Delivered |
 | --- | --- | --- | --- |
@@ -187,15 +194,25 @@ M0–M9 (the v1 spine) complete; M10–M11 (the post-v1 transparency wave) added
 | **M10** | Transparent cookies | Per-cookie user control + a visible inspector. | ✅ Allow/Session/Timed/Block/Allow-once dispositions over a 3-tier policy, layered under consent; Expires parsing; cookie inspector overlay + `cookies` CLI (ADR-0011) |
 | **M11** | Performance HUD | A nanosecond, non-bouncing timing overlay. | ✅ Rust-side stable named timings (network/scripts/style/layout+paint/page-load); top-right `PerfHud`; `--timers` + `RenderOutcome.timings` (ADR-0011) |
 
-**Next (M12+, sequenced):** events + bounded event loop + fetch/XHR (the
-SPA enabler — also lights up the HUD's handler/fetch rows), then flexbox/grid
-+ positioning, tabs + POST, and cross-platform. Each gets its own plan.
+**M12+ (shipped since, in 0.0.1 and the follow-on arc):** events + a bounded
+virtual-clock event loop + `fetch` (ADR-0013/0014); CSS selectors/`@media`/
+visibility/opacity (ADR-0019); the layout-measurement JS bridge (ADR-0021);
+flexbox + grid v1 (ADR-0023); gzip/deflate (ADR-0020); content-addressed cache
+interning (ADR-0016); the Windows port + `cerberus-sysmem` (ADR-0015);
+**concurrent multi-window mirror groups + autofill** (ADR-0017/0018/0022/0024);
+and the **multi-identity UX + efficiency** follow-on — drivable mirror typing,
+the driven badge, the converged-snapshot refocus skip, and the `mirror-bench`
+gate (ADR-0025/0026).
 
-**Parking lot (not scheduled):**
-[multi-window mirrored control](docs/ideas/multi-window-mirroring.md) — drive N
-sealed identities from one master window (clicks/scrolls/inputs replayed to every
-mirror), built on the M12 dispatch layer plus a macro record/replay layer whose
-catch-up model is what keeps the ≤1-live-engine budget (§1).
+**Still ahead (each gets its own plan):** event-driven re-render (listeners are
+inert today), CSS positioning, POST bodies + tabs, HTTP/2, the in-window
+identities panel + per-site driven selection + single-window fill gesture, and
+the macOS port. See [CHANGELOG](CHANGELOG.md) "Known limits".
+
+The once-parked
+[multi-window mirrored control](docs/ideas/multi-window-mirroring.md) idea is now
+**delivered** — N sealed identities driven from one master, the catch-up model
+holding the ≤1-live-engine budget (§1).
 
 ---
 

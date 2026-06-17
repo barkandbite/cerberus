@@ -3,6 +3,28 @@
 All notable changes to Cerberus are recorded here. Versions are small while the
 browser is pre-1.0; this is the first tagged preview.
 
+## [Unreleased]
+
+### Added
+- **Drivable mirror typing**: clicking a text field on the master captures it as
+  the typing focus; keystrokes route to every sealed window as one coalesced
+  `Action::Input`, so a follower converges in a single replay. Form controls are
+  now clickable in the mirror too — ADR-0025.
+- **"N profiles being driven" badge**: a small overlay on the mirror master
+  window, e.g. "23 profiles being driven · github.com" — ADR-0025.
+
+### Performance
+- **Layout**: intrinsic-width measurement reuses one scratch context instead of
+  allocating per flex/grid item per render; line buffers retain capacity — output
+  identical — ADR-0026.
+- **Mirror**: re-focusing a window already converged to the head of the log no
+  longer rebuilds its realm or reloads the page (it renders from its resident
+  snapshot); driving rebuilds on demand. At N=256 a warm focus sweep drops from
+  ~2.3 s to ~0.2 ms — ADR-0026.
+- **`mirror-bench`** gate: drives N sealed instances (focus sweep) and asserts
+  resident memory after releasing dormant snapshots stays within budget (~12 MB at
+  N=256), beside `mem-gate`/`bench` — ADR-0026.
+
 ## [0.0.1] — 2026-06-16
 
 First tagged build. A memory-lean (~7 MB resident, ~8 MB binary), privacy-first
