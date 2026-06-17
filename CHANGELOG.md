@@ -5,6 +5,14 @@ browser is pre-1.0; this is the first tagged preview.
 
 ## [Unreleased]
 
+### Changed
+- **Cookie manager is legible.** The per-cookie chip cycled through five
+  unexplained states; it's now a clear three-state control — **allow / session /
+  block** — with a legend ("allow = keep · session = forget on close · block =
+  never store") and color-coding (green / amber / red) so the state reads at a
+  glance. `Timed`/`Allow-once` remain in the engine (CLI/programmatic) but are
+  out of the everyday cycle.
+
 ### Fixed
 - **All buttons now align consistently.** Button labels were hand-placed per call
   site, so they drifted out of their boxes — most visibly the consent banner,

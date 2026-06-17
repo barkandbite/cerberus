@@ -792,7 +792,7 @@ pub struct CookieManager;
 
 const COOKIE_CHIP_W: u32 = 96;
 const COOKIE_BTN_W: u32 = 22;
-const COOKIE_LIST_TOP: i32 = 84; // panel-local y where rows begin
+const COOKIE_LIST_TOP: i32 = 104; // panel-local y where rows begin (after the legend)
 const COOKIE_LIST_BOTTOM_PAD: u32 = 40;
 
 /// Push `text`, centred horizontally and vertically, inside `rect`. Keeps the
@@ -834,6 +834,18 @@ fn draw_button(
     list.push(DisplayItem::Rect { rect, color: fill });
     if !label.is_empty() {
         push_centered(list, shaper, rect, label, px, text);
+    }
+}
+
+/// Background colour for a cookie-disposition chip, by its token, so the state
+/// reads at a glance: green = allow, amber = session, red = block. Anything else
+/// (legacy timed/allow-once) is neutral grey.
+fn chip_fill(token: &str) -> Color {
+    match token {
+        "allow" => Color::rgb(0xD9, 0xEF, 0xD9),
+        "session" => Color::rgb(0xFD, 0xEF, 0xC8),
+        "block" => Color::rgb(0xF6, 0xCF, 0xCF),
+        _ => Color::rgb(0xE4, 0xE4, 0xE4),
     }
 }
 
@@ -992,10 +1004,20 @@ impl CookieManager {
             shaper,
             gchip,
             global_chip,
-            Color::rgb(0xD9, 0xE7, 0xF7),
+            chip_fill(global_chip),
             Color::BLACK,
             12,
         );
+        // Legend: explains the per-cookie chip so it isn't a mystery cycle.
+        list.push(DisplayItem::Glyphs {
+            origin: Point::new(p.x + 12, p.y + 88),
+            glyphs: shaper.shape(
+                "allow = keep   ·   session = forget on close   ·   block = never store",
+                12,
+            ),
+            color: Color::rgb(0x60, 0x60, 0x60),
+            style: FontStyle::REGULAR,
+        });
         // Rows.
         let visible = Self::visible_rows(window);
         for vis_i in 0..visible {
@@ -1035,7 +1057,7 @@ impl CookieManager {
                 shaper,
                 chip,
                 &row.chip,
-                Color::rgb(0xD9, 0xEF, 0xD9),
+                chip_fill(&row.chip),
                 Color::BLACK,
                 12,
             );
