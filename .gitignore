@@ -2,5 +2,6 @@
 **/*.rs.bk
 # Local render artifacts produced by `cerberus-app render`.
 *.ppm
-# Generated UI previews (e.g. the `mirc_preview` example output).
+# Generated UI previews / example output (mirc_preview, forms_smoke).
 /mirc-*.png
+/forms-*.png

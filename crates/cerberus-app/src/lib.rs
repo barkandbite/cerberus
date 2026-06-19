@@ -1152,11 +1152,23 @@ struct FetchedPage {
 }
 
 /// In-flight navigation bookkeeping.
+/// A request body for a POST navigation (form submission). GET navigations carry
+/// `None`; the data then rides in the URL query instead.
+#[derive(Clone, Debug)]
+struct PostBody {
+    content_type: String,
+    body: Vec<u8>,
+}
+
 struct Pending {
     id: u64,
     /// If this load is an https upgrade of an `http` URL, the original URL — so a
     /// failure can offer the risk prompt.
     http_fallback: Option<String>,
+    /// The POST body, if this navigation is a form POST (so the load goes through
+    /// `fetch_in` with a body instead of a cacheable GET, and an https-upgrade
+    /// fallback can re-POST).
+    post: Option<PostBody>,
 }
 
 /// A job for the network worker. The `FetchContext` travels by value: it must
@@ -1166,6 +1178,7 @@ enum Job {
     Page {
         id: u64,
         url: String,
+        post: Option<PostBody>,
         ctx: FetchContext,
     },
     Sub {
@@ -1200,8 +1213,9 @@ enum Done {
 /// Performs page + sub-resource loads off the UI thread. Abstracted so the load
 /// state machine is testable without the network (see `FakeLoader` in tests).
 trait PageLoader {
-    /// Queue a page navigation in an identity context.
-    fn request(&self, id: u64, url: String, ctx: FetchContext);
+    /// Queue a page navigation in an identity context. `post` is `Some` for a
+    /// form POST (sent as a body), `None` for a GET.
+    fn request(&self, id: u64, url: String, post: Option<PostBody>, ctx: FetchContext);
     /// Queue an image sub-resource fetch (absolute URL) in an identity context.
     fn request_subresource(&self, url: String, ctx: FetchContext);
     /// Queue a JS `fetch` (absolute URL in `req.url`) in an identity context.
@@ -1255,8 +1269,8 @@ impl NetLoader {
                             Err(_) => break, // all senders dropped
                         };
                         let done = match job {
-                            Job::Page { id, url, ctx } => {
-                                let result = fetch_page(&client, &url, &ctx);
+                            Job::Page { id, url, post, ctx } => {
+                                let result = fetch_page(&client, &url, post.as_ref(), &ctx);
                                 Done::Page {
                                     id,
                                     requested_url: url,
@@ -1298,8 +1312,8 @@ impl NetLoader {
 }
 
 impl PageLoader for NetLoader {
-    fn request(&self, id: u64, url: String, ctx: FetchContext) {
-        let _ = self.tx.send(Job::Page { id, url, ctx });
+    fn request(&self, id: u64, url: String, post: Option<PostBody>, ctx: FetchContext) {
+        let _ = self.tx.send(Job::Page { id, url, post, ctx });
     }
     fn request_subresource(&self, url: String, ctx: FetchContext) {
         let _ = self.tx.send(Job::Sub { url, ctx });
@@ -1315,10 +1329,25 @@ impl PageLoader for NetLoader {
     }
 }
 
-fn fetch_page(client: &Router, url: &str, ctx: &FetchContext) -> Result<FetchedPage, String> {
+fn fetch_page(
+    client: &Router,
+    url: &str,
+    post: Option<&PostBody>,
+    ctx: &FetchContext,
+) -> Result<FetchedPage, String> {
     let parsed = parse_url(url).map_err(|e| e.to_string())?;
     let t = std::time::Instant::now();
-    let resp = client.get_in(&parsed, ctx).map_err(|e| format!("{e:?}"))?;
+    // A form POST sends a body through `fetch_in` (the same path JS `fetch` uses);
+    // a normal navigation is a cacheable GET.
+    let resp = match post {
+        Some(post) => {
+            let headers = vec![("content-type".to_string(), post.content_type.clone())];
+            client
+                .fetch_in(&parsed, "POST", &headers, &post.body, ctx)
+                .map_err(|e| format!("{e:?}"))?
+        }
+        None => client.get_in(&parsed, ctx).map_err(|e| format!("{e:?}"))?,
+    };
     let elapsed = t.elapsed();
     let user_agent = client.user_agent_for(&parsed);
     Ok(FetchedPage {
@@ -1656,6 +1685,9 @@ pub struct BrowserApp {
     next_id: u64,
     /// When `Some`, an `http` URL is awaiting the user's risk confirmation.
     insecure_prompt: Option<String>,
+    /// The POST body to replay if the awaiting `insecure_prompt` is confirmed
+    /// (so "Load anyway" re-POSTs a form over http instead of GETting it).
+    insecure_post: Option<PostBody>,
     /// Hit region of the "Load anyway" button while the prompt is shown.
     insecure_button: Option<Rect>,
     settings_open: bool,
@@ -1830,6 +1862,7 @@ impl BrowserApp {
             pending: None,
             next_id: 1,
             insecure_prompt: None,
+            insecure_post: None,
             insecure_button: None,
             settings_open: false,
             background: Color::WHITE,
@@ -1873,10 +1906,44 @@ impl BrowserApp {
         self.status
     }
 
-    /// Begin loading `url`: built-in pages synchronously; http(s) on the worker,
-    /// upgrading `http`→`https` first.
+    /// The current page's rendered text content (automation/inspection hook, the
+    /// live-window parallel of `render --dump-text`).
+    pub fn page_text(&self) -> String {
+        self.document.root().text_content()
+    }
+
+    /// Whether a navigation is in flight (no response committed yet).
+    pub fn is_loading(&self) -> bool {
+        self.pending.is_some()
+    }
+
+    /// Click points (centers) of the current page's text fields, from the last
+    /// rendered frame — an automation hook (used by the forms example).
+    pub fn text_field_centers(&self) -> Vec<(i32, i32)> {
+        self.form_fields
+            .iter()
+            .filter(|f| matches!(f.kind, FieldKind::Text | FieldKind::Textarea))
+            .map(|f| {
+                (
+                    f.rect.x + f.rect.w as i32 / 2,
+                    f.rect.y + f.rect.h as i32 / 2,
+                )
+            })
+            .collect()
+    }
+
+    /// Begin loading `url` (a GET): built-in pages synchronously; http(s) on the
+    /// worker, upgrading `http`→`https` first.
     fn start_load(&mut self, url: &str) {
+        self.begin_load(url, None);
+    }
+
+    /// Begin loading `url` with an optional form `post` body. With `Some`, the
+    /// load is a POST (the body is sent instead of a URL query); with `None`, a
+    /// normal GET. Shared prelude for both navigation kinds.
+    fn begin_load(&mut self, url: &str, post: Option<PostBody>) {
         self.insecure_prompt = None;
+        self.insecure_post = None;
         self.insecure_button = None;
         self.toolbar.blur_url();
         // New page: reset the performance table and stamp the clock (M11).
@@ -1890,7 +1957,7 @@ impl BrowserApp {
         self.form_fields.clear();
 
         if url.starts_with("cerberus:") {
-            self.load_builtin(url);
+            self.load_builtin(url); // built-in pages are GET-only; ignore any body
             return;
         }
         let (target, http_fallback) = if url.starts_with("http://") {
@@ -1901,34 +1968,42 @@ impl BrowserApp {
         } else {
             (url.to_string(), None)
         };
-        self.dispatch(target, http_fallback);
+        self.dispatch(target, http_fallback, post);
     }
 
-    /// Serve from cache if fresh, else queue a background fetch.
-    fn dispatch(&mut self, target: String, http_fallback: Option<String>) {
+    /// Serve from cache if fresh, else queue a background fetch. A POST (`post`
+    /// is `Some`) always hits the network — it is neither read from nor written
+    /// to the cache (POST is not idempotent).
+    fn dispatch(&mut self, target: String, http_fallback: Option<String>, post: Option<PostBody>) {
         let instance = self.heads.active().instance;
-        if let Some(resp) = self.cache.get(instance, &target) {
-            self.commit_response(
-                &target,
-                resp.status,
-                &resp.headers,
-                &resp.body,
-                DEFAULT_USER_AGENT,
-                false,
-            );
-            return;
+        if post.is_none() {
+            if let Some(resp) = self.cache.get(instance, &target) {
+                self.commit_response(
+                    &target,
+                    resp.status,
+                    &resp.headers,
+                    &resp.body,
+                    DEFAULT_USER_AGENT,
+                    false,
+                );
+                return;
+            }
         }
         self.toolbar.url_text = target.clone();
         self.toolbar.loading = true;
         self.set_document(loading_document(&target));
         let id = self.next_id;
         self.next_id += 1;
-        self.pending = Some(Pending { id, http_fallback });
+        self.pending = Some(Pending {
+            id,
+            http_fallback,
+            post: post.clone(),
+        });
         let ctx = FetchContext {
             instance,
             kind: FetchKind::Navigation,
         };
-        self.loader.request(id, target, ctx);
+        self.loader.request(id, target, post, ctx);
     }
 
     fn load_builtin(&mut self, url: &str) {
@@ -2046,6 +2121,7 @@ impl BrowserApp {
         self.toolbar.url_text = url.to_string();
         self.toolbar.loading = false;
         self.insecure_prompt = None;
+        self.insecure_post = None;
 
         self.request_page_images();
         self.update_nav();
@@ -2079,22 +2155,26 @@ impl BrowserApp {
             return false; // stale: superseded by Stop or a newer navigation
         }
         let http_fallback = pending.http_fallback.clone();
+        let post = pending.post.clone();
+        let is_post = post.is_some();
         self.pending = None;
         match result {
             Ok(page) => {
                 // Server response time for the navigation (M11).
+                let verb = if is_post { "POST" } else { "GET" };
                 let label = parse_url(&page.url)
                     .ok()
-                    .map(|u| format!("GET {}", u.host))
-                    .unwrap_or_else(|| "GET".into());
+                    .map(|u| format!("{verb} {}", u.host))
+                    .unwrap_or_else(|| verb.to_string());
                 self.timings.record(label, page.elapsed);
+                // A POST response is not cacheable (not idempotent).
                 self.commit_response(
                     &page.url,
                     page.status,
                     &page.headers,
                     &page.body,
                     &page.user_agent,
-                    true,
+                    !is_post,
                 )
             }
             Err(err) => match http_fallback {
@@ -2107,6 +2187,8 @@ impl BrowserApp {
                     self.toolbar.loading = false;
                     self.set_document(insecure_prompt_document(&http_url, &err));
                     self.insecure_prompt = Some(http_url);
+                    // Preserve any POST body so "Load anyway" re-POSTs over http.
+                    self.insecure_post = post;
                 }
                 _ => {
                     let msg = if is_dns_failure(&err) {
@@ -2513,7 +2595,8 @@ impl BrowserApp {
     /// Confirm the risk prompt: load the original `http` URL in plaintext.
     fn confirm_insecure(&mut self) {
         if let Some(http_url) = self.insecure_prompt.take() {
-            self.dispatch(http_url, None);
+            let post = self.insecure_post.take();
+            self.dispatch(http_url, None, post);
         }
     }
 
@@ -2718,12 +2801,41 @@ impl BrowserApp {
         // The enclosing <form> (if any) supplies the action/method; its absence
         // means the whole document is treated as one big form.
         let form_el = this.form;
-        let query = build_query(&controls, form_el, &self.forms);
+        // The successful controls, serialized as application/x-www-form-urlencoded
+        // — used as the URL query for GET, or the request body for POST.
+        let encoded = build_query(&controls, form_el, &self.forms);
         let action = form_el.and_then(|f| f.attr("action")).unwrap_or("");
-        // Method: GET today; POST falls back to a GET of the action.
-        // TODO POST: send the body instead of a query once the net layer allows.
-        let target = self.resolve_action(action, &query);
-        self.navigate(&target);
+        let is_post = form_el
+            .and_then(|f| f.attr("method"))
+            .is_some_and(|m| m.trim().eq_ignore_ascii_case("post"));
+        if is_post {
+            // POST: the encoded controls ride in the body, not the URL.
+            let target = self.resolve_action_base(action);
+            self.begin_load(
+                &target,
+                Some(PostBody {
+                    content_type: "application/x-www-form-urlencoded".to_string(),
+                    body: encoded.into_bytes(),
+                }),
+            );
+        } else {
+            // GET: the encoded controls become the URL's query string.
+            let target = self.resolve_action(action, &encoded);
+            self.navigate(&target);
+        }
+    }
+
+    /// Resolve a form `action` against the current URL, **without** touching its
+    /// query (POST carries the data in the body, so the action's own query — if
+    /// any — is preserved).
+    fn resolve_action_base(&self, action: &str) -> String {
+        match &self.current_url {
+            Some(base) if !action.is_empty() => join_url(base, action)
+                .map(|u| u.to_string())
+                .unwrap_or_else(|_| action.to_string()),
+            Some(base) => base.to_string(),
+            None => action.to_string(),
+        }
     }
 
     /// Resolve a form `action` against the current URL and append `?query`.
@@ -4865,6 +4977,9 @@ mod tests {
     use std::cell::RefCell;
     use std::collections::{HashMap, VecDeque};
 
+    /// `(url, post-body)` of each page request the fake loader saw, in order.
+    type SeenRequests = Arc<Mutex<Vec<(String, Option<PostBody>)>>>;
+
     struct FakeLoader {
         responses: HashMap<String, Result<FetchedPage, String>>,
         images: HashMap<String, Result<Vec<u8>, String>>,
@@ -4872,6 +4987,8 @@ mod tests {
         queue: RefCell<VecDeque<Done>>,
         /// Instances seen on page requests, in order (head-switch tests).
         seen_instances: Arc<Mutex<Vec<InstanceId>>>,
+        /// `(url, post)` of each page request, in order (form GET/POST tests).
+        seen_requests: SeenRequests,
     }
 
     impl FakeLoader {
@@ -4885,6 +5002,7 @@ mod tests {
                 fetches: HashMap::new(),
                 queue: RefCell::new(VecDeque::new()),
                 seen_instances: Arc::new(Mutex::new(Vec::new())),
+                seen_requests: Arc::new(Mutex::new(Vec::new())),
             }
         }
 
@@ -4906,8 +5024,9 @@ mod tests {
     }
 
     impl PageLoader for FakeLoader {
-        fn request(&self, id: u64, url: String, ctx: FetchContext) {
+        fn request(&self, id: u64, url: String, post: Option<PostBody>, ctx: FetchContext) {
             self.seen_instances.locked().push(ctx.instance);
+            self.seen_requests.locked().push((url.clone(), post));
             let result = self
                 .responses
                 .get(&url)
@@ -5527,6 +5646,53 @@ mod tests {
         assert!(b.submit(), "submit consumed");
         assert!(b.pending.is_some(), "navigation started");
         assert_eq!(b.toolbar.url_text, "https://site.test/s?q=hi");
+    }
+
+    #[test]
+    fn post_form_submits_a_body_not_a_query() {
+        // A POST login form: the encoded controls must ride in the request body,
+        // and the URL must stay query-free (the old behavior downgraded to GET).
+        let responses = vec![
+            (
+                "https://site.test/",
+                Ok(page(
+                    "https://site.test/",
+                    200,
+                    None,
+                    "<form action='/login' method='POST'><input name='user'></form>",
+                )),
+            ),
+            (
+                "https://site.test/login",
+                Ok(page("https://site.test/login", 200, None, "welcome")),
+            ),
+        ];
+        let loader = FakeLoader::new(responses);
+        let seen = loader.seen_requests.clone();
+        let mut b = BrowserApp::with_loader(Box::new(loader));
+        b.navigate("https://site.test/");
+        assert!(b.poll(), "form page loaded");
+
+        b.render_frame(Size::new(800, 600));
+        let r = b.form_fields[0].rect;
+        assert!(b.pointer_down(r.x + 1, r.y + 1));
+        assert!(b.text_input('h'));
+        assert!(b.text_input('i'));
+        assert!(b.submit(), "submit consumed");
+
+        // The URL is the bare action — the data is NOT in the query.
+        assert_eq!(b.toolbar.url_text, "https://site.test/login");
+        // The loader received a POST whose body is the urlencoded controls.
+        let reqs = seen.locked().clone();
+        let (url, post) = reqs.last().expect("a page request");
+        assert_eq!(url, "https://site.test/login");
+        let post = post.as_ref().expect("a POST body, not a GET");
+        assert_eq!(post.content_type, "application/x-www-form-urlencoded");
+        assert_eq!(String::from_utf8_lossy(&post.body), "user=hi");
+
+        // The POST response renders (and is not cached).
+        assert!(b.poll(), "post response drained");
+        assert_eq!(b.status, 200);
     }
 
     #[test]
