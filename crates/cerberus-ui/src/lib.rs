@@ -244,16 +244,16 @@ impl Toolbar {
             match control {
                 Control::UrlBox => self.paint_url_box(&mut list, shaper, rect, bg, &label, text),
                 Control::Head => draw_button(&mut list, shaper, rect, &label, bg, text, LABEL_PX),
-                // SYNC glows blue while broadcasting, and wears the driven-count
-                // badge ("N profiles") on its corner. Clicking it opens the MIRC
-                // panel that orchestrates the set.
+                // The MIRC button (a multiperson glyph) glows blue while
+                // broadcasting and wears the driven-count badge ("N profiles") on
+                // its corner. Clicking it opens the panel that orchestrates the set.
                 Control::Sync => {
                     let (fill, fg) = if self.broadcasting {
                         (Color::rgb(0x1E, 0x66, 0xE0), Color::WHITE)
                     } else {
                         (bg, text)
                     };
-                    draw_icon_button(&mut list, shaper, rect, IC_SYNC, ICON_PX, fill, fg);
+                    draw_icon_button(&mut list, shaper, rect, IC_USERS, ICON_PX, fill, fg);
                     push_count_badge(&mut list, shaper, rect, self.sync_count);
                 }
                 other => {
@@ -947,7 +947,8 @@ const IC_FORWARD: char = '\u{ea34}';
 const IC_RELOAD: char = '\u{e984}';
 const IC_CLOSE: char = '\u{ea0f}';
 const IC_GEAR: char = '\u{e994}';
-const IC_SYNC: char = '\u{ea2e}';
+/// MIRC button: "users" (multiperson) — it opens the multi-identity roster.
+const IC_USERS: char = '\u{e972}';
 const IC_EYE: char = '\u{e9ce}';
 const IC_TRASH: char = '\u{e9ac}';
 /// Icon size for the 28px toolbar buttons.
@@ -1637,15 +1638,16 @@ impl MircPanel {
                 rect: Rect::new(p.x + 14, y + (MIRC_ROW_H as i32 - 10) / 2, 10, 10),
                 color: mirc_state_dot(row.state),
             });
-            // Identity label + dimmed account.
+            // Identity label + dimmed account, vertically centered in the row so
+            // they line up with the chips/pills (which center in their boxes).
             list.push(DisplayItem::Glyphs {
-                origin: Point::new(p.x + 34, y + 19),
+                origin: Point::new(p.x + 34, y + (MIRC_ROW_H as i32 - 14) / 2),
                 glyphs: shaper.shape(&row.label, 14),
                 color: Color::rgb(0x18, 0x18, 0x18),
                 style: FontStyle::REGULAR,
             });
             list.push(DisplayItem::Glyphs {
-                origin: Point::new(p.x + MIRC_ACCOUNT_X, y + 19),
+                origin: Point::new(p.x + MIRC_ACCOUNT_X, y + (MIRC_ROW_H as i32 - 12) / 2),
                 glyphs: shaper.shape(&row.account, 12),
                 color: Color::rgb(0x78, 0x78, 0x78),
                 style: FontStyle::REGULAR,

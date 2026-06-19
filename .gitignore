@@ -3,4 +3,4 @@
 # Local render artifacts produced by `cerberus-app render`.
 *.ppm
 # Generated UI previews (e.g. the `mirc_preview` example output).
-/mirc-panel*.png
+/mirc-*.png

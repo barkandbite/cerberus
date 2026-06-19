@@ -1,17 +1,22 @@
 //! Render a preview PNG of the MIRC (Multi-Identity Remote Control) panel — the
 //! Phase 2a roster + orchestrator — so the design can be reviewed without a
-//! display server. It composes the *real* UI components (`Toolbar` with its SYNC
+//! display server. It composes the *real* UI components (`Toolbar` with its MIRC
 //! count badge, and `MircPanel`) over a faux page, exactly as the app paints
 //! them, then writes the frame with the headless PNG encoder.
 //!
+//! Rendered at 2× (crisp, re-outlined glyphs) for legibility, plus a cropped
+//! close-up of the toolbar button + first rows.
+//!
 //! Run: `cargo run -p cerberus-app --example mirc_preview`
-//! Output: `mirc-panel.png` (a working set) and `mirc-panel-100.png` (at scale).
 
 use cerberus_headless::write_png;
 use cerberus_paint::{DisplayItem, DisplayList, Framebuffer, Rasterizer, TextShaper};
 use cerberus_text::TextEngine;
 use cerberus_types::{Color, FontStyle, Point, Rect, Size};
 use cerberus_ui::{MircPanel, MircRow, MircState, Toolbar};
+
+/// Render scale (physical ÷ logical); 2× keeps the preview crisp when viewed.
+const SCALE: f32 = 2.0;
 
 fn main() {
     // A realistic working set: a dozen identities clearing a claims backlog.
@@ -30,12 +35,36 @@ fn main() {
         ("claims-11", "k.larsen@dot.gov", MircState::Dormant, true),
         ("claims-12", "l.mwangi@dot.gov", MircState::Dormant, true),
     ]);
-    render(Size::new(1360, 860), site, &working, 0, "mirc-panel.png");
+    let logical = Size::new(1180, 760);
+    let scene = render_scene(logical, site, &working, 0);
+    write_png("mirc-panel.png", &scene).expect("write png");
+
+    // A close-up of the top: the MIRC button + badge and the first rows, so the
+    // icon and the text↔chip alignment are easy to scrutinize.
+    let p = MircPanel::panel_rect(logical);
+    let rows_crop = crop(
+        &scene,
+        Rect::new(
+            sx(p.x - 8),
+            0,
+            su(p.w + 16),
+            su((p.y + 134 + 7 * 30) as u32),
+        ),
+    );
+    write_png("mirc-panel-rows.png", &rows_crop).expect("write png");
+
+    // A tight close-up of the toolbar's right side: the MIRC button (multiperson
+    // icon) with its broadcasting glow and "N" count badge, beside head+settings.
+    let button = crop(
+        &scene,
+        Rect::new(sx(logical.w as i32 - 150), 0, su(150), su(40)),
+    );
+    write_png("mirc-button.png", &button).expect("write png");
 
     // The vision at scale: 100 sealed sessions, the panel scrolled near the top.
     let many: Vec<MircRow> = (0..100)
         .map(|i| MircRow {
-            label: format!("claims-{:02}", i + 1),
+            label: format!("claims-{:03}", i + 1),
             account: format!("agent{:03}@dot.gov", i + 1),
             state: match i {
                 0 => MircState::Live,
@@ -45,9 +74,17 @@ fn main() {
             logged_in: i % 5 != 3,
         })
         .collect();
-    render(Size::new(1360, 860), site, &many, 0, "mirc-panel-100.png");
+    let scene100 = render_scene(logical, site, &many, 0);
+    write_png("mirc-panel-100.png", &scene100).expect("write png");
 
-    println!("wrote mirc-panel.png and mirc-panel-100.png");
+    println!("wrote mirc-panel.png, mirc-panel-rows.png, mirc-button.png, mirc-panel-100.png");
+}
+
+fn sx(v: i32) -> i32 {
+    (v as f32 * SCALE).round() as i32
+}
+fn su(v: u32) -> u32 {
+    ((v as f32 * SCALE).round() as u32).max(1)
 }
 
 fn roster(items: &[(&str, &str, MircState, bool)]) -> Vec<MircRow> {
@@ -62,34 +99,39 @@ fn roster(items: &[(&str, &str, MircState, bool)]) -> Vec<MircRow> {
         .collect()
 }
 
-fn render(window: Size, site: &str, rows: &[MircRow], scroll: usize, out: &str) {
+/// Render the whole frame (faux page + toolbar + MIRC panel) at `SCALE`.
+fn render_scene(logical: Size, site: &str, rows: &[MircRow], scroll: usize) -> Framebuffer {
     let text = TextEngine::new();
-    let mut fb = Framebuffer::new(window);
+    let physical = Size::new(su(logical.w), su(logical.h));
+    let mut fb = Framebuffer::new(physical);
     fb.clear(Color::rgb(0xF2, 0xF2, 0xF2));
 
-    // A faux page behind the modal, so the panel reads in context.
-    paint_faux_page(&mut fb, &text, window, site);
+    text.rasterize(&faux_page(&text, logical, site).scaled(SCALE), &mut fb);
 
-    // The real toolbar, with the SYNC button driven (broadcasting) and wearing
-    // the "N profiles" count badge.
     let mut toolbar = Toolbar::new("claims-01");
     toolbar.url_text = format!("https://{site}/claims/queue");
     toolbar.can_back = true;
     toolbar.broadcasting = true;
     toolbar.sync_count = rows.len();
-    text.rasterize(&toolbar.paint(window, &text), &mut fb);
+    text.rasterize(&toolbar.paint(logical, &text).scaled(SCALE), &mut fb);
 
-    // The MIRC panel itself.
     text.rasterize(
-        &MircPanel::paint(window, &text, true, site, rows, scroll),
+        &MircPanel::paint(logical, &text, true, site, rows, scroll).scaled(SCALE),
         &mut fb,
     );
-
-    write_png(out, &fb).expect("write png");
+    fb
 }
 
-/// A minimal faux "claims queue" page so the modal has realistic context.
-fn paint_faux_page(fb: &mut Framebuffer, text: &TextEngine, window: Size, site: &str) {
+/// Copy a physical-pixel sub-rect of `scene` into a new framebuffer.
+fn crop(scene: &Framebuffer, region: Rect) -> Framebuffer {
+    let mut out = Framebuffer::new(Size::new(region.w, region.h));
+    out.clear(Color::WHITE);
+    out.blit(Point::new(-region.x, -region.y), scene);
+    out
+}
+
+/// A minimal faux "claims queue" page (logical coords) so the modal has context.
+fn faux_page(text: &TextEngine, logical: Size, site: &str) -> DisplayList {
     let mut list = DisplayList::new();
     let top = cerberus_ui::TOOLBAR_HEIGHT as i32 + 24;
     list.push(DisplayItem::Glyphs {
@@ -104,12 +146,11 @@ fn paint_faux_page(fb: &mut Framebuffer, text: &TextEngine, window: Size, site: 
         color: Color::rgb(0x70, 0x70, 0x70),
         style: FontStyle::REGULAR,
     });
-    // A few faux table rows.
     for i in 0..10 {
         let y = top + 64 + i * 30;
         if i % 2 == 0 {
             list.push(DisplayItem::Rect {
-                rect: Rect::new(40, y - 16, window.w - 80, 28),
+                rect: Rect::new(40, y - 16, logical.w - 80, 28),
                 color: Color::rgb(0xFB, 0xFB, 0xFB),
             });
         }
@@ -126,5 +167,5 @@ fn paint_faux_page(fb: &mut Framebuffer, text: &TextEngine, window: Size, site: 
             style: FontStyle::REGULAR,
         });
     }
-    text.rasterize(&list, fb);
+    list
 }

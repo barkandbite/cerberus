@@ -28,9 +28,13 @@ Phase 2a builds the panel as a **rendered prototype** so the design can be
 reacted to before the full orchestration seam is wired. No new third-party deps;
 the panel is a pure `cerberus-ui` component like `CookieManager`/`ConsentBanner`.
 
-### SYNC button = count-badge that opens the panel
+### MIRC button = count-badge that opens the panel
 - `ToolbarAction::ToggleSync` → **`ToolbarAction::OpenSync`**. The button no
   longer toggles broadcast; clicking it opens the MIRC panel.
+- Its glyph is the bundled **"users" (multiperson) icon** (`IC_USERS`,
+  U+E972) — MIRC is *Multi-Identity* Remote Control and the button opens a roster
+  of identities, so the multiperson glyph previews exactly that (chosen over the
+  database/stack and the old loop/sync glyphs, which read as storage/refresh).
 - `Toolbar` gains `sync_count: usize`, drawn as a small notification-style count
   badge on the button corner (`push_count_badge`, capped at `99+`). The blue
   broadcasting glow is retained as an at-a-glance "broadcast on" signal.

@@ -229,9 +229,11 @@ mod tests {
     #[test]
     fn icon_font_has_the_toolbar_glyphs() {
         let e = TextEngine::new();
-        // reload, gear, back, forward, close, eye, trash — all present (non-.notdef).
+        // users (MIRC), reload, gear, back, forward, close, eye, trash — all
+        // present (non-.notdef).
         for cp in [
-            '\u{e984}', '\u{e994}', '\u{ea38}', '\u{ea34}', '\u{ea0f}', '\u{e9ce}', '\u{e9ac}',
+            '\u{e972}', '\u{e984}', '\u{e994}', '\u{ea38}', '\u{ea34}', '\u{ea0f}', '\u{e9ce}',
+            '\u{e9ac}',
         ] {
             let g = e.shape_icon(cp, 16);
             assert_eq!(g.len(), 1);
