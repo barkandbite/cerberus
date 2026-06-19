@@ -61,8 +61,8 @@ use cerberus_text::TextEngine;
 use cerberus_tls_rustls::RustlsProvider;
 use cerberus_types::{Color, FontStyle, HeadId, InstanceId, Origin, Point, RealmId, Rect, Size};
 use cerberus_ui::{
-    BannerAction, ConsentBanner, CookieAction, CookieManager, CookieRow, PerfHud, Toolbar,
-    ToolbarAction, BANNER_HEIGHT,
+    BannerAction, ConsentBanner, CookieAction, CookieManager, CookieRow, MircAction, MircPanel,
+    MircRow, MircState, PerfHud, Toolbar, ToolbarAction, BANNER_HEIGHT,
 };
 use cerberus_url::{join as join_url, parse as parse_url, Url};
 use std::collections::HashMap;
@@ -1593,6 +1593,13 @@ pub struct BrowserApp {
     timings: Timings,
     /// Whether the performance HUD is shown.
     hud_on: bool,
+    /// Whether the MIRC control panel overlay is open (the SYNC button).
+    mirc_open: bool,
+    /// Top row offset of the MIRC roster list.
+    mirc_scroll: usize,
+    /// A transient status line shown under the MIRC control bar (e.g. the result
+    /// of a bulk action), cleared on the next panel interaction.
+    mirc_status: Option<String>,
 }
 
 impl BrowserApp {
@@ -1745,7 +1752,12 @@ impl BrowserApp {
             cookie_ttl_edit: None,
             timings: Timings::new(),
             hud_on: false,
+            mirc_open: false,
+            mirc_scroll: 0,
+            mirc_status: None,
         };
+        // The SYNC button shows how many identities/sessions it can drive.
+        app.toolbar.sync_count = app.heads.heads().len();
         app.navigate("cerberus:home");
         app
     }
@@ -2807,6 +2819,124 @@ impl BrowserApp {
         self.persist();
     }
 
+    /// The current page's site (host), for the MIRC panel subtitle/roster.
+    /// Empty for built-in pages or before the first navigation.
+    fn current_site(&self) -> String {
+        self.current_url
+            .as_ref()
+            .map(|u| u.host.clone())
+            .filter(|h| !h.is_empty())
+            .unwrap_or_default()
+    }
+
+    /// Build the MIRC roster from the identities ("heads"). Phase 2a is a
+    /// read-only prototype: the active head is shown live and the rest dormant;
+    /// `account` is the identity's stored login (when the vault is unlocked) or a
+    /// sealed-session tag, and `logged_in` reflects whether that sealed session
+    /// actually holds cookies for the current site.
+    fn mirc_rows(&self) -> Vec<MircRow> {
+        let site = self.current_site();
+        let active = self.heads.active_index();
+        let heads: Vec<(usize, InstanceId, String)> = self
+            .heads
+            .heads()
+            .iter()
+            .enumerate()
+            .map(|(i, h)| (i, h.instance, h.label.clone()))
+            .collect();
+        let mut env = self.storage.locked();
+        heads
+            .into_iter()
+            .map(|(i, instance, label)| {
+                let logged_in = !site.is_empty()
+                    && env
+                        .instance(instance)
+                        .cookie_views()
+                        .iter()
+                        .any(|v| v.fp_site == site);
+                let username = env
+                    .load_blob(instance, AUTOFILL_PROFILE_KEY)
+                    .ok()
+                    .flatten()
+                    .and_then(|b| cerberus_autofill::Profile::from_bytes(&b))
+                    .map(|p| p.login.username)
+                    .filter(|u| !u.is_empty());
+                let account = username.unwrap_or_else(|| {
+                    let b = instance.0.as_bytes();
+                    format!("sealed session {:02x}{:02x}", b[14], b[15])
+                });
+                let state = if i == active {
+                    MircState::Live
+                } else {
+                    MircState::Dormant
+                };
+                MircRow {
+                    label,
+                    account,
+                    state,
+                    logged_in,
+                }
+            })
+            .collect()
+    }
+
+    /// Apply a MIRC panel click. Phase 2a wires the panel chrome — close,
+    /// broadcast on/off, scroll, and open-a-session (which surfaces that identity
+    /// in this window via the existing head switch). The bulk verbs
+    /// (navigate-all / login-all) are acknowledged with a status note until the
+    /// single-window app drives a live [`MirrorGroup`].
+    fn apply_mirc_action(&mut self, action: MircAction) {
+        match action {
+            MircAction::Close => {
+                self.mirc_open = false;
+                self.mirc_status = None;
+            }
+            MircAction::ToggleBroadcast => {
+                self.toolbar.broadcasting = !self.toolbar.broadcasting;
+                self.mirc_status = Some(if self.toolbar.broadcasting {
+                    "broadcast on — master actions will drive every session".to_string()
+                } else {
+                    "broadcast off — only this session is driven".to_string()
+                });
+            }
+            MircAction::NavigateAll => {
+                self.mirc_status =
+                    Some("navigate all: lands with the live mirror group (next phase)".to_string());
+            }
+            MircAction::LoginAll => {
+                self.mirc_status =
+                    Some("login all: lands with the live mirror group (next phase)".to_string());
+            }
+            MircAction::Open(idx) => {
+                // The lazy "select → render" gesture: surface that identity in
+                // this window. Today that is the head switch; with a live group
+                // it becomes a focus of the chosen instance.
+                if idx < self.heads.heads().len() && idx != self.heads.active_index() {
+                    let _ = self.heads.switch_to(idx);
+                    self.toolbar.head_label = self.heads.active().label.clone();
+                    let _ = self.heads.engine();
+                    if let Some(dir) = self.data_dir.clone() {
+                        let _ = save_heads(&dir, self.heads.heads(), self.heads.active_index());
+                    }
+                }
+                self.mirc_open = false;
+                self.mirc_status = None;
+            }
+            MircAction::ScrollUp => {
+                self.mirc_scroll = self.mirc_scroll.saturating_sub(1);
+            }
+            MircAction::ScrollDown => {
+                let len = self.heads.heads().len();
+                let visible = MircPanel::visible_rows(self.last_size);
+                let max = len.saturating_sub(visible);
+                if self.mirc_scroll < max {
+                    self.mirc_scroll += 1;
+                }
+            }
+            MircAction::None => {}
+        }
+    }
+
     fn handle(&mut self, action: ToolbarAction) -> bool {
         match action {
             ToolbarAction::Back => self.back(),
@@ -2838,10 +2968,13 @@ impl BrowserApp {
                 self.settings_open = !self.settings_open;
                 true
             }
-            ToolbarAction::ToggleSync => {
-                // MIRC broadcasting toggle (Phase 1: state + indicator; the
-                // drive-every-identity wiring lands next on the MirrorGroup seam).
-                self.toolbar.broadcasting = !self.toolbar.broadcasting;
+            ToolbarAction::OpenSync => {
+                // Open the MIRC control panel (Phase 2a: a rendered roster of the
+                // identities/sessions with status; broadcast/open are wired, the
+                // bulk verbs land next on the MirrorGroup seam).
+                self.mirc_open = true;
+                self.mirc_scroll = 0;
+                self.mirc_status = None;
                 true
             }
             ToolbarAction::None => false,
@@ -3137,6 +3270,34 @@ impl FrameApp for BrowserApp {
                 self.text.rasterize(&list.scaled(scale), &mut fb);
             }
         }
+        if self.mirc_open {
+            let rows = self.mirc_rows();
+            let site = self.current_site();
+            self.text.rasterize(
+                &MircPanel::paint(
+                    logical,
+                    &self.text,
+                    self.toolbar.broadcasting,
+                    &site,
+                    &rows,
+                    self.mirc_scroll,
+                )
+                .scaled(scale),
+                &mut fb,
+            );
+            // A transient status note under the control bar (bulk-verb feedback).
+            if let Some(msg) = &self.mirc_status {
+                let p = MircPanel::panel_rect(logical);
+                let mut list = DisplayList::new();
+                list.push(DisplayItem::Glyphs {
+                    origin: Point::new(p.x + 16, p.y + 122),
+                    glyphs: self.text.shape(msg, 12),
+                    color: Color::rgb(0x20, 0x40, 0x70),
+                    style: FontStyle::REGULAR,
+                });
+                self.text.rasterize(&list.scaled(scale), &mut fb);
+            }
+        }
         // Performance HUD on top of everything, when enabled (M11).
         if self.hud_on {
             let rows = self.timings.display_rows();
@@ -3156,6 +3317,19 @@ impl FrameApp for BrowserApp {
                     return true;
                 }
             }
+        }
+        if self.mirc_open {
+            // The MIRC panel owns all clicks while open; a click outside it (but
+            // not on a control) closes it.
+            if point_in_rect(MircPanel::panel_rect(self.last_size), x, y) {
+                let len = self.heads.heads().len();
+                let action = MircPanel::hit_test(self.last_size, len, self.mirc_scroll, x, y);
+                self.apply_mirc_action(action);
+            } else {
+                self.mirc_open = false;
+                self.mirc_status = None;
+            }
+            return true;
         }
         if self.cookie_manager_open {
             // The inspector owns all clicks while open. Commit any pending TTL
@@ -3252,6 +3426,11 @@ impl FrameApp for BrowserApp {
     }
 
     fn text_input(&mut self, c: char) -> bool {
+        // The MIRC panel is read-only (no text entry yet); it swallows typing so
+        // keystrokes don't leak to the URL box or page behind it.
+        if self.mirc_open {
+            return true;
+        }
         // The cookie inspector's TTL editor captures digits.
         if self.cookie_manager_open {
             if let Some((_, _, buf)) = &mut self.cookie_ttl_edit {
@@ -3285,6 +3464,9 @@ impl FrameApp for BrowserApp {
     }
 
     fn submit(&mut self) -> bool {
+        if self.mirc_open {
+            return true;
+        }
         if self.cookie_manager_open {
             self.commit_ttl_edit();
             return true;
@@ -3306,6 +3488,9 @@ impl FrameApp for BrowserApp {
     }
 
     fn backspace(&mut self) -> bool {
+        if self.mirc_open {
+            return true;
+        }
         if self.cookie_manager_open {
             if let Some((_, _, buf)) = &mut self.cookie_ttl_edit {
                 buf.pop();
@@ -4049,6 +4234,61 @@ mod tests {
         assert_eq!(outcome.third_party_decision, Decision::Deny);
         // A frame was produced at the requested size.
         assert_eq!(outcome.framebuffer.size, RenderConfig::default().viewport);
+    }
+
+    #[test]
+    fn mirc_panel_opens_lists_identities_broadcasts_and_closes() {
+        let mut app = BrowserApp::new();
+        // The SYNC button advertises one driver per identity.
+        let n = app.heads.heads().len();
+        assert!(n >= 1);
+        assert_eq!(app.toolbar.sync_count, n);
+
+        // The SYNC action opens the MIRC panel (it no longer toggles broadcast).
+        assert!(!app.mirc_open);
+        assert!(app.handle(ToolbarAction::OpenSync));
+        assert!(app.mirc_open);
+        assert!(
+            !app.toolbar.broadcasting,
+            "opening the panel doesn't broadcast"
+        );
+
+        // The roster has one row per identity; exactly the active head is live,
+        // and on a built-in page (no site) nothing reads as logged in.
+        let rows = app.mirc_rows();
+        assert_eq!(rows.len(), n);
+        assert_eq!(
+            rows.iter().filter(|r| r.state == MircState::Live).count(),
+            1
+        );
+        assert_eq!(rows[app.heads.active_index()].state, MircState::Live);
+        assert!(rows.iter().all(|r| !r.account.is_empty()));
+        assert!(rows.iter().all(|r| !r.logged_in));
+
+        // The panel paints over a frame without panicking (sets last_size).
+        let size = Size::new(1000, 700);
+        let _ = app.render_frame(size);
+
+        // Broadcast toggles from the panel now (it moved off the toolbar button).
+        app.apply_mirc_action(MircAction::ToggleBroadcast);
+        assert!(app.toolbar.broadcasting);
+        app.apply_mirc_action(MircAction::ToggleBroadcast);
+        assert!(!app.toolbar.broadcasting);
+
+        // A click outside the panel dismisses it.
+        let p = MircPanel::panel_rect(size);
+        assert!(app.pointer_down((p.x - 5).max(0), p.y + 5));
+        assert!(!app.mirc_open);
+
+        // Opening a *different* identity surfaces it (becomes the active head)
+        // and closes the panel — the lazy "select → render" gesture.
+        if n >= 2 {
+            app.handle(ToolbarAction::OpenSync);
+            let other = (app.heads.active_index() + 1) % n;
+            app.apply_mirc_action(MircAction::Open(other));
+            assert_eq!(app.heads.active_index(), other);
+            assert!(!app.mirc_open);
+        }
     }
 
     // ---- Persistent profile helpers ----

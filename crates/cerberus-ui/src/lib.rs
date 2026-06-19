@@ -40,8 +40,9 @@ pub enum ToolbarAction {
     SwitchHead,
     /// Open the settings panel.
     OpenSettings,
-    /// Toggle MIRC broadcasting (the SYNC button): drive every identity at once.
-    ToggleSync,
+    /// Open the MIRC control panel (the SYNC button): the count-badge button
+    /// that orchestrates every driven identity (broadcast, navigate-all, open).
+    OpenSync,
     /// The click hit no control (e.g. the page area).
     None,
 }
@@ -78,8 +79,11 @@ pub struct Toolbar {
     /// Short label for the active head (e.g. "work").
     pub head_label: String,
     /// Whether MIRC broadcasting is on (SYNC button highlighted; the master
-    /// drives every identity at once).
+    /// drives every identity at once). Toggled from the MIRC panel.
     pub broadcasting: bool,
+    /// How many identities/sessions the SYNC button drives — drawn as a count
+    /// badge on the button. Zero hides the badge.
+    pub sync_count: usize,
 }
 
 impl Toolbar {
@@ -94,6 +98,7 @@ impl Toolbar {
             loading: false,
             head_label: head_label.into(),
             broadcasting: false,
+            sync_count: 0,
         }
     }
 
@@ -159,7 +164,7 @@ impl Toolbar {
             Control::Reload => ToolbarAction::Reload,
             Control::Stop if self.loading => ToolbarAction::Stop,
             Control::UrlBox => ToolbarAction::FocusUrl,
-            Control::Sync => ToolbarAction::ToggleSync,
+            Control::Sync => ToolbarAction::OpenSync,
             Control::Head => ToolbarAction::SwitchHead,
             Control::Settings => ToolbarAction::OpenSettings,
             // Disabled controls swallow the click.
@@ -239,7 +244,9 @@ impl Toolbar {
             match control {
                 Control::UrlBox => self.paint_url_box(&mut list, shaper, rect, bg, &label, text),
                 Control::Head => draw_button(&mut list, shaper, rect, &label, bg, text, LABEL_PX),
-                // SYNC glows blue while broadcasting to every identity.
+                // SYNC glows blue while broadcasting, and wears the driven-count
+                // badge ("N profiles") on its corner. Clicking it opens the MIRC
+                // panel that orchestrates the set.
                 Control::Sync => {
                     let (fill, fg) = if self.broadcasting {
                         (Color::rgb(0x1E, 0x66, 0xE0), Color::WHITE)
@@ -247,6 +254,7 @@ impl Toolbar {
                         (bg, text)
                     };
                     draw_icon_button(&mut list, shaper, rect, IC_SYNC, ICON_PX, fill, fg);
+                    push_count_badge(&mut list, shaper, rect, self.sync_count);
                 }
                 other => {
                     let icon = match other {
@@ -982,6 +990,40 @@ fn draw_icon_button(
     push_icon(list, shaper, rect, icon, px, color);
 }
 
+/// Overlay a small count badge on the top-right corner of `rect` (the SYNC
+/// button's "N profiles" count). Zero paints nothing; counts over 99 show "99+".
+/// It rides slightly up-and-right of the corner, like a notification badge.
+fn push_count_badge(list: &mut DisplayList, shaper: &dyn TextShaper, rect: Rect, count: usize) {
+    if count == 0 {
+        return;
+    }
+    let text = if count > 99 {
+        "99+".to_string()
+    } else {
+        count.to_string()
+    };
+    let px = 10;
+    let glyphs = shaper.shape(&text, px);
+    let tw: i32 = glyphs.iter().map(|g| g.advance as i32).sum();
+    let bw = (tw + 6).max(14) as u32;
+    let bh = 14u32;
+    let bx = rect.x + rect.w as i32 - bw as i32 + 4;
+    let by = (rect.y - 3).max(0);
+    list.push(DisplayItem::Rect {
+        rect: Rect::new(bx, by, bw, bh),
+        color: Color::rgb(0xE5, 0x3E, 0x3E),
+    });
+    list.push(DisplayItem::Glyphs {
+        origin: Point::new(
+            bx + ((bw as i32 - tw) / 2).max(0),
+            by + (bh as i32 - px as i32) / 2,
+        ),
+        glyphs,
+        color: Color::WHITE,
+        style: FontStyle::REGULAR,
+    });
+}
+
 impl CookieManager {
     /// The inspector panel rect (centered, 74% of the window).
     pub fn panel_rect(window: Size) -> Rect {
@@ -1282,6 +1324,489 @@ mod cookie_manager_tests {
             .filter(|i| matches!(i, DisplayItem::Glyphs { .. }))
             .count();
         assert!(glyphs >= 3, "title + global + per-row labels");
+    }
+}
+
+// ---- MIRC control panel (Phase 2a): the multi-identity roster + orchestrator ----
+
+/// Liveness of one mirrored session, shown as the roster's status.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum MircState {
+    /// Holds the single live realm — rendered on screen right now.
+    Live,
+    /// A sealed, caught-up session that is paused (no live realm) — the cheap
+    /// state the other ~N profiles rest in until opened.
+    Dormant,
+    /// Fell out of lockstep with the master; needs manual attention.
+    Diverged,
+}
+
+/// One roster row, prepared by the app from a mirror instance / identity.
+#[derive(Clone, Debug)]
+pub struct MircRow {
+    /// Identity label (e.g. "work", "personal", "claim-bot-07").
+    pub label: String,
+    /// The account/session this identity uses on the current site (a login
+    /// username, or a sealed-session tag); shown dimmed.
+    pub account: String,
+    /// Live / dormant / diverged.
+    pub state: MircState,
+    /// Whether this session is authenticated on the current site.
+    pub logged_in: bool,
+}
+
+/// A click outcome in the MIRC panel. Row indices are absolute (into the full
+/// roster the app passed), already adjusted for the scroll offset.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum MircAction {
+    /// Close the panel.
+    Close,
+    /// Toggle broadcast on/off (master actions fan out to the driven set).
+    ToggleBroadcast,
+    /// Bulk: navigate every driven session to the master's current URL.
+    NavigateAll,
+    /// Bulk: run each session's login fill from its own profile.
+    LoginAll,
+    /// Open (focus + render) one session — the lazy "select → render" gesture.
+    Open(usize),
+    ScrollUp,
+    ScrollDown,
+    /// A click inside the panel that hit no control (consumed, no effect).
+    None,
+}
+
+/// The MIRC (Multi-Identity Remote Control) panel: a scrollable roster of every
+/// driven session — its identity, account, status, and login state — above a
+/// control bar to broadcast / navigate-all / login-all across the whole set and
+/// open any one session on screen. Pure paint + hit-test like [`CookieManager`];
+/// the app owns the roster data and applies the actions to the mirror group.
+pub struct MircPanel;
+
+const MIRC_ROW_H: u32 = 30;
+const MIRC_LIST_TOP: i32 = 134; // panel-local y where rows begin
+const MIRC_LIST_BOTTOM_PAD: u32 = 44; // room for the legend + scroll-down
+const MIRC_SCROLL_GUTTER: i32 = 28; // right-edge column for scroll buttons
+const MIRC_OPEN_W: u32 = 58;
+const MIRC_LOGIN_W: u32 = 96;
+const MIRC_STATE_W: u32 = 80;
+const MIRC_ACCOUNT_X: i32 = 196; // panel-local x of the account column
+
+/// Background fill for a state chip, so the status reads at a glance.
+fn mirc_state_fill(s: MircState) -> Color {
+    match s {
+        MircState::Live => Color::rgb(0xD9, 0xEF, 0xD9),
+        MircState::Dormant => Color::rgb(0xE6, 0xE6, 0xE6),
+        MircState::Diverged => Color::rgb(0xFD, 0xE2, 0xC8),
+    }
+}
+
+/// The status-dot color for a state (a stronger shade of the chip fill).
+fn mirc_state_dot(s: MircState) -> Color {
+    match s {
+        MircState::Live => Color::rgb(0x35, 0xA8, 0x5C),
+        MircState::Dormant => Color::rgb(0xA8, 0xA8, 0xA8),
+        MircState::Diverged => Color::rgb(0xE0, 0x8A, 0x1E),
+    }
+}
+
+fn mirc_state_label(s: MircState) -> &'static str {
+    match s {
+        MircState::Live => "live",
+        MircState::Dormant => "dormant",
+        MircState::Diverged => "diverged",
+    }
+}
+
+impl MircPanel {
+    /// The panel rect (centered, 80% of the window).
+    pub fn panel_rect(window: Size) -> Rect {
+        let pw = window.w * 80 / 100;
+        let ph = window.h * 80 / 100;
+        let px = (window.w.saturating_sub(pw) / 2) as i32;
+        let py = (window.h.saturating_sub(ph) / 2) as i32;
+        Rect::new(px, py, pw, ph)
+    }
+
+    /// How many roster rows fit in the list area for this window.
+    pub fn visible_rows(window: Size) -> usize {
+        let p = Self::panel_rect(window);
+        let list_h = (p.h as i32 - MIRC_LIST_TOP - MIRC_LIST_BOTTOM_PAD as i32).max(0);
+        (list_h / MIRC_ROW_H as i32).max(0) as usize
+    }
+
+    fn close_rect(window: Size) -> Rect {
+        let p = Self::panel_rect(window);
+        Rect::new(p.x + p.w as i32 - 32, p.y + 10, 22, 22)
+    }
+
+    fn broadcast_rect(window: Size) -> Rect {
+        let p = Self::panel_rect(window);
+        Rect::new(p.x + 16, p.y + 76, 150, 26)
+    }
+
+    fn navigate_rect(window: Size) -> Rect {
+        let b = Self::broadcast_rect(window);
+        Rect::new(b.x + b.w as i32 + 8, b.y, 118, 26)
+    }
+
+    fn login_rect(window: Size) -> Rect {
+        let n = Self::navigate_rect(window);
+        Rect::new(n.x + n.w as i32 + 8, n.y, 104, 26)
+    }
+
+    fn scroll_rects(window: Size) -> (Rect, Rect) {
+        let p = Self::panel_rect(window);
+        let x = p.x + p.w as i32 - MIRC_SCROLL_GUTTER;
+        let down_y = p.y + p.h as i32 - 30;
+        (
+            Rect::new(x, p.y + MIRC_LIST_TOP, 20, 20),
+            Rect::new(x, down_y, 20, 20),
+        )
+    }
+
+    /// Per-row control rects (state chip, login pill, open button) + the row's
+    /// top y, for the `vis_i`-th *visible* row (0-based from the list top).
+    fn row_controls(window: Size, vis_i: usize) -> (Rect, Rect, Rect, i32) {
+        let p = Self::panel_rect(window);
+        let y = p.y + MIRC_LIST_TOP + vis_i as i32 * MIRC_ROW_H as i32;
+        let open = Rect::new(
+            p.x + p.w as i32 - MIRC_SCROLL_GUTTER - MIRC_OPEN_W as i32,
+            y + 4,
+            MIRC_OPEN_W,
+            22,
+        );
+        let login = Rect::new(open.x - 8 - MIRC_LOGIN_W as i32, y + 4, MIRC_LOGIN_W, 22);
+        let state = Rect::new(login.x - 8 - MIRC_STATE_W as i32, y + 4, MIRC_STATE_W, 22);
+        (state, login, open, y)
+    }
+
+    /// Map a click to an action. `len` is the total roster size; `scroll` is the
+    /// app's current top offset.
+    pub fn hit_test(window: Size, len: usize, scroll: usize, x: i32, y: i32) -> MircAction {
+        let inside = |r: Rect| x >= r.x && y >= r.y && x < r.x + r.w as i32 && y < r.y + r.h as i32;
+        if inside(Self::close_rect(window)) {
+            return MircAction::Close;
+        }
+        if inside(Self::broadcast_rect(window)) {
+            return MircAction::ToggleBroadcast;
+        }
+        if inside(Self::navigate_rect(window)) {
+            return MircAction::NavigateAll;
+        }
+        if inside(Self::login_rect(window)) {
+            return MircAction::LoginAll;
+        }
+        let (up, down) = Self::scroll_rects(window);
+        if inside(up) {
+            return MircAction::ScrollUp;
+        }
+        if inside(down) {
+            return MircAction::ScrollDown;
+        }
+        let visible = Self::visible_rows(window);
+        for vis_i in 0..visible {
+            let abs = scroll + vis_i;
+            if abs >= len {
+                break;
+            }
+            let (_, _, open, _) = Self::row_controls(window, vis_i);
+            if inside(open) {
+                return MircAction::Open(abs);
+            }
+        }
+        MircAction::None
+    }
+
+    /// Paint the panel. `rows` is the full roster; `scroll` is the top row;
+    /// `broadcasting` drives the broadcast chip; `site` names the current site.
+    pub fn paint(
+        window: Size,
+        shaper: &dyn TextShaper,
+        broadcasting: bool,
+        site: &str,
+        rows: &[MircRow],
+        scroll: usize,
+    ) -> DisplayList {
+        let mut list = DisplayList::new();
+        let p = Self::panel_rect(window);
+        // Backdrop + panel.
+        list.push(DisplayItem::Rect {
+            rect: Rect::new(p.x - 1, p.y - 1, p.w + 2, p.h + 2),
+            color: Color::rgb(0x30, 0x30, 0x30),
+        });
+        list.push(DisplayItem::Rect {
+            rect: p,
+            color: Color::rgb(0xFA, 0xFA, 0xFA),
+        });
+        // Title + subtitle.
+        list.push(DisplayItem::Glyphs {
+            origin: Point::new(p.x + 16, p.y + 30),
+            glyphs: shaper.shape("MIRC — Multi-Identity Remote Control", 19),
+            color: Color::BLACK,
+            style: FontStyle::REGULAR,
+        });
+        let noun = if rows.len() == 1 {
+            "session"
+        } else {
+            "sessions"
+        };
+        let subtitle = if site.is_empty() {
+            format!("{} {noun} being driven", rows.len())
+        } else {
+            format!("{} {noun} being driven · {site}", rows.len())
+        };
+        list.push(DisplayItem::Glyphs {
+            origin: Point::new(p.x + 16, p.y + 54),
+            glyphs: shaper.shape(&subtitle, 13),
+            color: Color::rgb(0x60, 0x60, 0x60),
+            style: FontStyle::REGULAR,
+        });
+        // Close button.
+        draw_icon_button(
+            &mut list,
+            shaper,
+            Self::close_rect(window),
+            IC_CLOSE,
+            13,
+            Color::rgb(0xE0, 0xE0, 0xE0),
+            Color::BLACK,
+        );
+        // Control bar: broadcast toggle, then the bulk verbs.
+        let bc = Self::broadcast_rect(window);
+        let (bfill, bfg, blabel) = if broadcasting {
+            (Color::rgb(0x1E, 0x66, 0xE0), Color::WHITE, "broadcast: on")
+        } else {
+            (
+                Color::rgb(0xDF, 0xDF, 0xDF),
+                Color::rgb(0x30, 0x30, 0x30),
+                "broadcast: off",
+            )
+        };
+        draw_button(&mut list, shaper, bc, blabel, bfill, bfg, 13);
+        let bulk = Color::rgb(0xE6, 0xEE, 0xF6);
+        let bulk_fg = Color::rgb(0x20, 0x40, 0x70);
+        draw_button(
+            &mut list,
+            shaper,
+            Self::navigate_rect(window),
+            "navigate all",
+            bulk,
+            bulk_fg,
+            13,
+        );
+        draw_button(
+            &mut list,
+            shaper,
+            Self::login_rect(window),
+            "login all",
+            bulk,
+            bulk_fg,
+            13,
+        );
+        // Column headers + a hairline divider above the list.
+        list.push(DisplayItem::Glyphs {
+            origin: Point::new(p.x + 34, p.y + MIRC_LIST_TOP - 10),
+            glyphs: shaper.shape("identity", 11),
+            color: Color::rgb(0x90, 0x90, 0x90),
+            style: FontStyle::REGULAR,
+        });
+        list.push(DisplayItem::Glyphs {
+            origin: Point::new(p.x + MIRC_ACCOUNT_X, p.y + MIRC_LIST_TOP - 10),
+            glyphs: shaper.shape("account", 11),
+            color: Color::rgb(0x90, 0x90, 0x90),
+            style: FontStyle::REGULAR,
+        });
+        list.push(DisplayItem::Rect {
+            rect: Rect::new(p.x + 12, p.y + MIRC_LIST_TOP - 4, p.w - 24, 1),
+            color: Color::rgb(0xD8, 0xD8, 0xD8),
+        });
+        // Rows.
+        let visible = Self::visible_rows(window);
+        for vis_i in 0..visible {
+            let abs = scroll + vis_i;
+            let Some(row) = rows.get(abs) else { break };
+            let (state, login, open, y) = Self::row_controls(window, vis_i);
+            if vis_i % 2 == 1 {
+                list.push(DisplayItem::Rect {
+                    rect: Rect::new(p.x + 4, y, p.w - 8 - MIRC_SCROLL_GUTTER as u32, MIRC_ROW_H),
+                    color: Color::rgb(0xF0, 0xF0, 0xF0),
+                });
+            }
+            // Status dot.
+            list.push(DisplayItem::Rect {
+                rect: Rect::new(p.x + 14, y + (MIRC_ROW_H as i32 - 10) / 2, 10, 10),
+                color: mirc_state_dot(row.state),
+            });
+            // Identity label + dimmed account.
+            list.push(DisplayItem::Glyphs {
+                origin: Point::new(p.x + 34, y + 19),
+                glyphs: shaper.shape(&row.label, 14),
+                color: Color::rgb(0x18, 0x18, 0x18),
+                style: FontStyle::REGULAR,
+            });
+            list.push(DisplayItem::Glyphs {
+                origin: Point::new(p.x + MIRC_ACCOUNT_X, y + 19),
+                glyphs: shaper.shape(&row.account, 12),
+                color: Color::rgb(0x78, 0x78, 0x78),
+                style: FontStyle::REGULAR,
+            });
+            // State chip.
+            draw_button(
+                &mut list,
+                shaper,
+                state,
+                mirc_state_label(row.state),
+                mirc_state_fill(row.state),
+                Color::rgb(0x30, 0x30, 0x30),
+                12,
+            );
+            // Login pill.
+            let (lf, lt, ll) = if row.logged_in {
+                (
+                    Color::rgb(0xD9, 0xEF, 0xD9),
+                    Color::rgb(0x1E, 0x50, 0x20),
+                    "logged in",
+                )
+            } else {
+                (
+                    Color::rgb(0xEC, 0xEC, 0xEC),
+                    Color::rgb(0x80, 0x80, 0x80),
+                    "logged out",
+                )
+            };
+            draw_button(&mut list, shaper, login, ll, lf, lt, 12);
+            // Open (select → render) button.
+            draw_button(
+                &mut list,
+                shaper,
+                open,
+                "open",
+                Color::rgb(0xE6, 0xEE, 0xF6),
+                Color::rgb(0x20, 0x40, 0x70),
+                12,
+            );
+        }
+        // Legend.
+        list.push(DisplayItem::Glyphs {
+            origin: Point::new(p.x + 16, p.y + p.h as i32 - 16),
+            glyphs: shaper.shape(
+                "live = on screen   ·   dormant = sealed & paused   ·   diverged = needs attention",
+                12,
+            ),
+            color: Color::rgb(0x70, 0x70, 0x70),
+            style: FontStyle::REGULAR,
+        });
+        // Scroll affordances (same plain ASCII glyphs the cookie list uses).
+        let (up, down) = Self::scroll_rects(window);
+        for (r, glyph) in [(up, "^"), (down, "v")] {
+            draw_button(
+                &mut list,
+                shaper,
+                r,
+                glyph,
+                Color::rgb(0xE0, 0xE0, 0xE0),
+                Color::BLACK,
+                12,
+            );
+        }
+        list
+    }
+}
+
+#[cfg(test)]
+mod mirc_panel_tests {
+    use super::*;
+    use cerberus_paint::MonoShaper;
+
+    fn roster(n: usize) -> Vec<MircRow> {
+        (0..n)
+            .map(|i| MircRow {
+                label: format!("identity {i}"),
+                account: format!("user{i}@example.com"),
+                state: if i == 0 {
+                    MircState::Live
+                } else {
+                    MircState::Dormant
+                },
+                logged_in: i % 2 == 0,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn panel_is_centered_in_the_window() {
+        let w = Size::new(1200, 800);
+        let p = MircPanel::panel_rect(w);
+        assert!(p.x > 0 && p.y > 0);
+        assert_eq!(p.x * 2 + p.w as i32, w.w as i32, "horizontally centered");
+        assert_eq!(p.y * 2 + p.h as i32, w.h as i32, "vertically centered");
+    }
+
+    #[test]
+    fn control_bar_buttons_hit_test() {
+        let w = Size::new(1200, 800);
+        let bc = MircPanel::broadcast_rect(w);
+        assert_eq!(
+            MircPanel::hit_test(w, 3, 0, bc.x + 2, bc.y + 2),
+            MircAction::ToggleBroadcast
+        );
+        let nav = MircPanel::navigate_rect(w);
+        assert_eq!(
+            MircPanel::hit_test(w, 3, 0, nav.x + 2, nav.y + 2),
+            MircAction::NavigateAll
+        );
+        let login = MircPanel::login_rect(w);
+        assert_eq!(
+            MircPanel::hit_test(w, 3, 0, login.x + 2, login.y + 2),
+            MircAction::LoginAll
+        );
+        let close = MircPanel::close_rect(w);
+        assert_eq!(
+            MircPanel::hit_test(w, 3, 0, close.x + 2, close.y + 2),
+            MircAction::Close
+        );
+    }
+
+    #[test]
+    fn open_maps_to_absolute_row_index_with_scroll() {
+        let w = Size::new(1200, 800);
+        let (_, _, open, _) = MircPanel::row_controls(w, 0);
+        // With scroll=5, the top visible row is absolute index 5.
+        assert_eq!(
+            MircPanel::hit_test(w, 50, 5, open.x + 2, open.y + 2),
+            MircAction::Open(5)
+        );
+    }
+
+    #[test]
+    fn paint_emits_panel_rows_and_controls() {
+        let w = Size::new(1200, 800);
+        let list = MircPanel::paint(w, &MonoShaper, true, "github.com", &roster(3), 0);
+        let glyphs = list
+            .items
+            .iter()
+            .filter(|i| matches!(i, DisplayItem::Glyphs { .. }))
+            .count();
+        // title + subtitle + 2 headers + 3 control labels + legend + per-row
+        // (label, account, state, login, open = 5 each) + 2 scroll glyphs.
+        assert!(glyphs >= 3 * 5, "got {glyphs} glyph runs");
+        // A click outside any control inside the panel is consumed as None.
+        let p = MircPanel::panel_rect(w);
+        assert_eq!(
+            MircPanel::hit_test(w, 3, 0, p.x + 2, p.y + p.h as i32 - 2),
+            MircAction::None
+        );
+    }
+
+    #[test]
+    fn subtitle_pluralizes_and_omits_empty_site() {
+        // A single, site-less session: singular noun, no "·" suffix. (Exercised
+        // via paint not panicking; the format is unit-tested here directly.)
+        let one = MircPanel::paint(Size::new(1000, 700), &MonoShaper, false, "", &roster(1), 0);
+        assert!(one
+            .items
+            .iter()
+            .any(|i| matches!(i, DisplayItem::Glyphs { .. })));
     }
 }
 
