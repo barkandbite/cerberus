@@ -21,7 +21,14 @@ use parser::{
     parse_declaration_block, parse_stylesheet, ElemRef, MediaContext, SiblingRef, Specificity,
     Stylesheet,
 };
+use std::collections::HashMap;
 use std::rc::Rc;
+
+/// The cascaded CSS custom properties (`--name` → raw value) in scope for an
+/// element. Inherited down the tree and shared by `Rc` so elements that declare
+/// no custom properties (the common case) reuse their parent's map for free
+/// (ADR-0035). Keys are lowercased to match the parser's property-name folding.
+type Vars = Rc<HashMap<String, String>>;
 
 /// A matched rule during the cascade: (origin, specificity, source-order, decls).
 type MatchedRule<'a> = (u8, Specificity, usize, &'a Vec<(String, String)>);
@@ -70,12 +77,17 @@ impl CssEngine {
         }
     }
 
+    // The cascade walker threads per-element context (siblings/index/parent/
+    // custom-properties) plus the shared path & author sheet; these vary per call,
+    // so bundling them wouldn't aid readability.
+    #[allow(clippy::too_many_arguments)]
     fn build(
         &self,
         node: NodeRef<'_>,
         siblings: Rc<[SiblingRef]>,
         index: usize,
         parent: &ComputedStyle,
+        parent_vars: &Vars,
         path: &mut Vec<ElemRef>,
         author: &Stylesheet,
     ) -> StyledNode {
@@ -90,6 +102,10 @@ impl CssEngine {
             siblings: siblings.clone(),
             index,
         });
+
+        // The custom-property registry in scope for this element (inherited,
+        // augmented by any `--*` it declares) — see `collect_vars` (ADR-0035).
+        let mut vars = parent_vars.clone();
 
         if !is_root {
             // Collect matching declarations: (origin, specificity, source-order),
@@ -110,14 +126,20 @@ impl CssEngine {
                 }
             }
             matched.sort_by(|a, b| (a.0, a.1, a.2).cmp(&(b.0, b.1, b.2)));
-            for (_, _, _, decls) in &matched {
-                apply_declarations(&mut style, decls, parent.font_size);
-            }
 
-            // Inline `style=` has the highest priority.
-            if let Some(inline) = node.attr("style") {
-                let decls = parse_declaration_block(inline);
-                apply_declarations(&mut style, &decls, parent.font_size);
+            // Inline `style=` has the highest priority; parse it once and reuse
+            // it for both custom-property collection and normal application.
+            let inline = node.attr("style").map(parse_declaration_block);
+
+            // Custom properties first (full cascade), so a `var()` in any rule
+            // resolves against the winning value regardless of declaration order.
+            vars = collect_vars(parent_vars, &matched, inline.as_deref());
+
+            for (_, _, _, decls) in &matched {
+                apply_declarations(&mut style, decls, parent.font_size, &vars);
+            }
+            if let Some(decls) = &inline {
+                apply_declarations(&mut style, decls, parent.font_size, &vars);
             }
         }
 
@@ -140,6 +162,7 @@ impl CssEngine {
                         child_siblings.clone(),
                         elem_index,
                         &style,
+                        &vars,
                         path,
                         author,
                     );
@@ -172,11 +195,13 @@ impl StyleEngine for CssEngine {
         let mut path = Vec::new();
         let root = doc.root();
         let root_siblings: Rc<[SiblingRef]> = vec![sibling_ref(root)].into();
+        let no_vars: Vars = Rc::new(HashMap::new());
         let styled = self.build(
             root,
             root_siblings,
             0,
             &ComputedStyle::initial(),
+            &no_vars,
             &mut path,
             &author,
         );
@@ -211,13 +236,336 @@ fn collect_author_css(node: NodeRef<'_>) -> String {
     css
 }
 
+/// Build the custom-property registry in scope for an element: its parent's map
+/// plus any `--*` it declares (in cascade order, so later wins). Reuses the
+/// parent's `Rc` when the element declares none — the overwhelmingly common case
+/// — so only declaring elements pay for a clone (ADR-0035).
+fn collect_vars(
+    parent: &Vars,
+    matched: &[MatchedRule<'_>],
+    inline: Option<&[(String, String)]>,
+) -> Vars {
+    let is_custom = |d: &(String, String)| d.0.starts_with("--");
+    let declares = matched.iter().any(|(_, _, _, d)| d.iter().any(is_custom))
+        || inline.is_some_and(|d| d.iter().any(is_custom));
+    if !declares {
+        return parent.clone();
+    }
+    let mut map = (**parent).clone();
+    let mut insert = |decls: &[(String, String)]| {
+        for (p, v) in decls {
+            if p.starts_with("--") {
+                // Keys are already lowercased by the parser; store the raw value
+                // (its own `var()`s resolve lazily, at use, in `substitute_vars`).
+                map.insert(p.clone(), v.trim().to_string());
+            }
+        }
+    };
+    for (_, _, _, decls) in matched {
+        insert(decls);
+    }
+    if let Some(decls) = inline {
+        insert(decls);
+    }
+    Rc::new(map)
+}
+
+/// Resolve `var()` substitutions and `calc()` math in a raw declaration value,
+/// yielding a plain CSS value the existing property parsers can consume. Most
+/// values contain neither, so the fast path returns them untouched.
+fn resolve_value(value: &str, vars: &Vars, em: f32) -> String {
+    let has_var = value.contains("var(");
+    let has_calc = value.contains("calc(");
+    if !has_var && !has_calc {
+        return value.to_string();
+    }
+    let substituted = if has_var {
+        substitute_vars(value, vars, 0)
+    } else {
+        value.to_string()
+    };
+    if substituted.contains("calc(") {
+        eval_calcs(&substituted, em)
+    } else {
+        substituted
+    }
+}
+
+/// Replace every `var(--name[, fallback])` in `input` with the custom property's
+/// value (resolved recursively, since a custom property may itself reference
+/// others), falling back to the comma fallback or empty. Guarded against cycles
+/// and runaway depth.
+fn substitute_vars(input: &str, vars: &Vars, depth: usize) -> String {
+    if depth > 32 {
+        return String::new();
+    }
+    let mut out = String::new();
+    let mut rest = input;
+    while let Some(pos) = rest.find("var(") {
+        out.push_str(&rest[..pos]);
+        let after = &rest[pos + 4..];
+        let Some((inner, tail)) = take_group(after) else {
+            // Unbalanced parens: emit the remainder verbatim and stop.
+            out.push_str(&rest[pos..]);
+            return out;
+        };
+        let (name, fallback) = split_top_comma(inner);
+        let key = name.trim().to_ascii_lowercase();
+        let replacement = match vars.get(&key) {
+            Some(v) => substitute_vars(v, vars, depth + 1),
+            None => match fallback {
+                Some(fb) => substitute_vars(fb.trim(), vars, depth + 1),
+                None => String::new(),
+            },
+        };
+        out.push_str(replacement.trim());
+        rest = tail;
+    }
+    out.push_str(rest);
+    out
+}
+
+/// Given the text just after an opening `(`, return `(inner, tail)` where `inner`
+/// is the balanced group's contents and `tail` is what follows the matching `)`.
+fn take_group(after: &str) -> Option<(&str, &str)> {
+    let mut depth = 1;
+    for (i, c) in after.char_indices() {
+        match c {
+            '(' => depth += 1,
+            ')' => {
+                depth -= 1;
+                if depth == 0 {
+                    return Some((&after[..i], &after[i + 1..]));
+                }
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
+/// Split `var()` arguments at the first top-level comma: `(name, fallback?)`.
+fn split_top_comma(s: &str) -> (&str, Option<&str>) {
+    let mut depth = 0;
+    for (i, c) in s.char_indices() {
+        match c {
+            '(' => depth += 1,
+            ')' => depth -= 1,
+            ',' if depth == 0 => return (&s[..i], Some(&s[i + 1..])),
+            _ => {}
+        }
+    }
+    (s, None)
+}
+
+/// Replace every `calc(...)` in `input` with its evaluated length/number (in px
+/// where a unit is involved); leave a `calc()` we cannot evaluate untouched.
+fn eval_calcs(input: &str, em: f32) -> String {
+    let mut out = String::new();
+    let mut rest = input;
+    while let Some(pos) = rest.find("calc(") {
+        out.push_str(&rest[..pos]);
+        let after = &rest[pos + 5..];
+        let Some((inner, tail)) = take_group(after) else {
+            out.push_str(&rest[pos..]);
+            return out;
+        };
+        // Nested calc() inside this group resolves first.
+        let inner = eval_calcs(inner, em);
+        match eval_calc_expr(&inner, em) {
+            Some(px) => {
+                // Integer-ish results print without a trailing `.0`.
+                if (px.round() - px).abs() < 1e-4 {
+                    out.push_str(&format!("{}px", px.round() as i64));
+                } else {
+                    out.push_str(&format!("{px}px"));
+                }
+            }
+            None => {
+                out.push_str("calc(");
+                out.push_str(&inner);
+                out.push(')');
+            }
+        }
+        rest = tail;
+    }
+    out.push_str(rest);
+    out
+}
+
+/// Evaluate a `calc()` expression body to a px value, supporting `+ - * /`,
+/// parentheses, and px/em/rem/pt/% units (others convert via the same rules the
+/// length parser uses). Returns `None` if it cannot be reduced to a number.
+fn eval_calc_expr(expr: &str, em: f32) -> Option<f32> {
+    let tokens = tokenize_calc(expr, em)?;
+    let mut p = CalcParser {
+        tokens: &tokens,
+        i: 0,
+    };
+    let v = p.expr()?;
+    if p.i == p.tokens.len() {
+        Some(v)
+    } else {
+        None
+    }
+}
+
+/// A `calc()` token: a resolved px/number value or an operator/paren.
+#[derive(Clone, Copy, PartialEq)]
+enum CalcTok {
+    Num(f32),
+    Plus,
+    Minus,
+    Mul,
+    Div,
+    Open,
+    Close,
+}
+
+fn tokenize_calc(expr: &str, em: f32) -> Option<Vec<CalcTok>> {
+    let mut toks = Vec::new();
+    let bytes = expr.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        let c = bytes[i];
+        if c.is_ascii_whitespace() {
+            i += 1;
+            continue;
+        }
+        match c {
+            b'+' => {
+                toks.push(CalcTok::Plus);
+                i += 1;
+            }
+            b'-' if !at_number_start(&toks) => {
+                toks.push(CalcTok::Minus);
+                i += 1;
+            }
+            b'*' => {
+                toks.push(CalcTok::Mul);
+                i += 1;
+            }
+            b'/' => {
+                toks.push(CalcTok::Div);
+                i += 1;
+            }
+            b'(' => {
+                toks.push(CalcTok::Open);
+                i += 1;
+            }
+            b')' => {
+                toks.push(CalcTok::Close);
+                i += 1;
+            }
+            _ => {
+                // A number with an optional unit (a leading '-' is a sign here).
+                let start = i;
+                if bytes[i] == b'-' || bytes[i] == b'+' {
+                    i += 1;
+                }
+                while i < bytes.len() && (bytes[i].is_ascii_digit() || bytes[i] == b'.') {
+                    i += 1;
+                }
+                let num: f32 = expr[start..i].parse().ok()?;
+                let unit_start = i;
+                while i < bytes.len() && (bytes[i].is_ascii_alphabetic() || bytes[i] == b'%') {
+                    i += 1;
+                }
+                let unit = &expr[unit_start..i];
+                let px = match unit.to_ascii_lowercase().as_str() {
+                    "" | "px" => num,
+                    "em" => num * em,
+                    "rem" => num * 16.0,
+                    "pt" => num * 96.0 / 72.0,
+                    "%" => num / 100.0 * em,
+                    _ => return None,
+                };
+                toks.push(CalcTok::Num(px));
+            }
+        }
+    }
+    Some(toks)
+}
+
+/// Whether the next token would start a number (so a `-` is a sign, not minus).
+fn at_number_start(toks: &[CalcTok]) -> bool {
+    !matches!(toks.last(), Some(CalcTok::Num(_)) | Some(CalcTok::Close))
+}
+
+struct CalcParser<'a> {
+    tokens: &'a [CalcTok],
+    i: usize,
+}
+
+impl CalcParser<'_> {
+    fn peek(&self) -> Option<CalcTok> {
+        self.tokens.get(self.i).copied()
+    }
+
+    fn expr(&mut self) -> Option<f32> {
+        let mut v = self.term()?;
+        while let Some(op @ (CalcTok::Plus | CalcTok::Minus)) = self.peek() {
+            self.i += 1;
+            let rhs = self.term()?;
+            v = if op == CalcTok::Plus {
+                v + rhs
+            } else {
+                v - rhs
+            };
+        }
+        Some(v)
+    }
+
+    fn term(&mut self) -> Option<f32> {
+        let mut v = self.factor()?;
+        while let Some(op @ (CalcTok::Mul | CalcTok::Div)) = self.peek() {
+            self.i += 1;
+            let rhs = self.factor()?;
+            if op == CalcTok::Mul {
+                v *= rhs;
+            } else {
+                if rhs == 0.0 {
+                    return None;
+                }
+                v /= rhs;
+            }
+        }
+        Some(v)
+    }
+
+    fn factor(&mut self) -> Option<f32> {
+        match self.peek()? {
+            CalcTok::Num(n) => {
+                self.i += 1;
+                Some(n)
+            }
+            CalcTok::Open => {
+                self.i += 1;
+                let v = self.expr()?;
+                matches!(self.peek(), Some(CalcTok::Close)).then(|| self.i += 1)?;
+                Some(v)
+            }
+            _ => None,
+        }
+    }
+}
+
 fn apply_declarations(
     style: &mut ComputedStyle,
     decls: &[(String, String)],
     parent_font_size: u32,
+    vars: &Vars,
 ) {
     for (prop, value) in decls {
-        let v = value.trim();
+        // Custom properties are collected separately (`collect_vars`); they do
+        // not set any computed value here.
+        if prop.starts_with("--") {
+            continue;
+        }
+        // Resolve `var()` references and `calc()` math before parsing the value.
+        // `em` for `calc()` uses the element's current font size.
+        let resolved = resolve_value(value, vars, style.font_size as f32);
+        let v = resolved.trim();
         match prop.as_str() {
             "color" => {
                 if let Some(c) = parse_color(v) {
@@ -741,5 +1089,81 @@ mod tests {
         // Wide viewport: it does not.
         let wide = CssEngine::with_media(1200, 800).style(&parse_html(html));
         assert_eq!(first(&wide.root, "p").unwrap().style.color, Color::BLACK);
+    }
+
+    // ---- CSS custom properties + var()/calc() (ADR-0035) ----
+
+    #[test]
+    fn var_resolves_from_root_and_inherits() {
+        // A `:root` custom property is visible to a descendant via inheritance.
+        let html = "<html><head><style>:root{--brand:#ff0000} p{color:var(--brand)}\
+                    </style></head><body><p>x</p></body></html>";
+        let dom = CssEngine::new().style(&parse_html(html));
+        assert_eq!(
+            first(&dom.root, "p").unwrap().style.color,
+            Color::rgb(0xff, 0, 0)
+        );
+    }
+
+    #[test]
+    fn var_fallback_used_when_undefined() {
+        let html = "<p style='color:var(--missing, #00ff00)'>x</p>";
+        let dom = CssEngine::new().style(&parse_html(html));
+        assert_eq!(
+            first(&dom.root, "p").unwrap().style.color,
+            Color::rgb(0, 0xff, 0)
+        );
+    }
+
+    #[test]
+    fn var_is_overridable_in_scope() {
+        // The nearer declaration wins: the inner div redefines --c for itself.
+        let html = "<html><head><style>:root{--c:#ff0000} div{color:var(--c)}</style></head>\
+                    <body><div>outer<div style='--c:#0000ff'>inner</div></div></body></html>";
+        let dom = CssEngine::new().style(&parse_html(html));
+        let outer = first(&dom.root, "div").unwrap();
+        assert_eq!(outer.style.color, Color::rgb(0xff, 0, 0));
+        let inner = match outer.children.iter().find_map(|c| match c {
+            StyledChild::Element(e) if e.tag == "div" => Some(e),
+            _ => None,
+        }) {
+            Some(e) => e,
+            None => panic!("inner div"),
+        };
+        assert_eq!(inner.style.color, Color::rgb(0, 0, 0xff));
+    }
+
+    #[test]
+    fn var_resolves_nested_references() {
+        // --a -> var(--b) -> a concrete color, regardless of declaration order.
+        let html = "<html><head><style>:root{--a:var(--b);--b:#abcdef} p{color:var(--a)}\
+                    </style></head><body><p>x</p></body></html>";
+        let dom = CssEngine::new().style(&parse_html(html));
+        assert_eq!(
+            first(&dom.root, "p").unwrap().style.color,
+            Color::rgb(0xab, 0xcd, 0xef)
+        );
+    }
+
+    #[test]
+    fn calc_evaluates_length_math() {
+        // calc with mixed absolute units, precedence, and a var() operand (the
+        // element references its own custom property).
+        let html =
+            "<p style='--g:8px;margin-top:calc(2 * 4px + 1rem);margin-left:calc(var(--g) * 3)'>x</p>";
+        let dom = CssEngine::new().style(&parse_html(html));
+        let p = first(&dom.root, "p").unwrap();
+        assert_eq!(p.style.margin_top, 24, "2*4 + 16(rem) = 24");
+        assert_eq!(p.style.margin_left, 24, "8 * 3 = 24");
+    }
+
+    #[test]
+    fn var_cycle_does_not_hang() {
+        // A self-referential cycle resolves to empty (no infinite recursion); the
+        // property is left at its initial value rather than crashing.
+        let html = "<html><head><style>:root{--a:var(--b);--b:var(--a)} p{color:var(--a)}\
+                    </style></head><body><p>x</p></body></html>";
+        let dom = CssEngine::new().style(&parse_html(html));
+        assert_eq!(first(&dom.root, "p").unwrap().style.color, Color::BLACK);
     }
 }
