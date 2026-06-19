@@ -423,6 +423,102 @@ pub fn profile_admin(
     Ok(profile_lines(identity, &head.label, &load(&mut env)))
 }
 
+/// The no-frills CSV template (`profile --template`): header + example rows, in
+/// the chosen delimiter. Needs no vault — it is pure text.
+pub fn profile_csv_template(delim: char) -> String {
+    cerberus_autofill::csv_template(delim)
+}
+
+/// Export every identity's sealed autofill profile to `file` as CSV
+/// (`profile --export`), using `delim`. Unlocks the vault with `passphrase`.
+/// Returns the number of identities written. An identity with no stored profile
+/// is written as an empty row, so the export doubles as a labeled template.
+pub fn profile_export(
+    dir: &str,
+    file: &str,
+    passphrase: &str,
+    delim: char,
+) -> Result<usize, String> {
+    let path = Path::new(dir);
+    let heads = load_heads(path)
+        .map(|(h, _)| h)
+        .unwrap_or_else(default_heads);
+    let mut env = open_profile_storage(path).map_err(|e| e.to_string())?;
+    env.unlock_vault(&Secret::from_passphrase(passphrase))
+        .map_err(|e| format!("vault unlock failed: {e:?}"))?;
+
+    let rows: Vec<(String, cerberus_autofill::Profile)> = heads
+        .iter()
+        .map(|h| {
+            let profile = env
+                .load_blob(h.instance, AUTOFILL_PROFILE_KEY)
+                .ok()
+                .flatten()
+                .and_then(|b| cerberus_autofill::Profile::from_bytes(&b))
+                .unwrap_or_default();
+            (h.label.clone(), profile)
+        })
+        .collect();
+    let csv = cerberus_autofill::profiles_to_csv(&rows, delim);
+    std::fs::write(file, csv).map_err(|e| e.to_string())?;
+    Ok(rows.len())
+}
+
+/// Import autofill profiles from a CSV `file` (`profile --import`), sealing each
+/// in the vault. Rows map to identities by the `identity` label; a label with no
+/// existing identity is **created** (minted like `identities --add`), so a filled
+/// template sets up many identities at once. The delimiter is auto-detected.
+/// Returns a human-readable report (one line per row).
+pub fn profile_import(dir: &str, file: &str, passphrase: &str) -> Result<Vec<String>, String> {
+    let path = Path::new(dir);
+    std::fs::create_dir_all(path).map_err(|e| e.to_string())?;
+    let text = std::fs::read_to_string(file).map_err(|e| format!("cannot read {file}: {e}"))?;
+    let rows = cerberus_autofill::profiles_from_csv(&text)?;
+    if rows.is_empty() {
+        return Err("no identity rows found in the CSV".into());
+    }
+    // Each identity label must be unique within the file (else a later row would
+    // silently clobber an earlier one).
+    for (i, (label, _)) in rows.iter().enumerate() {
+        if rows[..i].iter().any(|(l, _)| l == label) {
+            return Err(format!("duplicate identity {label:?} in the CSV"));
+        }
+    }
+
+    let (mut heads, active) = load_heads(path).unwrap_or_else(|| (fresh_profile_heads(), 0));
+    let mut env = open_profile_storage(path).map_err(|e| e.to_string())?;
+    env.unlock_vault(&Secret::from_passphrase(passphrase))
+        .map_err(|e| format!("vault unlock failed: {e:?}"))?;
+
+    let mut report = Vec::new();
+    let mut created_any = false;
+    for (label, profile) in &rows {
+        let idx = match heads.iter().position(|h| &h.label == label) {
+            Some(i) => i,
+            None => {
+                let index = heads.len() as u64 + 1;
+                heads.push(mint_head(label, index));
+                created_any = true;
+                report.push(format!("created identity {label:?}"));
+                heads.len() - 1
+            }
+        };
+        env.store_blob(
+            heads[idx].instance,
+            AUTOFILL_PROFILE_KEY,
+            &profile.to_bytes(),
+        )
+        .map_err(|e| format!("{e:?}"))?;
+        report.push(format!("set profile for {label:?}"));
+    }
+    env.save(path).map_err(|e| e.to_string())?;
+    if created_any {
+        save_heads(path, &heads, active).map_err(|e| e.to_string())?;
+    }
+    report.push(format!("imported {} identities", rows.len()));
+    Ok(report)
+}
+
 /// Apply a `key=value;key=value` spec to a profile (used by `profile --set`).
 fn apply_profile_fields(p: &mut cerberus_autofill::Profile, spec: &str) -> Result<(), String> {
     for pair in spec.split(';') {
@@ -4332,6 +4428,47 @@ mod tests {
         let _env = open_profile_storage(&dir).unwrap();
         let salt2 = std::fs::read(dir.join(VAULT_SALT_FILE)).unwrap();
         assert_eq!(salt1, salt2, "salt must be stable across opens");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn profile_csv_import_creates_identities_and_round_trips_export() {
+        let dir = std::env::temp_dir().join(format!("cerb-csv-test-{}", std::process::id()));
+        std::fs::remove_dir_all(&dir).ok();
+        std::fs::create_dir_all(&dir).unwrap();
+        let dir_s = dir.to_str().unwrap();
+
+        // One existing default label ("work") + one brand-new identity.
+        // (Quoting/delimiter edge cases are covered by the cerberus-autofill csv
+        // unit tests; this test exercises the vault round-trip + identity creation.)
+        let csv = "identity:login.username:login.password:address.city:card.number\n\
+                   work:ada:pw1:London:4111111111111111\n\
+                   agent-x:bob:pw2:Paris:\n";
+        let in_file = dir.join("in.csv");
+        std::fs::write(&in_file, csv).unwrap();
+
+        let report = profile_import(dir_s, in_file.to_str().unwrap(), "pass").expect("import");
+        assert!(report
+            .iter()
+            .any(|l| l.contains("created identity \"agent-x\"")));
+        // The new identity was persisted as a real head.
+        let (heads, _) = load_heads(&dir).expect("heads saved");
+        assert!(heads.iter().any(|h| h.label == "agent-x"));
+
+        // Export and confirm the values survived the sealed vault round-trip.
+        let out_file = dir.join("out.csv");
+        let n = profile_export(dir_s, out_file.to_str().unwrap(), "pass", ':').expect("export");
+        assert!(n >= 4, "3 defaults + agent-x");
+        let text = std::fs::read_to_string(&out_file).unwrap();
+        let rows = cerberus_autofill::profiles_from_csv(&text).unwrap();
+        let work = rows.iter().find(|(l, _)| l == "work").unwrap();
+        assert_eq!(work.1.login.username, "ada");
+        assert_eq!(work.1.login.password, "pw1");
+        assert_eq!(work.1.address.city, "London");
+        assert_eq!(work.1.card.number, "4111111111111111");
+        let ax = rows.iter().find(|(l, _)| l == "agent-x").unwrap();
+        assert_eq!(ax.1.login.username, "bob");
+
         std::fs::remove_dir_all(&dir).ok();
     }
 

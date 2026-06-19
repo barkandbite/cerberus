@@ -12,6 +12,9 @@
 
 use cerberus_dom::{Document, NodeId, NodeRef};
 
+mod csv;
+pub use csv::{csv_template, profiles_from_csv, profiles_to_csv, CSV_HEADERS};
+
 /// Login credentials.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Login {

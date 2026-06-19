@@ -345,23 +345,118 @@ fn cmd_identities(args: &[String]) -> ExitCode {
     }
 }
 
-/// `profile` — show, or with `--set "key=value;…"`, update an identity's autofill
-/// profile (login/address/card), sealed in the encrypted vault. The vault
-/// passphrase comes from `CERBERUS_VAULT_PASS` (never an argument, to keep it out
-/// of shell history).
+/// Resolve a `--delimiter` value to a single char. Accepts a literal char or a
+/// name (`tab`/`colon`/`comma`/`semicolon`/`pipe`/`space`), since a tab can't be
+/// typed as an argument. The quote char is reserved for field quoting.
+fn parse_delimiter(s: &str) -> Result<char, String> {
+    let d = match s {
+        "tab" => '\t',
+        "colon" => ':',
+        "comma" => ',',
+        "semicolon" => ';',
+        "pipe" => '|',
+        "space" => ' ',
+        _ => {
+            let mut it = s.chars();
+            match (it.next(), it.next()) {
+                (Some(c), None) => c,
+                _ => return Err(format!("--delimiter must be one char or a name, got {s:?}")),
+            }
+        }
+    };
+    if d == '"' {
+        return Err("--delimiter cannot be the quote character".into());
+    }
+    Ok(d)
+}
+
+/// `profile` — manage identities' autofill profiles (login/address/card), sealed
+/// in the encrypted vault. Modes:
+///   --template <FILE|->        write a no-frills CSV template (no vault needed)
+///   --export   <FILE>          export every identity's profile to CSV
+///   --import   <FILE>          import profiles from CSV (creates missing ids)
+///   --set "key=value;…"        update one identity's profile (--identity N)
+///   (default)                  show one identity's profile (--identity N)
+/// `--delimiter <CHAR|name>` selects the CSV delimiter (default `:`; import
+/// auto-detects). The vault passphrase comes from `CERBERUS_VAULT_PASS` (never an
+/// argument, to keep it out of shell history) for every mode except --template.
 fn cmd_profile(args: &[String]) -> ExitCode {
+    let delim = match flag(args, "--delimiter").as_deref() {
+        Some(s) => match parse_delimiter(s) {
+            Ok(d) => d,
+            Err(e) => {
+                eprintln!("profile: {e}");
+                return ExitCode::FAILURE;
+            }
+        },
+        None => ':',
+    };
+
+    // --template needs no profile dir or vault: it is pure text.
+    if let Some(file) = flag(args, "--template") {
+        let text = cerberus_app::profile_csv_template(delim);
+        let res = if file == "-" {
+            use std::io::Write;
+            std::io::stdout()
+                .write_all(text.as_bytes())
+                .map_err(|e| e.to_string())
+        } else {
+            std::fs::write(&file, &text).map_err(|e| e.to_string())
+        };
+        return match res {
+            Ok(()) => {
+                if file != "-" {
+                    println!("profile: wrote CSV template to {file}");
+                }
+                ExitCode::SUCCESS
+            }
+            Err(e) => {
+                eprintln!("profile: {e}");
+                ExitCode::FAILURE
+            }
+        };
+    }
+
     let Some(dir) = flag(args, "--data-dir") else {
         eprintln!("profile: --data-dir <DIR> is required");
         return ExitCode::FAILURE;
     };
-    let identity = flag(args, "--identity")
-        .and_then(|s| s.parse::<usize>().ok())
-        .unwrap_or(0);
-    let set = flag(args, "--set");
     let Ok(passphrase) = std::env::var("CERBERUS_VAULT_PASS") else {
         eprintln!("profile: set CERBERUS_VAULT_PASS to the vault passphrase");
         return ExitCode::FAILURE;
     };
+
+    if let Some(file) = flag(args, "--export") {
+        return match cerberus_app::profile_export(&dir, &file, &passphrase, delim) {
+            Ok(n) => {
+                println!("profile: exported {n} identities to {file}");
+                ExitCode::SUCCESS
+            }
+            Err(e) => {
+                eprintln!("profile: {e}");
+                ExitCode::FAILURE
+            }
+        };
+    }
+    if let Some(file) = flag(args, "--import") {
+        return match cerberus_app::profile_import(&dir, &file, &passphrase) {
+            Ok(lines) => {
+                for line in lines {
+                    println!("{line}");
+                }
+                ExitCode::SUCCESS
+            }
+            Err(e) => {
+                eprintln!("profile: {e}");
+                ExitCode::FAILURE
+            }
+        };
+    }
+
+    let identity = flag(args, "--identity")
+        .and_then(|s| s.parse::<usize>().ok())
+        .unwrap_or(0);
+    let set = flag(args, "--set");
     match cerberus_app::profile_admin(&dir, identity, set.as_deref(), &passphrase) {
         Ok(lines) => {
             for line in lines {
@@ -390,8 +485,10 @@ fn print_usage() {
          \x20 mirror-bench  Large-N mirror gate: focus-sweep N instances, assert RSS\n\
          \x20 cookies    Inspect/retune a profile's cookie dispositions (--data-dir)\n\
          \x20 identities Manage a profile's identities (--data-dir; --add/--remove)\n\
-         \x20 profile    Show/set an identity's autofill profile (--data-dir;\n\
-         \x20            --identity N; --set \"key=value;...\"; CERBERUS_VAULT_PASS)\n\
+         \x20 profile    Show/set an identity's autofill profile, or bulk\n\
+         \x20            import/export via CSV (--data-dir; --identity N;\n\
+         \x20            --set \"key=value;...\"; --template/--export/--import\n\
+         \x20            <FILE>; --delimiter <CHAR|name>; CERBERUS_VAULT_PASS)\n\
          \x20 version    Print the version\n\
          \x20 help       Print this help\n\n\
          RUN OPTIONS:\n\
