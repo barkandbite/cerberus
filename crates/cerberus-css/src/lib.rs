@@ -13,8 +13,8 @@ pub use color::parse_color;
 
 use cerberus_dom::{Document, NodeRef};
 use cerberus_style::{
-    AlignItems, ComputedStyle, Display, FlexDirection, JustifyContent, StyleEngine, StyledChild,
-    StyledDom, StyledNode, TextAlign, Track, Visibility,
+    AlignItems, ComputedStyle, Display, FlexDirection, JustifyContent, Len, Position, StyleEngine,
+    StyledChild, StyledDom, StyledNode, TextAlign, Track, Visibility,
 };
 use cerberus_types::Color;
 use parser::{
@@ -290,6 +290,45 @@ fn apply_declarations(
                     style.opacity = o;
                 }
             }
+            "position" => {
+                style.position = match v.trim().to_ascii_lowercase().as_str() {
+                    "relative" => Position::Relative,
+                    "absolute" => Position::Absolute,
+                    "fixed" => Position::Fixed,
+                    "sticky" => Position::Sticky,
+                    "static" => Position::Static,
+                    _ => style.position,
+                }
+            }
+            "top" => {
+                if let Some(l) = parse_inset(v, style.font_size as f32) {
+                    style.inset_top = l;
+                }
+            }
+            "right" => {
+                if let Some(l) = parse_inset(v, style.font_size as f32) {
+                    style.inset_right = l;
+                }
+            }
+            "bottom" => {
+                if let Some(l) = parse_inset(v, style.font_size as f32) {
+                    style.inset_bottom = l;
+                }
+            }
+            "left" => {
+                if let Some(l) = parse_inset(v, style.font_size as f32) {
+                    style.inset_left = l;
+                }
+            }
+            "inset" => apply_inset_shorthand(style, v, style.font_size as f32),
+            "z-index" => {
+                let t = v.trim().to_ascii_lowercase();
+                if t == "auto" {
+                    style.z_index = None;
+                } else if let Ok(n) = t.parse::<i32>() {
+                    style.z_index = Some(n);
+                }
+            }
             "flex-direction" => {
                 style.flex_direction = match v.to_ascii_lowercase().as_str() {
                     "column" | "column-reverse" => FlexDirection::Column,
@@ -515,6 +554,46 @@ fn parse_css_px(v: &str, em_base: f32) -> Option<f32> {
         "ex" => num * em_base * 0.5,
         _ => return None,
     })
+}
+
+/// Parse a `top`/`right`/`bottom`/`left` inset: `auto`, a px length, or a `%`
+/// (kept as a percentage for resolution against the containing block at layout).
+fn parse_inset(v: &str, em_base: f32) -> Option<Len> {
+    let v = v.trim().to_ascii_lowercase();
+    if v == "auto" {
+        return Some(Len::Auto);
+    }
+    if v == "inherit" || v == "initial" {
+        return None;
+    }
+    let (num, unit) = split_num_unit(&v)?;
+    Some(match unit.as_str() {
+        "%" => Len::Pct(num),
+        "px" | "" => Len::Px(num.round() as i32),
+        "em" => Len::Px((num * em_base).round() as i32),
+        "rem" => Len::Px((num * 16.0).round() as i32),
+        "pt" => Len::Px((num * 96.0 / 72.0).round() as i32),
+        _ => return None,
+    })
+}
+
+/// Apply the `inset` shorthand (1–4 values: top/right/bottom/left, CSS order).
+fn apply_inset_shorthand(style: &mut ComputedStyle, v: &str, em: f32) {
+    let raw: Vec<&str> = v.split_whitespace().collect();
+    let Some(p): Option<Vec<Len>> = raw.iter().map(|s| parse_inset(s, em)).collect() else {
+        return;
+    };
+    let (t, r, b, l) = match p.len() {
+        1 => (p[0], p[0], p[0], p[0]),
+        2 => (p[0], p[1], p[0], p[1]),
+        3 => (p[0], p[1], p[2], p[1]),
+        4 => (p[0], p[1], p[2], p[3]),
+        _ => return,
+    };
+    style.inset_top = t;
+    style.inset_right = r;
+    style.inset_bottom = b;
+    style.inset_left = l;
 }
 
 fn split_num_unit(v: &str) -> Option<(f32, String)> {

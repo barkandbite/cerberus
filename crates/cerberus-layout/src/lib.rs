@@ -160,9 +160,10 @@ impl LayoutEngine for BlockLayout {
             .w
             .saturating_sub(2 * self.margin.max(0) as u32)
             .max(16) as i32;
-        let mut ctx = Ctx::new(self.margin, max_width, shaper, images, forms);
+        let mut ctx = Ctx::new(self.margin, max_width, viewport, shaper, images, forms);
         ctx.walk(&styled.root, None);
         ctx.flush_line();
+        ctx.finish_positioned();
         LaidOut {
             display: ctx.display,
             links: ctx.links,
@@ -188,6 +189,38 @@ struct LinePiece {
     underline: bool,
     href: Option<String>,
     link_node: Option<NodeId>,
+}
+
+/// A containing block (px), for resolving positioned insets (ADR-0034).
+#[derive(Clone, Copy)]
+struct ContainingBlock {
+    x: i32,
+    y: i32,
+    w: i32,
+    h: i32,
+}
+
+/// The flow state captured before laying a positioned element, so the tail can
+/// translate (relative) or lift out (absolute/fixed) exactly its output.
+struct PosBase {
+    disp: usize,
+    links: usize,
+    fields: usize,
+    elements: usize,
+    /// The element's in-flow top and reference left (`left0`).
+    y: i32,
+    x: i32,
+}
+
+/// An out-of-flow (`absolute`/`fixed`) element's painted output, lifted from the
+/// normal flow and painted on top in `z-index` then document order.
+struct PositionedLayer {
+    z: i32,
+    order: usize,
+    items: Vec<DisplayItem>,
+    links: Vec<LinkBox>,
+    fields: Vec<FormFieldBox>,
+    elements: Vec<ElementBox>,
 }
 
 /// Flow state.
@@ -224,12 +257,24 @@ struct Ctx<'a> {
     /// items so flex/grid sizing does not allocate a fresh `Ctx` (with its five
     /// output buffers) per item per render. Created lazily, cleared between uses.
     scratch: Option<Box<Ctx<'a>>>,
+    /// Viewport size (px) — the `fixed` containing block and the initial
+    /// containing block for `absolute`, plus the basis for `%` insets.
+    vw: i32,
+    vh: i32,
+    /// Out-of-flow layers (`absolute`/`fixed`), painted on top after the flow.
+    positioned: Vec<PositionedLayer>,
+    /// Document-order counter for stable z-index tie-breaking.
+    pos_order: usize,
+    /// Whether positioning is active. Only the root flow positions; sub-flows
+    /// (table cells, intrinsic measurement) keep elements in-flow (v1).
+    pos_enabled: bool,
 }
 
 impl<'a> Ctx<'a> {
     fn new(
         margin: i32,
         max_width: i32,
+        viewport: Size,
         shaper: &'a dyn TextShaper,
         images: &'a dyn ImageProvider,
         forms: &'a dyn FormState,
@@ -255,6 +300,11 @@ impl<'a> Ctx<'a> {
             cur_link_node: None,
             opacity_hidden: false,
             scratch: None,
+            vw: viewport.w as i32,
+            vh: viewport.h as i32,
+            positioned: Vec::new(),
+            pos_order: 0,
+            pos_enabled: true,
         }
     }
 
@@ -294,6 +344,11 @@ impl<'a> Ctx<'a> {
             cur_link_node: None,
             opacity_hidden: false,
             scratch: None,
+            vw: 0,
+            vh: 0,
+            positioned: Vec::new(),
+            pos_order: 0,
+            pos_enabled: false,
         }
     }
 
@@ -375,6 +430,54 @@ impl<'a> Ctx<'a> {
         if node.tag == "a" {
             self.cur_link_node = Some(node.node_id);
         }
+
+        // A positioned element (relative/absolute/fixed) is laid out in flow,
+        // then the tail below either translates it (relative) or lifts it into a
+        // paint-on-top layer (absolute/fixed) — ADR-0034. Flex/grid containers
+        // return early, so positioning applies to the block/inline path (v1).
+        let positioned = self.pos_enabled
+            && matches!(
+                style.position,
+                cerberus_style::Position::Relative
+                    | cerberus_style::Position::Absolute
+                    | cerberus_style::Position::Fixed
+            );
+        let pos_base = if positioned {
+            Some(PosBase {
+                disp: self.display.items.len(),
+                links: self.links.len(),
+                fields: self.fields.len(),
+                elements: self.elements.len(),
+                y: self.y,
+                x: self.left0,
+            })
+        } else {
+            None
+        };
+
+        // An out-of-flow box (`absolute`/`fixed`) uses its **shrink-to-fit**
+        // content width (or, when both left & right are set, the stretched width),
+        // not the full flow width — so right/bottom anchoring lands correctly.
+        let out_of_flow = pos_base.is_some()
+            && matches!(
+                style.position,
+                cerberus_style::Position::Absolute | cerberus_style::Position::Fixed
+            );
+        let saved_right = if out_of_flow {
+            let cb = self.containing_block(style.position);
+            let used_w = match (
+                style.inset_left.resolve(cb.w),
+                style.inset_right.resolve(cb.w),
+            ) {
+                (Some(l), Some(r)) => (cb.w - l - r).max(1),
+                _ => self.measure_intrinsic_width(node).clamp(1, cb.w.max(1)),
+            };
+            let saved = self.right;
+            self.right = self.left0 + used_w;
+            Some(saved)
+        } else {
+            None
+        };
 
         // Flex/grid containers lay their items out and return; everything else
         // falls through to block/inline flow.
@@ -459,7 +562,147 @@ impl<'a> Ctx<'a> {
             self.left = saved_left;
             self.x = self.left;
         }
+        if let Some(base) = pos_base {
+            self.apply_positioning(&node.style, base);
+        }
+        if let Some(r) = saved_right {
+            self.right = r;
+        }
         self.cur_link_node = saved_link_node;
+    }
+
+    /// The containing block for a positioned element (v1): `fixed` resolves
+    /// against the viewport; `absolute`/`relative` against the page content area
+    /// (the initial containing block) — nearest-positioned-ancestor is a
+    /// follow-up.
+    fn containing_block(&self, position: cerberus_style::Position) -> ContainingBlock {
+        match position {
+            // No positioned-ancestor tracking yet (v1): `absolute` and `fixed`
+            // both resolve against the viewport (the initial containing block).
+            cerberus_style::Position::Absolute | cerberus_style::Position::Fixed => {
+                ContainingBlock {
+                    x: 0,
+                    y: 0,
+                    w: self.vw,
+                    h: self.vh,
+                }
+            }
+            // `relative` % insets are relative to the page content area.
+            _ => ContainingBlock {
+                x: self.left0,
+                y: 0,
+                w: (self.right - self.left0).max(0),
+                h: self.vh,
+            },
+        }
+    }
+
+    /// Translate a `relative` element in place, or lift an `absolute`/`fixed`
+    /// element out of flow into a paint-on-top layer (ADR-0034).
+    fn apply_positioning(&mut self, style: &ComputedStyle, base: PosBase) {
+        use cerberus_style::Position;
+        let cb = self.containing_block(style.position);
+        let elem_w = (self.right - self.left0).max(0);
+        let elem_h = (self.y - base.y).max(0);
+
+        let (dx, dy) = match style.position {
+            Position::Relative => {
+                // Offset from the in-flow position; left wins over right, top over
+                // bottom. Flow space is preserved (the box keeps its slot).
+                let dx = style
+                    .inset_left
+                    .resolve(cb.w)
+                    .or_else(|| style.inset_right.resolve(cb.w).map(|r| -r))
+                    .unwrap_or(0);
+                let dy = style
+                    .inset_top
+                    .resolve(cb.h)
+                    .or_else(|| style.inset_bottom.resolve(cb.h).map(|b| -b))
+                    .unwrap_or(0);
+                (dx, dy)
+            }
+            // absolute / fixed: resolve an absolute origin, then translate from
+            // the in-flow reference origin to it.
+            _ => {
+                let ox = style
+                    .inset_left
+                    .resolve(cb.w)
+                    .map(|l| cb.x + l)
+                    .or_else(|| {
+                        style
+                            .inset_right
+                            .resolve(cb.w)
+                            .map(|r| cb.x + cb.w - r - elem_w)
+                    })
+                    .unwrap_or(base.x);
+                let oy = style
+                    .inset_top
+                    .resolve(cb.h)
+                    .map(|t| cb.y + t)
+                    .or_else(|| {
+                        style
+                            .inset_bottom
+                            .resolve(cb.h)
+                            .map(|b| cb.y + cb.h - b - elem_h)
+                    })
+                    .unwrap_or(base.y);
+                (ox - base.x, oy - base.y)
+            }
+        };
+
+        if style.position == Position::Relative {
+            for it in &mut self.display.items[base.disp..] {
+                translate_item(it, dx, dy);
+            }
+            for l in &mut self.links[base.links..] {
+                l.rect = offset_rect(l.rect, dx, dy);
+            }
+            for f in &mut self.fields[base.fields..] {
+                f.rect = offset_rect(f.rect, dx, dy);
+            }
+            for e in &mut self.elements[base.elements..] {
+                e.rect = offset_rect(e.rect, dx, dy);
+            }
+            return;
+        }
+
+        // Out of flow: drain this element's output, translate it, and stash it as
+        // a layer; then rewind the flow so siblings ignore the removed box.
+        let mut items: Vec<DisplayItem> = self.display.items.drain(base.disp..).collect();
+        for it in &mut items {
+            translate_item(it, dx, dy);
+        }
+        let links = drain_offset(&mut self.links, base.links, dx, dy, |l| &mut l.rect);
+        let fields = drain_offset(&mut self.fields, base.fields, dx, dy, |f| &mut f.rect);
+        let elements = drain_offset(&mut self.elements, base.elements, dx, dy, |e| &mut e.rect);
+        self.positioned.push(PositionedLayer {
+            z: style.z_index.unwrap_or(0),
+            order: self.pos_order,
+            items,
+            links,
+            fields,
+            elements,
+        });
+        self.pos_order += 1;
+        // Rewind flow to before the element (it occupies no normal-flow space).
+        self.y = base.y;
+        self.x = self.left;
+    }
+
+    /// Sort the out-of-flow layers by `z-index` (then document order) and append
+    /// them after the in-flow content, so they paint on top (ADR-0034).
+    fn finish_positioned(&mut self) {
+        if self.positioned.is_empty() {
+            return;
+        }
+        let mut layers = std::mem::take(&mut self.positioned);
+        layers.sort_by(|a, b| a.z.cmp(&b.z).then(a.order.cmp(&b.order)));
+        for layer in layers {
+            self.display.items.extend(layer.items);
+            self.links.extend(layer.links);
+            self.fields.extend(layer.fields);
+            self.elements.extend(layer.elements);
+        }
     }
 
     fn add_text(&mut self, text: &str, style: &ComputedStyle, href: Option<&str>) {
@@ -1476,6 +1719,45 @@ fn line_height(px: u32) -> i32 {
     px as i32 + px as i32 / 2
 }
 
+/// Offset a rect by `(dx, dy)` (for translating positioned output).
+fn offset_rect(r: Rect, dx: i32, dy: i32) -> Rect {
+    Rect::new(r.x + dx, r.y + dy, r.w, r.h)
+}
+
+fn offset_point(p: Point, dx: i32, dy: i32) -> Point {
+    Point::new(p.x + dx, p.y + dy)
+}
+
+/// Translate a display item in place by `(dx, dy)` (ADR-0034 positioning).
+fn translate_item(item: &mut DisplayItem, dx: i32, dy: i32) {
+    match item {
+        DisplayItem::Rect { rect, .. } | DisplayItem::Image { rect, .. } => {
+            *rect = offset_rect(*rect, dx, dy);
+        }
+        DisplayItem::Glyphs { origin, .. } => *origin = offset_point(*origin, dx, dy),
+        DisplayItem::Line { a, b, .. } => {
+            *a = offset_point(*a, dx, dy);
+            *b = offset_point(*b, dx, dy);
+        }
+    }
+}
+
+/// Drain `v[from..]`, offsetting each drained element's rect by `(dx, dy)`.
+fn drain_offset<T>(
+    v: &mut Vec<T>,
+    from: usize,
+    dx: i32,
+    dy: i32,
+    rect_of: impl Fn(&mut T) -> &mut Rect,
+) -> Vec<T> {
+    let mut out: Vec<T> = v.drain(from..).collect();
+    for item in &mut out {
+        let r = rect_of(item);
+        *r = offset_rect(*r, dx, dy);
+    }
+    out
+}
+
 fn space_width(shaper: &dyn TextShaper, px: u32) -> u32 {
     shaper.shape(" ", px).iter().map(|g| g.advance).sum()
 }
@@ -2010,5 +2292,78 @@ mod tests {
         let one = lay("<table><tr><td>x</td></tr></table>", 400);
         assert_eq!(total_glyphs(&one), 1, "single-cell table lays out its text");
         assert!(rect_count(&one) >= 4, "single cell has a four-rect border");
+    }
+
+    // ---- CSS positioning (ADR-0034) ----
+
+    /// Glyph (x, y) origins in display (paint) order.
+    fn glyph_xy(laid: &LaidOut) -> Vec<(i32, i32)> {
+        laid.display
+            .items
+            .iter()
+            .filter_map(|i| match i {
+                DisplayItem::Glyphs { origin, .. } => Some((origin.x, origin.y)),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn absolute_is_out_of_flow_and_placed_at_its_inset_origin() {
+        // The absolute <div> takes no flow space (C rises to the 2nd line) and is
+        // placed at top:100/left:40 against the viewport, painted last (on top).
+        let laid = lay(
+            "<p>A</p><div style=\"position:absolute;top:100px;left:40px\">B</div><p>C</p>",
+            400,
+        );
+        let g = glyph_xy(&laid);
+        assert_eq!(g.len(), 3, "A, C (in flow) + B (lifted out)");
+        // In paint order the in-flow glyphs come first, the absolute one last.
+        let (bx, by) = *g.last().unwrap();
+        assert!(
+            by >= 100 && (40..70).contains(&bx),
+            "B at its inset origin: {bx},{by}"
+        );
+        // C (the 2nd in-flow glyph) stays near the top — B reserved no space.
+        let in_flow_max_y = g[..2].iter().map(|(_, y)| *y).max().unwrap();
+        assert!(
+            in_flow_max_y < 100,
+            "in-flow content not pushed down by abs"
+        );
+    }
+
+    #[test]
+    fn relative_shifts_in_place_and_keeps_its_flow_space() {
+        // Glyphs are A, B, C in document order. `relative` translates B in place,
+        // so C (index 2) keeps the exact y it has with no positioning.
+        let plain = lay("<p>A</p><p>B</p><p>C</p>", 400);
+        let rel = lay(
+            "<p>A</p><p style=\"position:relative;left:25px;top:10px\">B</p><p>C</p>",
+            400,
+        );
+        let (gp, gr) = (glyph_xy(&plain), glyph_xy(&rel));
+        assert_eq!(gp.len(), 3);
+        assert_eq!(gr.len(), 3);
+        // C unchanged (relative reserved B's flow slot).
+        assert_eq!(gr[2].1, gp[2].1, "following element's y is unchanged");
+        // B shifted by the insets.
+        assert_eq!(gr[1].0, gp[1].0 + 25, "B shifted right by left:25");
+        assert_eq!(gr[1].1, gp[1].1 + 10, "B shifted down by top:10");
+    }
+
+    #[test]
+    fn z_index_orders_positioned_layers_in_paint() {
+        // Two absolutes; the higher z-index paints last (on top) regardless of
+        // document order.
+        let laid = lay(
+            "<div style=\"position:absolute;z-index:5;left:100px\">P</div>\
+             <div style=\"position:absolute;z-index:1;left:10px\">Q</div>",
+            400,
+        );
+        let g = glyph_xy(&laid);
+        assert_eq!(g.len(), 2);
+        // Sorted by z: the left:10 (z1) paints first, the left:100 (z5) last.
+        assert!(g[0].0 < 30, "low z first");
+        assert!(g[1].0 >= 100, "high z on top (painted last)");
     }
 }

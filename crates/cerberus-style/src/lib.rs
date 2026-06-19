@@ -8,6 +8,39 @@
 use cerberus_dom::{Document, NodeId};
 use cerberus_types::{Color, FontStyle};
 
+/// CSS `position`. `Static` is normal flow; the rest are positioned.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub enum Position {
+    #[default]
+    Static,
+    Relative,
+    Absolute,
+    Fixed,
+    /// Parsed but laid out as normal flow until scroll containers exist (v1).
+    Sticky,
+}
+
+/// A CSS inset value for `top`/`right`/`bottom`/`left`: `auto`, a px length, or a
+/// percentage of the containing block (resolved at layout).
+#[derive(Clone, Copy, Debug, PartialEq, Default)]
+pub enum Len {
+    #[default]
+    Auto,
+    Px(i32),
+    Pct(f32),
+}
+
+impl Len {
+    /// Resolve against a containing-block `extent` in px; `auto` → `None`.
+    pub fn resolve(self, extent: i32) -> Option<i32> {
+        match self {
+            Len::Auto => None,
+            Len::Px(p) => Some(p),
+            Len::Pct(f) => Some((f / 100.0 * extent as f32).round() as i32),
+        }
+    }
+}
+
 /// CSS `display` (the subset we flow).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Display {
@@ -109,6 +142,14 @@ pub struct ComputedStyle {
     pub gap: u32,
     pub grid_template_columns: Vec<Track>,
     pub grid_template_rows: Vec<Track>,
+    /// `position` and its insets/`z-index` (ADR-0034). Insets resolve against the
+    /// containing block at layout; `z_index` orders positioned layers in paint.
+    pub position: Position,
+    pub inset_top: Len,
+    pub inset_right: Len,
+    pub inset_bottom: Len,
+    pub inset_left: Len,
+    pub z_index: Option<i32>,
 }
 
 impl ComputedStyle {
@@ -135,6 +176,12 @@ impl ComputedStyle {
             gap: 0,
             grid_template_columns: Vec::new(),
             grid_template_rows: Vec::new(),
+            position: Position::Static,
+            inset_top: Len::Auto,
+            inset_right: Len::Auto,
+            inset_bottom: Len::Auto,
+            inset_left: Len::Auto,
+            z_index: None,
         }
     }
 
@@ -163,6 +210,13 @@ impl ComputedStyle {
             gap: 0,
             grid_template_columns: Vec::new(),
             grid_template_rows: Vec::new(),
+            // Positioning is not inherited; every element starts in normal flow.
+            position: Position::Static,
+            inset_top: Len::Auto,
+            inset_right: Len::Auto,
+            inset_bottom: Len::Auto,
+            inset_left: Len::Auto,
+            z_index: None,
         }
     }
 }
