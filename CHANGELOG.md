@@ -3,7 +3,10 @@
 All notable changes to Cerberus are recorded here. Versions are small while the
 browser is pre-1.0; this is the first tagged preview.
 
-## [Unreleased]
+## [0.0.4] — 2026-06-19
+
+UI polish + robustness: a real icon set, crisp hi-DPI text, a legible cookie
+manager, faster (parallel) page loads, and assorted fixes.
 
 ### Changed
 - **Real icon set.** The toolbar (back, forward, reload, stop, settings) and the
