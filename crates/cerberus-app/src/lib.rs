@@ -2838,6 +2838,12 @@ impl BrowserApp {
                 self.settings_open = !self.settings_open;
                 true
             }
+            ToolbarAction::ToggleSync => {
+                // MIRC broadcasting toggle (Phase 1: state + indicator; the
+                // drive-every-identity wiring lands next on the MirrorGroup seam).
+                self.toolbar.broadcasting = !self.toolbar.broadcasting;
+                true
+            }
             ToolbarAction::None => false,
         }
     }

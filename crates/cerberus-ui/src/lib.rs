@@ -40,6 +40,8 @@ pub enum ToolbarAction {
     SwitchHead,
     /// Open the settings panel.
     OpenSettings,
+    /// Toggle MIRC broadcasting (the SYNC button): drive every identity at once.
+    ToggleSync,
     /// The click hit no control (e.g. the page area).
     None,
 }
@@ -52,6 +54,7 @@ enum Control {
     Reload,
     Stop,
     UrlBox,
+    Sync,
     Head,
     Settings,
 }
@@ -74,6 +77,9 @@ pub struct Toolbar {
     pub loading: bool,
     /// Short label for the active head (e.g. "work").
     pub head_label: String,
+    /// Whether MIRC broadcasting is on (SYNC button highlighted; the master
+    /// drives every identity at once).
+    pub broadcasting: bool,
 }
 
 impl Toolbar {
@@ -87,6 +93,7 @@ impl Toolbar {
             can_forward: false,
             loading: false,
             head_label: head_label.into(),
+            broadcasting: false,
         }
     }
 
@@ -114,15 +121,18 @@ impl Toolbar {
             x += BTN as i32 + PAD;
         }
 
-        // Right-anchored: Settings, then Head, laid out from the right edge.
+        // Right-anchored from the right edge: Settings, Head, then the SYNC
+        // button (just right of the URL bar, per the MIRC concept).
         let w = window.w as i32;
         let settings_x = (w - PAD - BTN as i32).max(x);
         let head_x = (settings_x - PAD - HEAD_W as i32).max(x);
+        let sync_x = (head_x - PAD - BTN as i32).max(x);
 
-        // URL box fills the gap between the left group and the head switcher.
+        // URL box fills the gap between the left group and the SYNC button.
         let url_x = x;
-        let url_w = (head_x - PAD - url_x).max(0) as u32;
+        let url_w = (sync_x - PAD - url_x).max(0) as u32;
         out.push((Control::UrlBox, Rect::new(url_x, PAD, url_w, BTN)));
+        out.push((Control::Sync, Rect::new(sync_x, PAD, BTN, BTN)));
         out.push((Control::Head, Rect::new(head_x, PAD, HEAD_W, BTN)));
         out.push((Control::Settings, Rect::new(settings_x, PAD, BTN, BTN)));
         out
@@ -149,6 +159,7 @@ impl Toolbar {
             Control::Reload => ToolbarAction::Reload,
             Control::Stop if self.loading => ToolbarAction::Stop,
             Control::UrlBox => ToolbarAction::FocusUrl,
+            Control::Sync => ToolbarAction::ToggleSync,
             Control::Head => ToolbarAction::SwitchHead,
             Control::Settings => ToolbarAction::OpenSettings,
             // Disabled controls swallow the click.
@@ -228,6 +239,15 @@ impl Toolbar {
             match control {
                 Control::UrlBox => self.paint_url_box(&mut list, shaper, rect, bg, &label, text),
                 Control::Head => draw_button(&mut list, shaper, rect, &label, bg, text, LABEL_PX),
+                // SYNC glows blue while broadcasting to every identity.
+                Control::Sync => {
+                    let (fill, fg) = if self.broadcasting {
+                        (Color::rgb(0x1E, 0x66, 0xE0), Color::WHITE)
+                    } else {
+                        (bg, text)
+                    };
+                    draw_icon_button(&mut list, shaper, rect, IC_SYNC, ICON_PX, fill, fg);
+                }
                 other => {
                     let icon = match other {
                         Control::Back => IC_BACK,
@@ -235,7 +255,7 @@ impl Toolbar {
                         Control::Reload => IC_RELOAD,
                         Control::Stop => IC_CLOSE,
                         Control::Settings => IC_GEAR,
-                        Control::UrlBox | Control::Head => unreachable!(),
+                        Control::UrlBox | Control::Head | Control::Sync => unreachable!(),
                     };
                     draw_icon_button(&mut list, shaper, rect, icon, ICON_PX, bg, text);
                 }
@@ -308,6 +328,9 @@ impl Toolbar {
             Control::Reload => (btn_bg, "R".into(), true),
             Control::Stop => (btn_bg, "X".into(), self.loading),
             Control::UrlBox => (box_bg, self.url_display(), true),
+            // SYNC: label unused (painted as an icon); the broadcasting highlight
+            // is applied in `paint`.
+            Control::Sync => (btn_bg, String::new(), true),
             Control::Head => (Color::rgb(0xD0, 0xDC, 0xF0), self.head_label.clone(), true),
             Control::Settings => (btn_bg, "S".into(), true),
         }
@@ -916,6 +939,7 @@ const IC_FORWARD: char = '\u{ea34}';
 const IC_RELOAD: char = '\u{e984}';
 const IC_CLOSE: char = '\u{ea0f}';
 const IC_GEAR: char = '\u{e994}';
+const IC_SYNC: char = '\u{ea2e}';
 const IC_EYE: char = '\u{e9ce}';
 const IC_TRASH: char = '\u{e9ac}';
 /// Icon size for the 28px toolbar buttons.
