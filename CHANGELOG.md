@@ -6,9 +6,11 @@ browser is pre-1.0; this is the first tagged preview.
 ## [Unreleased]
 
 ### Changed
-- **Toolbar icons.** Reload is a circular arrow and Settings is a gear, drawn as
-  crisp anti-aliased vector strokes (a new `DisplayItem::Line` that scales with
-  the display list) instead of the letters `R`/`S`.
+- **Real icon set.** The toolbar (back, forward, reload, stop, settings) and the
+  cookie manager (close, reveal-eye, delete-trash) now render glyphs from a
+  bundled icon font (IcoMoon subset) through the crisp glyph pipeline — replacing
+  the letters `R`/`S` and the earlier hand-drawn vector shapes. A new
+  `FontStyle::ICON` + `TextShaper::shape_icon` select the icon font per run.
 - **HiDPI rendering is now crisp.** The shell previously rendered at logical size
   and bitmap-upscaled to the physical surface (soft text at >1×). The app now
   lays out in logical pixels and paints at physical resolution via a scaled

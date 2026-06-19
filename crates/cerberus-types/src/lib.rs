@@ -194,6 +194,8 @@ impl Color {
 pub struct FontStyle {
     pub bold: bool,
     pub italic: bool,
+    /// Render from the bundled icon font rather than the text font.
+    pub icon: bool,
 }
 
 impl FontStyle {
@@ -201,6 +203,14 @@ impl FontStyle {
     pub const REGULAR: FontStyle = FontStyle {
         bold: false,
         italic: false,
+        icon: false,
+    };
+
+    /// A glyph from the icon font (the rasterizer selects that font).
+    pub const ICON: FontStyle = FontStyle {
+        bold: false,
+        italic: false,
+        icon: true,
     };
 
     /// A bold style.
@@ -208,6 +218,7 @@ impl FontStyle {
         Self {
             bold: true,
             italic: false,
+            icon: false,
         }
     }
 }

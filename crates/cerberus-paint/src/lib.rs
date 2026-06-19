@@ -244,6 +244,13 @@ pub trait Rasterizer: Send {
 pub trait TextShaper: Send + Sync {
     /// Shape `text` at the given pixel size into glyph boxes.
     fn shape(&self, text: &str, px: u32) -> Vec<GlyphBox>;
+
+    /// Shape a single icon glyph (a codepoint in the bundled icon font), to be
+    /// painted in a run styled [`FontStyle::ICON`]. Default: no glyph (a shaper
+    /// without an icon font draws nothing).
+    fn shape_icon(&self, _ch: char, _px: u32) -> Vec<GlyphBox> {
+        Vec::new()
+    }
 }
 
 /// Decodes image bytes. Wraps image decoders (M2) — a historically large CVE

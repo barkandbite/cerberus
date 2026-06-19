@@ -18,17 +18,22 @@ use cerberus_types::{Color, FontStyle, Point, Rect};
 
 /// The bundled font (Roboto Regular, Apache-2.0). See `assets/Roboto-LICENSE.txt`.
 const FONT_BYTES: &[u8] = include_bytes!("../assets/Roboto-Regular.ttf");
+/// Bundled icon font (user-supplied IcoMoon subset). See `assets/icomoon-LICENSE.txt`.
+const ICON_FONT_BYTES: &[u8] = include_bytes!("../assets/icomoon.ttf");
 
-/// A software text shaper + rasterizer over the bundled font.
+/// A software text shaper + rasterizer over the bundled text and icon fonts.
 pub struct TextEngine {
     font: FontRef<'static>,
+    icon_font: FontRef<'static>,
 }
 
 impl TextEngine {
-    /// Load the bundled font.
+    /// Load the bundled text + icon fonts.
     pub fn new() -> Self {
         let font = FontRef::try_from_slice(FONT_BYTES).expect("bundled Roboto font is valid");
-        Self { font }
+        let icon_font =
+            FontRef::try_from_slice(ICON_FONT_BYTES).expect("bundled icon font is valid");
+        Self { font, icon_font }
     }
 
     fn draw_run(
@@ -40,13 +45,19 @@ impl TextEngine {
         target: &mut Framebuffer,
     ) {
         let mut pen_x = origin.x as f32;
+        // Icon runs are outlined from the icon font; everything else from Roboto.
+        let font = if style.icon {
+            &self.icon_font
+        } else {
+            &self.font
+        };
         for g in glyphs {
             let scale = PxScale::from(g.px.max(1) as f32);
-            let scaled = self.font.as_scaled(scale);
+            let scaled = font.as_scaled(scale);
             let baseline = origin.y as f32 + scaled.ascent();
 
             let glyph = GlyphId(g.id).with_scale_and_position(scale, point(pen_x, baseline));
-            if let Some(outlined) = self.font.outline_glyph(glyph) {
+            if let Some(outlined) = font.outline_glyph(glyph) {
                 let bounds = outlined.px_bounds();
                 outlined.draw(|gx, gy, coverage| {
                     let x = bounds.min.x as i32 + gx as i32;
@@ -141,6 +152,20 @@ impl TextShaper for TextEngine {
             })
             .collect()
     }
+
+    fn shape_icon(&self, ch: char, px: u32) -> Vec<GlyphBox> {
+        let scale = PxScale::from(px.max(1) as f32);
+        let scaled = self.icon_font.as_scaled(scale);
+        let id = self.icon_font.glyph_id(ch);
+        let advance = scaled.h_advance(id).round().max(0.0) as u32;
+        vec![GlyphBox {
+            advance,
+            w: 0,
+            h: 0,
+            id: id.0,
+            px,
+        }]
+    }
 }
 
 impl Rasterizer for TextEngine {
@@ -199,5 +224,18 @@ mod tests {
             .filter(|px| px[..3] != [255, 255, 255])
             .count();
         assert!(inked > 0, "expected anti-aliased glyph ink");
+    }
+
+    #[test]
+    fn icon_font_has_the_toolbar_glyphs() {
+        let e = TextEngine::new();
+        // reload, gear, back, forward, close, eye, trash — all present (non-.notdef).
+        for cp in [
+            '\u{e984}', '\u{e994}', '\u{ea38}', '\u{ea34}', '\u{ea0f}', '\u{e9ce}', '\u{e9ac}',
+        ] {
+            let g = e.shape_icon(cp, 16);
+            assert_eq!(g.len(), 1);
+            assert!(g[0].id != 0, "missing icon glyph U+{:04X}", cp as u32);
+        }
     }
 }

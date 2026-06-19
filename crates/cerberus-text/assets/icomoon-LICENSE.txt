@@ -1,0 +1,21 @@
+Icon font: icomoon.ttf
+======================
+
+A small icon subset exported from IcoMoon (https://icomoon.io), supplied by the
+project owner for the toolbar and cookie-manager icons.
+
+IcoMoon's bundled free icon packs are licensed per-pack (commonly CC BY 4.0 or
+GPL; see https://icomoon.io/#icons). Confirm the exact pack(s) used and record
+the required attribution here before any public distribution of the binary.
+
+Codepoints in use (Unicode Private Use Area), probed from this file:
+  e984  reload / refresh
+  e994  gear / settings
+  ea38  arrow-left  (Back)
+  ea34  arrow-right (Forward)
+  ea0f  close (x)   (Stop / dismiss)
+  e9ce  eye         (cookie "reveal value")
+  e9ac  trash       (cookie "delete")
+
+The file also contains other glyphs (book, users, database, …) in the
+e91f–ea38 range that are not currently referenced.

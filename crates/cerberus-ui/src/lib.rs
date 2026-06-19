@@ -223,20 +223,22 @@ impl Toolbar {
             } else {
                 Color::rgb(0xA0, 0xA0, 0xA0)
             };
-            // The URL box is a text field (own background, caret, selection);
-            // Reload/Settings are vector icons; every other control is a labelled
-            // button. All share the same button chrome.
+            // The URL box is a text field; the head chip keeps its text label;
+            // the nav/reload/stop/settings buttons are icon-font glyphs.
             match control {
                 Control::UrlBox => self.paint_url_box(&mut list, shaper, rect, bg, &label, text),
-                Control::Reload => {
-                    draw_button(&mut list, shaper, rect, "", bg, text, LABEL_PX);
-                    push_reload_icon(&mut list, rect, text);
+                Control::Head => draw_button(&mut list, shaper, rect, &label, bg, text, LABEL_PX),
+                other => {
+                    let icon = match other {
+                        Control::Back => IC_BACK,
+                        Control::Forward => IC_FORWARD,
+                        Control::Reload => IC_RELOAD,
+                        Control::Stop => IC_CLOSE,
+                        Control::Settings => IC_GEAR,
+                        Control::UrlBox | Control::Head => unreachable!(),
+                    };
+                    draw_icon_button(&mut list, shaper, rect, icon, ICON_PX, bg, text);
                 }
-                Control::Settings => {
-                    draw_button(&mut list, shaper, rect, "", bg, text, LABEL_PX);
-                    push_gear_icon(&mut list, rect, text);
-                }
-                _ => draw_button(&mut list, shaper, rect, &label, bg, text, LABEL_PX),
             }
         }
         list
@@ -550,16 +552,19 @@ mod tests {
     }
 
     #[test]
-    fn reload_and_settings_render_as_vector_icons() {
+    fn nav_buttons_render_icon_font_runs() {
         let t = Toolbar::new("work");
         let list = t.paint(window(), &MonoShaper);
-        let lines = list
+        let icons = list
             .items
             .iter()
-            .filter(|i| matches!(i, DisplayItem::Line { .. }))
+            .filter(|i| matches!(i, DisplayItem::Glyphs { style, .. } if style.icon))
             .count();
-        // The circular-arrow and gear are built from many short segments.
-        assert!(lines > 20, "reload + gear emit line segments; got {lines}");
+        // back, forward, reload, stop, settings → five icon-styled runs.
+        assert!(
+            icons >= 5,
+            "expected icon runs for nav/settings buttons; got {icons}"
+        );
     }
 
     #[test]
@@ -905,98 +910,52 @@ fn chip_fill(token: &str) -> Color {
     }
 }
 
-/// Push a stroked circular-arrow ("reload") icon centred in `rect`, built from
-/// short line segments so it scales crisply.
-fn push_reload_icon(list: &mut DisplayList, rect: Rect, color: Color) {
-    use std::f32::consts::PI;
-    let cx = rect.x as f32 + rect.w as f32 / 2.0;
-    let cy = rect.y as f32 + rect.h as f32 / 2.0;
-    let r = ((rect.w.min(rect.h) as f32) / 2.0 - 5.0).max(5.0);
-    let w = (rect.w / 16).max(2);
-    let pt = |ang: f32| {
-        Point::new(
-            (cx + r * ang.cos()).round() as i32,
-            (cy + r * ang.sin()).round() as i32,
-        )
-    };
-    // A near-full circle with a small gap at the top for the arrowhead.
-    let gap = 0.42_f32;
-    let start = -PI / 2.0 + gap;
-    let sweep = 2.0 * PI - 2.0 * gap;
-    let n = 26;
-    let mut prev = pt(start);
-    for i in 1..=n {
-        let p = pt(start + sweep * (i as f32 / n as f32));
-        list.push(DisplayItem::Line {
-            a: prev,
-            b: p,
-            width: w,
-            color,
-        });
-        prev = p;
-    }
-    // Arrowhead at the arc's end, two short barbs along the (clockwise) tangent.
-    let end = start + sweep;
-    let tip = pt(end);
-    let tangent = (-end.sin(), end.cos());
-    let rev = (-tangent.0, -tangent.1);
-    let bl = (r * 0.62).max(4.0);
-    for s in [0.55_f32, -0.55] {
-        let (rx, ry) = (
-            rev.0 * s.cos() - rev.1 * s.sin(),
-            rev.0 * s.sin() + rev.1 * s.cos(),
-        );
-        list.push(DisplayItem::Line {
-            a: tip,
-            b: Point::new(
-                (tip.x as f32 + bl * rx).round() as i32,
-                (tip.y as f32 + bl * ry).round() as i32,
-            ),
-            width: w,
-            color,
-        });
-    }
+// Icon-font codepoints (bundled IcoMoon subset; see cerberus-text/assets).
+const IC_BACK: char = '\u{ea38}';
+const IC_FORWARD: char = '\u{ea34}';
+const IC_RELOAD: char = '\u{e984}';
+const IC_CLOSE: char = '\u{ea0f}';
+const IC_GEAR: char = '\u{e994}';
+const IC_EYE: char = '\u{e9ce}';
+const IC_TRASH: char = '\u{e9ac}';
+/// Icon size for the 28px toolbar buttons.
+const ICON_PX: u32 = 18;
+
+/// Push an icon-font glyph centred in `rect`, in a run styled [`FontStyle::ICON`]
+/// so the rasterizer outlines it from the icon font (crisp at any scale).
+fn push_icon(
+    list: &mut DisplayList,
+    shaper: &dyn TextShaper,
+    rect: Rect,
+    icon: char,
+    px: u32,
+    color: Color,
+) {
+    let glyphs = shaper.shape_icon(icon, px);
+    let text_w: i32 = glyphs.iter().map(|g| g.advance as i32).sum();
+    let x = rect.x + ((rect.w as i32 - text_w) / 2).max(0);
+    let y = rect.y + (rect.h as i32 - px as i32) / 2;
+    list.push(DisplayItem::Glyphs {
+        origin: Point::new(x, y),
+        glyphs,
+        color,
+        style: FontStyle::ICON,
+    });
 }
 
-/// Push a stroked gear ("settings") icon centred in `rect`: a rim, eight radial
-/// teeth, and a hub — all line segments, so it scales crisply.
-fn push_gear_icon(list: &mut DisplayList, rect: Rect, color: Color) {
-    use std::f32::consts::PI;
-    let cx = rect.x as f32 + rect.w as f32 / 2.0;
-    let cy = rect.y as f32 + rect.h as f32 / 2.0;
-    let r = ((rect.w.min(rect.h) as f32) / 2.0 - 8.0).max(3.0);
-    let w = (rect.w / 16).max(2);
-    let pt = |ang: f32, rad: f32| {
-        Point::new(
-            (cx + rad * ang.cos()).round() as i32,
-            (cy + rad * ang.sin()).round() as i32,
-        )
-    };
-    let ring = |list: &mut DisplayList, rad: f32, segs: usize| {
-        let mut prev = pt(0.0, rad);
-        for i in 1..=segs {
-            let p = pt(2.0 * PI * (i as f32 / segs as f32), rad);
-            list.push(DisplayItem::Line {
-                a: prev,
-                b: p,
-                width: w,
-                color,
-            });
-            prev = p;
-        }
-    };
-    ring(list, r, 20); // rim
-    ring(list, r * 0.42, 12); // hub
-    let tlen = r * 0.5;
-    for i in 0..8 {
-        let ang = 2.0 * PI * (i as f32 / 8.0);
-        list.push(DisplayItem::Line {
-            a: pt(ang, r),
-            b: pt(ang, r + tlen),
-            width: w + 1,
-            color,
-        });
-    }
+/// A button (fill + border) whose label is a centred icon-font glyph.
+fn draw_icon_button(
+    list: &mut DisplayList,
+    shaper: &dyn TextShaper,
+    rect: Rect,
+    icon: char,
+    px: u32,
+    fill: Color,
+    color: Color,
+) {
+    list.push(DisplayItem::Rect { rect, color: fill });
+    stroke_rect(list, rect, darken(fill));
+    push_icon(list, shaper, rect, icon, px, color);
 }
 
 impl CookieManager {
@@ -1132,14 +1091,14 @@ impl CookieManager {
         });
         // Close button.
         let close = Self::close_rect(window);
-        draw_button(
+        draw_icon_button(
             &mut list,
             shaper,
             close,
-            "×",
+            IC_CLOSE,
+            13,
             Color::rgb(0xE0, 0xE0, 0xE0),
             Color::BLACK,
-            13,
         );
         // Global default chip.
         list.push(DisplayItem::Glyphs {
@@ -1193,14 +1152,14 @@ impl CookieManager {
                 style: FontStyle::REGULAR,
             });
             // reveal (eye), chip, delete (x)
-            draw_button(
+            draw_icon_button(
                 &mut list,
                 shaper,
                 reveal,
-                "o",
+                IC_EYE,
+                12,
                 Color::rgb(0xE8, 0xE8, 0xE8),
                 Color::BLACK,
-                12,
             );
             draw_button(
                 &mut list,
@@ -1211,14 +1170,14 @@ impl CookieManager {
                 Color::BLACK,
                 12,
             );
-            draw_button(
+            draw_icon_button(
                 &mut list,
                 shaper,
                 delete,
-                "×",
+                IC_TRASH,
+                12,
                 Color::rgb(0xF3, 0xD9, 0xD9),
                 Color::BLACK,
-                12,
             );
         }
         // Scroll affordances.
