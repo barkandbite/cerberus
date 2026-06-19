@@ -51,15 +51,28 @@ pub fn send(stream: &mut dyn ReadWrite, req: &Request<'_>) -> Result<HttpRespons
     parse_response(&raw)
 }
 
+/// Hard cap on a single response (raw bytes off the wire, pre-decompression):
+/// a large or hostile/endless response must not OOM the process. 32 MiB is far
+/// above any real page/subresource while bounding worst-case memory.
+const MAX_RESPONSE_BYTES: usize = 32 * 1024 * 1024;
+
 /// Read until EOF, tolerating a TLS peer that closes without `close_notify`
-/// (common) — we already have the body in that case.
+/// (common) — we already have the body in that case. Aborts past
+/// [`MAX_RESPONSE_BYTES`] so a huge/endless response can't exhaust memory.
 fn read_to_end_tolerant(stream: &mut dyn ReadWrite) -> Result<Vec<u8>, NetError> {
     let mut raw = Vec::new();
     let mut buf = [0u8; 16 * 1024];
     loop {
         match stream.read(&mut buf) {
             Ok(0) => break,
-            Ok(n) => raw.extend_from_slice(&buf[..n]),
+            Ok(n) => {
+                raw.extend_from_slice(&buf[..n]);
+                if raw.len() > MAX_RESPONSE_BYTES {
+                    return Err(NetError::Protocol(format!(
+                        "response exceeds {MAX_RESPONSE_BYTES} bytes"
+                    )));
+                }
+            }
             Err(e) if e.kind() == ErrorKind::UnexpectedEof => break,
             Err(e) if e.kind() == ErrorKind::Interrupted => continue,
             Err(e) => return Err(NetError::Io(e.to_string())),
@@ -171,6 +184,28 @@ mod tests {
     #[test]
     fn rejects_garbage() {
         assert!(parse_response(b"not http").is_err());
+    }
+
+    #[test]
+    fn aborts_oversized_response() {
+        use std::io::{Read, Write};
+        // A peer that never stops sending must be cut off, not allowed to OOM.
+        struct Endless;
+        impl Read for Endless {
+            fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+                Ok(buf.len())
+            }
+        }
+        impl Write for Endless {
+            fn write(&mut self, b: &[u8]) -> std::io::Result<usize> {
+                Ok(b.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        let err = read_to_end_tolerant(&mut Endless).unwrap_err();
+        assert!(matches!(err, NetError::Protocol(_)), "got {err:?}");
     }
 
     #[test]

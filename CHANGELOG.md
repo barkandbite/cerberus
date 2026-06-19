@@ -30,6 +30,11 @@ browser is pre-1.0; this is the first tagged preview.
   subresources took ~6.8 s). A small worker pool (4) now fetches them concurrently
   off a shared queue; memory stays within the gate (~15 MB).
 
+### Security
+- **HTTP response size is capped (DoS guard).** A response is now bounded at
+  32 MiB of raw bytes; a huge or endless response is aborted instead of being
+  read into memory until the process OOMs (issue #13).
+
 ### Fixed
 - **Named HTML entities render correctly.** `&copy;`, `&mdash;`, `&eacute;`, … were
   shown literally (only `&amp;`/`&lt;`/`&gt;`/`&quot;`/`&nbsp;` + numeric refs were
