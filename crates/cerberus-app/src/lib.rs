@@ -2131,6 +2131,47 @@ impl BrowserApp {
         self.persist();
     }
 
+    /// The directory downloads are saved to: `<data-dir>/downloads` for a
+    /// persistent profile, else the OS `~/Downloads`, else a temp dir.
+    fn downloads_dir(&self) -> PathBuf {
+        if let Some(dir) = &self.data_dir {
+            return dir.join("downloads");
+        }
+        if let Some(home) = std::env::var_os("HOME").or_else(|| std::env::var_os("USERPROFILE")) {
+            return PathBuf::from(home).join("Downloads");
+        }
+        std::env::temp_dir().join("cerberus-downloads")
+    }
+
+    /// Save a downloaded response body to the downloads directory and show a
+    /// "download complete" page. The file is written under a unique name (never
+    /// overwriting), and the response is not cached or parsed as a page.
+    fn commit_download(&mut self, url: &str, filename: &str, body: &[u8]) {
+        let dir = self.downloads_dir();
+        let outcome = match std::fs::create_dir_all(&dir) {
+            Ok(()) => {
+                let path = unique_download_path(&dir, filename);
+                match std::fs::write(&path, body) {
+                    Ok(()) => Ok(path),
+                    Err(e) => Err(e.to_string()),
+                }
+            }
+            Err(e) => Err(e.to_string()),
+        };
+        self.status = 200;
+        self.toolbar.loading = false;
+        self.current_url = parse_url(url).ok();
+        match outcome {
+            Ok(path) => {
+                self.set_document(download_done_document(filename, body.len(), &path));
+            }
+            Err(e) => {
+                self.set_document(error_document(url, &format!("download failed: {e}")));
+            }
+        }
+        self.update_nav();
+    }
+
     fn show_error(&mut self, url: &str, message: &str) {
         self.status = 0;
         self.set_document(error_document(url, message));
@@ -2167,15 +2208,22 @@ impl BrowserApp {
                     .map(|u| format!("{verb} {}", u.host))
                     .unwrap_or_else(|| verb.to_string());
                 self.timings.record(label, page.elapsed);
-                // A POST response is not cacheable (not idempotent).
-                self.commit_response(
-                    &page.url,
-                    page.status,
-                    &page.headers,
-                    &page.body,
-                    &page.user_agent,
-                    !is_post,
-                )
+                // A response the server marks as a download (Content-Disposition:
+                // attachment, or a non-renderable content type) is saved to disk
+                // instead of being parsed as a page.
+                if let Some(filename) = download_target(&page.headers, &page.url) {
+                    self.commit_download(&page.url, &filename, &page.body);
+                } else {
+                    // A POST response is not cacheable (not idempotent).
+                    self.commit_response(
+                        &page.url,
+                        page.status,
+                        &page.headers,
+                        &page.body,
+                        &page.user_agent,
+                        !is_post,
+                    )
+                }
             }
             Err(err) => match http_fallback {
                 // The https upgrade failed at the connection/cert layer; http may
@@ -2798,18 +2846,30 @@ impl BrowserApp {
         let Some(this) = controls.iter().find(|c| c.id == id) else {
             return;
         };
-        // The enclosing <form> (if any) supplies the action/method; its absence
-        // means the whole document is treated as one big form.
+        // The enclosing <form> (if any) supplies the action/method/enctype; its
+        // absence means the whole document is treated as one big form.
         let form_el = this.form;
-        // The successful controls, serialized as application/x-www-form-urlencoded
-        // — used as the URL query for GET, or the request body for POST.
-        let encoded = build_query(&controls, form_el, &self.forms);
         let action = form_el.and_then(|f| f.attr("action")).unwrap_or("");
         let is_post = form_el
             .and_then(|f| f.attr("method"))
             .is_some_and(|m| m.trim().eq_ignore_ascii_case("post"));
+        // multipart/form-data only applies to POST (HTML ignores enctype for GET).
+        let multipart = is_post
+            && form_el
+                .and_then(|f| f.attr("enctype"))
+                .is_some_and(|e| e.trim().eq_ignore_ascii_case("multipart/form-data"));
+
+        if multipart {
+            // POST a multipart body — the only encoding that carries file uploads.
+            let target = self.resolve_action_base(action);
+            let (content_type, body) = build_multipart(&controls, form_el, &self.forms);
+            self.begin_load(&target, Some(PostBody { content_type, body }));
+            return;
+        }
+        // Otherwise the controls serialize as application/x-www-form-urlencoded —
+        // the URL query for GET, or the request body for POST.
+        let encoded = build_query(&controls, form_el, &self.forms);
         if is_post {
-            // POST: the encoded controls ride in the body, not the URL.
             let target = self.resolve_action_base(action);
             self.begin_load(
                 &target,
@@ -2819,7 +2879,6 @@ impl BrowserApp {
                 }),
             );
         } else {
-            // GET: the encoded controls become the URL's query string.
             let target = self.resolve_action(action, &encoded);
             self.navigate(&target);
         }
@@ -3747,6 +3806,110 @@ fn is_dns_failure(err: &str) -> bool {
     err.starts_with("Dns(")
 }
 
+/// Decide whether a response is a download (and its filename) rather than a page
+/// to render. A download is signalled by `Content-Disposition: attachment`, or by
+/// a content type we don't render (anything that isn't HTML/XML/plain text). The
+/// filename comes from the `Content-Disposition` `filename=`, else the URL's last
+/// path segment, else a generic name.
+fn download_target(headers: &[(String, String)], url: &str) -> Option<String> {
+    let header = |name: &str| {
+        headers
+            .iter()
+            .find(|(k, _)| k.eq_ignore_ascii_case(name))
+            .map(|(_, v)| v.as_str())
+    };
+    let disposition = header("content-disposition").unwrap_or("");
+    let is_attachment = disposition.to_ascii_lowercase().contains("attachment");
+
+    let content_type = header("content-type").unwrap_or("");
+    let mime = content_type
+        .split(';')
+        .next()
+        .unwrap_or("")
+        .trim()
+        .to_ascii_lowercase();
+    // We render HTML/XHTML/XML and plain text; everything else (zip, pdf, octet-
+    // stream, …) is a download. An empty/absent type defaults to renderable so a
+    // misconfigured page isn't force-downloaded.
+    let renderable = mime.is_empty()
+        || mime == "text/html"
+        || mime == "application/xhtml+xml"
+        || mime == "text/plain"
+        || mime == "text/xml"
+        || mime == "application/xml";
+    if !is_attachment && renderable {
+        return None;
+    }
+
+    let from_disposition = disposition
+        .split(';')
+        .filter_map(|p| p.trim().strip_prefix("filename="))
+        .map(|v| v.trim().trim_matches('"').to_string())
+        .find(|v| !v.is_empty());
+    let from_url = parse_url(url)
+        .ok()
+        .and_then(|u| u.path.rsplit('/').next().map(str::to_string))
+        .filter(|s| !s.is_empty());
+    Some(sanitize_filename(
+        &from_disposition
+            .or(from_url)
+            .unwrap_or_else(|| "download".to_string()),
+    ))
+}
+
+/// Strip any directory components and parent refs from a filename so a server
+/// can't write outside the downloads directory.
+fn sanitize_filename(name: &str) -> String {
+    let base = name.rsplit(['/', '\\']).next().unwrap_or(name).trim();
+    let cleaned: String = base
+        .chars()
+        .filter(|c| !c.is_control() && *c != '/' && *c != '\\')
+        .collect();
+    let cleaned = cleaned.trim_matches('.').trim();
+    if cleaned.is_empty() {
+        "download".to_string()
+    } else {
+        cleaned.to_string()
+    }
+}
+
+/// A path in `dir` for `filename` that doesn't exist yet: `name`, then
+/// `name (1)`, `name (2)`, … so a download never overwrites an existing file.
+fn unique_download_path(dir: &Path, filename: &str) -> PathBuf {
+    let first = dir.join(filename);
+    if !first.exists() {
+        return first;
+    }
+    let (stem, ext) = match filename.rsplit_once('.') {
+        Some((s, e)) if !s.is_empty() => (s.to_string(), format!(".{e}")),
+        _ => (filename.to_string(), String::new()),
+    };
+    for n in 1.. {
+        let candidate = dir.join(format!("{stem} ({n}){ext}"));
+        if !candidate.exists() {
+            return candidate;
+        }
+    }
+    first
+}
+
+/// The "download complete" page shown after a file is saved.
+fn download_done_document(filename: &str, size: usize, path: &Path) -> Document {
+    let mut b = DocumentBuilder::new();
+    let mut kids = Vec::new();
+    for (tag, text) in [
+        ("h1", "Download complete".to_string()),
+        ("p", format!("Saved {filename} ({} bytes)", size)),
+        ("p", format!("to {}", path.display())),
+    ] {
+        let t = b.text(text);
+        kids.push(b.element(tag, [t]));
+    }
+    let body = b.element("body", kids);
+    let root = b.element("#root", [body]);
+    b.finish(root)
+}
+
 fn error_document(url: &str, message: &str) -> Document {
     let mut b = DocumentBuilder::new();
     let mut kids = Vec::new();
@@ -3953,6 +4116,134 @@ fn build_query(
         }
     }
     pairs.join("&")
+}
+
+/// Whether a control is a file input (`<input type=file>`).
+fn is_file_input(el: NodeRef<'_>) -> bool {
+    el.tag() == "input"
+        && el
+            .attr("type")
+            .is_some_and(|t| t.trim().eq_ignore_ascii_case("file"))
+}
+
+/// Build a `multipart/form-data` body for the form's successful controls,
+/// returning `(content_type_with_boundary, body)`. Text controls become text
+/// parts; a file input's value is read as a **filesystem path** (typed into the
+/// field, or set programmatically by the mirror driver) and sent as a file part.
+/// Filling-only: no file is read unless the user/automation supplied its path.
+fn build_multipart(
+    controls: &[ControlRef<'_>],
+    form: Option<NodeRef<'_>>,
+    store: &FormStore,
+) -> (String, Vec<u8>) {
+    // A unique boundary that won't collide with the data.
+    let boundary = format!(
+        "----CerberusFormBoundary{}",
+        random_bytes(12)
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect::<String>()
+    );
+    let mut body = Vec::new();
+    for c in controls.iter().filter(|c| same_form(c.form, form)) {
+        let Some(name) = c.el.attr("name").filter(|n| !n.is_empty()) else {
+            continue;
+        };
+        if is_file_input(c.el) {
+            // The field value is a path; an empty path sends an empty file part
+            // (matches browsers, which still send the part with a blank filename).
+            let path = store
+                .value(c.id)
+                .map(str::to_string)
+                .unwrap_or_else(|| c.el.attr("value").unwrap_or("").to_string());
+            let (filename, ctype, bytes) = if path.is_empty() {
+                (String::new(), "application/octet-stream", Vec::new())
+            } else {
+                let filename = path.rsplit(['/', '\\']).next().unwrap_or(&path).to_string();
+                // An unreadable path still sends the part (empty) so the server
+                // sees the field — the upload just carries no bytes.
+                match std::fs::read(&path) {
+                    Ok(bytes) => (
+                        filename.clone(),
+                        guess_upload_content_type(&filename),
+                        bytes,
+                    ),
+                    Err(_) => (filename, "application/octet-stream", Vec::new()),
+                }
+            };
+            write_file_part(&mut body, &boundary, name, &filename, ctype, &bytes);
+        } else {
+            for value in control_values(c, store) {
+                write_text_part(&mut body, &boundary, name, &value);
+            }
+        }
+    }
+    body.extend_from_slice(format!("--{boundary}--\r\n").as_bytes());
+    (format!("multipart/form-data; boundary={boundary}"), body)
+}
+
+/// Write one text part to a multipart `body`.
+fn write_text_part(body: &mut Vec<u8>, boundary: &str, name: &str, value: &str) {
+    body.extend_from_slice(format!("--{boundary}\r\n").as_bytes());
+    body.extend_from_slice(
+        format!(
+            "Content-Disposition: form-data; name=\"{}\"\r\n\r\n",
+            escape_quotes(name)
+        )
+        .as_bytes(),
+    );
+    body.extend_from_slice(value.as_bytes());
+    body.extend_from_slice(b"\r\n");
+}
+
+/// Write one file part (with a filename + content type) to a multipart `body`.
+fn write_file_part(
+    body: &mut Vec<u8>,
+    boundary: &str,
+    name: &str,
+    filename: &str,
+    content_type: &str,
+    bytes: &[u8],
+) {
+    body.extend_from_slice(format!("--{boundary}\r\n").as_bytes());
+    body.extend_from_slice(
+        format!(
+            "Content-Disposition: form-data; name=\"{}\"; filename=\"{}\"\r\n",
+            escape_quotes(name),
+            escape_quotes(filename)
+        )
+        .as_bytes(),
+    );
+    body.extend_from_slice(format!("Content-Type: {content_type}\r\n\r\n").as_bytes());
+    body.extend_from_slice(bytes);
+    body.extend_from_slice(b"\r\n");
+}
+
+/// Escape `"` and CR/LF in a multipart header parameter (name/filename).
+fn escape_quotes(s: &str) -> String {
+    s.replace('"', "%22").replace(['\r', '\n'], "")
+}
+
+/// Guess an upload part's `Content-Type` from a filename extension (a small,
+/// common set; anything else is the generic binary type).
+fn guess_upload_content_type(filename: &str) -> &'static str {
+    let ext = filename
+        .rsplit_once('.')
+        .map(|(_, e)| e.to_ascii_lowercase())
+        .unwrap_or_default();
+    match ext.as_str() {
+        "txt" | "csv" | "text" => "text/plain",
+        "html" | "htm" => "text/html",
+        "json" => "application/json",
+        "pdf" => "application/pdf",
+        "png" => "image/png",
+        "jpg" | "jpeg" => "image/jpeg",
+        "gif" => "image/gif",
+        "webp" => "image/webp",
+        "svg" => "image/svg+xml",
+        "zip" => "application/zip",
+        _ => "application/octet-stream",
+    }
 }
 
 /// The submitted value(s) of one control (empty if it is not successful, e.g. an
@@ -5693,6 +5984,111 @@ mod tests {
         // The POST response renders (and is not cached).
         assert!(b.poll(), "post response drained");
         assert_eq!(b.status, 200);
+    }
+
+    #[test]
+    fn multipart_builds_text_and_file_parts() {
+        let dir = std::env::temp_dir().join(format!("cerb-upload-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("hello.txt");
+        std::fs::write(&file, b"FILE-CONTENTS").unwrap();
+
+        let doc = parse_html(
+            "<form method=\"post\" enctype=\"multipart/form-data\">\
+             <input name=\"note\" value=\"hi\"><input type=\"file\" name=\"upload\"></form>",
+        );
+        let controls = collect_controls(doc.root());
+        let form = controls[0].form;
+        let mut store = FormStore::default();
+        let file_id = controls.iter().find(|c| is_file_input(c.el)).unwrap().id;
+        store
+            .values
+            .insert(file_id, file.to_string_lossy().to_string());
+
+        let (ctype, body) = build_multipart(&controls, form, &store);
+        assert!(ctype.starts_with("multipart/form-data; boundary=----CerberusFormBoundary"));
+        let text = String::from_utf8_lossy(&body);
+        assert!(text.contains("name=\"note\""), "text part header");
+        assert!(text.contains("\r\n\r\nhi\r\n"), "text part value");
+        assert!(
+            text.contains("name=\"upload\"; filename=\"hello.txt\""),
+            "file part header"
+        );
+        assert!(text.contains("Content-Type: text/plain"), "guessed type");
+        assert!(text.contains("FILE-CONTENTS"), "file bytes inlined");
+        assert!(text.trim_end().ends_with("--"), "closing boundary");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn download_target_detects_attachments_and_binary_types() {
+        // Content-Disposition: attachment → download, filename from the header.
+        let h = vec![(
+            "Content-Disposition".to_string(),
+            "attachment; filename=\"report.csv\"".to_string(),
+        )];
+        assert_eq!(
+            download_target(&h, "https://x.test/gen"),
+            Some("report.csv".to_string())
+        );
+        // A non-renderable content type → download, filename from the URL.
+        let h = vec![("content-type".to_string(), "application/zip".to_string())];
+        assert_eq!(
+            download_target(&h, "https://x.test/files/pack.zip"),
+            Some("pack.zip".to_string())
+        );
+        // HTML / plain text render (not downloads).
+        let h = vec![(
+            "content-type".to_string(),
+            "text/html; charset=utf-8".to_string(),
+        )];
+        assert_eq!(download_target(&h, "https://x.test/"), None);
+        // Path traversal in the filename is stripped.
+        let h = vec![(
+            "Content-Disposition".to_string(),
+            "attachment; filename=\"../../etc/passwd\"".to_string(),
+        )];
+        assert_eq!(
+            download_target(&h, "https://x.test/x"),
+            Some("passwd".to_string())
+        );
+    }
+
+    #[test]
+    fn attachment_response_is_saved_to_the_downloads_dir() {
+        let dir = std::env::temp_dir().join(format!("cerb-dl-{}", std::process::id()));
+        std::fs::remove_dir_all(&dir).ok();
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let url = "https://files.test/export";
+        let body = b"id,amount\n1,42\n".to_vec();
+        let resp = FetchedPage {
+            url: url.to_string(),
+            status: 200,
+            headers: vec![(
+                "Content-Disposition".to_string(),
+                "attachment; filename=\"claims.csv\"".to_string(),
+            )],
+            body: body.clone(),
+            user_agent: DEFAULT_USER_AGENT.to_string(),
+            elapsed: Duration::from_millis(3),
+        };
+        let loader = FakeLoader::new(vec![(url, Ok(resp))]);
+        let mut app = BrowserApp::build(
+            Box::new(loader),
+            Arc::new(Mutex::new(StorageEnvironment::with_no_vault())),
+            default_heads(),
+            Some(dir.clone()),
+        );
+        app.navigate(url);
+        assert!(app.poll(), "download drained");
+
+        // The file was saved, and the page reports the download (not the bytes).
+        let saved = dir.join("downloads").join("claims.csv");
+        assert!(saved.exists(), "file written to downloads dir");
+        assert_eq!(std::fs::read(&saved).unwrap(), body);
+        assert!(app.page_text().contains("Download complete"));
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]
