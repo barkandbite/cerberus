@@ -11,15 +11,26 @@
 //! the `Action::Fill` wiring live in the app and mirror layers.
 
 use cerberus_dom::{Document, NodeId, NodeRef};
+use zeroize::ZeroizeOnDrop;
 
 mod csv;
 pub use csv::{csv_template, profiles_from_csv, profiles_to_csv, CSV_HEADERS};
 
-/// Login credentials.
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
+/// Login credentials. The password is wiped from memory on drop (issue #17) and
+/// redacted in `Debug`.
+#[derive(Clone, Default, PartialEq, Eq, ZeroizeOnDrop)]
 pub struct Login {
     pub username: String,
     pub password: String,
+}
+
+impl std::fmt::Debug for Login {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Login")
+            .field("username", &self.username)
+            .field("password", &"<redacted>")
+            .finish()
+    }
 }
 
 /// A postal/contact address.
@@ -37,8 +48,9 @@ pub struct Address {
 }
 
 /// A payment card. CVV is stored per the owner's explicit choice (vault-sealed
-/// at rest in the app layer).
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
+/// at rest in the app layer). The number and CVV are wiped from memory on drop
+/// (issue #17) and redacted in `Debug`.
+#[derive(Clone, Default, PartialEq, Eq, ZeroizeOnDrop)]
 pub struct Card {
     pub holder: String,
     pub number: String,
@@ -47,19 +59,36 @@ pub struct Card {
     pub cvv: String,
 }
 
-/// One identity's autofill data: login + address + card.
+impl std::fmt::Debug for Card {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Card")
+            .field("holder", &self.holder)
+            .field("number", &"<redacted>")
+            .field("exp_month", &self.exp_month)
+            .field("exp_year", &self.exp_year)
+            .field("cvv", &"<redacted>")
+            .finish()
+    }
+}
+
+/// One identity's autofill data: login + address + card, bound to the site its
+/// secrets belong to.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Profile {
     pub login: Login,
     pub address: Address,
     pub card: Card,
+    /// The host this profile's **secrets** (password, card) are bound to (issue
+    /// #12). Autofill refuses to put a secret into a page on any other host.
+    /// Empty = unbound: secrets are never autofilled (fail closed).
+    pub origin: String,
 }
 
 impl Profile {
     /// Serialize to a versioned, length-prefixed byte blob (no serde) for
-    /// vault-sealed storage in the app layer.
+    /// vault-sealed storage in the app layer. Version 2 appends `origin`.
     pub fn to_bytes(&self) -> Vec<u8> {
-        let mut out = vec![1u8]; // format version
+        let mut out = vec![2u8]; // format version
         for field in [
             &self.login.username,
             &self.login.password,
@@ -77,6 +106,7 @@ impl Profile {
             &self.card.exp_month,
             &self.card.exp_year,
             &self.card.cvv,
+            &self.origin,
         ] {
             put_str(&mut out, field);
         }
@@ -84,14 +114,18 @@ impl Profile {
     }
 
     /// Parse a blob produced by [`to_bytes`](Profile::to_bytes); `None` if it is
-    /// malformed or a future version.
+    /// malformed or a future version. Version 1 blobs (no `origin`) load with an
+    /// empty origin.
     pub fn from_bytes(bytes: &[u8]) -> Option<Profile> {
         let mut p = bytes;
-        if get_u8(&mut p)? != 1 {
+        let version = get_u8(&mut p)?;
+        if version != 1 && version != 2 {
             return None;
         }
-        let mut fields = Vec::with_capacity(16);
-        for _ in 0..16 {
+        // v1 has 16 fields; v2 appends `origin` (17).
+        let count = if version == 1 { 16 } else { 17 };
+        let mut fields = Vec::with_capacity(count);
+        for _ in 0..count {
             fields.push(get_str(&mut p)?);
         }
         let mut it = fields.into_iter();
@@ -119,8 +153,28 @@ impl Profile {
                 exp_year: next(),
                 cvv: next(),
             },
+            origin: next(), // empty for v1
         })
     }
+
+    /// Whether this profile's secrets may be autofilled into a page on `host`.
+    /// True only when the profile is bound (`origin` non-empty) and `host` equals
+    /// or is a subdomain of that origin (a dot-boundary suffix match).
+    pub fn secrets_allowed_on(&self, host: &str) -> bool {
+        host_matches(host, &self.origin)
+    }
+}
+
+/// Whether request `host` is covered by a `bound` host: equal, or a subdomain on
+/// a dot boundary (so `example.gov` covers `login.example.gov` but not
+/// `notexample.gov`). An empty `bound` matches nothing (fail closed).
+fn host_matches(host: &str, bound: &str) -> bool {
+    let host = host.trim().trim_end_matches('.').to_ascii_lowercase();
+    let bound = bound.trim().trim_end_matches('.').to_ascii_lowercase();
+    if bound.is_empty() || host.is_empty() {
+        return false;
+    }
+    host == bound || host.ends_with(&format!(".{bound}"))
 }
 
 fn put_str(out: &mut Vec<u8>, s: &str) {
@@ -196,8 +250,29 @@ impl FieldKind {
     }
 }
 
-/// The fill value for a detected field, or `None` to skip it.
-pub fn value_for(kind: FieldKind, profile: &Profile) -> Option<String> {
+/// Whether a field carries an origin-bound secret (password or card data) that
+/// must only be filled on the profile's bound site (issue #12).
+fn is_secret_field(kind: FieldKind) -> bool {
+    matches!(
+        kind,
+        FieldKind::Password
+            | FieldKind::CardNumber
+            | FieldKind::CardExp
+            | FieldKind::CardExpMonth
+            | FieldKind::CardExpYear
+            | FieldKind::CardCvv
+            | FieldKind::CardHolder
+    )
+}
+
+/// The fill value for a detected field, or `None` to skip it. `page_host` is the
+/// host of the page being filled: a **secret** field (password/card) is only
+/// filled when the profile's `origin` covers `page_host` (issue #12); non-secret
+/// fields (name/address/email/phone/username) fill regardless.
+pub fn value_for(kind: FieldKind, profile: &Profile, page_host: &str) -> Option<String> {
+    if is_secret_field(kind) && !profile.secrets_allowed_on(page_host) {
+        return None;
+    }
     let a = &profile.address;
     let c = &profile.card;
     let v = match kind {
@@ -335,25 +410,37 @@ fn from_hints(h: &str) -> Option<FieldKind> {
 }
 
 /// Detect the fillable fields in `doc` and return the `(NodeId, value)` pairs to
-/// set for `kind` from `profile`. Empty values and out-of-category fields are
-/// skipped; submit is never included (fill-only).
-pub fn fill_plan(doc: &Document, profile: &Profile, kind: FillKind) -> Vec<(NodeId, String)> {
+/// set for `kind` from `profile`, for a page on `page_host`. Empty values and
+/// out-of-category fields are skipped; submit is never included (fill-only); and
+/// secret fields are skipped unless `profile.origin` covers `page_host` (#12).
+pub fn fill_plan(
+    doc: &Document,
+    profile: &Profile,
+    kind: FillKind,
+    page_host: &str,
+) -> Vec<(NodeId, String)> {
     let mut plan = Vec::new();
-    collect(doc.root(), profile, kind, &mut plan);
+    collect(doc.root(), profile, kind, page_host, &mut plan);
     plan
 }
 
-fn collect(node: NodeRef<'_>, profile: &Profile, kind: FillKind, out: &mut Vec<(NodeId, String)>) {
+fn collect(
+    node: NodeRef<'_>,
+    profile: &Profile,
+    kind: FillKind,
+    page_host: &str,
+    out: &mut Vec<(NodeId, String)>,
+) {
     if let Some(fk) = classify(node) {
         let in_scope = kind == FillKind::All || fk.category() == kind;
         if in_scope {
-            if let Some(value) = value_for(fk, profile) {
+            if let Some(value) = value_for(fk, profile, page_host) {
                 out.push((node.id(), value));
             }
         }
     }
     for child in node.children() {
-        collect(child, profile, kind, out);
+        collect(child, profile, kind, page_host, out);
     }
 }
 
@@ -361,6 +448,29 @@ fn collect(node: NodeRef<'_>, profile: &Profile, kind: FillKind, out: &mut Vec<(
 mod tests {
     use super::*;
     use cerberus_dom::parse_html;
+
+    #[test]
+    fn debug_redacts_password_and_card_secrets() {
+        let login = Login {
+            username: "ada".into(),
+            password: "s3cret".into(),
+        };
+        let dbg = format!("{login:?}");
+        assert!(dbg.contains("ada"));
+        assert!(!dbg.contains("s3cret"), "password must not appear in Debug");
+
+        let card = Card {
+            holder: "Ada".into(),
+            number: "4111111111111111".into(),
+            exp_month: String::new(),
+            exp_year: String::new(),
+            cvv: "123".into(),
+        };
+        let dbg = format!("{card:?}");
+        assert!(dbg.contains("Ada"), "non-secret holder still shown");
+        assert!(!dbg.contains("4111111111111111"), "PAN must not appear");
+        assert!(!dbg.contains("123"), "CVV must not appear");
+    }
 
     fn profile() -> Profile {
         Profile {
@@ -383,6 +493,7 @@ mod tests {
                 exp_year: "2030".into(),
                 cvv: "123".into(),
             },
+            origin: "x.test".into(),
         }
     }
 
@@ -418,7 +529,7 @@ mod tests {
             <input id=\"go\" type=\"submit\">\
             </form>";
         let doc = parse_html(html);
-        let plan = fill_plan(&doc, &profile(), FillKind::All);
+        let plan = fill_plan(&doc, &profile(), FillKind::All, "x.test");
         assert_eq!(value_at(&plan, &doc, "u").as_deref(), Some("ada"));
         assert_eq!(value_at(&plan, &doc, "p").as_deref(), Some("s3cret"));
         assert_eq!(value_at(&plan, &doc, "e").as_deref(), Some("ada@x.test"));
@@ -435,13 +546,13 @@ mod tests {
     fn fill_kind_scopes_the_plan() {
         let html = "<input id=\"u\" name=\"username\"><input id=\"cc\" autocomplete=\"cc-number\">";
         let doc = parse_html(html);
-        let login = fill_plan(&doc, &profile(), FillKind::Login);
+        let login = fill_plan(&doc, &profile(), FillKind::Login, "x.test");
         assert!(value_at(&login, &doc, "u").is_some());
         assert!(
             value_at(&login, &doc, "cc").is_none(),
             "login fill skips the card"
         );
-        let pay = fill_plan(&doc, &profile(), FillKind::Payment);
+        let pay = fill_plan(&doc, &profile(), FillKind::Payment, "x.test");
         assert!(value_at(&pay, &doc, "u").is_none());
         assert!(value_at(&pay, &doc, "cc").is_some());
     }
@@ -450,9 +561,43 @@ mod tests {
     fn card_exp_is_composed_and_empty_values_skip() {
         let html = "<input id=\"x\" autocomplete=\"cc-exp\"><input id=\"l2\" autocomplete=\"address-line2\">";
         let doc = parse_html(html);
-        let plan = fill_plan(&doc, &profile(), FillKind::All);
+        let plan = fill_plan(&doc, &profile(), FillKind::All, "x.test");
         assert_eq!(value_at(&plan, &doc, "x").as_deref(), Some("04/30"));
         // address line2 is empty in the profile -> not in the plan.
         assert_eq!(value_at(&plan, &doc, "l2"), None);
+    }
+
+    #[test]
+    fn secrets_are_withheld_on_a_non_matching_origin() {
+        let html = "<form>\
+            <input id=\"u\" name=\"user\">\
+            <input id=\"p\" type=\"password\">\
+            <input id=\"e\" type=\"email\">\
+            <input id=\"cc\" autocomplete=\"cc-number\">\
+            <input id=\"name\" autocomplete=\"name\">\
+            </form>";
+        let doc = parse_html(html);
+        // The profile is bound to x.test; a fill on evil.test must NOT leak the
+        // password or card, but non-secret fields still fill (issue #12).
+        let plan = fill_plan(&doc, &profile(), FillKind::All, "evil.test");
+        assert_eq!(value_at(&plan, &doc, "p"), None, "password withheld");
+        assert_eq!(value_at(&plan, &doc, "cc"), None, "card withheld");
+        assert_eq!(value_at(&plan, &doc, "u").as_deref(), Some("ada"));
+        assert_eq!(value_at(&plan, &doc, "e").as_deref(), Some("ada@x.test"));
+
+        // A subdomain of the bound origin IS covered.
+        let sub = fill_plan(&doc, &profile(), FillKind::All, "login.x.test");
+        assert_eq!(value_at(&sub, &doc, "p").as_deref(), Some("s3cret"));
+
+        // An unbound profile (empty origin) never fills secrets, even same-host.
+        let mut unbound = profile();
+        unbound.origin = String::new();
+        let plan = fill_plan(&doc, &unbound, FillKind::All, "x.test");
+        assert_eq!(
+            value_at(&plan, &doc, "p"),
+            None,
+            "unbound withholds secrets"
+        );
+        assert_eq!(value_at(&plan, &doc, "u").as_deref(), Some("ada"));
     }
 }

@@ -547,6 +547,8 @@ fn apply_profile_fields(p: &mut cerberus_autofill::Profile, spec: &str) -> Resul
             "card.exp_month" => p.card.exp_month = v,
             "card.exp_year" => p.card.exp_year = v,
             "card.cvv" => p.card.cvv = v,
+            // The host this profile's secrets are bound to (issue #12).
+            "origin" => p.origin = v,
             other => return Err(format!("unknown field {other:?}")),
         }
     }
@@ -586,6 +588,14 @@ fn profile_lines(identity: usize, label: &str, p: &cerberus_autofill::Profile) -
             p.card.exp_month, p.card.exp_year
         ),
         format!("  card.cvv         : {}", redact(&p.card.cvv)),
+        format!(
+            "  origin           : {}",
+            if p.origin.is_empty() {
+                "(unbound — secrets won't autofill)"
+            } else {
+                &p.origin
+            }
+        ),
     ]
 }
 
@@ -3126,7 +3136,7 @@ impl BrowserApp {
                     .ok()
                     .flatten()
                     .and_then(|b| cerberus_autofill::Profile::from_bytes(&b))
-                    .map(|p| p.login.username)
+                    .map(|p| p.login.username.clone())
                     .filter(|u| !u.is_empty());
                 let account = username.unwrap_or_else(|| {
                     let b = instance.0.as_bytes();

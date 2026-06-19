@@ -8,8 +8,12 @@
 
 use std::io::{self, Read, Write};
 use std::path::Path;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 const MAGIC: &[u8; 4] = b"CERB";
+
+/// Per-process counter making each temp file name unique (issue #15).
+static TMP_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 /// File kinds (the `u16` after the version).
 pub(crate) const KIND_COOKIES: u16 = 1;
@@ -17,18 +21,45 @@ pub(crate) const KIND_VAULT: u16 = 2;
 
 pub(crate) const FORMAT_VERSION: u16 = 1;
 
-/// Write `bytes` to `path` atomically: tmp sibling → fsync → rename.
+/// Write `bytes` to `path` atomically and privately: a **unique** tmp sibling →
+/// fsync → rename. The tmp name carries the pid + a process-local counter so
+/// concurrent writers to the same dir never race on a shared `.tmp` (issue #15),
+/// and the file is created `0600` on Unix so data at rest isn't world-readable
+/// (issue #8). A failed write removes the tmp instead of leaving it behind.
 pub fn atomic_write(path: &Path, bytes: &[u8]) -> io::Result<()> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
     }
-    let tmp = path.with_extension("tmp");
-    {
-        let mut f = std::fs::File::create(&tmp)?;
+    let n = TMP_COUNTER.fetch_add(1, Ordering::Relaxed);
+    let tmp = path.with_extension(format!("tmp.{}.{n}", std::process::id()));
+    let result = (|| {
+        let mut f = create_private(&tmp)?;
         f.write_all(bytes)?;
         f.sync_all()?;
+        std::fs::rename(&tmp, path)
+    })();
+    if result.is_err() {
+        let _ = std::fs::remove_file(&tmp);
     }
-    std::fs::rename(&tmp, path)
+    result
+}
+
+/// Create (truncating) a file readable/writable only by the owner.
+#[cfg(unix)]
+fn create_private(path: &Path) -> io::Result<std::fs::File> {
+    use std::os::unix::fs::OpenOptionsExt;
+    std::fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .mode(0o600)
+        .open(path)
+}
+
+/// Non-Unix: create normally (Windows ACL hardening is a tracked follow-up).
+#[cfg(not(unix))]
+fn create_private(path: &Path) -> io::Result<std::fs::File> {
+    std::fs::File::create(path)
 }
 
 /// Serializes records into an in-memory buffer (then [`atomic_write`] it).
@@ -174,7 +205,24 @@ mod tests {
         atomic_write(&path, b"one").unwrap();
         atomic_write(&path, b"two").unwrap();
         assert_eq!(std::fs::read(&path).unwrap(), b"two");
-        assert!(!path.with_extension("tmp").exists());
+        // No tmp sibling lingers (unique-named tmps are renamed away).
+        let leftover_tmp = std::fs::read_dir(&dir)
+            .unwrap()
+            .filter_map(Result::ok)
+            .any(|e| e.file_name().to_string_lossy().contains(".tmp"));
+        assert!(!leftover_tmp, "no .tmp file should remain");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn atomic_write_creates_owner_only_files() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = std::env::temp_dir().join(format!("cerb-perm-test-{}", std::process::id()));
+        let path = dir.join("secret.bin");
+        atomic_write(&path, b"private").unwrap();
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600, "data at rest must be owner-only, got {mode:o}");
         std::fs::remove_dir_all(&dir).ok();
     }
 }

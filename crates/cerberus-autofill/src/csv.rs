@@ -14,9 +14,10 @@
 
 use crate::{Address, Card, Login, Profile};
 
-/// The CSV columns, in order: the identity label, then the 16 profile fields in
-/// [`Profile::to_bytes`] order. The field names match the `profile --set` keys.
-pub const CSV_HEADERS: [&str; 17] = [
+/// The CSV columns: the identity label, the 16 profile fields in
+/// [`Profile::to_bytes`] order (names match the `profile --set` keys), then the
+/// secret-binding `origin` host (issue #12).
+pub const CSV_HEADERS: [&str; 18] = [
     "identity",
     "login.username",
     "login.password",
@@ -34,13 +35,14 @@ pub const CSV_HEADERS: [&str; 17] = [
     "card.exp_month",
     "card.exp_year",
     "card.cvv",
+    "origin",
 ];
 
 /// Delimiters auto-detection considers, best-first. `:` is the owner's default.
 const CANDIDATE_DELIMS: [char; 5] = [':', ',', ';', '\t', '|'];
 
-/// The 17 cells of a row, in [`CSV_HEADERS`] order.
-fn row_cells(label: &str, p: &Profile) -> [String; 17] {
+/// The 18 cells of a row, in [`CSV_HEADERS`] order.
+fn row_cells(label: &str, p: &Profile) -> [String; 18] {
     [
         label.to_string(),
         p.login.username.clone(),
@@ -59,6 +61,7 @@ fn row_cells(label: &str, p: &Profile) -> [String; 17] {
         p.card.exp_month.clone(),
         p.card.exp_year.clone(),
         p.card.cvv.clone(),
+        p.origin.clone(),
     ]
 }
 
@@ -95,6 +98,7 @@ pub fn csv_template(delim: char) -> String {
                     ..Address::default()
                 },
                 card: Card::default(),
+                origin: "example.com".to_string(),
             },
         )
     };
@@ -170,6 +174,7 @@ pub fn profiles_from_csv(text: &str) -> Result<Vec<(String, Profile)>, String> {
                     exp_year: next(),
                     cvv: next(),
                 },
+                origin: next(),
             },
         ));
     }
@@ -290,6 +295,7 @@ mod tests {
                         ..Address::default()
                     },
                     card: Card::default(),
+                    origin: "example.com".into(),
                 },
             ),
             (

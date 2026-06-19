@@ -282,6 +282,7 @@ impl FillProvider for PerProfileFill {
         instance: InstanceId,
         _kind: FillKind,
         doc: &Document,
+        _page_host: &str,
     ) -> Vec<(NodeId, String)> {
         fn find(n: NodeRef<'_>, id: &str) -> Option<NodeId> {
             if n.attr("id") == Some(id) {

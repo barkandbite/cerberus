@@ -116,9 +116,15 @@ impl ProfileFillProvider {
 }
 
 impl FillProvider for ProfileFillProvider {
-    fn fills(&self, instance: InstanceId, kind: FillKind, doc: &Document) -> Vec<(NodeId, String)> {
+    fn fills(
+        &self,
+        instance: InstanceId,
+        kind: FillKind,
+        doc: &Document,
+        page_host: &str,
+    ) -> Vec<(NodeId, String)> {
         match self.profiles.get(&instance) {
-            Some(profile) => fill_plan(doc, profile, kind),
+            Some(profile) => fill_plan(doc, profile, kind, page_host),
             None => Vec::new(),
         }
     }
@@ -404,8 +410,16 @@ mod tests {
         );
         let provider = ProfileFillProvider::new(profiles);
         let doc = parse_html("<input id=\"u\" name=\"username\">");
-        assert_eq!(provider.fills(inst, FillKind::Login, &doc).len(), 1);
-        assert!(provider.fills(other, FillKind::All, &doc).is_empty());
+        // Username is not a secret, so it fills regardless of origin binding.
+        assert_eq!(
+            provider
+                .fills(inst, FillKind::Login, &doc, "any.test")
+                .len(),
+            1
+        );
+        assert!(provider
+            .fills(other, FillKind::All, &doc, "any.test")
+            .is_empty());
     }
 
     #[test]

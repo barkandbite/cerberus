@@ -13,3 +13,6 @@ workspace = true
 
 [dependencies]
 cerberus-dom = { path = "../cerberus-dom" }
+# Wipe decrypted login/card secrets from memory on drop (ADR-0033, issue #17).
+# Audited, already in the tree via cerberus-crypto.
+zeroize = { version = "1", features = ["derive"] }

@@ -33,8 +33,16 @@ use crate::MirrorError;
 /// so a single master [`Action::Fill`] fills every window with its **own**
 /// credentials.
 pub trait FillProvider {
-    /// The `(NodeId, value)` pairs to set for `kind` in `instance`'s `doc`.
-    fn fills(&self, instance: InstanceId, kind: FillKind, doc: &Document) -> Vec<(NodeId, String)>;
+    /// The `(NodeId, value)` pairs to set for `kind` in `instance`'s `doc`, for a
+    /// page on `page_host`. Secret fields (password/card) must only be returned
+    /// when the identity's profile is bound to `page_host` (issue #12).
+    fn fills(
+        &self,
+        instance: InstanceId,
+        kind: FillKind,
+        doc: &Document,
+        page_host: &str,
+    ) -> Vec<(NodeId, String)>;
 }
 
 /// A set of mirrored windows of one site driven from a single master.
@@ -389,8 +397,9 @@ impl MirrorGroup {
                 return Ok(());
             };
             let inst = &self.instances[idx];
+            let host = inst.url.as_deref().map(host_of).unwrap_or("");
             provider
-                .fills(inst.id, kind, &inst.doc)
+                .fills(inst.id, kind, &inst.doc, host)
                 .into_iter()
                 .filter_map(|(node, value)| inst.node_to_js.get(&node).map(|&js| (js, value)))
                 .collect()
@@ -431,4 +440,17 @@ impl MirrorGroup {
             user_agent: self.user_agent.clone(),
         }
     }
+}
+
+/// The host of a URL string (`scheme://[userinfo@]host[:port]/…`), for binding
+/// autofill secrets to an origin (issue #12). Userinfo is stripped so a crafted
+/// `https://trusted@evil.test/` resolves to the real host (`evil.test`).
+fn host_of(url: &str) -> &str {
+    let after_scheme = url.split_once("://").map(|(_, r)| r).unwrap_or(url);
+    let authority = after_scheme
+        .split(['/', '?', '#'])
+        .next()
+        .unwrap_or(after_scheme);
+    let host_port = authority.rsplit('@').next().unwrap_or(authority);
+    host_port.split(':').next().unwrap_or(host_port)
 }
