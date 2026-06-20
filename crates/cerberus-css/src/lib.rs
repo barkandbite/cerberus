@@ -13,8 +13,8 @@ pub use color::parse_color;
 
 use cerberus_dom::{Document, NodeRef};
 use cerberus_style::{
-    AlignItems, ComputedStyle, Display, FlexDirection, JustifyContent, Len, Position, StyleEngine,
-    StyledChild, StyledDom, StyledNode, TextAlign, Track, Visibility,
+    AlignItems, AlignSelf, ComputedStyle, Display, FlexBasis, FlexDirection, JustifyContent, Len,
+    Position, StyleEngine, StyledChild, StyledDom, StyledNode, TextAlign, Track, Visibility,
 };
 use cerberus_types::Color;
 use parser::{
@@ -167,7 +167,7 @@ impl CssEngine {
                         author,
                     );
                     elem_index += 1;
-                    StyledChild::Element(styled)
+                    StyledChild::Element(Box::new(styled))
                 }
             })
             .collect();
@@ -678,10 +678,12 @@ fn apply_declarations(
                 }
             }
             "flex-direction" => {
-                style.flex_direction = match v.to_ascii_lowercase().as_str() {
+                let low = v.to_ascii_lowercase();
+                style.flex_direction = match low.as_str() {
                     "column" | "column-reverse" => FlexDirection::Column,
                     _ => FlexDirection::Row,
-                }
+                };
+                style.flex_reverse = low.ends_with("-reverse");
             }
             "flex-wrap" => style.flex_wrap = v.to_ascii_lowercase().starts_with("wrap"),
             "justify-content" => {
@@ -689,7 +691,8 @@ fn apply_declarations(
                     "center" => JustifyContent::Center,
                     "flex-end" | "end" | "right" => JustifyContent::End,
                     "space-between" => JustifyContent::SpaceBetween,
-                    "space-around" | "space-evenly" => JustifyContent::SpaceAround,
+                    "space-around" => JustifyContent::SpaceAround,
+                    "space-evenly" => JustifyContent::SpaceEvenly,
                     _ => JustifyContent::Start,
                 }
             }
@@ -699,6 +702,32 @@ fn apply_declarations(
                     "flex-end" | "end" => AlignItems::End,
                     "flex-start" | "start" => AlignItems::Start,
                     _ => AlignItems::Stretch,
+                }
+            }
+            "align-self" => {
+                style.align_self = match v.to_ascii_lowercase().as_str() {
+                    "center" => AlignSelf::Center,
+                    "flex-end" | "end" => AlignSelf::End,
+                    "flex-start" | "start" => AlignSelf::Start,
+                    "stretch" => AlignSelf::Stretch,
+                    _ => AlignSelf::Auto,
+                }
+            }
+            "flex" => apply_flex_shorthand(style, v, style.font_size as f32),
+            "flex-grow" => {
+                if let Ok(n) = v.trim().parse::<f32>() {
+                    style.flex_grow = n.max(0.0);
+                }
+            }
+            "flex-shrink" => {
+                if let Ok(n) = v.trim().parse::<f32>() {
+                    style.flex_shrink = n.max(0.0);
+                }
+            }
+            "flex-basis" => style.flex_basis = parse_flex_basis(v, style.font_size as f32),
+            "order" => {
+                if let Ok(n) = v.trim().parse::<i32>() {
+                    style.order = n;
                 }
             }
             "gap" | "grid-gap" | "column-gap" | "row-gap" => {
@@ -923,6 +952,77 @@ fn parse_inset(v: &str, em_base: f32) -> Option<Len> {
         "pt" => Len::Px((num * 96.0 / 72.0).round() as i32),
         _ => return None,
     })
+}
+
+/// Parse a `flex-basis` value: `auto`, `content` (and friends), a px length, or
+/// a percentage of the container's main size (kept symbolic for layout).
+fn parse_flex_basis(v: &str, em: f32) -> FlexBasis {
+    let v = v.trim().to_ascii_lowercase();
+    match v.as_str() {
+        "auto" | "" | "inherit" | "initial" => FlexBasis::Auto,
+        "content" | "max-content" | "min-content" | "fit-content" => FlexBasis::Content,
+        _ => {
+            if let Some(num) = v
+                .strip_suffix('%')
+                .and_then(|n| n.trim().parse::<f32>().ok())
+            {
+                FlexBasis::Pct(num)
+            } else if let Some(px) = parse_len(&v, em) {
+                FlexBasis::Px(px)
+            } else {
+                FlexBasis::Auto
+            }
+        }
+    }
+}
+
+/// Apply the `flex` shorthand: `none`/`auto`/`initial`, a unitless grow (and
+/// optional shrink), and/or a basis — defaulting omitted parts per CSS.
+fn apply_flex_shorthand(style: &mut ComputedStyle, v: &str, em: f32) {
+    let low = v.trim().to_ascii_lowercase();
+    match low.as_str() {
+        "none" => {
+            style.flex_grow = 0.0;
+            style.flex_shrink = 0.0;
+            style.flex_basis = FlexBasis::Auto;
+            return;
+        }
+        "auto" => {
+            style.flex_grow = 1.0;
+            style.flex_shrink = 1.0;
+            style.flex_basis = FlexBasis::Auto;
+            return;
+        }
+        "initial" | "" => {
+            style.flex_grow = 0.0;
+            style.flex_shrink = 1.0;
+            style.flex_basis = FlexBasis::Auto;
+            return;
+        }
+        _ => {}
+    }
+    // Up to two leading unitless numbers are grow/shrink; any remaining token is
+    // the basis.
+    let mut nums: Vec<f32> = Vec::new();
+    let mut basis_tok: Option<&str> = None;
+    for p in low.split_whitespace() {
+        match p.parse::<f32>() {
+            Ok(n) if basis_tok.is_none() && nums.len() < 2 => nums.push(n.max(0.0)),
+            _ => {
+                if basis_tok.is_none() {
+                    basis_tok = Some(p);
+                }
+            }
+        }
+    }
+    style.flex_grow = nums.first().copied().unwrap_or(1.0);
+    style.flex_shrink = nums.get(1).copied().unwrap_or(1.0);
+    // A numeric form (`flex: 1`) implies basis 0; a basis-only form keeps it.
+    style.flex_basis = match basis_tok {
+        Some(b) => parse_flex_basis(b, em),
+        None if nums.is_empty() => FlexBasis::Auto,
+        None => FlexBasis::Px(0),
+    };
 }
 
 /// Apply the `inset` shorthand (1–4 values: top/right/bottom/left, CSS order).

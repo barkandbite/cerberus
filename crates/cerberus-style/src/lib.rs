@@ -90,6 +90,7 @@ pub enum JustifyContent {
     End,
     SpaceBetween,
     SpaceAround,
+    SpaceEvenly,
 }
 
 /// CSS `align-items` — cross-axis alignment.
@@ -100,6 +101,32 @@ pub enum AlignItems {
     End,
     #[default]
     Stretch,
+}
+
+/// CSS `align-self` — a flex item's per-item cross-axis alignment. `Auto` defers
+/// to the container's `align-items`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub enum AlignSelf {
+    #[default]
+    Auto,
+    Start,
+    Center,
+    End,
+    Stretch,
+}
+
+/// CSS `flex-basis` — a flex item's initial main size before grow/shrink.
+#[derive(Clone, Copy, Debug, PartialEq, Default)]
+pub enum FlexBasis {
+    /// `auto` (use the item's main size, falling back to its content size).
+    #[default]
+    Auto,
+    /// `content` (always the content size).
+    Content,
+    /// A fixed px length.
+    Px(i32),
+    /// A percentage of the container's main size.
+    Pct(f32),
 }
 
 /// A grid track size (one column/row in `grid-template-columns`/`-rows`).
@@ -135,9 +162,19 @@ pub struct ComputedStyle {
     /// Flex/grid container properties (meaningful only when `display` is
     /// `Flex`/`Grid`); reset per element.
     pub flex_direction: FlexDirection,
+    /// `flex-direction: row-reverse`/`column-reverse` — main axis is reversed.
+    pub flex_reverse: bool,
     pub flex_wrap: bool,
     pub justify_content: JustifyContent,
     pub align_items: AlignItems,
+    /// Flex *item* properties (meaningful when this element is a flex child);
+    /// reset per element (ADR-0036). `flex: grow shrink basis`, plus per-item
+    /// cross alignment and reorder.
+    pub flex_grow: f32,
+    pub flex_shrink: f32,
+    pub flex_basis: FlexBasis,
+    pub align_self: AlignSelf,
+    pub order: i32,
     /// `gap` between flex items / grid tracks, in CSS pixels.
     pub gap: u32,
     pub grid_template_columns: Vec<Track>,
@@ -170,9 +207,15 @@ impl ComputedStyle {
             visibility: Visibility::Visible,
             opacity: 1.0,
             flex_direction: FlexDirection::Row,
+            flex_reverse: false,
             flex_wrap: false,
             justify_content: JustifyContent::Start,
             align_items: AlignItems::Stretch,
+            flex_grow: 0.0,
+            flex_shrink: 1.0,
+            flex_basis: FlexBasis::Auto,
+            align_self: AlignSelf::Auto,
+            order: 0,
             gap: 0,
             grid_template_columns: Vec::new(),
             grid_template_rows: Vec::new(),
@@ -204,9 +247,16 @@ impl ComputedStyle {
             margin_bottom: 0,
             margin_left: 0,
             flex_direction: FlexDirection::Row,
+            flex_reverse: false,
             flex_wrap: false,
             justify_content: JustifyContent::Start,
             align_items: AlignItems::Stretch,
+            // Flex-item properties are not inherited.
+            flex_grow: 0.0,
+            flex_shrink: 1.0,
+            flex_basis: FlexBasis::Auto,
+            align_self: AlignSelf::Auto,
+            order: 0,
             gap: 0,
             grid_template_columns: Vec::new(),
             grid_template_rows: Vec::new(),
@@ -221,11 +271,13 @@ impl ComputedStyle {
     }
 }
 
-/// A child within the styled tree.
+/// A child within the styled tree. The element node is boxed so a `Text` child
+/// doesn't reserve a whole `StyledNode`'s worth of slack in the children vector
+/// (which matters on text-heavy pages) and to keep the enum small.
 #[derive(Clone, Debug)]
 pub enum StyledChild {
     Text(String),
-    Element(StyledNode),
+    Element(Box<StyledNode>),
 }
 
 /// An element with its computed style and styled children.
