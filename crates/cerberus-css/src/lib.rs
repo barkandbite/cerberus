@@ -13,8 +13,9 @@ pub use color::parse_color;
 
 use cerberus_dom::{Document, NodeRef};
 use cerberus_style::{
-    AlignItems, AlignSelf, ComputedStyle, Display, FlexBasis, FlexDirection, JustifyContent, Len,
-    Position, StyleEngine, StyledChild, StyledDom, StyledNode, TextAlign, Track, Visibility,
+    AlignItems, AlignSelf, ComputedStyle, Display, ExternalSheets, FlexBasis, FlexDirection,
+    JustifyContent, Len, Position, StyleEngine, StyledChild, StyledDom, StyledNode, TextAlign,
+    Track, Visibility,
 };
 use cerberus_types::Color;
 use parser::{
@@ -191,7 +192,13 @@ impl Default for CssEngine {
 
 impl StyleEngine for CssEngine {
     fn style(&self, doc: &Document) -> StyledDom {
-        let author = parse_stylesheet(&collect_author_css(doc.root()));
+        self.style_with_sheets(doc, &ExternalSheets::new())
+    }
+
+    fn style_with_sheets(&self, doc: &Document, sheets: &ExternalSheets) -> StyledDom {
+        let mut css = String::new();
+        collect_author_css(doc.root(), sheets, &mut css);
+        let author = parse_stylesheet(&css);
         let mut path = Vec::new();
         let root = doc.root();
         let root_siblings: Rc<[SiblingRef]> = vec![sibling_ref(root)].into();
@@ -221,19 +228,37 @@ fn sibling_ref(node: NodeRef<'_>) -> SiblingRef {
     }
 }
 
-/// Concatenate the text of every `<style>` element (the HTML parser keeps it raw).
-fn collect_author_css(node: NodeRef<'_>) -> String {
-    let mut css = String::new();
-    if node.tag() == "style" {
-        css.push_str(&node.text_content());
-        css.push('\n');
+/// Append author CSS in document order: each `<style>` element's text, and each
+/// `<link rel="stylesheet">`'s externally-fetched body (from `sheets`) spliced in
+/// at the link's position so the cascade order is faithful (ADR-0037).
+fn collect_author_css(node: NodeRef<'_>, sheets: &ExternalSheets, out: &mut String) {
+    match node.tag() {
+        "style" => {
+            out.push_str(&node.text_content());
+            out.push('\n');
+        }
+        "link" if link_is_stylesheet(node) => {
+            if let Some(css) = node.attr("href").and_then(|href| sheets.get(href)) {
+                out.push_str(css);
+                out.push('\n');
+            }
+        }
+        _ => {}
     }
     for child in node.children() {
         if child.is_element() {
-            css.push_str(&collect_author_css(child));
+            collect_author_css(child, sheets, out);
         }
     }
-    css
+}
+
+/// Whether a `<link>` carries `rel="stylesheet"` (rel is a space-separated,
+/// case-insensitive token list).
+fn link_is_stylesheet(node: NodeRef<'_>) -> bool {
+    node.attr("rel").is_some_and(|rel| {
+        rel.split_whitespace()
+            .any(|t| t.eq_ignore_ascii_case("stylesheet"))
+    })
 }
 
 /// Build the custom-property registry in scope for an element: its parent's map
@@ -1264,6 +1289,71 @@ mod tests {
         let html = "<html><head><style>:root{--a:var(--b);--b:var(--a)} p{color:var(--a)}\
                     </style></head><body><p>x</p></body></html>";
         let dom = CssEngine::new().style(&parse_html(html));
+        assert_eq!(first(&dom.root, "p").unwrap().style.color, Color::BLACK);
+    }
+
+    // ---- External <link> stylesheets (ADR-0037) ----
+
+    #[test]
+    fn external_link_stylesheet_applies() {
+        let html = "<html><head><link rel='stylesheet' href='/site.css'></head>\
+                    <body><p>x</p></body></html>";
+        let mut sheets = ExternalSheets::new();
+        sheets.insert("/site.css".to_string(), "p{color:#ff0000}".to_string());
+        let dom = CssEngine::new().style_with_sheets(&parse_html(html), &sheets);
+        assert_eq!(
+            first(&dom.root, "p").unwrap().style.color,
+            Color::rgb(0xff, 0, 0)
+        );
+        // Without the fetched body, the rule is absent (the link contributes
+        // nothing) — `style()` is the no-sheets path.
+        let plain = CssEngine::new().style(&parse_html(html));
+        assert_eq!(first(&plain.root, "p").unwrap().style.color, Color::BLACK);
+    }
+
+    #[test]
+    fn external_sheet_respects_cascade_source_order() {
+        // The <link> precedes the inline <style>, so the (equal-specificity)
+        // inline rule wins by source order — proving the sheet is spliced at the
+        // link's document position, not appended at the end.
+        let html = "<html><head><link rel='stylesheet' href='/a.css'>\
+                    <style>p{color:#00ff00}</style></head><body><p>x</p></body></html>";
+        let mut sheets = ExternalSheets::new();
+        sheets.insert("/a.css".to_string(), "p{color:#ff0000}".to_string());
+        let dom = CssEngine::new().style_with_sheets(&parse_html(html), &sheets);
+        assert_eq!(
+            first(&dom.root, "p").unwrap().style.color,
+            Color::rgb(0, 0xff, 0),
+            "later inline <style> wins over the earlier <link>"
+        );
+    }
+
+    #[test]
+    fn external_sheet_can_define_variables() {
+        // A design-token sheet on :root resolves for the whole page (ADR-0035 +
+        // ADR-0037 together — the common real-world setup).
+        let html = "<html><head><link rel='stylesheet' href='/tokens.css'></head>\
+                    <body><p>x</p></body></html>";
+        let mut sheets = ExternalSheets::new();
+        sheets.insert(
+            "/tokens.css".to_string(),
+            ":root{--fg:#3366cc} p{color:var(--fg)}".to_string(),
+        );
+        let dom = CssEngine::new().style_with_sheets(&parse_html(html), &sheets);
+        assert_eq!(
+            first(&dom.root, "p").unwrap().style.color,
+            Color::rgb(0x33, 0x66, 0xcc)
+        );
+    }
+
+    #[test]
+    fn non_stylesheet_link_is_ignored() {
+        // A non-stylesheet rel (e.g. icon) never contributes CSS even if a body
+        // is somehow present for its href.
+        let html = "<html><head><link rel='icon' href='/x'></head><body><p>y</p></body></html>";
+        let mut sheets = ExternalSheets::new();
+        sheets.insert("/x".to_string(), "p{color:#ff0000}".to_string());
+        let dom = CssEngine::new().style_with_sheets(&parse_html(html), &sheets);
         assert_eq!(first(&dom.root, "p").unwrap().style.color, Color::BLACK);
     }
 }

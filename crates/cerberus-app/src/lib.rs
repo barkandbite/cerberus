@@ -56,7 +56,7 @@ use cerberus_storage::{
     atomic_write, parse_set_cookie, random_bytes, CookieDisposition, CookiePolicy, CookieView,
     EncryptedVault, Group, StorageEnvironment, DEFAULT_TIMED_SECS,
 };
-use cerberus_style::{StyleEngine, StyledDom};
+use cerberus_style::{ExternalSheets, StyleEngine, StyledDom};
 use cerberus_text::TextEngine;
 use cerberus_tls_rustls::RustlsProvider;
 use cerberus_types::{Color, FontStyle, HeadId, InstanceId, Origin, Point, RealmId, Rect, Size};
@@ -950,20 +950,31 @@ pub fn render(config: &RenderConfig) -> Result<RenderOutcome, AppError> {
     let engines_live = heads.engines_live();
     timings.record("scripts", scripts_t.elapsed());
 
-    let style_t = Instant::now();
-    let styled = CssEngine::new().style(&document);
-    timings.record("style", style_t.elapsed());
-
-    // Fetch + decode this page's images up front (the one-shot path is
-    // synchronous; the interactive browser fetches them on its worker), in the
-    // page's subresource context so image fetches carry/capture cookies under
-    // the same first party. Built-in pages reference no network images.
+    // Subresource context (sealed jar + consent) shared by this page's external
+    // CSS and images, so both carry/capture cookies under the same first party.
     let sub_ctx = FetchContext {
         instance: active_instance,
         kind: FetchKind::Subresource {
             first_party: first_party.clone(),
         },
     };
+
+    // External `<link>` stylesheets are fetched up front (render-blocking) so the
+    // cascade sees them before styling — the one-shot path is synchronous, and
+    // third-party sheets are consent-gated like any other subresource (ADR-0037).
+    let sheets = match &client {
+        Some(client) => {
+            fetch_stylesheets_sync(&document, &url, client, &sub_ctx, &consent, &first_party)
+        }
+        None => ExternalSheets::new(),
+    };
+    let style_t = Instant::now();
+    let styled = CssEngine::new().style_with_sheets(&document, &sheets);
+    timings.record("style", style_t.elapsed());
+
+    // Fetch + decode this page's images up front (the one-shot path is
+    // synchronous; the interactive browser fetches them on its worker). Built-in
+    // pages reference no network images.
     let images = match &client {
         Some(client) => {
             fetch_images_sync(&document, &url, client, &sub_ctx, &consent, &first_party)
@@ -1610,6 +1621,75 @@ fn collect_image_urls(node: NodeRef<'_>, out: &mut Vec<String>) {
     }
 }
 
+/// Collect the `href`s (as written) of every `<link rel="stylesheet">`, in
+/// document order. The raw href is the key the cascade looks up, so it is kept
+/// verbatim here and resolved to an absolute URL only for fetching (ADR-0037).
+fn collect_stylesheet_links(node: NodeRef<'_>, out: &mut Vec<String>) {
+    if node.tag() == "link" && link_is_stylesheet(node) {
+        if let Some(href) = node.attr("href") {
+            out.push(href.to_string());
+        }
+    }
+    for child in node.children() {
+        if child.is_element() {
+            collect_stylesheet_links(child, out);
+        }
+    }
+}
+
+/// Whether a `<link>` is a stylesheet (`rel` is a case-insensitive token list).
+fn link_is_stylesheet(node: NodeRef<'_>) -> bool {
+    node.attr("rel").is_some_and(|rel| {
+        rel.split_whitespace()
+            .any(|t| t.eq_ignore_ascii_case("stylesheet"))
+    })
+}
+
+/// Synchronously fetch every `<link rel="stylesheet">` body, keyed by the link's
+/// raw `href` (what the cascade looks up). Used by the one-shot [`render`] (the
+/// interactive browser fetches them on its worker). Third-party sheets are
+/// consent-gated like images; a blocked or failed sheet simply contributes no
+/// CSS. Builds no client and returns empty when there are no http(s) links.
+fn fetch_stylesheets_sync(
+    document: &Document,
+    base: &Url,
+    client: &Router,
+    ctx: &FetchContext,
+    policy: &Mutex<DefaultDenyPolicy>,
+    first_party: &Origin,
+) -> ExternalSheets {
+    let mut hrefs = Vec::new();
+    collect_stylesheet_links(document.root(), &mut hrefs);
+    let mut sheets = ExternalSheets::new();
+    for href in hrefs {
+        if sheets.contains_key(&href) {
+            continue;
+        }
+        let abs = resolve_subresource(Some(base), &href);
+        if !(abs.starts_with("http://") || abs.starts_with("https://")) {
+            continue;
+        }
+        // Consent gate: unruled third-party stylesheets never hit the network.
+        let allowed = parse_url(&abs)
+            .ok()
+            .and_then(|u| u.origin())
+            .is_some_and(|origin| {
+                policy
+                    .locked()
+                    .evaluate(ctx.instance, &origin, first_party)
+                    .decision
+                    == Decision::Allow
+            });
+        if !allowed {
+            continue;
+        }
+        if let Ok(bytes) = fetch_bytes(client, &abs, ctx) {
+            sheets.insert(href, String::from_utf8_lossy(&bytes).into_owned());
+        }
+    }
+    sheets
+}
+
 /// Live, per-page state of the interactive form controls, keyed by the field id
 /// (the 0-based pre-order index over every `<input>`/`<textarea>`/`<select>`/
 /// `<button>` — the same numbering layout assigns). A control appears here only
@@ -1661,6 +1741,14 @@ pub struct BrowserApp {
     style_engine: CssEngine,
     image_codec: ImageCodec,
     images: HashMap<String, ImageState>,
+    /// Fetched external `<link>` stylesheets, keyed by the link's raw `href`
+    /// (what the cascade looks up). Re-styled into `styled` as sheets arrive
+    /// (ADR-0037).
+    sheets: ExternalSheets,
+    /// In-flight stylesheet fetches: resolved absolute URL → raw `href`, so a
+    /// `Done::Sub` response can be routed to CSS (vs. an image) and stored under
+    /// the href the cascade keys on.
+    pending_sheets: HashMap<String, String>,
     history: Vec<String>,
     index: usize,
     document: Document,
@@ -1855,6 +1943,8 @@ impl BrowserApp {
             style_engine,
             image_codec: ImageCodec::new(),
             images: HashMap::new(),
+            sheets: ExternalSheets::new(),
+            pending_sheets: HashMap::new(),
             history: Vec::new(),
             index: 0,
             document: empty_document(),
@@ -2043,12 +2133,27 @@ impl BrowserApp {
         let doc = self.run_scripts(doc);
         self.timings.record("scripts", t.elapsed());
         self.page_title = doc.title();
+        // New page: drop the previous page's external stylesheets. The first
+        // cascade uses inline CSS only; external `<link>` sheets fetch on the
+        // worker and re-style as they arrive (ADR-0037).
+        self.sheets.clear();
+        self.pending_sheets.clear();
         let t = Instant::now();
         self.styled = self.style_engine.style(&doc);
         self.timings.record("style", t.elapsed());
         self.document = doc;
         // Dispatch any fetches the page scheduled at load to the worker (async).
         self.pump_fetches();
+    }
+
+    /// Re-run the cascade with the external stylesheets fetched so far, splicing
+    /// each in at its `<link>`'s position. Called as sheets arrive (ADR-0037).
+    fn restyle_with_sheets(&mut self) {
+        let t = Instant::now();
+        self.styled = self
+            .style_engine
+            .style_with_sheets(&self.document, &self.sheets);
+        self.timings.record("style", t.elapsed());
     }
 
     /// Run the document's inline scripts against the active head's engine and
@@ -2134,6 +2239,7 @@ impl BrowserApp {
         self.insecure_post = None;
 
         self.request_page_images();
+        self.request_page_stylesheets();
         self.update_nav();
         // Page-load total covers fetch → parse → scripts → style (M11);
         // layout+paint is timed per frame in render_frame.
@@ -2261,7 +2367,8 @@ impl BrowserApp {
         true
     }
 
-    /// Apply a decoded image sub-resource (or its failure) to the store.
+    /// Apply a completed sub-resource. A response for a pending stylesheet URL is
+    /// routed to the cascade (ADR-0037); everything else is decoded as an image.
     fn handle_subresource(
         &mut self,
         url: String,
@@ -2271,6 +2378,9 @@ impl BrowserApp {
         // Subresources are aggregated into one stable row so an image-heavy
         // page doesn't flood (and reflow) the HUD.
         self.timings.add("subresources", elapsed);
+        if self.pending_sheets.contains_key(&url) {
+            return self.handle_stylesheet(url, bytes);
+        }
         let state =
             match bytes.and_then(|b| self.image_codec.decode(&b).map_err(|e| format!("{e:?}"))) {
                 Ok(img) => ImageState::Ready(Arc::new(img)),
@@ -2278,6 +2388,27 @@ impl BrowserApp {
             };
         self.images.insert(url, state);
         true // a newly-decoded image changes layout — redraw
+    }
+
+    /// Store a fetched external stylesheet (under the `<link>`'s raw href) and,
+    /// once every in-flight sheet has resolved, re-run the cascade so they all
+    /// apply in one pass (ADR-0037). A failed fetch simply contributes no CSS.
+    fn handle_stylesheet(&mut self, url: String, bytes: Result<Vec<u8>, String>) -> bool {
+        let Some(href) = self.pending_sheets.remove(&url) else {
+            return false;
+        };
+        if let Ok(b) = bytes {
+            self.sheets
+                .insert(href, String::from_utf8_lossy(&b).into_owned());
+        }
+        // Re-style once the last pending sheet arrives, so the page doesn't
+        // re-cascade once per sheet on a multi-stylesheet page.
+        if self.pending_sheets.is_empty() {
+            self.restyle_with_sheets();
+            true
+        } else {
+            false
+        }
     }
 
     /// Drain the realm's JS-`fetch` queue and dispatch each request to the
@@ -2417,6 +2548,41 @@ impl BrowserApp {
                 continue;
             }
             self.images.insert(abs.clone(), ImageState::Pending);
+            self.loader.request_subresource(
+                abs,
+                FetchContext {
+                    instance,
+                    kind: FetchKind::Subresource { first_party },
+                },
+            );
+        }
+    }
+
+    /// Scan the current document for `<link rel="stylesheet">` and queue a
+    /// background fetch for each new http(s) sheet, consent-gated like an image.
+    /// Responses route to the cascade in `handle_stylesheet` (ADR-0037).
+    fn request_page_stylesheets(&mut self) {
+        let first_party = self.current_url.as_ref().and_then(first_party_of);
+        let instance = self.heads.active().instance;
+        let mut hrefs = Vec::new();
+        collect_stylesheet_links(self.document.root(), &mut hrefs);
+        for href in hrefs {
+            let abs = resolve_subresource(self.current_url.as_ref(), &href);
+            if !(abs.starts_with("http://") || abs.starts_with("https://")) {
+                continue;
+            }
+            // One fetch per distinct URL per page (already fetched or in flight).
+            if self.sheets.contains_key(&href) || self.pending_sheets.contains_key(&abs) {
+                continue;
+            }
+            let Some(first_party) = first_party.clone() else {
+                continue;
+            };
+            // Consent gate: a third-party stylesheet needs an Allow rule.
+            if self.gate_subresource(&abs, &first_party) != Decision::Allow {
+                continue;
+            }
+            self.pending_sheets.insert(abs.clone(), href);
             self.loader.request_subresource(
                 abs,
                 FetchContext {
@@ -2639,6 +2805,8 @@ impl BrowserApp {
             self.images.remove(&url);
         }
         self.request_page_images();
+        // A stylesheet from the newly-allowed site can now be fetched too.
+        self.request_page_stylesheets();
     }
 
     /// Persist the standing consent rules into the profile (if any).
@@ -5739,6 +5907,81 @@ mod tests {
         );
         // A frame renders without panicking now that an Image item is present.
         b.render_frame(Size::new(800, 600));
+    }
+
+    /// The `color` of the first `<p>` in a styled tree (helper for the external
+    /// stylesheet tests).
+    fn styled_p_color(node: &cerberus_style::StyledNode) -> Option<Color> {
+        if node.tag == "p" {
+            return Some(node.style.color);
+        }
+        node.children.iter().find_map(|c| match c {
+            cerberus_style::StyledChild::Element(e) => styled_p_color(e),
+            _ => None,
+        })
+    }
+
+    #[test]
+    fn external_stylesheet_loads_via_worker_and_restyles() {
+        // A first-party <link rel=stylesheet> is fetched on the worker, routed to
+        // the cascade (not the image decoder), and re-styles the page when it
+        // lands (ADR-0037).
+        let mut b = fake_app_img(
+            vec![(
+                "https://site.test/",
+                Ok(page(
+                    "https://site.test/",
+                    200,
+                    None,
+                    "<html><head><link rel=\"stylesheet\" href=\"/s.css\"></head>\
+                     <body><p>hi</p></body></html>",
+                )),
+            )],
+            vec![("https://site.test/s.css", Ok(b"p{color:#ff0000}".to_vec()))],
+        );
+        b.navigate("https://site.test/");
+        // One poll drains the page load (inline styling → UA-default black) and
+        // the stylesheet it queued (re-styles to red).
+        assert!(b.poll());
+        assert_eq!(
+            styled_p_color(&b.styled.root),
+            Some(Color::rgb(0xff, 0, 0)),
+            "external stylesheet applied via the async worker path"
+        );
+        // The sheet went to the cascade, not the image store, and none is left
+        // pending.
+        assert!(b.images.is_empty(), "stylesheet not stored as an image");
+        assert!(b.pending_sheets.is_empty(), "no stylesheet left pending");
+    }
+
+    #[test]
+    fn third_party_stylesheet_is_consent_blocked() {
+        // A cross-site stylesheet is gated by default-deny: never fetched, never
+        // applied — consistent with image subresources.
+        let mut b = fake_app_img(
+            vec![(
+                "https://site.test/",
+                Ok(page(
+                    "https://site.test/",
+                    200,
+                    None,
+                    "<html><head><link rel=\"stylesheet\" href=\"https://cdn.other/s.css\"></head>\
+                     <body><p>hi</p></body></html>",
+                )),
+            )],
+            vec![("https://cdn.other/s.css", Ok(b"p{color:#ff0000}".to_vec()))],
+        );
+        b.navigate("https://site.test/");
+        assert!(b.poll());
+        assert_eq!(
+            styled_p_color(&b.styled.root),
+            Some(Color::BLACK),
+            "third-party stylesheet must not apply without consent"
+        );
+        assert!(
+            b.pending_sheets.is_empty(),
+            "blocked sheet is never dispatched"
+        );
     }
 
     #[test]

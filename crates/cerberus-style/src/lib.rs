@@ -325,8 +325,21 @@ pub struct StyledDom {
     pub root: StyledNode,
 }
 
+/// Externally-fetched stylesheets (`<link rel="stylesheet">` bodies), keyed by
+/// the link's `href` exactly as it appears in the document, so the cascade can
+/// splice each sheet in at its `<link>`'s document position (ADR-0037).
+pub type ExternalSheets = std::collections::HashMap<String, String>;
+
 /// Turns a parsed `Document` into a `StyledDom` (UA + author CSS cascade).
 pub trait StyleEngine: Send {
-    /// Compute styles for `doc`.
+    /// Compute styles for `doc` (inline `<style>` + `style=` author CSS only).
     fn style(&self, doc: &Document) -> StyledDom;
+
+    /// Compute styles for `doc`, splicing externally-fetched `<link>`
+    /// stylesheets into the cascade at each link's position. The default ignores
+    /// them (so non-CSS engines need not implement it).
+    fn style_with_sheets(&self, doc: &Document, sheets: &ExternalSheets) -> StyledDom {
+        let _ = sheets;
+        self.style(doc)
+    }
 }
