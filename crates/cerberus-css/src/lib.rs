@@ -40,6 +40,10 @@ html, body, div, p, h1, h2, h3, h4, h5, h6, ul, ol, li, section, article,
 header, footer, nav, main, aside, blockquote, pre, figure, figcaption, form,
 table, tr, hr, dl, dt, dd, fieldset, address { display: block; }
 head, title, meta, link, style, script, base, template { display: none; }
+/* We don't paint SVG graphics; hiding it avoids flowing its <text>/markup as
+   stray page text (e.g. decorative symbol grids). Icons render as nothing,
+   which is what unpainted SVG already was. */
+svg { display: none; }
 li { display: list-item; }
 h1 { font-size: 32px; font-weight: bold; margin-top: 16px; margin-bottom: 16px; }
 h2 { font-size: 24px; font-weight: bold; margin-top: 14px; margin-bottom: 14px; }
@@ -778,6 +782,9 @@ fn apply_declarations(
                 let (tracks, auto_fill) = parse_grid_template(v, style.font_size as f32);
                 style.grid_template_columns = tracks;
                 style.grid_auto_fill = auto_fill;
+                // A named-line template (full-bleed centering pattern) is collapsed
+                // to one full-width column at layout (we don't resolve named lines).
+                style.grid_cols_named = auto_fill.is_none() && v.contains('[');
             }
             "grid-template-rows" => {
                 style.grid_template_rows = parse_tracks(v, style.font_size as f32);
@@ -787,8 +794,20 @@ fn apply_declarations(
                     .first()
                     .map(|t| parse_one_track(t, style.font_size as f32));
             }
-            "grid-column" => style.grid_column_span = parse_grid_span(v),
+            "grid-column" => {
+                style.grid_column_span = parse_grid_span(v);
+                if grid_line_is_named(v) {
+                    style.grid_named_place = true;
+                }
+            }
             "grid-row" => style.grid_row_span = parse_grid_span(v),
+            "grid-area" => {
+                // `grid-area: name` (a named area/line) — we don't resolve areas,
+                // so flag it for content-track placement (ADR-0038).
+                if grid_line_is_named(v) {
+                    style.grid_named_place = true;
+                }
+            }
             // Still ignored (no compositor/timeline): animation*, transition*,
             // transform, and everything else.
             _ => {}
@@ -901,6 +920,12 @@ fn parse_grid_template(v: &str, em_base: f32) -> (Vec<Track>, Option<Track>) {
 /// into `out`.
 fn expand_track(tok: &str, em_base: f32, out: &mut Vec<Track>) {
     let t = tok.trim().to_ascii_lowercase();
+    // `[line-name]` tokens name grid lines; they are not tracks (skipping them is
+    // essential — otherwise a named-line template inflates the column count and
+    // squeezes the real content track to near-zero width).
+    if t.starts_with('[') {
+        return;
+    }
     if let Some(inner) = t.strip_prefix("repeat(").and_then(|s| s.strip_suffix(')')) {
         let mut parts = inner.splitn(2, ',');
         if let (Some(n), Some(group_src)) = (parts.next(), parts.next()) {
@@ -976,6 +1001,21 @@ fn parse_url_value(v: &str) -> Option<String> {
         return None;
     }
     Some(url.to_string())
+}
+
+/// Whether a `grid-column`/`grid-row`/`grid-area` value references a *named* line
+/// or area (a letter-led token that isn't `span`/`auto`) — which we don't resolve
+/// to a track index, so layout uses content-track placement instead (ADR-0038).
+fn grid_line_is_named(v: &str) -> bool {
+    v.split(['/', ' '])
+        .map(str::trim)
+        .filter(|t| !t.is_empty())
+        .any(|t| {
+            let low = t.to_ascii_lowercase();
+            low != "span"
+                && low != "auto"
+                && t.chars().next().is_some_and(|c| c.is_ascii_alphabetic())
+        })
 }
 
 /// Parse a `grid-column`/`grid-row` placement into a track *span* count:

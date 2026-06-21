@@ -268,6 +268,12 @@ struct Ctx<'a> {
     /// Whether positioning is active. Only the root flow positions; sub-flows
     /// (table cells, intrinsic measurement) keep elements in-flow (v1).
     pos_enabled: bool,
+    /// Whether this context is measuring intrinsic width (laid at a huge probe
+    /// width). Flex/grid then pack items at their base size, left-aligned, with no
+    /// grow/justify/align offsets — otherwise grow fills the probe width and
+    /// center/justify offsets place content at ~width/2, both wildly inflating the
+    /// measured width and corrupting nested sizing (ADR-0038).
+    measuring: bool,
 }
 
 impl<'a> Ctx<'a> {
@@ -305,6 +311,7 @@ impl<'a> Ctx<'a> {
             positioned: Vec::new(),
             pos_order: 0,
             pos_enabled: true,
+            measuring: false,
         }
     }
 
@@ -349,6 +356,7 @@ impl<'a> Ctx<'a> {
             positioned: Vec::new(),
             pos_order: 0,
             pos_enabled: false,
+            measuring: false,
         }
     }
 
@@ -1154,6 +1162,7 @@ impl<'a> Ctx<'a> {
         self.line_align = TextAlign::Left;
         self.cur_link_node = None;
         self.opacity_hidden = false;
+        self.measuring = true;
     }
 
     /// Intrinsic content width of `node`: lay it into an effectively unbounded
@@ -1252,6 +1261,9 @@ impl<'a> Ctx<'a> {
             e.rect = offset_rect(e.rect, dx, dy);
             self.elements.push(e);
         }
+        // Bubble the sub's content extent up so flex/grid/table containers report a
+        // real intrinsic width to `measure_intrinsic_width` (ADR-0038).
+        self.max_x = self.max_x.max(sub.max_x + dx);
     }
 
     /// Lay out a flex container (ADR-0036): row/column (+ `-reverse`), `gap`,
@@ -1272,7 +1284,7 @@ impl<'a> Ctx<'a> {
             .children
             .iter()
             .filter_map(|c| match c {
-                StyledChild::Element(e) if e.style.display != Display::None => Some(e.as_ref()),
+                StyledChild::Element(e) if is_flex_grid_item(e) => Some(e.as_ref()),
                 _ => None,
             })
             .collect();
@@ -1358,45 +1370,54 @@ impl<'a> Ctx<'a> {
             let gaps = gap * (n as i32 - 1).max(0);
             let inner_avail = (avail - gaps).max(0) as f32;
             let line_basis: Vec<f32> = line.iter().map(|&i| basis[i] as f32).collect();
-            let grow: Vec<f32> = line.iter().map(|&i| items[i].style.flex_grow).collect();
-            let shrink: Vec<f32> = line.iter().map(|&i| items[i].style.flex_shrink).collect();
 
-            // Min-content floors are only needed (and only measured) when the line
-            // is shrinking — the common grow/fit cases skip the extra pass.
-            let total_basis: f32 = line_basis.iter().sum();
-            let mins: Vec<f32> = if total_basis > inner_avail {
-                line.iter()
-                    .map(|&i| {
-                        self.measure_min_content_width(items[i])
-                            .min(basis[i])
-                            .max(0) as f32
-                    })
-                    .collect()
+            // Probe width (intrinsic measurement): use base sizes only — no grow
+            // (it would fill the huge probe width) and no shrink — so the measured
+            // extent reflects content, not the probe (ADR-0038).
+            let widths: Vec<i32> = if self.measuring {
+                line_basis.iter().map(|b| (*b as i32).max(1)).collect()
             } else {
-                vec![0.0; n]
+                let grow: Vec<f32> = line.iter().map(|&i| items[i].style.flex_grow).collect();
+                let shrink: Vec<f32> = line.iter().map(|&i| items[i].style.flex_shrink).collect();
+                // Min-content floors are only needed (and measured) when shrinking.
+                let total_basis: f32 = line_basis.iter().sum();
+                let mins: Vec<f32> = if total_basis > inner_avail {
+                    line.iter()
+                        .map(|&i| {
+                            self.measure_min_content_width(items[i])
+                                .min(basis[i])
+                                .max(0) as f32
+                        })
+                        .collect()
+                } else {
+                    vec![0.0; n]
+                };
+                let sizes = resolve_flex(&line_basis, &grow, &shrink, &mins, inner_avail);
+                sizes.iter().map(|s| s.round().max(1.0) as i32).collect()
             };
 
-            let sizes = resolve_flex(&line_basis, &grow, &shrink, &mins, inner_avail);
-            let widths: Vec<i32> = sizes.iter().map(|s| s.round().max(1.0) as i32).collect();
-
             // Leftover after flexing (zero when something grew) is placed by
-            // justify-content.
+            // justify-content; while measuring, pack at the start.
             let content: i32 = widths.iter().sum();
             let free = (avail - content - gaps).max(0);
             let count = n as i32;
-            let (mut x, eff_gap) = match style.justify_content {
-                JustifyContent::Start => (left, gap),
-                JustifyContent::Center => (left + free / 2, gap),
-                JustifyContent::End => (left + free, gap),
-                JustifyContent::SpaceBetween if count > 1 => (left, gap + free / (count - 1)),
-                JustifyContent::SpaceBetween => (left, gap),
-                JustifyContent::SpaceAround => {
-                    let around = if count > 0 { free / count } else { 0 };
-                    (left + around / 2, gap + around)
-                }
-                JustifyContent::SpaceEvenly => {
-                    let around = if count >= 0 { free / (count + 1) } else { 0 };
-                    (left + around, gap + around)
+            let (mut x, eff_gap) = if self.measuring {
+                (left, gap)
+            } else {
+                match style.justify_content {
+                    JustifyContent::Start => (left, gap),
+                    JustifyContent::Center => (left + free / 2, gap),
+                    JustifyContent::End => (left + free, gap),
+                    JustifyContent::SpaceBetween if count > 1 => (left, gap + free / (count - 1)),
+                    JustifyContent::SpaceBetween => (left, gap),
+                    JustifyContent::SpaceAround => {
+                        let around = if count > 0 { free / count } else { 0 };
+                        (left + around / 2, gap + around)
+                    }
+                    JustifyContent::SpaceEvenly => {
+                        let around = if count >= 0 { free / (count + 1) } else { 0 };
+                        (left + around, gap + around)
+                    }
                 }
             };
 
@@ -1420,6 +1441,7 @@ impl<'a> Ctx<'a> {
                     self.forms,
                     self.field_id,
                 );
+                sub.measuring = self.measuring;
                 sub.walk(items[i], None);
                 sub.flush_line();
                 self.field_id = sub.field_id;
@@ -1430,13 +1452,17 @@ impl<'a> Ctx<'a> {
             }
             for (sub, h, i) in laid {
                 let align = resolve_align(items[i].style.align_self, style.align_items);
-                let dy = match align {
-                    // Stretch along a row is the cross (height) axis; treated as
-                    // top-aligned for now (height stretch of item backgrounds is a
-                    // later refinement).
-                    AlignItems::Start | AlignItems::Stretch => 0,
-                    AlignItems::Center => (row_h - h) / 2,
-                    AlignItems::End => row_h - h,
+                let dy = if self.measuring {
+                    0
+                } else {
+                    match align {
+                        // Stretch along a row is the cross (height) axis; treated as
+                        // top-aligned for now (height stretch of item backgrounds is
+                        // a later refinement).
+                        AlignItems::Start | AlignItems::Stretch => 0,
+                        AlignItems::Center => (row_h - h) / 2,
+                        AlignItems::End => row_h - h,
+                    }
                 };
                 self.merge_sub(sub, 0, dy);
             }
@@ -1469,16 +1495,23 @@ impl<'a> Ctx<'a> {
                 y += gap;
             }
             let align = resolve_align(it.style.align_self, style.align_items);
-            let (x0, w) = match align {
-                AlignItems::Stretch => (left, avail_cross),
-                _ => {
-                    let iw = self.measure_intrinsic_width(it).clamp(1, avail_cross);
-                    let dx = match align {
-                        AlignItems::Center => (avail_cross - iw) / 2,
-                        AlignItems::End => avail_cross - iw,
-                        _ => 0,
-                    };
-                    (left + dx, iw)
+            // While measuring (huge probe width), don't stretch or center —
+            // size each item to its content at the left, so the column's measured
+            // width is the widest item's content, not the probe (ADR-0038).
+            let (x0, w) = if self.measuring {
+                (left, self.measure_intrinsic_width(it).max(1))
+            } else {
+                match align {
+                    AlignItems::Stretch => (left, avail_cross),
+                    _ => {
+                        let iw = self.measure_intrinsic_width(it).clamp(1, avail_cross);
+                        let dx = match align {
+                            AlignItems::Center => (avail_cross - iw) / 2,
+                            AlignItems::End => avail_cross - iw,
+                            _ => 0,
+                        };
+                        (left + dx, iw)
+                    }
                 }
             };
             let mut sub = Ctx::sub(
@@ -1490,6 +1523,7 @@ impl<'a> Ctx<'a> {
                 self.forms,
                 self.field_id,
             );
+            sub.measuring = self.measuring;
             sub.walk(it, None);
             sub.flush_line();
             self.field_id = sub.field_id;
@@ -1515,7 +1549,29 @@ impl<'a> Ctx<'a> {
         let bg_index = self.display.items.len();
         let avail = (right - left).max(1);
 
-        let widths = resolve_grid_columns(&node.style, avail, gap);
+        let items: Vec<&StyledNode> = node
+            .children
+            .iter()
+            .filter_map(|c| match c {
+                StyledChild::Element(e) if is_flex_grid_item(e) => Some(e.as_ref()),
+                _ => None,
+            })
+            .collect();
+
+        // While measuring (huge probe width), don't expand the template (auto-fill
+        // would create thousands of columns); use one content-wide column so the
+        // grid's measured width is the widest item's content (ADR-0038).
+        let widths = if self.measuring {
+            let w = items
+                .iter()
+                .map(|it| self.measure_intrinsic_width(it))
+                .max()
+                .unwrap_or(1)
+                .max(1);
+            vec![w]
+        } else {
+            resolve_grid_columns(&node.style, avail, gap)
+        };
         let ncols = widths.len().max(1);
         let mut col_x = Vec::with_capacity(widths.len());
         let mut cx = left;
@@ -1524,23 +1580,29 @@ impl<'a> Ctx<'a> {
             cx += w + gap;
         }
 
-        let items: Vec<&StyledNode> = node
-            .children
-            .iter()
-            .filter_map(|c| match c {
-                StyledChild::Element(e) if e.style.display != Display::None => Some(e.as_ref()),
-                _ => None,
-            })
-            .collect();
-
         // Auto-placement: scan row-major for the first free span_c × span_r block.
         let mut occ: Vec<Vec<bool>> = Vec::new();
         let mut placed: Vec<GridPlacement> = Vec::with_capacity(items.len());
         let mut cursor = (0usize, 0usize); // (row, col) search hint
+                                           // The content track: where items with unresolvable named placement land
+                                           // (the common `1fr [content] minmax/content 1fr` centering pattern would
+                                           // otherwise drop them into a leading gutter).
+        let content_col = widths
+            .iter()
+            .enumerate()
+            .max_by_key(|(_, w)| **w)
+            .map(|(i, _)| i)
+            .unwrap_or(0);
         for it in &items {
-            let cs = (it.style.grid_column_span as usize).clamp(1, ncols);
             let rs = (it.style.grid_row_span as usize).max(1);
-            let (r0, c0) = find_free_cell(&mut occ, ncols, cs, rs, cursor);
+            let (r0, c0, cs) = if it.style.grid_named_place {
+                let c0 = content_col;
+                (find_free_in_col(&mut occ, ncols, c0, rs), c0, 1)
+            } else {
+                let cs = (it.style.grid_column_span as usize).clamp(1, ncols);
+                let (r0, c0) = find_free_cell(&mut occ, ncols, cs, rs, cursor);
+                (r0, c0, cs)
+            };
             for row in occ.iter_mut().take(r0 + rs).skip(r0) {
                 for cell in row.iter_mut().take(c0 + cs).skip(c0) {
                     *cell = true;
@@ -1566,6 +1628,7 @@ impl<'a> Ctx<'a> {
                 self.forms,
                 self.field_id,
             );
+            sub.measuring = self.measuring;
             sub.walk(it, None);
             sub.flush_line();
             self.field_id = sub.field_id;
@@ -1862,6 +1925,18 @@ fn drain_offset<T>(
 
 /// A flex item's effective cross alignment: `align-self` if set, else the
 /// container's `align-items` (ADR-0036).
+/// Whether an element participates in flex/grid layout: rendered and **in flow**.
+/// Per CSS, `absolute`/`fixed` children are taken out of flex/grid flow (they
+/// don't size or shift the tracks) — including them corrupts sizing, e.g. a
+/// `width:100%` absolute overlay forcing its siblings to min-content (ADR-0038).
+fn is_flex_grid_item(e: &StyledNode) -> bool {
+    e.style.display != Display::None
+        && !matches!(
+            e.style.position,
+            cerberus_style::Position::Absolute | cerberus_style::Position::Fixed
+        )
+}
+
 /// One item's resolved grid placement: top-left cell + span (ADR-0038).
 struct GridPlacement {
     r0: usize,
@@ -1898,6 +1973,22 @@ fn find_free_cell(
             c = 0;
             r += 1;
         }
+    }
+}
+
+/// The first row where column `col` is free for `rs` rows (content-track
+/// placement for named items), growing the occupancy grid as needed.
+fn find_free_in_col(occ: &mut Vec<Vec<bool>>, ncols: usize, col: usize, rs: usize) -> usize {
+    let col = col.min(ncols.saturating_sub(1));
+    let mut r = 0;
+    loop {
+        while occ.len() < r + rs {
+            occ.push(vec![false; ncols]);
+        }
+        if (r..r + rs).all(|rr| !occ[rr][col]) {
+            return r;
+        }
+        r += 1;
     }
 }
 
@@ -1957,12 +2048,20 @@ fn resolve_tracks(tracks: &[Track], avail: i32, gap: i32) -> Vec<i32> {
 fn resolve_grid_columns(style: &ComputedStyle, avail: i32, gap: i32) -> Vec<i32> {
     if let Some(track) = style.grid_auto_fill {
         let (base, _) = track_base_fr(track);
-        let min = base.max(1);
-        let ncols = (((avail + gap) / (min + gap)).max(1)) as usize;
-        let tracks = vec![track; ncols.min(1000)];
+        // A non-positive minimum (`minmax(0, 1fr)`) can't determine a count, so a
+        // single full-width track is the only sane fit — otherwise the count is
+        // floor((avail+gap)/(min+gap)), bounded so a tiny min can't explode into
+        // hundreds of 1px columns (which collapses content to per-character).
+        if base < 8 {
+            return resolve_tracks(&[track], avail, gap);
+        }
+        let ncols = (((avail + gap) / (base + gap)).max(1) as usize).min(64);
+        let tracks = vec![track; ncols];
         return resolve_tracks(&tracks, avail, gap);
     }
-    if style.grid_template_columns.is_empty() {
+    // Named-line (full-bleed) templates collapse to one full-width column so
+    // content stacks readably rather than landing in a gutter track (ADR-0038).
+    if style.grid_cols_named || style.grid_template_columns.is_empty() {
         return vec![avail.max(1)];
     }
     resolve_tracks(&style.grid_template_columns, avail, gap)
@@ -2522,6 +2621,49 @@ mod tests {
         );
         // B is placed in the third column (after the 2-col span), not overlapping.
         assert!(r[1].x >= r[0].x + 380, "B starts after the spanned cell");
+    }
+
+    #[test]
+    fn absolute_flex_child_does_not_shrink_its_sibling() {
+        // An absolutely-positioned flex child is out of flex flow; it must not
+        // consume basis and shrink the in-flow sibling (ADR-0038).
+        let laid = lay(
+            "<div style='display:flex'>\
+             <div style='position:absolute'>a very long absolute overlay heading that is wide</div>\
+             <div style='flex:1;background:#ff0000'>hi</div></div>",
+            400,
+        );
+        let r = fill_rects(&laid);
+        assert_eq!(r.len(), 1, "only the in-flow item paints a background");
+        assert!(
+            (r[0].w as i32 - 384).abs() <= 4,
+            "flex:1 item fills the row despite the absolute sibling: {}",
+            r[0].w
+        );
+    }
+
+    #[test]
+    fn nested_centered_flex_is_measured_by_content_not_probe_width() {
+        // A flex item that is itself a centered flex column must be measured by its
+        // content width; otherwise the probe-width centering inflates it and it
+        // shrinks to per-word min-content (the Apple/MDN hero bug — ADR-0038).
+        let laid = lay(
+            "<div style='display:flex'>\
+             <div style='display:flex;flex-direction:column;align-items:center;background:#ff0000'>\
+               <div>Item One Heading</div></div>\
+             <div style='display:flex;flex-direction:column;align-items:center;background:#00ff00'>\
+               <div>Item Two Heading</div></div></div>",
+            600,
+        );
+        let r = fill_rects(&laid);
+        assert_eq!(r.len(), 2);
+        // Each measured to its content (well above a single-word min-content), laid
+        // side by side rather than collapsed into a narrow column.
+        assert!(r[0].w >= 70, "first item sized to content: {}", r[0].w);
+        assert!(
+            r[1].x >= r[0].x + 70,
+            "items are side by side, not collapsed"
+        );
     }
 
     #[test]

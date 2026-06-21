@@ -197,10 +197,18 @@ pub struct ComputedStyle {
     pub grid_auto_fill: Option<Track>,
     /// `grid-auto-rows` — size of implicitly-created rows (else content-sized).
     pub grid_auto_rows: Option<Track>,
+    /// The column template used named grid lines (`[name]`), i.e. the full-bleed
+    /// centering pattern we don't resolve; layout collapses it to one full-width
+    /// column so content stacks readably instead of landing in a gutter (ADR-0038).
+    pub grid_cols_named: bool,
     /// Grid *item* placement spans (`grid-column`/`grid-row: span N` or `a / b`);
     /// 1 unless the item spans multiple tracks. Reset per element (ADR-0038).
     pub grid_column_span: u32,
     pub grid_row_span: u32,
+    /// The item used named-line/area placement we don't resolve (e.g.
+    /// `grid-column: content`); layout places it in the container's widest
+    /// (content) track rather than dumping it into a leading gutter (ADR-0038).
+    pub grid_named_place: bool,
     /// `position` and its insets/`z-index` (ADR-0034). Insets resolve against the
     /// containing block at layout; `z_index` orders positioned layers in paint.
     pub position: Position,
@@ -244,8 +252,10 @@ impl ComputedStyle {
             grid_template_rows: Vec::new(),
             grid_auto_fill: None,
             grid_auto_rows: None,
+            grid_cols_named: false,
             grid_column_span: 1,
             grid_row_span: 1,
+            grid_named_place: false,
             position: Position::Static,
             inset_top: Len::Auto,
             inset_right: Len::Auto,
@@ -290,8 +300,10 @@ impl ComputedStyle {
             grid_template_rows: Vec::new(),
             grid_auto_fill: None,
             grid_auto_rows: None,
+            grid_cols_named: false,
             grid_column_span: 1,
             grid_row_span: 1,
+            grid_named_place: false,
             // Positioning is not inherited; every element starts in normal flow.
             position: Position::Static,
             inset_top: Len::Auto,
