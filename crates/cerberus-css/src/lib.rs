@@ -15,7 +15,7 @@ use cerberus_dom::{Document, NodeRef};
 use cerberus_style::{
     AlignItems, AlignSelf, ComputedStyle, Display, ExternalSheets, FlexBasis, FlexDirection,
     JustifyContent, Len, Position, StyleEngine, StyledChild, StyledDom, StyledNode, TextAlign,
-    Track, Visibility,
+    Track, TrackMax, Visibility,
 };
 use cerberus_types::Color;
 use parser::{
@@ -601,6 +601,14 @@ fn apply_declarations(
                 if let Some(c) = parse_bg_color(v) {
                     style.background = (c.a != 0).then_some(c);
                 }
+                // The `background` shorthand may also carry an image; `none`
+                // clears it.
+                if prop == "background" {
+                    style.background_image = parse_url_value(v);
+                }
+            }
+            "background-image" => {
+                style.background_image = parse_url_value(v);
             }
             "font-size" => {
                 if let Some(px) = parse_size(v, parent_font_size) {
@@ -613,6 +621,12 @@ fn apply_declarations(
                 style.font.italic = low == "italic" || low == "oblique";
             }
             "font" => apply_font_shorthand(style, v, parent_font_size),
+            // `font-family` is intentionally not honored: the font set is fixed
+            // to the bundled face (a privacy/anti-fingerprinting property — no
+            // system or downloadable fonts are read), so families and `@font-face`
+            // text render in the bundled font. Consumed here so the decision is
+            // explicit rather than a silent fall-through (ADR-0038).
+            "font-family" => {}
             "text-align" => {
                 style.text_align = match v.to_ascii_lowercase().as_str() {
                     "center" => TextAlign::Center,
@@ -761,11 +775,20 @@ fn apply_declarations(
                 }
             }
             "grid-template-columns" => {
-                style.grid_template_columns = parse_tracks(v, style.font_size as f32);
+                let (tracks, auto_fill) = parse_grid_template(v, style.font_size as f32);
+                style.grid_template_columns = tracks;
+                style.grid_auto_fill = auto_fill;
             }
             "grid-template-rows" => {
                 style.grid_template_rows = parse_tracks(v, style.font_size as f32);
             }
+            "grid-auto-rows" => {
+                style.grid_auto_rows = split_top(v.trim())
+                    .first()
+                    .map(|t| parse_one_track(t, style.font_size as f32));
+            }
+            "grid-column" => style.grid_column_span = parse_grid_span(v),
+            "grid-row" => style.grid_row_span = parse_grid_span(v),
             // Still ignored (no compositor/timeline): animation*, transition*,
             // transform, and everything else.
             _ => {}
@@ -852,7 +875,30 @@ fn split_top(v: &str) -> Vec<String> {
     toks
 }
 
-/// Expand one track token (`200px`, `1fr`, `auto`, or `repeat(N, …)`) into `out`.
+/// Parse a `grid-template-columns` value into `(explicit tracks, auto-fill
+/// track)`. A whole-value `repeat(auto-fill|auto-fit, <track>)` yields no
+/// explicit tracks and an auto-fill track whose count layout derives from the
+/// container width (ADR-0038); anything else expands to explicit tracks.
+fn parse_grid_template(v: &str, em_base: f32) -> (Vec<Track>, Option<Track>) {
+    let toks = split_top(v.trim());
+    if toks.len() == 1 {
+        let t = toks[0].trim().to_ascii_lowercase();
+        if let Some(inner) = t.strip_prefix("repeat(").and_then(|s| s.strip_suffix(')')) {
+            let mut parts = inner.splitn(2, ',');
+            if let (Some(kw), Some(group)) = (parts.next(), parts.next()) {
+                let kw = kw.trim();
+                if kw == "auto-fill" || kw == "auto-fit" {
+                    // The repeated group is a single track in practice.
+                    return (Vec::new(), Some(parse_one_track(group.trim(), em_base)));
+                }
+            }
+        }
+    }
+    (parse_tracks(v, em_base), None)
+}
+
+/// Expand one track token (`200px`, `1fr`, `auto`, `minmax(…)`, or `repeat(N,…)`)
+/// into `out`.
 fn expand_track(tok: &str, em_base: f32, out: &mut Vec<Track>) {
     let t = tok.trim().to_ascii_lowercase();
     if let Some(inner) = t.strip_prefix("repeat(").and_then(|s| s.strip_suffix(')')) {
@@ -860,8 +906,8 @@ fn expand_track(tok: &str, em_base: f32, out: &mut Vec<Track>) {
         if let (Some(n), Some(group_src)) = (parts.next(), parts.next()) {
             if let Ok(count) = n.trim().parse::<usize>() {
                 let mut group = Vec::new();
-                for sub in group_src.split_whitespace() {
-                    expand_track(sub, em_base, &mut group);
+                for sub in split_top(group_src.trim()) {
+                    expand_track(&sub, em_base, &mut group);
                 }
                 for _ in 0..count.min(1000) {
                     out.extend(group.iter().copied());
@@ -870,20 +916,85 @@ fn expand_track(tok: &str, em_base: f32, out: &mut Vec<Track>) {
         }
         return;
     }
+    out.push(parse_one_track(tok, em_base));
+}
+
+/// Parse a single grid track (`200px` / `1fr` / `auto` / `minmax(min, max)`).
+fn parse_one_track(tok: &str, em_base: f32) -> Track {
+    let t = tok.trim().to_ascii_lowercase();
+    if let Some(inner) = t.strip_prefix("minmax(").and_then(|s| s.strip_suffix(')')) {
+        let mut parts = inner.splitn(2, ',');
+        if let (Some(min), Some(max)) = (parts.next(), parts.next()) {
+            let min_px = parse_len(min.trim(), em_base).unwrap_or(0).max(0) as u32;
+            let max = parse_track_max(max.trim(), em_base);
+            return Track::MinMax(min_px, max);
+        }
+    }
     if let Some(fr) = t.strip_suffix("fr") {
         if let Ok(n) = fr.trim().parse::<f32>() {
-            out.push(Track::Fr(n.max(0.0)));
-            return;
+            return Track::Fr(n.max(0.0));
+        }
+    }
+    if t == "auto" || t == "min-content" || t == "max-content" || t == "fit-content" {
+        return Track::Auto;
+    }
+    match parse_len(&t, em_base) {
+        Some(px) => Track::Px(px.max(0) as u32),
+        None => Track::Auto,
+    }
+}
+
+/// The `max` side of a `minmax()`.
+fn parse_track_max(tok: &str, em_base: f32) -> TrackMax {
+    let t = tok.trim().to_ascii_lowercase();
+    if let Some(fr) = t.strip_suffix("fr") {
+        if let Ok(n) = fr.trim().parse::<f32>() {
+            return TrackMax::Fr(n.max(0.0));
         }
     }
     if t == "auto" || t == "min-content" || t == "max-content" {
-        out.push(Track::Auto);
-        return;
+        return TrackMax::Auto;
     }
-    match parse_len(tok, em_base) {
-        Some(px) => out.push(Track::Px(px.max(0) as u32)),
-        None => out.push(Track::Auto),
+    match parse_len(&t, em_base) {
+        Some(px) => TrackMax::Px(px.max(0) as u32),
+        None => TrackMax::Auto,
     }
+}
+
+/// Extract the URL from the first `url(...)` in a value (e.g. a `background` /
+/// `background-image`), stripping quotes. Returns `None` for `none`, gradients,
+/// or a missing/`data:` url — i.e. only fetchable image URLs (ADR-0038).
+fn parse_url_value(v: &str) -> Option<String> {
+    let start = v.find("url(")? + 4;
+    let rest = &v[start..];
+    let end = rest.find(')')?;
+    let url = rest[..end]
+        .trim()
+        .trim_matches(|c| c == '"' || c == '\'')
+        .trim();
+    if url.is_empty() || url.starts_with("data:") {
+        return None;
+    }
+    Some(url.to_string())
+}
+
+/// Parse a `grid-column`/`grid-row` placement into a track *span* count:
+/// `span N`, `a / b` (→ b−a), `a / span N`, else 1 (ADR-0038).
+fn parse_grid_span(v: &str) -> u32 {
+    let v = v.trim().to_ascii_lowercase();
+    if let Some(rest) = v.strip_prefix("span") {
+        return rest.trim().parse::<u32>().unwrap_or(1).max(1);
+    }
+    if let Some((a, b)) = v.split_once('/') {
+        let b = b.trim();
+        if let Some(n) = b.strip_prefix("span") {
+            return n.trim().parse::<u32>().unwrap_or(1).max(1);
+        }
+        if let (Ok(ai), Ok(bi)) = (a.trim().parse::<i32>(), b.parse::<i32>()) {
+            return (bi - ai).unsigned_abs().max(1);
+        }
+    }
+    1
 }
 
 fn apply_font_shorthand(style: &mut ComputedStyle, v: &str, parent_font_size: u32) {
@@ -1344,6 +1455,57 @@ mod tests {
             first(&dom.root, "p").unwrap().style.color,
             Color::rgb(0x33, 0x66, 0xcc)
         );
+    }
+
+    #[test]
+    fn supports_block_rules_are_applied_and_font_face_is_skipped() {
+        // @supports content is applied (condition not evaluated); @font-face never
+        // injects rules; text still renders (bundled font).
+        let html = "<html><head><style>\
+            @font-face { font-family: 'X'; src: url(x.woff2); }\
+            @supports (display: grid) { p { color: #ff0000 } }\
+            </style></head><body><p style=\"font-family:'X', sans-serif\">hi</p></body></html>";
+        let dom = CssEngine::new().style(&parse_html(html));
+        assert_eq!(
+            first(&dom.root, "p").unwrap().style.color,
+            Color::rgb(0xff, 0, 0),
+            "@supports rule applied; @font-face caused no breakage"
+        );
+    }
+
+    #[test]
+    fn background_image_url_is_parsed() {
+        let dom = CssEngine::new().style(&parse_html(
+            "<div style=\"background-image: url('hero.jpg')\">x</div>",
+        ));
+        assert_eq!(
+            first(&dom.root, "div")
+                .unwrap()
+                .style
+                .background_image
+                .as_deref(),
+            Some("hero.jpg")
+        );
+        // The `background` shorthand carries both color and image.
+        let dom2 = CssEngine::new().style(&parse_html(
+            "<div style='background: #fff url(bg.png) no-repeat'>x</div>",
+        ));
+        let s = &first(&dom2.root, "div").unwrap().style;
+        assert_eq!(s.background_image.as_deref(), Some("bg.png"));
+        assert_eq!(s.background, Some(Color::rgb(255, 255, 255)));
+    }
+
+    #[test]
+    fn data_uri_and_gradient_backgrounds_are_not_fetchable_urls() {
+        // We only surface fetchable image URLs; data: and gradients yield None.
+        let dom = CssEngine::new().style(&parse_html(
+            "<div style='background-image: linear-gradient(red, blue)'>x</div>",
+        ));
+        assert!(first(&dom.root, "div")
+            .unwrap()
+            .style
+            .background_image
+            .is_none());
     }
 
     #[test]

@@ -56,7 +56,7 @@ use cerberus_storage::{
     atomic_write, parse_set_cookie, random_bytes, CookieDisposition, CookiePolicy, CookieView,
     EncryptedVault, Group, StorageEnvironment, DEFAULT_TIMED_SECS,
 };
-use cerberus_style::{ExternalSheets, StyleEngine, StyledDom};
+use cerberus_style::{ExternalSheets, StyleEngine, StyledChild, StyledDom, StyledNode};
 use cerberus_text::TextEngine;
 use cerberus_tls_rustls::RustlsProvider;
 use cerberus_types::{Color, FontStyle, HeadId, InstanceId, Origin, Point, RealmId, Rect, Size};
@@ -976,9 +976,15 @@ pub fn render(config: &RenderConfig) -> Result<RenderOutcome, AppError> {
     // synchronous; the interactive browser fetches them on its worker). Built-in
     // pages reference no network images.
     let images = match &client {
-        Some(client) => {
-            fetch_images_sync(&document, &url, client, &sub_ctx, &consent, &first_party)
-        }
+        Some(client) => fetch_images_sync(
+            &document,
+            &styled,
+            &url,
+            client,
+            &sub_ctx,
+            &consent,
+            &first_party,
+        ),
         None => HashMap::new(),
     };
     let subresources_blocked = images
@@ -1481,6 +1487,7 @@ const IMAGE_DECODE_BUDGET_BYTES: usize = 16 * 1024 * 1024;
 
 fn fetch_images_sync(
     document: &Document,
+    styled: &StyledDom,
     base: &Url,
     client: &Router,
     ctx: &FetchContext,
@@ -1489,6 +1496,7 @@ fn fetch_images_sync(
 ) -> HashMap<String, ImageState> {
     let mut srcs = Vec::new();
     collect_image_urls(document.root(), &mut srcs);
+    collect_bg_image_urls(&styled.root, &mut srcs);
 
     let mut urls: Vec<String> = Vec::new();
     for src in srcs {
@@ -1621,6 +1629,19 @@ fn collect_image_urls(node: NodeRef<'_>, out: &mut Vec<String>) {
     }
 }
 
+/// Collect `background-image` URLs from the styled tree (they live in computed
+/// style, not the DOM), so they fetch through the same image pipeline (ADR-0038).
+fn collect_bg_image_urls(node: &StyledNode, out: &mut Vec<String>) {
+    if let Some(url) = &node.style.background_image {
+        out.push(url.clone());
+    }
+    for c in &node.children {
+        if let StyledChild::Element(e) = c {
+            collect_bg_image_urls(e, out);
+        }
+    }
+}
+
 /// Collect the `href`s (as written) of every `<link rel="stylesheet">`, in
 /// document order. The raw href is the key the cascade looks up, so it is kept
 /// verbatim here and resolved to an absolute URL only for fetching (ADR-0037).
@@ -1670,24 +1691,107 @@ fn fetch_stylesheets_sync(
             continue;
         }
         // Consent gate: unruled third-party stylesheets never hit the network.
-        let allowed = parse_url(&abs)
-            .ok()
-            .and_then(|u| u.origin())
-            .is_some_and(|origin| {
-                policy
-                    .locked()
-                    .evaluate(ctx.instance, &origin, first_party)
-                    .decision
-                    == Decision::Allow
-            });
-        if !allowed {
+        if !subresource_allowed(&abs, policy, ctx.instance, first_party) {
             continue;
         }
         if let Ok(bytes) = fetch_bytes(client, &abs, ctx) {
-            sheets.insert(href, String::from_utf8_lossy(&bytes).into_owned());
+            let text = String::from_utf8_lossy(&bytes).into_owned();
+            // Resolve any `@import`ed sheets (relative to this sheet) and inline
+            // them ahead of this sheet's own rules (ADR-0038).
+            let text = inline_imports(&text, &abs, client, ctx, policy, first_party, 0);
+            sheets.insert(href, text);
         }
     }
     sheets
+}
+
+/// Whether a subresource at `abs` is allowed under the consent policy (same-origin
+/// first-party loads; cross-site needs an Allow rule).
+fn subresource_allowed(
+    abs: &str,
+    policy: &Mutex<DefaultDenyPolicy>,
+    instance: InstanceId,
+    first_party: &Origin,
+) -> bool {
+    parse_url(abs)
+        .ok()
+        .and_then(|u| u.origin())
+        .is_some_and(|origin| {
+            policy
+                .locked()
+                .evaluate(instance, &origin, first_party)
+                .decision
+                == Decision::Allow
+        })
+}
+
+/// Recursively inline `@import`ed stylesheets, resolved against `base` and
+/// consent-gated, ahead of the importing sheet's rules (bounded depth). Imports
+/// we can't fetch are dropped; the cascade parser skips any leftover `@import`.
+fn inline_imports(
+    css: &str,
+    base: &str,
+    client: &Router,
+    ctx: &FetchContext,
+    policy: &Mutex<DefaultDenyPolicy>,
+    first_party: &Origin,
+    depth: usize,
+) -> String {
+    if depth >= 4 || !css.contains("@import") {
+        return css.to_string();
+    }
+    let base_url = parse_url(base).ok();
+    let mut out = String::new();
+    let mut rest = css;
+    while let Some(pos) = rest.find("@import") {
+        out.push_str(&rest[..pos]);
+        let stmt_end = rest[pos..]
+            .find(';')
+            .map(|s| pos + s + 1)
+            .unwrap_or(rest.len());
+        if let Some(url) = parse_import_url(&rest[pos..stmt_end]) {
+            let abs = resolve_subresource(base_url.as_ref(), &url);
+            if (abs.starts_with("http://") || abs.starts_with("https://"))
+                && subresource_allowed(&abs, policy, ctx.instance, first_party)
+            {
+                if let Ok(bytes) = fetch_bytes(client, &abs, ctx) {
+                    let text = String::from_utf8_lossy(&bytes).into_owned();
+                    out.push_str(&inline_imports(
+                        &text,
+                        &abs,
+                        client,
+                        ctx,
+                        policy,
+                        first_party,
+                        depth + 1,
+                    ));
+                    out.push('\n');
+                }
+            }
+        }
+        rest = &rest[stmt_end..];
+    }
+    out.push_str(rest);
+    out
+}
+
+/// Extract the URL from an `@import url("…")` / `@import "…"` statement.
+fn parse_import_url(stmt: &str) -> Option<String> {
+    let s = stmt.trim().strip_prefix("@import")?.trim();
+    if let Some(start) = s.find("url(") {
+        let inner = &s[start + 4..];
+        let end = inner.find(')')?;
+        let u = inner[..end]
+            .trim()
+            .trim_matches(|c| c == '"' || c == '\'')
+            .trim();
+        return (!u.is_empty()).then(|| u.to_string());
+    }
+    // Bare-string form: @import "x.css";
+    let s = s.trim_start_matches(['"', '\'']);
+    let end = s.find(['"', '\'']).unwrap_or(s.len());
+    let u = s[..end].trim();
+    (!u.is_empty()).then(|| u.to_string())
 }
 
 /// Live, per-page state of the interactive form controls, keyed by the field id
@@ -2405,6 +2509,8 @@ impl BrowserApp {
         // re-cascade once per sheet on a multi-stylesheet page.
         if self.pending_sheets.is_empty() {
             self.restyle_with_sheets();
+            // External CSS can introduce new background-images; fetch them now.
+            self.request_page_images();
             true
         } else {
             false
@@ -2528,6 +2634,7 @@ impl BrowserApp {
         let instance = self.heads.active().instance;
         let mut srcs = Vec::new();
         collect_image_urls(self.document.root(), &mut srcs);
+        collect_bg_image_urls(&self.styled.root, &mut srcs);
         for src in srcs {
             let abs = resolve_subresource(self.current_url.as_ref(), &src);
             // Only http(s) sub-resources go to the network worker.

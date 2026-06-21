@@ -314,6 +314,20 @@ fn parse_rules_into(text: &str, media: Option<&MediaQuery>, out: &mut Vec<Rule>)
                     }
                 }
             }
+            // `@supports`: we don't evaluate the feature condition (we can't probe
+            // support the way a full engine does); apply the inner rules, which
+            // are overwhelmingly safe progressive enhancements, preserving source
+            // order so a later fallback still wins where it should.
+            if let Some(after_at) = rest.strip_prefix("@supports") {
+                if let Some(brace) = after_at.find('{') {
+                    let inner = &after_at[brace + 1..];
+                    if let Some(end) = matching_brace(inner) {
+                        parse_rules_into(&inner[..end], media, out);
+                        rest = &inner[end + 1..];
+                        continue;
+                    }
+                }
+            }
             rest = skip_at_rule(rest);
             continue;
         }

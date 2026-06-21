@@ -15,7 +15,7 @@ use cerberus_dom::NodeId;
 use cerberus_paint::{DecodedImage, DisplayItem, DisplayList, GlyphBox, TextShaper};
 use cerberus_style::{
     AlignItems, ComputedStyle, Display, FlexDirection, JustifyContent, StyledChild, StyledDom,
-    StyledNode, TextAlign, Track,
+    StyledNode, TextAlign, Track, TrackMax,
 };
 use cerberus_types::{Color, FontStyle, Point, Rect, Size};
 use std::sync::Arc;
@@ -526,21 +526,16 @@ impl<'a> Ctx<'a> {
 
         if is_block {
             self.flush_line();
-            if let Some(color) = style.background.filter(|_| visible) {
+            if visible {
                 let h = (self.y - bg_start_y).max(0) as u32;
                 if h > 0 {
-                    self.display.items.insert(
-                        bg_index,
-                        DisplayItem::Rect {
-                            rect: Rect::new(
-                                self.left0,
-                                bg_start_y,
-                                (self.right - self.left0) as u32,
-                                h,
-                            ),
-                            color,
-                        },
+                    let rect = Rect::new(
+                        self.left0,
+                        bg_start_y,
+                        (self.right - self.left0).max(0) as u32,
+                        h,
                     );
+                    self.paint_background(bg_index, style, rect);
                 }
             }
             // Generic hit box for this block element (M12b): the content extent
@@ -1218,6 +1213,26 @@ impl<'a> Ctx<'a> {
 
     /// Merge a finished sub-context's output into this one, shifting it down by
     /// `dy` (cross-axis alignment). All sub items are already in absolute coords.
+    /// Paint an element's background — solid color then `background-image` — at
+    /// `bg_index`, behind its content. The image (if fetched) is stretched to the
+    /// box; a not-yet-available image simply doesn't paint (ADR-0038).
+    fn paint_background(&mut self, bg_index: usize, style: &ComputedStyle, rect: Rect) {
+        let mut idx = bg_index;
+        if let Some(color) = style.background {
+            self.display
+                .items
+                .insert(idx, DisplayItem::Rect { rect, color });
+            idx += 1;
+        }
+        if let Some(url) = &style.background_image {
+            if let Some(img) = self.images.get(url) {
+                self.display
+                    .items
+                    .insert(idx, DisplayItem::Image { rect, image: img });
+            }
+        }
+    }
+
     fn merge_sub(&mut self, sub: Ctx<'a>, dx: i32, dy: i32) {
         for mut item in sub.display.items {
             if dx != 0 || dy != 0 {
@@ -1274,17 +1289,10 @@ impl<'a> Ctx<'a> {
 
         let h = (self.y - start_y).max(0) as u32;
         if h > 0 {
-            if let Some(color) = node.style.background {
-                self.display.items.insert(
-                    bg_index,
-                    DisplayItem::Rect {
-                        rect: Rect::new(left, start_y, (right - left).max(0) as u32, h),
-                        color,
-                    },
-                );
-            }
+            let rect = Rect::new(left, start_y, (right - left).max(0) as u32, h);
+            self.paint_background(bg_index, &node.style, rect);
             self.elements.push(ElementBox {
-                rect: Rect::new(left, start_y, (right - left).max(0) as u32, h),
+                rect,
                 node: node.node_id,
             });
         }
@@ -1492,11 +1500,12 @@ impl<'a> Ctx<'a> {
         self.y = y;
     }
 
-    /// Lay out a grid container (explicit tracks v1): `grid-template-columns`
-    /// (Px fixed; Fr/Auto share the leftover) defines the columns; children are
-    /// placed row-major into cells with `gap`; each row's height is its tallest
-    /// cell. `grid-template-rows` and auto-placement/spanning are not modeled —
-    /// rows are content-sized.
+    /// Lay out a grid container (ADR-0038): resolve column tracks
+    /// (`px`/`fr`/`auto`/`minmax()`, or `repeat(auto-fill, …)` whose count comes
+    /// from the container width), auto-place items into a 2-D occupancy grid
+    /// honoring `grid-column`/`grid-row` spans, size rows from
+    /// `grid-template-rows`/`grid-auto-rows` or content, and place each item
+    /// (spanning the union of its tracks).
     fn grid_layout(&mut self, node: &StyledNode) {
         self.flush_line();
         let left = self.left;
@@ -1504,39 +1513,10 @@ impl<'a> Ctx<'a> {
         let start_y = self.y;
         let gap = node.style.gap as i32;
         let bg_index = self.display.items.len();
-
-        let cols = &node.style.grid_template_columns;
-        let ncols = cols.len().max(1);
         let avail = (right - left).max(1);
 
-        // Resolve column widths.
-        let widths: Vec<i32> = if cols.is_empty() {
-            vec![avail]
-        } else {
-            let total_gap = gap * (ncols as i32 - 1).max(0);
-            let space = (avail - total_gap).max(ncols as i32);
-            let mut fixed = 0i32;
-            let mut fr_total = 0f32;
-            for t in cols {
-                match t {
-                    Track::Px(p) => fixed += *p as i32,
-                    Track::Fr(f) => fr_total += f.max(0.0),
-                    Track::Auto => fr_total += 1.0,
-                }
-            }
-            let leftover = (space - fixed).max(0) as f32;
-            cols.iter()
-                .map(|t| match t {
-                    Track::Px(p) => (*p as i32).max(1),
-                    Track::Fr(f) if fr_total > 0.0 => {
-                        (leftover * f.max(0.0) / fr_total).floor().max(1.0) as i32
-                    }
-                    Track::Auto if fr_total > 0.0 => (leftover / fr_total).floor().max(1.0) as i32,
-                    _ => 1,
-                })
-                .collect()
-        };
-
+        let widths = resolve_grid_columns(&node.style, avail, gap);
+        let ncols = widths.len().max(1);
         let mut col_x = Vec::with_capacity(widths.len());
         let mut cx = left;
         for &w in &widths {
@@ -1553,55 +1533,90 @@ impl<'a> Ctx<'a> {
             })
             .collect();
 
-        let mut y = start_y;
-        let mut start = 0;
-        while start < items.len() {
-            let end = (start + ncols).min(items.len());
-            let mut row_h = 0;
-            let mut laid: Vec<Ctx<'a>> = Vec::new();
-            for (col, it) in items[start..end].iter().enumerate() {
-                let x0 = col_x[col];
-                let w = widths[col];
-                let mut sub = Ctx::sub(
-                    x0,
-                    x0 + w,
-                    y,
-                    self.shaper,
-                    self.images,
-                    self.forms,
-                    self.field_id,
-                );
-                sub.walk(it, None);
-                sub.flush_line();
-                self.field_id = sub.field_id;
-                row_h = row_h.max((sub.y - y).max(1));
-                laid.push(sub);
+        // Auto-placement: scan row-major for the first free span_c × span_r block.
+        let mut occ: Vec<Vec<bool>> = Vec::new();
+        let mut placed: Vec<GridPlacement> = Vec::with_capacity(items.len());
+        let mut cursor = (0usize, 0usize); // (row, col) search hint
+        for it in &items {
+            let cs = (it.style.grid_column_span as usize).clamp(1, ncols);
+            let rs = (it.style.grid_row_span as usize).max(1);
+            let (r0, c0) = find_free_cell(&mut occ, ncols, cs, rs, cursor);
+            for row in occ.iter_mut().take(r0 + rs).skip(r0) {
+                for cell in row.iter_mut().take(c0 + cs).skip(c0) {
+                    *cell = true;
+                }
             }
-            for sub in laid {
-                self.merge_sub(sub, 0, 0);
+            cursor = (r0, (c0 + cs) % ncols.max(1));
+            placed.push(GridPlacement { r0, c0, cs, rs });
+        }
+        let nrows = occ.len();
+
+        // Lay each item into its column-span width (starting at `start_y`), and
+        // record its content height.
+        let mut subs: Vec<(Ctx<'a>, i32)> = Vec::with_capacity(items.len());
+        for (it, p) in items.iter().zip(&placed) {
+            let x0 = col_x[p.c0];
+            let span_w = span_extent(&widths, p.c0, p.cs, gap);
+            let mut sub = Ctx::sub(
+                x0,
+                x0 + span_w,
+                start_y,
+                self.shaper,
+                self.images,
+                self.forms,
+                self.field_id,
+            );
+            sub.walk(it, None);
+            sub.flush_line();
+            self.field_id = sub.field_id;
+            let h = (sub.y - start_y).max(1);
+            subs.push((sub, h));
+        }
+
+        // Row heights: explicit (`grid-template-rows`/`grid-auto-rows`) or the
+        // tallest single-row item; multi-row items push any deficit onto their
+        // last spanned row so they never overlap the next row.
+        let mut row_h = vec![0i32; nrows];
+        for (r, h) in row_h.iter_mut().enumerate() {
+            *h = explicit_row_height(&node.style, r);
+        }
+        for ((_, h), p) in subs.iter().zip(&placed) {
+            if p.rs == 1 {
+                row_h[p.r0] = row_h[p.r0].max(*h);
             }
-            y += row_h + gap;
-            start = end;
+        }
+        for ((_, h), p) in subs.iter().zip(&placed) {
+            if p.rs > 1 {
+                let span: i32 =
+                    row_h[p.r0..p.r0 + p.rs].iter().sum::<i32>() + gap * (p.rs as i32 - 1);
+                if span < *h {
+                    row_h[p.r0 + p.rs - 1] += *h - span;
+                }
+            }
+        }
+        let mut row_y = Vec::with_capacity(nrows);
+        let mut ry = start_y;
+        for &h in &row_h {
+            row_y.push(ry);
+            ry += h + gap;
+        }
+
+        for ((sub, _), p) in subs.into_iter().zip(&placed) {
+            let dy = row_y.get(p.r0).copied().unwrap_or(start_y) - start_y;
+            self.merge_sub(sub, 0, dy);
         }
         self.y = if items.is_empty() {
             start_y
         } else {
-            (y - gap).max(start_y)
+            (ry - gap).max(start_y)
         };
 
         let h = (self.y - start_y).max(0) as u32;
         if h > 0 {
-            if let Some(color) = node.style.background {
-                self.display.items.insert(
-                    bg_index,
-                    DisplayItem::Rect {
-                        rect: Rect::new(left, start_y, (right - left).max(0) as u32, h),
-                        color,
-                    },
-                );
-            }
+            let rect = Rect::new(left, start_y, (right - left).max(0) as u32, h);
+            self.paint_background(bg_index, &node.style, rect);
             self.elements.push(ElementBox {
-                rect: Rect::new(left, start_y, (right - left).max(0) as u32, h),
+                rect,
                 node: node.node_id,
             });
         }
@@ -1847,6 +1862,129 @@ fn drain_offset<T>(
 
 /// A flex item's effective cross alignment: `align-self` if set, else the
 /// container's `align-items` (ADR-0036).
+/// One item's resolved grid placement: top-left cell + span (ADR-0038).
+struct GridPlacement {
+    r0: usize,
+    c0: usize,
+    cs: usize,
+    rs: usize,
+}
+
+/// Find the first free `cs × rs` cell block scanning row-major from `cursor`,
+/// growing the occupancy grid as needed.
+fn find_free_cell(
+    occ: &mut Vec<Vec<bool>>,
+    ncols: usize,
+    cs: usize,
+    rs: usize,
+    cursor: (usize, usize),
+) -> (usize, usize) {
+    let ncols = ncols.max(1);
+    let (mut r, mut c) = cursor;
+    if c + cs > ncols {
+        c = 0;
+        r += 1;
+    }
+    loop {
+        while occ.len() < r + rs {
+            occ.push(vec![false; ncols]);
+        }
+        let free = (r..r + rs).all(|rr| (c..c + cs).all(|cc| !occ[rr][cc]));
+        if free {
+            return (r, c);
+        }
+        c += 1;
+        if c + cs > ncols {
+            c = 0;
+            r += 1;
+        }
+    }
+}
+
+/// The pixel width spanned by columns `[c0, c0+cs)` including internal gaps.
+fn span_extent(widths: &[i32], c0: usize, cs: usize, gap: i32) -> i32 {
+    let end = (c0 + cs).min(widths.len());
+    let w: i32 = widths[c0..end].iter().sum();
+    w + gap * ((end - c0) as i32 - 1).max(0)
+}
+
+/// A grid track's fixed base (px floor) and flex weight (`fr`).
+fn track_base_fr(track: Track) -> (i32, f32) {
+    match track {
+        Track::Px(p) => (p as i32, 0.0),
+        Track::Fr(f) => (0, f.max(0.0)),
+        Track::Auto => (0, 1.0),
+        Track::MinMax(min, max) => match max {
+            TrackMax::Px(p) => ((min as i32).max(p as i32), 0.0),
+            TrackMax::Fr(f) => (min as i32, f.max(0.0)),
+            TrackMax::Auto => (min as i32, 1.0),
+        },
+    }
+}
+
+/// Resolve explicit grid tracks to pixel widths: fixed bases first, then `fr`
+/// tracks share the leftover (ADR-0038).
+fn resolve_tracks(tracks: &[Track], avail: i32, gap: i32) -> Vec<i32> {
+    let n = tracks.len();
+    if n == 0 {
+        return vec![avail.max(1)];
+    }
+    let total_gap = gap * (n as i32 - 1).max(0);
+    let mut bases = Vec::with_capacity(n);
+    let mut frs = Vec::with_capacity(n);
+    for &t in tracks {
+        let (b, f) = track_base_fr(t);
+        bases.push(b);
+        frs.push(f);
+    }
+    let leftover = (avail - bases.iter().sum::<i32>() - total_gap).max(0) as f32;
+    let fr_sum: f32 = frs.iter().sum();
+    (0..n)
+        .map(|i| {
+            let extra = if fr_sum > 0.0 {
+                leftover * frs[i] / fr_sum
+            } else {
+                0.0
+            };
+            (bases[i] as f32 + extra).round().max(1.0) as i32
+        })
+        .collect()
+}
+
+/// Resolve a grid container's column widths: a `repeat(auto-fill, …)` derives the
+/// column count from the container width; otherwise the explicit template
+/// (or one full-width column) is resolved (ADR-0038).
+fn resolve_grid_columns(style: &ComputedStyle, avail: i32, gap: i32) -> Vec<i32> {
+    if let Some(track) = style.grid_auto_fill {
+        let (base, _) = track_base_fr(track);
+        let min = base.max(1);
+        let ncols = (((avail + gap) / (min + gap)).max(1)) as usize;
+        let tracks = vec![track; ncols.min(1000)];
+        return resolve_tracks(&tracks, avail, gap);
+    }
+    if style.grid_template_columns.is_empty() {
+        return vec![avail.max(1)];
+    }
+    resolve_tracks(&style.grid_template_columns, avail, gap)
+}
+
+/// The explicit pixel height of grid row `r` (`grid-template-rows` then
+/// `grid-auto-rows`), or 0 to mean "size to content" (ADR-0038).
+fn explicit_row_height(style: &ComputedStyle, r: usize) -> i32 {
+    let track = style
+        .grid_template_rows
+        .get(r)
+        .copied()
+        .or(style.grid_auto_rows);
+    match track {
+        Some(Track::Px(p)) => p as i32,
+        Some(Track::MinMax(min, TrackMax::Px(p))) => (min as i32).max(p as i32),
+        Some(Track::MinMax(min, _)) => min as i32,
+        // fr/auto rows are content-sized (the container height is indefinite).
+        _ => 0,
+    }
+}
+
 fn resolve_align(
     s: cerberus_style::AlignSelf,
     container: cerberus_style::AlignItems,
@@ -2334,6 +2472,73 @@ mod tests {
         assert!(distinct(&glyph_ys(&grid)) >= 2, "one column -> two rows");
     }
 
+    // ---- Grid v2: minmax / auto-fill / spans (ADR-0038) ----
+
+    #[test]
+    fn grid_auto_fill_minmax_derives_column_count_from_width() {
+        // avail 784 with minmax(200px, 1fr) auto-fill -> 3 columns; the 4th item
+        // wraps to a second row.
+        let laid = lay(
+            "<div style='display:grid;grid-template-columns:repeat(auto-fill, minmax(200px, 1fr))'>\
+             <div style='background:#ff0000'>A</div><div style='background:#00ff00'>B</div>\
+             <div style='background:#0000ff'>C</div><div style='background:#ffff00'>D</div></div>",
+            800,
+        );
+        let r = fill_rects(&laid);
+        assert_eq!(r.len(), 4);
+        let xs: Vec<i32> = r.iter().map(|rc| rc.x).collect();
+        assert_eq!(distinct(&xs), 3, "three columns at 800px wide");
+        let ys: Vec<i32> = r.iter().map(|rc| rc.y).collect();
+        assert!(distinct(&ys) >= 2, "the 4th item wraps to a second row");
+        for rc in &r {
+            assert!(
+                (rc.w as i32 - 261).abs() <= 4,
+                "column width ~261: {}",
+                rc.w
+            );
+        }
+    }
+
+    #[test]
+    fn grid_item_column_span_widens_the_cell() {
+        // 4 equal columns (~196 each); the first item spans 2 (~392).
+        let laid = lay(
+            "<div style='display:grid;grid-template-columns:repeat(4, 1fr)'>\
+             <div style='background:#ff0000;grid-column:span 2'>A</div>\
+             <div style='background:#00ff00'>B</div></div>",
+            800,
+        );
+        let r = fill_rects(&laid);
+        assert_eq!(r.len(), 2);
+        assert!(
+            (r[0].w as i32 - 392).abs() <= 6,
+            "span-2 cell ~392: {}",
+            r[0].w
+        );
+        assert!(
+            (r[1].w as i32 - 196).abs() <= 4,
+            "single cell ~196: {}",
+            r[1].w
+        );
+        // B is placed in the third column (after the 2-col span), not overlapping.
+        assert!(r[1].x >= r[0].x + 380, "B starts after the spanned cell");
+    }
+
+    #[test]
+    fn grid_minmax_floor_is_respected() {
+        // minmax(300px,1fr) + 1fr at 800: col0 floored at 300 then shares; both fr.
+        let laid = lay(
+            "<div style='display:grid;grid-template-columns:minmax(300px,1fr) 1fr'>\
+             <div style='background:#ff0000'>A</div><div style='background:#00ff00'>B</div></div>",
+            800,
+        );
+        let r = fill_rects(&laid);
+        assert_eq!(r.len(), 2);
+        assert!(r[0].w >= 300, "minmax floor honored: {}", r[0].w);
+        // col0 = 300 + half of (784-300); col1 = half of (784-300).
+        assert!(r[0].w as i32 > r[1].w as i32, "floored track is wider");
+    }
+
     fn total_glyphs(laid: &LaidOut) -> usize {
         laid.display
             .items
@@ -2437,6 +2642,38 @@ mod tests {
                 .any(|i| matches!(i, DisplayItem::Image { .. })),
             "decoded image emitted"
         );
+    }
+
+    #[test]
+    fn background_image_paints_behind_block_content() {
+        // `background-image: url(...)` on a block paints a stretched image item
+        // (ADR-0038), supplied by the provider keyed by the url.
+        let styled = CssEngine::new().style(&parse_html(
+            "<div style='background-image:url(bg.png)'>hello</div>",
+        ));
+        let img = Arc::new(DecodedImage {
+            size: Size::new(8, 8),
+            rgba: vec![200; 8 * 8 * 4],
+        });
+        let laid = BlockLayout::default().layout(
+            &styled,
+            Size::new(400, 2000),
+            &MonoShaper,
+            &OneImage(img),
+            &NoForms,
+        );
+        let bg = laid
+            .display
+            .items
+            .iter()
+            .find_map(|i| match i {
+                DisplayItem::Image { rect, .. } => Some(*rect),
+                _ => None,
+            })
+            .expect("background image emitted");
+        // The background fills the block width (here the full content area).
+        assert!(bg.w >= 300, "bg image stretched to the box: {}", bg.w);
+        assert_eq!(bg.x, 8, "bg starts at the page margin");
     }
 
     #[test]

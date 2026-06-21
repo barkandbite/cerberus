@@ -138,6 +138,16 @@ pub enum Track {
     Fr(f32),
     /// Content-sized (v1: treated as one `fr`).
     Auto,
+    /// `minmax(min, max)` — a floor in px and a max that flexes (ADR-0038).
+    MinMax(u32, TrackMax),
+}
+
+/// The `max` side of a `minmax()` track.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum TrackMax {
+    Px(u32),
+    Fr(f32),
+    Auto,
 }
 
 /// The computed style applied to one element (after the cascade).
@@ -146,6 +156,9 @@ pub struct ComputedStyle {
     pub display: Display,
     pub color: Color,
     pub background: Option<Color>,
+    /// `background-image: url(...)` — the (unresolved) URL, painted behind the
+    /// element's content via the image pipeline (ADR-0038). Not inherited.
+    pub background_image: Option<String>,
     pub font_size: u32,
     pub font: FontStyle,
     pub text_align: TextAlign,
@@ -179,6 +192,15 @@ pub struct ComputedStyle {
     pub gap: u32,
     pub grid_template_columns: Vec<Track>,
     pub grid_template_rows: Vec<Track>,
+    /// `repeat(auto-fill|auto-fit, <track>)` columns: the repeated track, with the
+    /// count computed from the container width at layout (ADR-0038).
+    pub grid_auto_fill: Option<Track>,
+    /// `grid-auto-rows` — size of implicitly-created rows (else content-sized).
+    pub grid_auto_rows: Option<Track>,
+    /// Grid *item* placement spans (`grid-column`/`grid-row: span N` or `a / b`);
+    /// 1 unless the item spans multiple tracks. Reset per element (ADR-0038).
+    pub grid_column_span: u32,
+    pub grid_row_span: u32,
     /// `position` and its insets/`z-index` (ADR-0034). Insets resolve against the
     /// containing block at layout; `z_index` orders positioned layers in paint.
     pub position: Position,
@@ -196,6 +218,7 @@ impl ComputedStyle {
             display: Display::Block,
             color: Color::BLACK,
             background: None,
+            background_image: None,
             font_size: 16,
             font: FontStyle::REGULAR,
             text_align: TextAlign::Left,
@@ -219,6 +242,10 @@ impl ComputedStyle {
             gap: 0,
             grid_template_columns: Vec::new(),
             grid_template_rows: Vec::new(),
+            grid_auto_fill: None,
+            grid_auto_rows: None,
+            grid_column_span: 1,
+            grid_row_span: 1,
             position: Position::Static,
             inset_top: Len::Auto,
             inset_right: Len::Auto,
@@ -242,6 +269,7 @@ impl ComputedStyle {
             // Reset per element:
             display: Display::Inline,
             background: None,
+            background_image: None,
             opacity: 1.0,
             margin_top: 0,
             margin_bottom: 0,
@@ -260,6 +288,10 @@ impl ComputedStyle {
             gap: 0,
             grid_template_columns: Vec::new(),
             grid_template_rows: Vec::new(),
+            grid_auto_fill: None,
+            grid_auto_rows: None,
+            grid_column_span: 1,
+            grid_row_span: 1,
             // Positioning is not inherited; every element starts in normal flow.
             position: Position::Static,
             inset_top: Len::Auto,
