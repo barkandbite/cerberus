@@ -70,6 +70,41 @@ weren't handled. This ADR closes those, completing the fidelity arc.
   sheets async; nested `@import` there is a follow-up).
 - Web fonts are substituted by design (see above), not downloaded.
 
+## Cross-category verification (and bugs fixed)
+
+Live-rendered representative sites per category; positioning, `var()`/`calc()`,
+flexbox v2, external CSS, grid v2, and backgrounds were exercised end-to-end:
+
+- **Government:** gov.uk — hero, 3-column "Popular" grid, services list. ✓
+- **Reference/search:** Wikipedia, MDN, GNU — articles, multi-column card grids,
+  two-column media. ✓ (MDN required the grid named-line + measurement fixes.)
+- **Retail/ecommerce:** apple.com — centered hero copy and a 2-column product
+  tile grid. ✓ (Required the absolute-flex-child and measurement fixes.)
+- **Design/portfolio:** stripe.com, tailwindcss.com — full-width hero, image
+  collages, sections. ✓
+
+Bugs found and fixed during this pass (see the layout commit): intrinsic-width
+**measurement inflation** by grow/justify/align at the probe width (the "one word
+per line" hero collapse); `merge_sub` not bubbling `max_x`; `absolute`/`fixed`
+children corrupting flex/grid sizing; grid **named-line** tokens parsed as `auto`
+tracks; `auto-fill` with a zero min exploding into 1px columns; and inline
+`<svg>` `<text>` flowing as stray page symbols.
+
+## Architectural limitations surfaced (out of this scope)
+
+These are pre-existing, beyond grid/backgrounds/fonts, and explain the remaining
+imperfect renders:
+
+- **Client-rendered SPAs** (YouTube, DuckDuckGo) paint blank — they build the DOM
+  via framework JS that needs the full event-driven loop (a separate, larger
+  arc). Static/SSR pages are unaffected.
+- **`float`-based layouts** (Bootstrap 3, e.g. books.toscrape) stack instead of
+  sitting side-by-side — `float`/`clear` aren't modeled. Modern flex/grid sites
+  are unaffected.
+- **Element `width`/`max-width`** on plain blocks is not honored (only flex/grid
+  algorithms size); centered max-width containers render full-width.
+- Some sites apply **anti-bot 403s** (e.g. bbc.com) before any rendering.
+
 ## Alternatives considered
 
 - **Download web fonts for typeface fidelity:** rejected — conflicts with the
