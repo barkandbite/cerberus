@@ -505,18 +505,26 @@ impl<'a> Ctx<'a> {
         let is_block = matches!(style.display, Display::Block | Display::ListItem);
         let saved_left = self.left;
         let saved_right0 = self.right;
-        let (bg_index, bg_start_y) = (self.display.items.len(), self.y);
+        let bg_index = self.display.items.len();
+        // The border box (left/right/top + per-side border widths), recorded at
+        // block-open and used to paint the background + border and the hit box at
+        // block-close (ADR-0040).
+        let mut bbox: Option<BorderBox> = None;
 
         if is_block {
             self.flush_line();
             self.y += style.margin_top;
             self.line_align = style.text_align;
-            // Constrain to width/max-width (ADR-0039); `margin:auto` centers the
-            // box, otherwise honor margin-left. Unconstrained blocks fill the line.
             let avail = (self.right - self.left).max(1);
-            match resolve_block_width(style, avail) {
-                Some(w) => {
-                    let extra = (avail - w).max(0);
+            let (pl, pr) = (style.padding_left, style.padding_right);
+            let (bl, br) = (style.border_left, style.border_right);
+            let h_extra = pl + pr + bl + br;
+            // Border-box width from width/max-width (box-sizing aware); `margin:
+            // auto` centers it, else margin-left offsets (ADR-0039/0040).
+            let (box_left, box_w) = match resolve_border_box_width(style, avail, h_extra) {
+                Some(bw) => {
+                    let bw = bw.clamp(1, avail);
+                    let extra = (avail - bw).max(0);
                     let off = if style.margin_left_auto && style.margin_right_auto {
                         extra / 2
                     } else if style.margin_left_auto {
@@ -526,11 +534,26 @@ impl<'a> Ctx<'a> {
                     } else {
                         style.margin_left.clamp(0, extra)
                     };
-                    self.left += off;
-                    self.right = self.left + w;
+                    (self.left + off, bw)
                 }
-                None => self.left += style.margin_left,
-            }
+                None => {
+                    let l = self.left + style.margin_left;
+                    (l, (self.right - l).max(1))
+                }
+            };
+            bbox = Some(BorderBox {
+                left: box_left,
+                right: box_left + box_w,
+                top: self.y,
+                bt: style.border_top,
+                br,
+                bb: style.border_bottom,
+                bl,
+            });
+            // Content box = border box inset by border + padding.
+            self.left = box_left + bl + pl;
+            self.right = (box_left + box_w - br - pr).max(self.left + 1);
+            self.y += style.border_top + style.padding_top;
             self.x = self.left;
             if visible && style.display == Display::ListItem {
                 self.add_run("\u{2022}", style, None);
@@ -572,32 +595,27 @@ impl<'a> Ctx<'a> {
 
         if is_block {
             self.flush_line();
-            if visible {
-                let h = (self.y - bg_start_y).max(0) as u32;
+            // Close the box: bottom padding + border, then paint the border box's
+            // background/border and record the hit box over it (ADR-0040).
+            self.y += style.padding_bottom + style.border_bottom;
+            if let Some(bx) = bbox {
+                let h = (self.y - bx.top).max(0) as u32;
                 if h > 0 {
-                    let rect = Rect::new(
-                        self.left,
-                        bg_start_y,
-                        (self.right - self.left).max(0) as u32,
-                        h,
-                    );
-                    self.paint_background(bg_index, style, rect);
+                    let rect = Rect::new(bx.left, bx.top, (bx.right - bx.left).max(0) as u32, h);
+                    if visible {
+                        self.paint_box(bg_index, style, rect, &bx);
+                    }
+                    self.elements.push(ElementBox {
+                        rect,
+                        node: node.node_id,
+                    });
                 }
             }
-            // Generic hit box for this block element (M12b): the content extent
-            // it occupied. Boxes nest (a parent contains its children); the app
-            // resolves a click to the smallest one and lets the event bubble.
-            let elem_h = (self.y - bg_start_y).max(0) as u32;
-            if elem_h > 0 {
-                self.elements.push(ElementBox {
-                    rect: Rect::new(
-                        self.left,
-                        bg_start_y,
-                        (self.right - self.left).max(0) as u32,
-                        elem_h,
-                    ),
-                    node: node.node_id,
-                });
+            // Intrinsic width includes the box's right padding + border (the left
+            // insets are already in the content's x). Only while measuring — in
+            // real layout `max_x` is unused and a no-width box spans the line.
+            if self.measuring {
+                self.max_x += style.padding_right + style.border_right;
             }
             self.y += style.margin_bottom;
             self.left = saved_left;
@@ -1263,8 +1281,9 @@ impl<'a> Ctx<'a> {
     /// `dy` (cross-axis alignment). All sub items are already in absolute coords.
     /// Paint an element's background — solid color then `background-image` — at
     /// `bg_index`, behind its content. The image (if fetched) is stretched to the
-    /// box; a not-yet-available image simply doesn't paint (ADR-0038).
-    fn paint_background(&mut self, bg_index: usize, style: &ComputedStyle, rect: Rect) {
+    /// box; a not-yet-available image simply doesn't paint (ADR-0038). Returns the
+    /// next insert index (after the painted layers).
+    fn paint_background(&mut self, bg_index: usize, style: &ComputedStyle, rect: Rect) -> usize {
         let mut idx = bg_index;
         if let Some(color) = style.background {
             self.display
@@ -1277,7 +1296,40 @@ impl<'a> Ctx<'a> {
                 self.display
                     .items
                     .insert(idx, DisplayItem::Image { rect, image: img });
+                idx += 1;
             }
+        }
+        idx
+    }
+
+    /// Paint a block's background/image then its border (4 solid edge rects) over
+    /// the border box, behind content (ADR-0040).
+    fn paint_box(&mut self, bg_index: usize, style: &ComputedStyle, rect: Rect, bx: &BorderBox) {
+        let mut idx = self.paint_background(bg_index, style, rect);
+        let col = style.border_color;
+        let (l, t) = (rect.x, rect.y);
+        let (w, h) = (rect.w as i32, rect.h as i32);
+        let mut edge = |r: Rect| {
+            self.display.items.insert(
+                idx,
+                DisplayItem::Rect {
+                    rect: r,
+                    color: col,
+                },
+            );
+            idx += 1;
+        };
+        if bx.bt > 0 {
+            edge(Rect::new(l, t, w.max(0) as u32, bx.bt as u32));
+        }
+        if bx.bb > 0 {
+            edge(Rect::new(l, t + h - bx.bb, w.max(0) as u32, bx.bb as u32));
+        }
+        if bx.bl > 0 {
+            edge(Rect::new(l, t, bx.bl as u32, h.max(0) as u32));
+        }
+        if bx.br > 0 {
+            edge(Rect::new(l + w - bx.br, t, bx.br as u32, h.max(0) as u32));
         }
     }
 
@@ -1373,10 +1425,17 @@ impl<'a> Ctx<'a> {
     /// shrink (floored at each item's min-content); the cross axis aligns/stretches.
     fn flex_layout(&mut self, node: &StyledNode) {
         self.flush_line();
-        let left = self.left;
-        let right = self.right.max(left + 1);
-        let start_y = self.y;
-        let gap = node.style.gap as i32;
+        let s = &node.style;
+        // The container border box; items lay inside it inset by border + padding
+        // (ADR-0040).
+        let box_left = self.left;
+        let box_right = self.right.max(box_left + 1);
+        let box_top = self.y;
+        let left = box_left + s.border_left + s.padding_left;
+        let right = (box_right - s.border_right - s.padding_right).max(left + 1);
+        let start_y = box_top + s.border_top + s.padding_top;
+        self.y = start_y;
+        let gap = s.gap as i32;
         let bg_index = self.display.items.len();
 
         // Flex items in `order` (stable sort keeps document order within a group).
@@ -1399,10 +1458,20 @@ impl<'a> Ctx<'a> {
             }
         }
 
-        let h = (self.y - start_y).max(0) as u32;
+        self.y += s.padding_bottom + s.border_bottom;
+        let h = (self.y - box_top).max(0) as u32;
         if h > 0 {
-            let rect = Rect::new(left, start_y, (right - left).max(0) as u32, h);
-            self.paint_background(bg_index, &node.style, rect);
+            let rect = Rect::new(box_left, box_top, (box_right - box_left).max(0) as u32, h);
+            let bx = BorderBox {
+                left: box_left,
+                right: box_right,
+                top: box_top,
+                bt: s.border_top,
+                br: s.border_right,
+                bb: s.border_bottom,
+                bl: s.border_left,
+            };
+            self.paint_box(bg_index, &node.style, rect, &bx);
             self.elements.push(ElementBox {
                 rect,
                 node: node.node_id,
@@ -1642,10 +1711,15 @@ impl<'a> Ctx<'a> {
     /// (spanning the union of its tracks).
     fn grid_layout(&mut self, node: &StyledNode) {
         self.flush_line();
-        let left = self.left;
-        let right = self.right.max(left + 1);
-        let start_y = self.y;
-        let gap = node.style.gap as i32;
+        let s = &node.style;
+        // Container border box; cells lay inside it inset by border+padding (0040).
+        let box_left = self.left;
+        let box_right = self.right.max(box_left + 1);
+        let box_top = self.y;
+        let left = box_left + s.border_left + s.padding_left;
+        let right = (box_right - s.border_right - s.padding_right).max(left + 1);
+        let start_y = box_top + s.border_top + s.padding_top;
+        let gap = s.gap as i32;
         let bg_index = self.display.items.len();
         let avail = (right - left).max(1);
 
@@ -1773,11 +1847,21 @@ impl<'a> Ctx<'a> {
         } else {
             (ry - gap).max(start_y)
         };
+        self.y += s.padding_bottom + s.border_bottom;
 
-        let h = (self.y - start_y).max(0) as u32;
+        let h = (self.y - box_top).max(0) as u32;
         if h > 0 {
-            let rect = Rect::new(left, start_y, (right - left).max(0) as u32, h);
-            self.paint_background(bg_index, &node.style, rect);
+            let rect = Rect::new(box_left, box_top, (box_right - box_left).max(0) as u32, h);
+            let bx = BorderBox {
+                left: box_left,
+                right: box_right,
+                top: box_top,
+                bt: s.border_top,
+                br: s.border_right,
+                bb: s.border_bottom,
+                bl: s.border_left,
+            };
+            self.paint_box(bg_index, &node.style, rect, &bx);
             self.elements.push(ElementBox {
                 rect,
                 node: node.node_id,
@@ -2025,6 +2109,29 @@ fn drain_offset<T>(
 
 /// A flex item's effective cross alignment: `align-self` if set, else the
 /// container's `align-items` (ADR-0036).
+/// A block's border box (edges + per-side border widths), recorded at block-open
+/// to paint the background/border and the hit box at block-close (ADR-0040).
+struct BorderBox {
+    left: i32,
+    right: i32,
+    top: i32,
+    bt: i32,
+    br: i32,
+    bb: i32,
+    bl: i32,
+}
+
+/// The used **border-box** width of a block (box-sizing aware) from
+/// `width`/`max-width`, or `None` when unconstrained — `h_extra` is the
+/// horizontal padding+border (ADR-0040).
+fn resolve_border_box_width(style: &ComputedStyle, avail: i32, h_extra: i32) -> Option<i32> {
+    let raw = resolve_block_width(style, avail)?;
+    Some(match style.box_sizing {
+        cerberus_style::BoxSizing::BorderBox => raw,
+        cerberus_style::BoxSizing::ContentBox => raw + h_extra,
+    })
+}
+
 /// State for packing a run of `float` siblings into rows (ADR-0039).
 struct FloatBand {
     /// The container's content-left (where each band row starts).
@@ -2877,6 +2984,54 @@ mod tests {
             r[1].w as i32 > 400,
             "cleared block spans the full width: {}",
             r[1].w
+        );
+    }
+
+    #[test]
+    fn padding_insets_content_and_enlarges_box() {
+        // Padding grows the background box and insets the text (ADR-0040).
+        let plain = lay("<div style='background:#ff0000'>hi</div>", 400);
+        let padded = lay("<div style='background:#ff0000;padding:20px'>hi</div>", 400);
+        let (pr, dr) = (fill_rects(&plain), fill_rects(&padded));
+        assert!(dr[0].h > pr[0].h + 30, "vertical padding grows the box");
+        let min_plain = *glyph_xs(&plain).iter().min().unwrap();
+        let min_pad = *glyph_xs(&padded).iter().min().unwrap();
+        assert!(min_pad >= min_plain + 15, "text inset by left padding");
+    }
+
+    #[test]
+    fn border_paints_four_edges() {
+        let laid = lay("<div style='border:2px solid #000000'>hi</div>", 400);
+        let rects = laid
+            .display
+            .items
+            .iter()
+            .filter(|i| matches!(i, DisplayItem::Rect { .. }))
+            .count();
+        assert!(rects >= 4, "border paints 4 edge rects, got {rects}");
+    }
+
+    #[test]
+    fn box_sizing_border_box_includes_padding() {
+        // border-box: the 200px width includes 20px padding each side (box=200);
+        // content-box: width adds the padding (box=240).
+        let bb = lay(
+            "<div style='box-sizing:border-box;width:200px;padding:20px;background:#ff0000'>x</div>",
+            600,
+        );
+        let cb = lay(
+            "<div style='width:200px;padding:20px;background:#ff0000'>x</div>",
+            600,
+        );
+        assert!(
+            (fill_rects(&bb)[0].w as i32 - 200).abs() <= 2,
+            "border-box width includes padding: {}",
+            fill_rects(&bb)[0].w
+        );
+        assert!(
+            (fill_rects(&cb)[0].w as i32 - 240).abs() <= 2,
+            "content-box adds padding to width: {}",
+            fill_rects(&cb)[0].w
         );
     }
 

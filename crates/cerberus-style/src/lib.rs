@@ -41,6 +41,15 @@ impl Len {
     }
 }
 
+/// CSS `box-sizing` — whether `width`/`height` include padding + border
+/// (`border-box`) or just the content (`content-box`, the default) — ADR-0040.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub enum BoxSizing {
+    #[default]
+    ContentBox,
+    BorderBox,
+}
+
 /// CSS `float` — take a box out of normal flow to the left/right, with siblings
 /// flowing alongside (ADR-0039).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
@@ -198,6 +207,21 @@ pub struct ComputedStyle {
     /// `float` / `clear` (ADR-0039). Not inherited.
     pub float: Float,
     pub clear: Clear,
+    /// `padding` (px per side) — inner spacing between border and content
+    /// (ADR-0040). Not inherited.
+    pub padding_top: i32,
+    pub padding_right: i32,
+    pub padding_bottom: i32,
+    pub padding_left: i32,
+    /// `border-*-width` (px per side) and a single `border-color` — a solid
+    /// border painted around the padding box (ADR-0040). Not inherited.
+    pub border_top: i32,
+    pub border_right: i32,
+    pub border_bottom: i32,
+    pub border_left: i32,
+    pub border_color: Color,
+    /// `box-sizing` (ADR-0040). Not inherited.
+    pub box_sizing: BoxSizing,
     /// Preserve whitespace/newlines (`<pre>`); otherwise collapse + wrap.
     pub preformatted: bool,
     /// `visibility: hidden` — laid out but not painted. Inherited.
@@ -273,6 +297,16 @@ impl ComputedStyle {
             min_width: Len::Auto,
             float: Float::None,
             clear: Clear::None,
+            padding_top: 0,
+            padding_right: 0,
+            padding_bottom: 0,
+            padding_left: 0,
+            border_top: 0,
+            border_right: 0,
+            border_bottom: 0,
+            border_left: 0,
+            border_color: Color::BLACK,
+            box_sizing: BoxSizing::ContentBox,
             preformatted: false,
             visibility: Visibility::Visible,
             opacity: 1.0,
@@ -330,6 +364,16 @@ impl ComputedStyle {
             min_width: Len::Auto,
             float: Float::None,
             clear: Clear::None,
+            padding_top: 0,
+            padding_right: 0,
+            padding_bottom: 0,
+            padding_left: 0,
+            border_top: 0,
+            border_right: 0,
+            border_bottom: 0,
+            border_left: 0,
+            border_color: Color::BLACK,
+            box_sizing: BoxSizing::ContentBox,
             flex_direction: FlexDirection::Row,
             flex_reverse: false,
             flex_wrap: false,

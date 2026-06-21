@@ -13,9 +13,9 @@ pub use color::parse_color;
 
 use cerberus_dom::{Document, NodeRef};
 use cerberus_style::{
-    AlignItems, AlignSelf, Clear, ComputedStyle, Display, ExternalSheets, FlexBasis, FlexDirection,
-    Float, JustifyContent, Len, Position, StyleEngine, StyledChild, StyledDom, StyledNode,
-    TextAlign, Track, TrackMax, Visibility,
+    AlignItems, AlignSelf, BoxSizing, Clear, ComputedStyle, Display, ExternalSheets, FlexBasis,
+    FlexDirection, Float, JustifyContent, Len, Position, StyleEngine, StyledChild, StyledDom,
+    StyledNode, TextAlign, Track, TrackMax, Visibility,
 };
 use cerberus_types::Color;
 use parser::{
@@ -694,6 +694,60 @@ fn apply_declarations(
                     _ => Clear::None,
                 }
             }
+            "box-sizing" => {
+                style.box_sizing = if v.trim().eq_ignore_ascii_case("border-box") {
+                    BoxSizing::BorderBox
+                } else {
+                    BoxSizing::ContentBox
+                }
+            }
+            "padding" => apply_box_shorthand(
+                v,
+                style.font_size as f32,
+                &mut [
+                    &mut style.padding_top,
+                    &mut style.padding_right,
+                    &mut style.padding_bottom,
+                    &mut style.padding_left,
+                ],
+            ),
+            "padding-top" => set_len(&mut style.padding_top, v, style.font_size as f32),
+            "padding-right" => set_len(&mut style.padding_right, v, style.font_size as f32),
+            "padding-bottom" => set_len(&mut style.padding_bottom, v, style.font_size as f32),
+            "padding-left" => set_len(&mut style.padding_left, v, style.font_size as f32),
+            "border" => apply_border(style, v, [true, true, true, true]),
+            "border-top" => apply_border(style, v, [true, false, false, false]),
+            "border-right" => apply_border(style, v, [false, true, false, false]),
+            "border-bottom" => apply_border(style, v, [false, false, true, false]),
+            "border-left" => apply_border(style, v, [false, false, false, true]),
+            "border-width" => apply_box_shorthand(
+                v,
+                style.font_size as f32,
+                &mut [
+                    &mut style.border_top,
+                    &mut style.border_right,
+                    &mut style.border_bottom,
+                    &mut style.border_left,
+                ],
+            ),
+            "border-color" => {
+                if let Some(c) = parse_color(v.split_whitespace().next().unwrap_or(v)) {
+                    style.border_color = c;
+                }
+            }
+            "border-style" => {
+                // `none`/`hidden` removes the border; any other style keeps width.
+                if matches!(v.trim().to_ascii_lowercase().as_str(), "none" | "hidden") {
+                    style.border_top = 0;
+                    style.border_right = 0;
+                    style.border_bottom = 0;
+                    style.border_left = 0;
+                }
+            }
+            "border-top-width" => set_len(&mut style.border_top, v, style.font_size as f32),
+            "border-right-width" => set_len(&mut style.border_right, v, style.font_size as f32),
+            "border-bottom-width" => set_len(&mut style.border_bottom, v, style.font_size as f32),
+            "border-left-width" => set_len(&mut style.border_left, v, style.font_size as f32),
             "white-space" => style.preformatted = v.to_ascii_lowercase().starts_with("pre"),
             "visibility" => {
                 style.visibility = match v.to_ascii_lowercase().as_str() {
@@ -1236,6 +1290,93 @@ fn apply_flex_shorthand(style: &mut ComputedStyle, v: &str, em: f32) {
         None if nums.is_empty() => FlexBasis::Auto,
         None => FlexBasis::Px(0),
     };
+}
+
+/// Set a px field from a length value (no-op if it doesn't parse), clamped ≥ 0.
+fn set_len(field: &mut i32, v: &str, em: f32) {
+    if let Some(n) = parse_len(v, em) {
+        *field = n.max(0);
+    }
+}
+
+/// Apply a 1–4 value box shorthand (top/right/bottom/left, CSS order) to four px
+/// fields — used for `padding` and `border-width` (ADR-0040).
+fn apply_box_shorthand(v: &str, em: f32, sides: &mut [&mut i32; 4]) {
+    let p: Vec<i32> = v
+        .split_whitespace()
+        .map(|t| parse_len(t, em).unwrap_or(0).max(0))
+        .collect();
+    let (t, r, b, l) = match p.len() {
+        1 => (p[0], p[0], p[0], p[0]),
+        2 => (p[0], p[1], p[0], p[1]),
+        3 => (p[0], p[1], p[2], p[1]),
+        n if n >= 4 => (p[0], p[1], p[2], p[3]),
+        _ => return,
+    };
+    *sides[0] = t;
+    *sides[1] = r;
+    *sides[2] = b;
+    *sides[3] = l;
+}
+
+/// A `border-width` keyword (`thin`/`medium`/`thick`) or length, in px.
+fn parse_border_width(tok: &str, em: f32) -> Option<i32> {
+    match tok {
+        "thin" => Some(1),
+        "medium" => Some(3),
+        "thick" => Some(5),
+        _ => parse_len(tok, em).map(|w| w.max(0)),
+    }
+}
+
+/// Apply a `border` (or per-side `border-*`) shorthand: a width, an optional
+/// style keyword (`none`/`hidden` removes it), and a color, in any order. `sides`
+/// selects which of top/right/bottom/left to set (ADR-0040).
+fn apply_border(style: &mut ComputedStyle, v: &str, sides: [bool; 4]) {
+    let em = style.font_size as f32;
+    let mut width: Option<i32> = None;
+    let mut color: Option<cerberus_types::Color> = None;
+    let mut style_none = false;
+    let mut saw_style = false;
+    for tok in v.split_whitespace() {
+        match tok.to_ascii_lowercase().as_str() {
+            "none" | "hidden" => {
+                style_none = true;
+                saw_style = true;
+            }
+            "solid" | "dashed" | "dotted" | "double" | "groove" | "ridge" | "inset" | "outset" => {
+                saw_style = true
+            }
+            low => {
+                if let Some(w) = parse_border_width(low, em) {
+                    width = Some(w);
+                } else if let Some(c) = parse_color(tok) {
+                    color = Some(c);
+                }
+            }
+        }
+    }
+    // Width: explicit wins; `none` is 0; a bare style/color implies the default
+    // medium width so the border is visible.
+    let w = if style_none {
+        0
+    } else {
+        width.unwrap_or(if saw_style || color.is_some() { 3 } else { 0 })
+    };
+    let fields = [
+        &mut style.border_top,
+        &mut style.border_right,
+        &mut style.border_bottom,
+        &mut style.border_left,
+    ];
+    for (i, f) in fields.into_iter().enumerate() {
+        if sides[i] {
+            *f = w;
+        }
+    }
+    if let Some(c) = color {
+        style.border_color = c;
+    }
 }
 
 /// Apply the `inset` shorthand (1–4 values: top/right/bottom/left, CSS order).
