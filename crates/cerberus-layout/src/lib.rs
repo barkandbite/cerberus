@@ -14,7 +14,7 @@
 use cerberus_dom::NodeId;
 use cerberus_paint::{DecodedImage, DisplayItem, DisplayList, GlyphBox, TextShaper};
 use cerberus_style::{
-    AlignItems, ComputedStyle, Display, FlexDirection, JustifyContent, StyledChild, StyledDom,
+    AlignItems, ComputedStyle, Display, FlexDirection, JustifyContent, Len, StyledChild, StyledDom,
     StyledNode, TextAlign, Track, TrackMax,
 };
 use cerberus_types::{Color, FontStyle, Point, Rect, Size};
@@ -504,13 +504,33 @@ impl<'a> Ctx<'a> {
         }
         let is_block = matches!(style.display, Display::Block | Display::ListItem);
         let saved_left = self.left;
+        let saved_right0 = self.right;
         let (bg_index, bg_start_y) = (self.display.items.len(), self.y);
 
         if is_block {
             self.flush_line();
             self.y += style.margin_top;
             self.line_align = style.text_align;
-            self.left += style.margin_left;
+            // Constrain to width/max-width (ADR-0039); `margin:auto` centers the
+            // box, otherwise honor margin-left. Unconstrained blocks fill the line.
+            let avail = (self.right - self.left).max(1);
+            match resolve_block_width(style, avail) {
+                Some(w) => {
+                    let extra = (avail - w).max(0);
+                    let off = if style.margin_left_auto && style.margin_right_auto {
+                        extra / 2
+                    } else if style.margin_left_auto {
+                        extra
+                    } else if style.margin_right_auto {
+                        0
+                    } else {
+                        style.margin_left.clamp(0, extra)
+                    };
+                    self.left += off;
+                    self.right = self.left + w;
+                }
+                None => self.left += style.margin_left,
+            }
             self.x = self.left;
             if visible && style.display == Display::ListItem {
                 self.add_run("\u{2022}", style, None);
@@ -520,16 +540,34 @@ impl<'a> Ctx<'a> {
 
         let saved_opacity_hidden = self.opacity_hidden;
         self.opacity_hidden = subtree_hidden;
+        // Float band state: consecutive `float` children pack left-to-right and
+        // wrap (the common column-grid pattern); a non-float child, text, or
+        // `clear` drops below the band (ADR-0039). Text wrap-around is not modeled.
+        let mut fb = FloatBand::new(self.left, self.y);
         for child in &node.children {
             match child {
                 StyledChild::Text(t) => {
+                    self.flush_floats(&mut fb);
                     if visible {
                         self.add_text(t, style, href);
                     }
                 }
-                StyledChild::Element(e) => self.walk(e, href),
+                StyledChild::Element(e)
+                    if e.style.float != cerberus_style::Float::None
+                        && e.style.display != Display::None =>
+                {
+                    self.place_float(e, href, &mut fb);
+                }
+                StyledChild::Element(e) => {
+                    if e.style.clear != cerberus_style::Clear::None {
+                        self.flush_floats(&mut fb);
+                    }
+                    self.flush_floats(&mut fb);
+                    self.walk(e, href);
+                }
             }
         }
+        self.flush_floats(&mut fb);
         self.opacity_hidden = saved_opacity_hidden;
 
         if is_block {
@@ -538,9 +576,9 @@ impl<'a> Ctx<'a> {
                 let h = (self.y - bg_start_y).max(0) as u32;
                 if h > 0 {
                     let rect = Rect::new(
-                        self.left0,
+                        self.left,
                         bg_start_y,
-                        (self.right - self.left0).max(0) as u32,
+                        (self.right - self.left).max(0) as u32,
                         h,
                     );
                     self.paint_background(bg_index, style, rect);
@@ -553,9 +591,9 @@ impl<'a> Ctx<'a> {
             if elem_h > 0 {
                 self.elements.push(ElementBox {
                     rect: Rect::new(
-                        self.left0,
+                        self.left,
                         bg_start_y,
-                        (self.right - self.left0).max(0) as u32,
+                        (self.right - self.left).max(0) as u32,
                         elem_h,
                     ),
                     node: node.node_id,
@@ -563,6 +601,7 @@ impl<'a> Ctx<'a> {
             }
             self.y += style.margin_bottom;
             self.left = saved_left;
+            self.right = saved_right0;
             self.x = self.left;
         }
         if let Some(base) = pos_base {
@@ -1239,6 +1278,67 @@ impl<'a> Ctx<'a> {
                     .items
                     .insert(idx, DisplayItem::Image { rect, image: img });
             }
+        }
+    }
+
+    /// Place one `float` child into the current float band: pack left-to-right,
+    /// wrapping to a new row when it doesn't fit, sizing it from its
+    /// `width`/`max-width` (else shrink-to-fit) — ADR-0039. (Right floats are
+    /// left-packed; text wrap-around is not modeled.)
+    fn place_float(&mut self, e: &StyledNode, in_link: Option<&str>, fb: &mut FloatBand) {
+        let avail = (self.right - self.left).max(1);
+        let explicit = resolve_block_width(&e.style, avail);
+        let w = explicit
+            .unwrap_or_else(|| self.measure_intrinsic_width(e).min(avail))
+            .clamp(1, avail);
+        if !fb.active {
+            fb.active = true;
+            fb.row_top = self.y;
+            fb.x = fb.left;
+            fb.row_h = 0;
+            fb.bottom = self.y;
+        }
+        // Wrap to a new band row when the float won't fit beside the previous one.
+        if fb.x != fb.left && fb.x + w > self.right {
+            fb.row_top += fb.row_h;
+            fb.x = fb.left;
+            fb.row_h = 0;
+        }
+        // An explicit-width float gets the full avail (so `walk` resolves its
+        // width% against the container); a shrink-to-fit float is bounded to its
+        // content. Either way its box lands in `[fb.x, fb.x + w]`.
+        let sub_right = if explicit.is_some() {
+            fb.x + avail
+        } else {
+            fb.x + w
+        };
+        let mut sub = Ctx::sub(
+            fb.x,
+            sub_right,
+            fb.row_top,
+            self.shaper,
+            self.images,
+            self.forms,
+            self.field_id,
+        );
+        sub.measuring = self.measuring;
+        sub.walk(e, in_link);
+        sub.flush_line();
+        self.field_id = sub.field_id;
+        let h = (sub.y - fb.row_top).max(1);
+        self.merge_sub(sub, 0, 0);
+        fb.row_h = fb.row_h.max(h);
+        fb.x += w;
+        fb.bottom = fb.bottom.max(fb.row_top + fb.row_h);
+    }
+
+    /// Close the float band: drop the flow below the floats (also handles `clear`
+    /// and any in-flow content following floats) — ADR-0039.
+    fn flush_floats(&mut self, fb: &mut FloatBand) {
+        if fb.active {
+            self.y = self.y.max(fb.bottom);
+            self.x = self.left;
+            *fb = FloatBand::new(fb.left, self.y);
         }
     }
 
@@ -1925,6 +2025,58 @@ fn drain_offset<T>(
 
 /// A flex item's effective cross alignment: `align-self` if set, else the
 /// container's `align-items` (ADR-0036).
+/// State for packing a run of `float` siblings into rows (ADR-0039).
+struct FloatBand {
+    /// The container's content-left (where each band row starts).
+    left: i32,
+    /// Next float x within the current row.
+    x: i32,
+    /// Top y of the current band row.
+    row_top: i32,
+    /// Height of the tallest float in the current row.
+    row_h: i32,
+    /// Whether any float is currently placed (the band is open).
+    active: bool,
+    /// The lowest point reached by any float (where flow resumes).
+    bottom: i32,
+}
+
+impl FloatBand {
+    fn new(left: i32, y: i32) -> Self {
+        Self {
+            left,
+            x: left,
+            row_top: y,
+            row_h: 0,
+            active: false,
+            bottom: y,
+        }
+    }
+}
+
+/// The used content width of a block from `width`/`max-width`/`min-width`, or
+/// `None` when unconstrained (fill the available width) — ADR-0039.
+fn resolve_block_width(style: &ComputedStyle, avail: i32) -> Option<i32> {
+    let res = |len: Len| match len {
+        Len::Px(p) => Some(p.max(0)),
+        Len::Pct(f) => Some((f / 100.0 * avail as f32).round().max(0.0) as i32),
+        Len::Auto => None,
+    };
+    let mut w = res(style.width);
+    if let Some(mw) = res(style.max_width) {
+        w = Some(w.unwrap_or(avail).min(mw));
+    }
+    if let Some(mw) = res(style.min_width) {
+        w = Some(w.unwrap_or(0).max(mw));
+    }
+    let w = w?;
+    // Not a constraint if `width` is auto and it wouldn't narrow the box.
+    if w >= avail && matches!(style.width, Len::Auto) {
+        return None;
+    }
+    Some(w.clamp(1, avail))
+}
+
 /// Whether an element participates in flex/grid layout: rendered and **in flow**.
 /// Per CSS, `absolute`/`fixed` children are taken out of flex/grid flow (they
 /// don't size or shift the tracks) — including them corrupts sizing, e.g. a
@@ -2663,6 +2815,68 @@ mod tests {
         assert!(
             r[1].x >= r[0].x + 70,
             "items are side by side, not collapsed"
+        );
+    }
+
+    #[test]
+    fn max_width_with_auto_margins_centers_block() {
+        // A 200px max-width block with margin:auto centers in the content area.
+        let laid = lay(
+            "<div style='max-width:200px;margin:0 auto;background:#ff0000'>hi</div>",
+            600,
+        );
+        let r = fill_rects(&laid);
+        assert_eq!(r.len(), 1);
+        assert!(
+            (r[0].w as i32 - 200).abs() <= 2,
+            "constrained to 200: {}",
+            r[0].w
+        );
+        assert!(r[0].x > 100, "centered, not flush left: {}", r[0].x);
+    }
+
+    #[test]
+    fn float_left_blocks_sit_side_by_side() {
+        // Two float:left 50% columns share a row (the Bootstrap grid pattern).
+        let laid = lay(
+            "<div><div style='float:left;width:50%;background:#ff0000'>A</div>\
+             <div style='float:left;width:50%;background:#00ff00'>B</div></div>",
+            600,
+        );
+        let r = fill_rects(&laid);
+        assert_eq!(r.len(), 2);
+        assert!(
+            (r[0].w as i32 - 292).abs() <= 4,
+            "first column ~50%: {}",
+            r[0].w
+        );
+        assert!(
+            r[1].x > r[0].x + 200,
+            "second float beside the first: {}",
+            r[1].x
+        );
+        assert!((r[0].y - r[1].y).abs() <= 2, "floats share a row");
+    }
+
+    #[test]
+    fn clear_drops_below_floats() {
+        // A cleared block starts below the float row, not beside it.
+        let laid = lay(
+            "<div><div style='float:left;width:50%;background:#ff0000'>A</div>\
+             <div style='clear:both;background:#0000ff'>below</div></div>",
+            600,
+        );
+        let r = fill_rects(&laid);
+        assert_eq!(r.len(), 2);
+        // The cleared block is full-width and below the float.
+        assert!(
+            r[1].y >= r[0].y + r[0].h as i32,
+            "cleared block is below the float"
+        );
+        assert!(
+            r[1].w as i32 > 400,
+            "cleared block spans the full width: {}",
+            r[1].w
         );
     }
 

@@ -41,6 +41,26 @@ impl Len {
     }
 }
 
+/// CSS `float` — take a box out of normal flow to the left/right, with siblings
+/// flowing alongside (ADR-0039).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub enum Float {
+    #[default]
+    None,
+    Left,
+    Right,
+}
+
+/// CSS `clear` — drop below preceding floats on the named side(s).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub enum Clear {
+    #[default]
+    None,
+    Left,
+    Right,
+    Both,
+}
+
 /// CSS `display` (the subset we flow).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Display {
@@ -166,6 +186,18 @@ pub struct ComputedStyle {
     pub margin_top: i32,
     pub margin_bottom: i32,
     pub margin_left: i32,
+    /// `margin-left`/`-right: auto` — used to center a width-constrained block
+    /// (ADR-0039). Not inherited.
+    pub margin_left_auto: bool,
+    pub margin_right_auto: bool,
+    /// `width`/`max-width`/`min-width` for block boxes (ADR-0039). `Auto` means
+    /// unconstrained (fill the available width). Not inherited.
+    pub width: Len,
+    pub max_width: Len,
+    pub min_width: Len,
+    /// `float` / `clear` (ADR-0039). Not inherited.
+    pub float: Float,
+    pub clear: Clear,
     /// Preserve whitespace/newlines (`<pre>`); otherwise collapse + wrap.
     pub preformatted: bool,
     /// `visibility: hidden` — laid out but not painted. Inherited.
@@ -234,6 +266,13 @@ impl ComputedStyle {
             margin_top: 0,
             margin_bottom: 0,
             margin_left: 0,
+            margin_left_auto: false,
+            margin_right_auto: false,
+            width: Len::Auto,
+            max_width: Len::Auto,
+            min_width: Len::Auto,
+            float: Float::None,
+            clear: Clear::None,
             preformatted: false,
             visibility: Visibility::Visible,
             opacity: 1.0,
@@ -284,6 +323,13 @@ impl ComputedStyle {
             margin_top: 0,
             margin_bottom: 0,
             margin_left: 0,
+            margin_left_auto: false,
+            margin_right_auto: false,
+            width: Len::Auto,
+            max_width: Len::Auto,
+            min_width: Len::Auto,
+            float: Float::None,
+            clear: Clear::None,
             flex_direction: FlexDirection::Row,
             flex_reverse: false,
             flex_wrap: false,

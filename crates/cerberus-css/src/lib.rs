@@ -13,9 +13,9 @@ pub use color::parse_color;
 
 use cerberus_dom::{Document, NodeRef};
 use cerberus_style::{
-    AlignItems, AlignSelf, ComputedStyle, Display, ExternalSheets, FlexBasis, FlexDirection,
-    JustifyContent, Len, Position, StyleEngine, StyledChild, StyledDom, StyledNode, TextAlign,
-    Track, TrackMax, Visibility,
+    AlignItems, AlignSelf, Clear, ComputedStyle, Display, ExternalSheets, FlexBasis, FlexDirection,
+    Float, JustifyContent, Len, Position, StyleEngine, StyledChild, StyledDom, StyledNode,
+    TextAlign, Track, TrackMax, Visibility,
 };
 use cerberus_types::Color;
 use parser::{
@@ -664,8 +664,34 @@ fn apply_declarations(
                 }
             }
             "margin-left" => {
+                style.margin_left_auto = v.trim().eq_ignore_ascii_case("auto");
                 if let Some(m) = parse_len(v, style.font_size as f32) {
                     style.margin_left = m;
+                }
+            }
+            "margin-right" => {
+                style.margin_right_auto = v.trim().eq_ignore_ascii_case("auto");
+            }
+            "width" => style.width = parse_inset(v, style.font_size as f32).unwrap_or(Len::Auto),
+            "max-width" => {
+                style.max_width = parse_inset(v, style.font_size as f32).unwrap_or(Len::Auto)
+            }
+            "min-width" => {
+                style.min_width = parse_inset(v, style.font_size as f32).unwrap_or(Len::Auto)
+            }
+            "float" => {
+                style.float = match v.trim().to_ascii_lowercase().as_str() {
+                    "left" => Float::Left,
+                    "right" => Float::Right,
+                    _ => Float::None,
+                }
+            }
+            "clear" => {
+                style.clear = match v.trim().to_ascii_lowercase().as_str() {
+                    "left" => Clear::Left,
+                    "right" => Clear::Right,
+                    "both" => Clear::Both,
+                    _ => Clear::None,
                 }
             }
             "white-space" => style.preformatted = v.to_ascii_lowercase().starts_with("pre"),
@@ -1053,20 +1079,31 @@ fn apply_font_shorthand(style: &mut ComputedStyle, v: &str, parent_font_size: u3
 }
 
 fn apply_margin_shorthand(style: &mut ComputedStyle, v: &str, em_base: f32) {
-    let parts: Vec<i32> = v
-        .split_whitespace()
+    let toks: Vec<&str> = v.split_whitespace().collect();
+    let parts: Vec<i32> = toks
+        .iter()
         .map(|p| parse_len(p, em_base).unwrap_or(0))
         .collect();
-    let (top, bottom, left) = match parts.len() {
-        1 => (parts[0], parts[0], parts[0]),
-        2 => (parts[0], parts[0], parts[1]),
-        3 => (parts[0], parts[2], parts[1]),
-        n if n >= 4 => (parts[0], parts[2], parts[3]),
+    // Track which sides are `auto` (for centering): horizontal sides are index 1
+    // (right) and 3 (left) in the 4-value form, or index 1 in the 2/3-value form.
+    let is_auto = |i: usize| toks.get(i).is_some_and(|t| t.eq_ignore_ascii_case("auto"));
+    let (top, bottom, left, l_auto, r_auto) = match parts.len() {
+        1 => (parts[0], parts[0], parts[0], is_auto(0), is_auto(0)),
+        2 | 3 => (
+            parts[0],
+            if parts.len() == 3 { parts[2] } else { parts[0] },
+            parts[1],
+            is_auto(1),
+            is_auto(1),
+        ),
+        n if n >= 4 => (parts[0], parts[2], parts[3], is_auto(3), is_auto(1)),
         _ => return,
     };
     style.margin_top = top;
     style.margin_bottom = bottom;
     style.margin_left = left;
+    style.margin_left_auto = l_auto;
+    style.margin_right_auto = r_auto;
 }
 
 fn parse_size(v: &str, parent: u32) -> Option<u32> {
