@@ -162,6 +162,18 @@ impl Rect {
     }
 }
 
+/// How an image fills its box (`object-fit` / `background-size`) — ADR-0044.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub enum ImageFit {
+    /// Stretch to fill the box (the default `fill`, and `background-size: 100%`).
+    #[default]
+    Fill,
+    /// Scale to cover the box, cropping overflow, preserving aspect ratio.
+    Cover,
+    /// Scale to fit inside the box, letterboxing, preserving aspect ratio.
+    Contain,
+}
+
 /// A straight RGBA color, 8 bits per channel.
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
 pub struct Color {

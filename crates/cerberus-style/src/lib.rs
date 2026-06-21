@@ -6,7 +6,7 @@
 //! reimplemented without touching layout. Layout consumes only these types.
 
 use cerberus_dom::{Document, NodeId};
-use cerberus_types::{Color, FontStyle};
+use cerberus_types::{Color, FontStyle, ImageFit};
 
 /// CSS `position`. `Static` is normal flow; the rest are positioned.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
@@ -288,6 +288,12 @@ pub struct ComputedStyle {
     pub border_radius: u16,
     pub background_gradient: Option<Box<Gradient>>,
     pub box_shadow: Option<Box<BoxShadow>>,
+    /// `object-fit` (`<img>`) / `background-size` (cover/contain) — how an image
+    /// scales into its box (ADR-0044). `Fill` (stretch) is the default. The two
+    /// are separate CSS properties on the same element, so they're tracked apart.
+    /// Not inherited.
+    pub object_fit: ImageFit,
+    pub background_size: ImageFit,
     /// Preserve whitespace/newlines (`<pre>`); otherwise collapse + wrap.
     pub preformatted: bool,
     /// `visibility: hidden` — laid out but not painted. Inherited.
@@ -383,6 +389,8 @@ impl ComputedStyle {
             border_radius: 0,
             background_gradient: None,
             box_shadow: None,
+            object_fit: ImageFit::Fill,
+            background_size: ImageFit::Fill,
             preformatted: false,
             visibility: Visibility::Visible,
             opacity: 1.0,
@@ -460,6 +468,9 @@ impl ComputedStyle {
             border_radius: 0,
             background_gradient: None,
             box_shadow: None,
+            // object-fit / background-size are not inherited.
+            object_fit: ImageFit::Fill,
+            background_size: ImageFit::Fill,
             flex_direction: FlexDirection::Row,
             flex_reverse: false,
             flex_wrap: false,

@@ -976,7 +976,8 @@ impl<'a> Ctx<'a> {
             }
             self.place_box(w, h.max(1));
             let rect = Rect::new(self.x, self.y, w, h.max(1));
-            self.display.push(DisplayItem::Image { rect, image });
+            let fit = node.style.object_fit;
+            self.display.push(DisplayItem::Image { rect, image, fit });
             self.advance_box(w, h);
         } else if let (Some(w), Some(h)) = (attr_w, attr_h) {
             // Not decoded yet: reserve the declared box so layout doesn't reflow.
@@ -1433,9 +1434,14 @@ impl<'a> Ctx<'a> {
         }
         if let Some(url) = &style.background_image {
             if let Some(img) = self.images.get(url) {
-                self.display
-                    .items
-                    .insert(idx, DisplayItem::Image { rect, image: img });
+                self.display.items.insert(
+                    idx,
+                    DisplayItem::Image {
+                        rect,
+                        image: img,
+                        fit: style.background_size,
+                    },
+                );
                 idx += 1;
             }
         }
@@ -2864,6 +2870,7 @@ mod tests {
     use cerberus_dom::parse_html;
     use cerberus_paint::MonoShaper;
     use cerberus_style::StyleEngine;
+    use cerberus_types::ImageFit;
 
     fn lay(html: &str, width: u32) -> LaidOut {
         let styled = CssEngine::new().style(&parse_html(html));
@@ -3666,6 +3673,44 @@ mod tests {
                 .iter()
                 .any(|i| matches!(i, DisplayItem::Image { .. })),
             "decoded image emitted"
+        );
+    }
+
+    #[test]
+    fn object_fit_and_background_size_reach_the_image_item() {
+        // `<img object-fit:cover>` tags its Image item Cover; a block's
+        // `background-size:contain` tags its background Image Contain (ADR-0044).
+        let fit_of = |html: &str| {
+            let styled = CssEngine::new().style(&parse_html(html));
+            let img = Arc::new(DecodedImage {
+                size: Size::new(20, 10),
+                rgba: vec![255; 20 * 10 * 4],
+            });
+            let laid = BlockLayout::default().layout(
+                &styled,
+                Size::new(400, 2000),
+                &MonoShaper,
+                &OneImage(img),
+                &NoForms,
+            );
+            laid.display.items.iter().find_map(|i| match i {
+                DisplayItem::Image { fit, .. } => Some(*fit),
+                _ => None,
+            })
+        };
+        assert_eq!(
+            fit_of("<img src='pic.png' style='object-fit:cover'>"),
+            Some(ImageFit::Cover)
+        );
+        assert_eq!(
+            fit_of("<div style='background-image:url(bg.png); background-size:contain'>x</div>"),
+            Some(ImageFit::Contain)
+        );
+        // Default (no property) stays Fill.
+        assert_eq!(
+            fit_of("<img src='pic.png'>"),
+            Some(ImageFit::Fill),
+            "default object-fit is Fill (stretch)"
         );
     }
 

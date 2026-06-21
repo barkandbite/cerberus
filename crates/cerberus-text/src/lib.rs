@@ -14,7 +14,7 @@ use ab_glyph::{point, Font, FontRef, GlyphId, PxScale, ScaleFont};
 use cerberus_paint::{
     DecodedImage, DisplayItem, DisplayList, Framebuffer, GlyphBox, Rasterizer, TextShaper,
 };
-use cerberus_types::{Color, FontStyle, Point, Rect};
+use cerberus_types::{Color, FontStyle, ImageFit, Point, Rect};
 
 /// The bundled font (Roboto Regular, Apache-2.0). See `assets/Roboto-LICENSE.txt`.
 const FONT_BYTES: &[u8] = include_bytes!("../assets/Roboto-Regular.ttf");
@@ -83,15 +83,47 @@ impl TextEngine {
         }
     }
 
-    /// Draw a decoded image scaled (nearest-neighbor) into `rect`, alpha-blended.
-    fn draw_image(&self, rect: Rect, image: &DecodedImage, target: &mut Framebuffer) {
+    /// Draw a decoded image into `rect` (nearest-neighbor, alpha-blended) with the
+    /// given fit: `Fill` stretches; `Cover` scales to cover and crops; `Contain`
+    /// fits inside and letterboxes (ADR-0044).
+    fn draw_image(
+        &self,
+        rect: Rect,
+        image: &DecodedImage,
+        fit: ImageFit,
+        target: &mut Framebuffer,
+    ) {
         if rect.w == 0 || rect.h == 0 || image.size.w == 0 || image.size.h == 0 {
             return;
         }
+        let (rw, rh) = (rect.w as f32, rect.h as f32);
+        let (iw, ih) = (image.size.w as f32, image.size.h as f32);
+        // Per-axis scale (px of source per px of dest) and a centering offset in
+        // dest space; `Fill` is the stretch identity.
+        let (sxr, syr, off_x, off_y) = match fit {
+            ImageFit::Fill => (iw / rw, ih / rh, 0.0, 0.0),
+            ImageFit::Cover => {
+                let s = (rw / iw).max(rh / ih); // dest px per source px
+                (1.0 / s, 1.0 / s, (rw - iw * s) / 2.0, (rh - ih * s) / 2.0)
+            }
+            ImageFit::Contain => {
+                let s = (rw / iw).min(rh / ih);
+                (1.0 / s, 1.0 / s, (rw - iw * s) / 2.0, (rh - ih * s) / 2.0)
+            }
+        };
         for dy in 0..rect.h {
-            let sy = (dy * image.size.h / rect.h).min(image.size.h - 1);
+            // Source row for this dest row (dest minus the centering offset).
+            let syf = (dy as f32 - off_y) * syr;
+            if syf < 0.0 || syf >= ih {
+                continue; // letterbox band (Contain)
+            }
+            let sy = (syf as u32).min(image.size.h - 1);
             for dx in 0..rect.w {
-                let sx = (dx * image.size.w / rect.w).min(image.size.w - 1);
+                let sxf = (dx as f32 - off_x) * sxr;
+                if sxf < 0.0 || sxf >= iw {
+                    continue;
+                }
+                let sx = (sxf as u32).min(image.size.w - 1);
                 let si = ((sy * image.size.w + sx) * 4) as usize;
                 let a = image.rgba[si + 3] as f32 / 255.0;
                 target.blend_pixel(
@@ -359,7 +391,9 @@ impl Rasterizer for TextEngine {
                 DisplayItem::Shadow { rect, blur, color } => {
                     draw_shadow(*rect, *blur as i32, *color, target)
                 }
-                DisplayItem::Image { rect, image } => self.draw_image(*rect, image, target),
+                DisplayItem::Image { rect, image, fit } => {
+                    self.draw_image(*rect, image, *fit, target)
+                }
                 DisplayItem::Glyphs {
                     origin,
                     glyphs,
@@ -399,6 +433,64 @@ fn intersect_rect(a: Rect, b: Rect) -> Rect {
 mod tests {
     use super::*;
     use cerberus_types::Size;
+
+    #[test]
+    fn image_fit_fill_cover_contain() {
+        // A wide 20x10 source: column 0 green, the rest red. Drawn into a square
+        // 20x20 box over white, the three fits read distinctly (ADR-0044).
+        let mut rgba = vec![0u8; 20 * 10 * 4];
+        for y in 0..10 {
+            for x in 0..20 {
+                let i = (y * 20 + x) * 4;
+                let (r, g) = if x == 0 { (0, 255) } else { (255, 0) };
+                rgba[i] = r;
+                rgba[i + 1] = g;
+                rgba[i + 3] = 255;
+            }
+        }
+        let image = DecodedImage {
+            size: Size::new(20, 10),
+            rgba,
+        };
+        let draw = |fit: ImageFit| {
+            let mut fb = Framebuffer::new(Size::new(20, 20));
+            fb.fill_rect(Rect::new(0, 0, 20, 20), Color::WHITE);
+            TextEngine::new().draw_image(Rect::new(0, 0, 20, 20), &image, fit, &mut fb);
+            fb
+        };
+        // Fill stretches the whole source in: the left edge column (green) shows.
+        let fill = draw(ImageFit::Fill);
+        assert_eq!(
+            fill.pixel(0, 10).unwrap(),
+            Color::rgb(0, 255, 0),
+            "fill: edge"
+        );
+        // Cover scales to cover the box and crops the sides — the green edge is
+        // cropped away (red there) and every pixel is painted (no letterbox).
+        let cover = draw(ImageFit::Cover);
+        assert_eq!(
+            cover.pixel(0, 10).unwrap(),
+            Color::rgb(255, 0, 0),
+            "cover: edge cropped"
+        );
+        assert_eq!(
+            cover.pixel(10, 1).unwrap(),
+            Color::rgb(255, 0, 0),
+            "cover: full coverage, no letterbox"
+        );
+        // Contain fits inside, leaving top/bottom letterbox bands untouched.
+        let contain = draw(ImageFit::Contain);
+        assert_eq!(
+            contain.pixel(10, 1).unwrap(),
+            Color::WHITE,
+            "contain: top letterbox band"
+        );
+        assert_eq!(
+            contain.pixel(10, 10).unwrap(),
+            Color::rgb(255, 0, 0),
+            "contain: image painted in the middle band"
+        );
+    }
 
     #[test]
     fn round_rect_clears_corners_keeps_center() {

@@ -17,7 +17,7 @@ use cerberus_style::{
     FlexBasis, FlexDirection, Float, Gradient, JustifyContent, Len, Position, StyleEngine,
     StyledChild, StyledDom, StyledNode, TextAlign, TextTransform, Track, TrackMax, Visibility,
 };
-use cerberus_types::Color;
+use cerberus_types::{Color, ImageFit};
 use parser::{
     parse_declaration_block, parse_stylesheet, ElemRef, MediaContext, SiblingRef, Specificity,
     Stylesheet,
@@ -615,6 +615,10 @@ fn apply_declarations(
                 style.background_image = parse_url_value(v);
                 style.background_gradient = parse_gradient(v).map(Box::new);
             }
+            // `cover`/`contain` are the only keywords that change scaling; explicit
+            // sizes and `auto`/`100%` fall through to `Fill` (stretch) — ADR-0044.
+            "object-fit" => style.object_fit = parse_image_fit(v),
+            "background-size" => style.background_size = parse_image_fit(v),
             "border-radius" => {
                 // Uniform radius (first value of the 1–4 corner shorthand).
                 style.border_radius = v
@@ -1243,6 +1247,18 @@ fn parse_box_shadow(v: &str, em: f32) -> Option<BoxShadow> {
 /// Extract the URL from the first `url(...)` in a value (e.g. a `background` /
 /// `background-image`), stripping quotes. Returns `None` for `none`, gradients,
 /// or a missing/`data:` url — i.e. only fetchable image URLs (ADR-0038).
+/// Map `object-fit`/`background-size` to an [`ImageFit`]. Only the aspect-ratio
+/// keywords matter to the rasterizer: `cover` crops to fill, `contain` (and the
+/// no-upscale `scale-down`) letterbox. `fill`, `none`, explicit sizes (`100%`,
+/// `200px 100px`), `auto`, and anything else stretch (`Fill`) — ADR-0044.
+fn parse_image_fit(v: &str) -> ImageFit {
+    match v.trim().to_ascii_lowercase().as_str() {
+        "cover" => ImageFit::Cover,
+        "contain" | "scale-down" => ImageFit::Contain,
+        _ => ImageFit::Fill,
+    }
+}
+
 fn parse_url_value(v: &str) -> Option<String> {
     let start = v.find("url(")? + 4;
     let rest = &v[start..];
@@ -1907,6 +1923,38 @@ mod tests {
         let s = &first(&dom2.root, "div").unwrap().style;
         assert_eq!(s.background_image.as_deref(), Some("bg.png"));
         assert_eq!(s.background, Some(Color::rgb(255, 255, 255)));
+    }
+
+    #[test]
+    fn object_fit_and_background_size_parse() {
+        let fit = |css: &str| {
+            let dom = CssEngine::new().style(&parse_html(&format!("<img style='{css}'>")));
+            first(&dom.root, "img").unwrap().style.object_fit
+        };
+        assert_eq!(fit("object-fit: cover"), ImageFit::Cover);
+        assert_eq!(fit("object-fit: contain"), ImageFit::Contain);
+        assert_eq!(fit("object-fit: scale-down"), ImageFit::Contain);
+        assert_eq!(fit("object-fit: fill"), ImageFit::Fill);
+        assert_eq!(fit("object-fit: none"), ImageFit::Fill);
+
+        let bg = |css: &str| {
+            let dom = CssEngine::new().style(&parse_html(&format!("<div style='{css}'>x</div>")));
+            first(&dom.root, "div").unwrap().style.background_size
+        };
+        assert_eq!(bg("background-size: cover"), ImageFit::Cover);
+        assert_eq!(bg("background-size: contain"), ImageFit::Contain);
+        assert_eq!(
+            bg("background-size: 100% 50%"),
+            ImageFit::Fill,
+            "explicit sizes stretch (Fill)"
+        );
+        // The two are independent properties on one element.
+        let dom = CssEngine::new().style(&parse_html(
+            "<img style='object-fit: cover; background-size: contain'>",
+        ));
+        let s = &first(&dom.root, "img").unwrap().style;
+        assert_eq!(s.object_fit, ImageFit::Cover);
+        assert_eq!(s.background_size, ImageFit::Contain);
     }
 
     #[test]
