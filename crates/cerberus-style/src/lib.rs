@@ -28,15 +28,28 @@ pub enum Len {
     Auto,
     Px(i32),
     Pct(f32),
+    /// Viewport-relative: percent of viewport width / height (ADR-0042).
+    Vw(f32),
+    Vh(f32),
 }
 
 impl Len {
-    /// Resolve against a containing-block `extent` in px; `auto` → `None`.
+    /// Resolve against a containing-block `extent` in px; `auto`/viewport units
+    /// → `None` (use [`Len::resolve_vp`] when the viewport is known).
     pub fn resolve(self, extent: i32) -> Option<i32> {
         match self {
-            Len::Auto => None,
             Len::Px(p) => Some(p),
             Len::Pct(f) => Some((f / 100.0 * extent as f32).round() as i32),
+            Len::Auto | Len::Vw(_) | Len::Vh(_) => None,
+        }
+    }
+
+    /// Resolve including viewport units (`vw`/`vh`) against `vw`×`vh` px.
+    pub fn resolve_vp(self, extent: i32, vw: i32, vh: i32) -> Option<i32> {
+        match self {
+            Len::Vw(f) => Some((f / 100.0 * vw as f32).round() as i32),
+            Len::Vh(f) => Some((f / 100.0 * vh as f32).round() as i32),
+            other => other.resolve(extent),
         }
     }
 }
@@ -104,6 +117,8 @@ pub enum Clear {
 pub enum Display {
     Block,
     Inline,
+    /// An atomic inline-level box with the block box model (ADR-0042).
+    InlineBlock,
     ListItem,
     /// Flex container (single-axis v1).
     Flex,
@@ -239,6 +254,12 @@ pub struct ComputedStyle {
     pub width: Len,
     pub max_width: Len,
     pub min_width: Len,
+    /// `height`/`min-height`/`max-height` for block & flex/grid container boxes
+    /// (ADR-0042). `Auto` = content-sized; `%` heights (indefinite parent) are
+    /// treated as auto. Not inherited.
+    pub height: Len,
+    pub min_height: Len,
+    pub max_height: Len,
     /// `float` / `clear` (ADR-0039). Not inherited.
     pub float: Float,
     pub clear: Clear,
@@ -339,6 +360,9 @@ impl ComputedStyle {
             width: Len::Auto,
             max_width: Len::Auto,
             min_width: Len::Auto,
+            height: Len::Auto,
+            min_height: Len::Auto,
+            max_height: Len::Auto,
             float: Float::None,
             clear: Clear::None,
             padding_top: 0,
@@ -412,6 +436,9 @@ impl ComputedStyle {
             width: Len::Auto,
             max_width: Len::Auto,
             min_width: Len::Auto,
+            height: Len::Auto,
+            min_height: Len::Auto,
+            max_height: Len::Auto,
             float: Float::None,
             clear: Clear::None,
             padding_top: 0,

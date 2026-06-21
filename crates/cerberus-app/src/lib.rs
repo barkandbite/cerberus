@@ -3561,6 +3561,7 @@ fn computed_css(s: &cerberus_style::ComputedStyle) -> Vec<(String, String)> {
     let display = match s.display {
         cerberus_style::Display::Block => "block",
         cerberus_style::Display::Inline => "inline",
+        cerberus_style::Display::InlineBlock => "inline-block",
         cerberus_style::Display::ListItem => "list-item",
         cerberus_style::Display::Flex => "flex",
         cerberus_style::Display::Grid => "grid",

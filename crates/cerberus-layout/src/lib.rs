@@ -265,6 +265,10 @@ struct Ctx<'a> {
     positioned: Vec<PositionedLayer>,
     /// Document-order counter for stable z-index tie-breaking.
     pos_order: usize,
+    /// Stack of positioned ancestors' (in-flow) border boxes, so `absolute`
+    /// resolves against its nearest positioned ancestor, not the viewport
+    /// (ADR-0042). Pushed/popped around a positioned block's children.
+    cb_stack: Vec<ContainingBlock>,
     /// Whether positioning is active. Only the root flow positions; sub-flows
     /// (table cells, intrinsic measurement) keep elements in-flow (v1).
     pos_enabled: bool,
@@ -274,6 +278,9 @@ struct Ctx<'a> {
     /// center/justify offsets place content at ~width/2, both wildly inflating the
     /// measured width and corrupting nested sizing (ADR-0038).
     measuring: bool,
+    /// One-shot: treat the next walked element as a block (the inline-block atom
+    /// laid into its own sub gets the full block box model) — ADR-0042.
+    as_block_once: bool,
 }
 
 impl<'a> Ctx<'a> {
@@ -310,8 +317,10 @@ impl<'a> Ctx<'a> {
             vh: viewport.h as i32,
             positioned: Vec::new(),
             pos_order: 0,
+            cb_stack: Vec::new(),
             pos_enabled: true,
             measuring: false,
+            as_block_once: false,
         }
     }
 
@@ -355,8 +364,10 @@ impl<'a> Ctx<'a> {
             vh: 0,
             positioned: Vec::new(),
             pos_order: 0,
+            cb_stack: Vec::new(),
             pos_enabled: false,
             measuring: false,
+            as_block_once: false,
         }
     }
 
@@ -474,8 +485,8 @@ impl<'a> Ctx<'a> {
         let saved_right = if out_of_flow {
             let cb = self.containing_block(style.position);
             let used_w = match (
-                style.inset_left.resolve(cb.w),
-                style.inset_right.resolve(cb.w),
+                style.inset_left.resolve_vp(cb.w, self.vw, self.vh),
+                style.inset_right.resolve_vp(cb.w, self.vw, self.vh),
             ) {
                 (Some(l), Some(r)) => (cb.w - l - r).max(1),
                 _ => self.measure_intrinsic_width(node).clamp(1, cb.w.max(1)),
@@ -502,7 +513,17 @@ impl<'a> Ctx<'a> {
             }
             _ => {}
         }
-        let is_block = matches!(style.display, Display::Block | Display::ListItem);
+        // An inline-block flows inline but carries the block box model: lay it as
+        // an atomic box on the current line (ADR-0042). `as_block_once` is the
+        // atom's own sub-layout asking for the block path (avoids re-routing).
+        if style.display == Display::InlineBlock && !self.as_block_once {
+            self.add_inline_block(node, href);
+            self.cur_link_node = saved_link_node;
+            return;
+        }
+        let is_block =
+            matches!(style.display, Display::Block | Display::ListItem) || self.as_block_once;
+        self.as_block_once = false;
         let saved_left = self.left;
         let saved_right0 = self.right;
         let bg_index = self.display.items.len();
@@ -521,26 +542,27 @@ impl<'a> Ctx<'a> {
             let h_extra = pl + pr + bl + br;
             // Border-box width from width/max-width (box-sizing aware); `margin:
             // auto` centers it, else margin-left offsets (ADR-0039/0040).
-            let (box_left, box_w) = match resolve_border_box_width(style, avail, h_extra) {
-                Some(bw) => {
-                    let bw = bw.clamp(1, avail);
-                    let extra = (avail - bw).max(0);
-                    let off = if style.margin_left_auto && style.margin_right_auto {
-                        extra / 2
-                    } else if style.margin_left_auto {
-                        extra
-                    } else if style.margin_right_auto {
-                        0
-                    } else {
-                        style.margin_left.clamp(0, extra)
-                    };
-                    (self.left + off, bw)
-                }
-                None => {
-                    let l = self.left + style.margin_left;
-                    (l, (self.right - l).max(1))
-                }
-            };
+            let (box_left, box_w) =
+                match resolve_border_box_width(style, avail, h_extra, self.vw, self.vh) {
+                    Some(bw) => {
+                        let bw = bw.clamp(1, avail);
+                        let extra = (avail - bw).max(0);
+                        let off = if style.margin_left_auto && style.margin_right_auto {
+                            extra / 2
+                        } else if style.margin_left_auto {
+                            extra
+                        } else if style.margin_right_auto {
+                            0
+                        } else {
+                            style.margin_left.clamp(0, extra)
+                        };
+                        (self.left + off, bw)
+                    }
+                    None => {
+                        let l = self.left + style.margin_left;
+                        (l, (self.right - l).max(1))
+                    }
+                };
             bbox = Some(BorderBox {
                 left: box_left,
                 right: box_left + box_w,
@@ -550,6 +572,17 @@ impl<'a> Ctx<'a> {
                 bb: style.border_bottom,
                 bl,
             });
+            // A positioned block is the containing block for its descendants'
+            // `absolute` (ADR-0042): push its (in-flow) border box; the whole
+            // subtree is translated together if this element is later lifted.
+            if positioned {
+                self.cb_stack.push(ContainingBlock {
+                    x: box_left,
+                    y: self.y,
+                    w: box_w,
+                    h: self.vh,
+                });
+            }
             // Content box = border box inset by border + padding.
             self.left = box_left + bl + pl;
             self.right = (box_left + box_w - br - pr).max(self.left + 1);
@@ -595,10 +628,17 @@ impl<'a> Ctx<'a> {
 
         if is_block {
             self.flush_line();
-            // Close the box: bottom padding + border, then paint the border box's
-            // background/border and record the hit box over it (ADR-0040).
+            // Close the box: bottom padding + border, then apply height/min-height/
+            // max-height (ADR-0042) before painting the border box (ADR-0040).
             self.y += style.padding_bottom + style.border_bottom;
             if let Some(bx) = bbox {
+                let v_extra = style.padding_top
+                    + style.padding_bottom
+                    + style.border_top
+                    + style.border_bottom;
+                let natural = (self.y - bx.top).max(0);
+                let sized = resolve_block_height(style, natural, v_extra, self.vw, self.vh);
+                self.y = bx.top + sized;
                 let h = (self.y - bx.top).max(0) as u32;
                 if h > 0 {
                     let rect = Rect::new(bx.left, bx.top, (bx.right - bx.left).max(0) as u32, h);
@@ -621,6 +661,11 @@ impl<'a> Ctx<'a> {
             self.left = saved_left;
             self.right = saved_right0;
             self.x = self.left;
+            // Pop this element's CB before its own `apply_positioning`, so that
+            // resolves against *its* containing block, not itself (ADR-0042).
+            if positioned {
+                self.cb_stack.pop();
+            }
         }
         if let Some(base) = pos_base {
             self.apply_positioning(&node.style, base);
@@ -631,29 +676,27 @@ impl<'a> Ctx<'a> {
         self.cur_link_node = saved_link_node;
     }
 
-    /// The containing block for a positioned element (v1): `fixed` resolves
-    /// against the viewport; `absolute`/`relative` against the page content area
-    /// (the initial containing block) — nearest-positioned-ancestor is a
-    /// follow-up.
+    /// The containing block for a positioned element (ADR-0034/0042): `fixed`
+    /// resolves against the viewport; `absolute` against its nearest positioned
+    /// ancestor (top of the CB stack) else the viewport; `relative` against that
+    /// ancestor else the page content area.
     fn containing_block(&self, position: cerberus_style::Position) -> ContainingBlock {
+        use cerberus_style::Position;
+        let viewport = ContainingBlock {
+            x: 0,
+            y: 0,
+            w: self.vw,
+            h: self.vh,
+        };
         match position {
-            // No positioned-ancestor tracking yet (v1): `absolute` and `fixed`
-            // both resolve against the viewport (the initial containing block).
-            cerberus_style::Position::Absolute | cerberus_style::Position::Fixed => {
-                ContainingBlock {
-                    x: 0,
-                    y: 0,
-                    w: self.vw,
-                    h: self.vh,
-                }
-            }
-            // `relative` % insets are relative to the page content area.
-            _ => ContainingBlock {
+            Position::Fixed => viewport,
+            Position::Absolute => self.cb_stack.last().copied().unwrap_or(viewport),
+            _ => self.cb_stack.last().copied().unwrap_or(ContainingBlock {
                 x: self.left0,
                 y: 0,
                 w: (self.right - self.left0).max(0),
                 h: self.vh,
-            },
+            }),
         }
     }
 
@@ -671,13 +714,23 @@ impl<'a> Ctx<'a> {
                 // bottom. Flow space is preserved (the box keeps its slot).
                 let dx = style
                     .inset_left
-                    .resolve(cb.w)
-                    .or_else(|| style.inset_right.resolve(cb.w).map(|r| -r))
+                    .resolve_vp(cb.w, self.vw, self.vh)
+                    .or_else(|| {
+                        style
+                            .inset_right
+                            .resolve_vp(cb.w, self.vw, self.vh)
+                            .map(|r| -r)
+                    })
                     .unwrap_or(0);
                 let dy = style
                     .inset_top
-                    .resolve(cb.h)
-                    .or_else(|| style.inset_bottom.resolve(cb.h).map(|b| -b))
+                    .resolve_vp(cb.h, self.vw, self.vh)
+                    .or_else(|| {
+                        style
+                            .inset_bottom
+                            .resolve_vp(cb.h, self.vw, self.vh)
+                            .map(|b| -b)
+                    })
                     .unwrap_or(0);
                 (dx, dy)
             }
@@ -686,23 +739,23 @@ impl<'a> Ctx<'a> {
             _ => {
                 let ox = style
                     .inset_left
-                    .resolve(cb.w)
+                    .resolve_vp(cb.w, self.vw, self.vh)
                     .map(|l| cb.x + l)
                     .or_else(|| {
                         style
                             .inset_right
-                            .resolve(cb.w)
+                            .resolve_vp(cb.w, self.vw, self.vh)
                             .map(|r| cb.x + cb.w - r - elem_w)
                     })
                     .unwrap_or(base.x);
                 let oy = style
                     .inset_top
-                    .resolve(cb.h)
+                    .resolve_vp(cb.h, self.vw, self.vh)
                     .map(|t| cb.y + t)
                     .or_else(|| {
                         style
                             .inset_bottom
-                            .resolve(cb.h)
+                            .resolve_vp(cb.h, self.vw, self.vh)
                             .map(|b| cb.y + cb.h - b - elem_h)
                     })
                     .unwrap_or(base.y);
@@ -834,6 +887,44 @@ impl<'a> Ctx<'a> {
         let px = style.font_size.max(1);
         let (glyphs, w) = self.shape_run(text, px, style);
         self.push_piece(px, w, glyphs, style, href);
+    }
+
+    /// Place an `inline-block` as an atomic box on the current line (ADR-0042): a
+    /// `width`-sized (else shrink-to-fit) sub laid with the full block box model,
+    /// positioned at the inline cursor and advancing it; wraps if it overflows.
+    fn add_inline_block(&mut self, e: &StyledNode, in_link: Option<&str>) {
+        let avail = (self.right - self.left).max(1);
+        let h_extra = e.style.padding_left
+            + e.style.padding_right
+            + e.style.border_left
+            + e.style.border_right;
+        let w = resolve_border_box_width(&e.style, avail, h_extra, self.vw, self.vh)
+            .unwrap_or_else(|| self.measure_intrinsic_width(e).min(avail))
+            .clamp(1, avail);
+        if self.x != self.left && self.x + w > self.right {
+            self.newline();
+        }
+        let mut sub = Ctx::sub(
+            self.x,
+            self.x + w,
+            self.y,
+            self.shaper,
+            self.images,
+            self.forms,
+            self.field_id,
+        );
+        sub.measuring = self.measuring;
+        sub.vw = self.vw;
+        sub.vh = self.vh;
+        sub.as_block_once = true; // lay `e` with the block box model, filling [x, x+w]
+        sub.walk(e, in_link);
+        sub.flush_line();
+        self.field_id = sub.field_id;
+        let h = (sub.y - self.y).max(1);
+        self.merge_sub(sub, 0, 0);
+        self.x += w;
+        self.max_x = self.max_x.max(self.x);
+        self.line_h = self.line_h.max(h);
     }
 
     fn push_piece(
@@ -1273,6 +1364,9 @@ impl<'a> Ctx<'a> {
             ))
         });
         scratch.reset_for_measure(field_id);
+        // Measure an inline-block by its block content (avoids re-routing into
+        // `add_inline_block`, which would recurse here) — ADR-0042.
+        scratch.as_block_once = matches!(node.style.display, Display::InlineBlock);
         scratch.walk(node, None);
         scratch.flush_line();
         let width = scratch.max_x.max(1);
@@ -1299,6 +1393,7 @@ impl<'a> Ctx<'a> {
         });
         scratch.reset_for_measure(field_id);
         scratch.right = 1; // force a wrap at every opportunity
+        scratch.as_block_once = matches!(node.style.display, Display::InlineBlock);
         scratch.walk(node, None);
         scratch.flush_line();
         let width = scratch.max_x.max(1);
@@ -1440,7 +1535,7 @@ impl<'a> Ctx<'a> {
     /// left-packed; text wrap-around is not modeled.)
     fn place_float(&mut self, e: &StyledNode, in_link: Option<&str>, fb: &mut FloatBand) {
         let avail = (self.right - self.left).max(1);
-        let explicit = resolve_block_width(&e.style, avail);
+        let explicit = resolve_block_width(&e.style, avail, self.vw, self.vh);
         let w = explicit
             .unwrap_or_else(|| self.measure_intrinsic_width(e).min(avail))
             .clamp(1, avail);
@@ -1550,6 +1645,12 @@ impl<'a> Ctx<'a> {
             .collect();
         items.sort_by_key(|e| e.style.order);
 
+        let (ds, ls, fs, es) = (
+            self.display.items.len(),
+            self.links.len(),
+            self.fields.len(),
+            self.elements.len(),
+        );
         if !items.is_empty() {
             match node.style.flex_direction {
                 FlexDirection::Row => self.flex_row(&items, left, right, gap, start_y, &node.style),
@@ -1560,6 +1661,45 @@ impl<'a> Ctx<'a> {
         }
 
         self.y += s.padding_bottom + s.border_bottom;
+        // Apply height/min-height/max-height (ADR-0042). When the box is taller
+        // than its content, center/end-align the content along the block axis (the
+        // common full-height hero) — row uses align-items, column uses
+        // justify-content as the vertical proxy.
+        let v_extra = s.padding_top + s.padding_bottom + s.border_top + s.border_bottom;
+        let natural = (self.y - box_top).max(0);
+        let sized = resolve_block_height(s, natural, v_extra, self.vw, self.vh);
+        if sized > natural {
+            let extra = sized - natural;
+            let vrt = matches!(s.flex_direction, FlexDirection::Row);
+            let dy = if vrt {
+                match s.align_items {
+                    AlignItems::Center => extra / 2,
+                    AlignItems::End => extra,
+                    _ => 0,
+                }
+            } else {
+                match s.justify_content {
+                    JustifyContent::Center => extra / 2,
+                    JustifyContent::End => extra,
+                    _ => 0,
+                }
+            };
+            if dy != 0 {
+                for item in &mut self.display.items[ds..] {
+                    translate_item(item, 0, dy);
+                }
+                for l in &mut self.links[ls..] {
+                    l.rect = offset_rect(l.rect, 0, dy);
+                }
+                for f in &mut self.fields[fs..] {
+                    f.rect = offset_rect(f.rect, 0, dy);
+                }
+                for e in &mut self.elements[es..] {
+                    e.rect = offset_rect(e.rect, 0, dy);
+                }
+            }
+            self.y = box_top + sized;
+        }
         let h = (self.y - box_top).max(0) as u32;
         if h > 0 {
             let rect = Rect::new(box_left, box_top, (box_right - box_left).max(0) as u32, h);
@@ -1949,6 +2089,10 @@ impl<'a> Ctx<'a> {
             (ry - gap).max(start_y)
         };
         self.y += s.padding_bottom + s.border_bottom;
+        // Apply height/min-height/max-height to the grid container (ADR-0042).
+        let v_extra = s.padding_top + s.padding_bottom + s.border_top + s.border_bottom;
+        let natural = (self.y - box_top).max(0);
+        self.y = box_top + resolve_block_height(s, natural, v_extra, self.vw, self.vh);
 
         let h = (self.y - box_top).max(0) as u32;
         if h > 0 {
@@ -2248,8 +2392,14 @@ struct BorderBox {
 /// The used **border-box** width of a block (box-sizing aware) from
 /// `width`/`max-width`, or `None` when unconstrained — `h_extra` is the
 /// horizontal padding+border (ADR-0040).
-fn resolve_border_box_width(style: &ComputedStyle, avail: i32, h_extra: i32) -> Option<i32> {
-    let raw = resolve_block_width(style, avail)?;
+fn resolve_border_box_width(
+    style: &ComputedStyle,
+    avail: i32,
+    h_extra: i32,
+    vw: i32,
+    vh: i32,
+) -> Option<i32> {
+    let raw = resolve_block_width(style, avail, vw, vh)?;
     Some(match style.box_sizing {
         cerberus_style::BoxSizing::BorderBox => raw,
         cerberus_style::BoxSizing::ContentBox => raw + h_extra,
@@ -2287,12 +2437,8 @@ impl FloatBand {
 
 /// The used content width of a block from `width`/`max-width`/`min-width`, or
 /// `None` when unconstrained (fill the available width) — ADR-0039.
-fn resolve_block_width(style: &ComputedStyle, avail: i32) -> Option<i32> {
-    let res = |len: Len| match len {
-        Len::Px(p) => Some(p.max(0)),
-        Len::Pct(f) => Some((f / 100.0 * avail as f32).round().max(0.0) as i32),
-        Len::Auto => None,
-    };
+fn resolve_block_width(style: &ComputedStyle, avail: i32, vw: i32, vh: i32) -> Option<i32> {
+    let res = |len: Len| len.resolve_vp(avail, vw, vh).map(|v| v.max(0));
     let mut w = res(style.width);
     if let Some(mw) = res(style.max_width) {
         w = Some(w.unwrap_or(avail).min(mw));
@@ -2306,6 +2452,38 @@ fn resolve_block_width(style: &ComputedStyle, avail: i32) -> Option<i32> {
         return None;
     }
     Some(w.clamp(1, avail))
+}
+
+/// The used **border-box** height of a block (box-sizing aware) from `height`/
+/// `min-height`/`max-height`, given the content's natural border-box height.
+/// `%` heights (indefinite parent) are ignored. `v_extra` is vertical
+/// padding+border (ADR-0042).
+fn resolve_block_height(
+    style: &ComputedStyle,
+    natural: i32,
+    v_extra: i32,
+    vw: i32,
+    vh: i32,
+) -> i32 {
+    // Only px / vw / vh count; `%`/`auto` leave the box content-sized.
+    let res = |len: Len| match len {
+        Len::Px(p) => Some(p.max(0)),
+        Len::Vw(f) => Some((f / 100.0 * vw as f32).round().max(0.0) as i32),
+        Len::Vh(f) => Some((f / 100.0 * vh as f32).round().max(0.0) as i32),
+        Len::Auto | Len::Pct(_) => None,
+    };
+    let adjust = |v: i32| match style.box_sizing {
+        cerberus_style::BoxSizing::BorderBox => v,
+        cerberus_style::BoxSizing::ContentBox => v + v_extra,
+    };
+    let mut h = res(style.height).map(adjust).unwrap_or(natural);
+    if let Some(min) = res(style.min_height) {
+        h = h.max(adjust(min));
+    }
+    if let Some(max) = res(style.max_height) {
+        h = h.min(adjust(max));
+    }
+    h.max(0)
 }
 
 /// Whether an element participates in flex/grid layout: rendered and **in flow**.
@@ -3194,6 +3372,82 @@ mod tests {
                 .any(|i| matches!(i, DisplayItem::RoundRect { .. })),
             "rounded border paints an outer round rect"
         );
+    }
+
+    #[test]
+    fn inline_block_gets_box_model_and_flows_inline() {
+        // Two inline-block "buttons" with padding sit side by side, each
+        // shrink-to-fit (content + padding), not full width (ADR-0042).
+        let laid = lay(
+            "<div><span style='display:inline-block;padding:10px;background:#ff0000'>A</span>\
+             <span style='display:inline-block;padding:10px;background:#00ff00'>B</span></div>",
+            600,
+        );
+        let r = fill_rects(&laid);
+        assert_eq!(r.len(), 2, "two inline-block backgrounds");
+        assert!(r[0].w < 200, "shrink-to-fit, not full width: {}", r[0].w);
+        assert!(r[0].w >= 20, "includes horizontal padding: {}", r[0].w);
+        assert!((r[0].y - r[1].y).abs() <= 2, "flow on one line");
+        assert!(r[1].x > r[0].x + 10, "second box follows the first");
+    }
+
+    #[test]
+    fn absolute_resolves_against_positioned_ancestor() {
+        // An absolute child of a relative parent lands at the PARENT's origin
+        // (below the 100px spacer, indented by its margin), not the viewport's.
+        let laid = lay(
+            "<div style='height:100px'>spacer</div>\
+             <div style='position:relative;margin-left:50px'>\
+               <div style='position:absolute;top:0;left:0;background:#ff0000'>X</div>\
+               parent</div>",
+            400,
+        );
+        let r = fill_rects(&laid);
+        assert_eq!(r.len(), 1, "the absolute child's background");
+        assert!(
+            r[0].y >= 90,
+            "resolves to the parent's top, not viewport: {}",
+            r[0].y
+        );
+        assert!(
+            r[0].x >= 50,
+            "resolves to the parent's left (margin-left:50): {}",
+            r[0].x
+        );
+    }
+
+    #[test]
+    fn min_height_and_vh_size_the_box() {
+        let tall = lay(
+            "<div style='background:#ff0000;min-height:200px'>hi</div>",
+            400,
+        );
+        assert!(
+            fill_rects(&tall)[0].h >= 200,
+            "min-height extends: {}",
+            fill_rects(&tall)[0].h
+        );
+        let plain = lay("<div style='background:#ff0000'>hi</div>", 400);
+        assert!(
+            fill_rects(&plain)[0].h < 60,
+            "unconstrained block stays content-sized"
+        );
+        let vh = lay("<div style='background:#ff0000;height:50vh'>x</div>", 400);
+        assert!(
+            (fill_rects(&vh)[0].h as i32 - 1000).abs() <= 4,
+            "50vh of 2000 ~ 1000: {}",
+            fill_rects(&vh)[0].h
+        );
+    }
+
+    #[test]
+    fn flex_min_height_centers_content_vertically() {
+        let laid = lay(
+            "<div style='display:flex;align-items:center;min-height:400px'><div>hi</div></div>",
+            400,
+        );
+        let min_y = *glyph_ys(&laid).iter().min().unwrap();
+        assert!(min_y > 100, "content centered within the tall box: {min_y}");
     }
 
     #[test]

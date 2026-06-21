@@ -708,6 +708,13 @@ fn apply_declarations(
             "min-width" => {
                 style.min_width = parse_inset(v, style.font_size as f32).unwrap_or(Len::Auto)
             }
+            "height" => style.height = parse_inset(v, style.font_size as f32).unwrap_or(Len::Auto),
+            "max-height" => {
+                style.max_height = parse_inset(v, style.font_size as f32).unwrap_or(Len::Auto)
+            }
+            "min-height" => {
+                style.min_height = parse_inset(v, style.font_size as f32).unwrap_or(Len::Auto)
+            }
             "float" => {
                 style.float = match v.trim().to_ascii_lowercase().as_str() {
                     "left" => Float::Left,
@@ -952,7 +959,8 @@ fn parse_display(v: &str) -> Option<Display> {
     Some(match v.trim().to_ascii_lowercase().as_str() {
         "none" => Display::None,
         "list-item" => Display::ListItem,
-        "inline" | "inline-block" | "contents" => Display::Inline,
+        "inline" | "contents" => Display::Inline,
+        "inline-block" => Display::InlineBlock,
         "flex" | "inline-flex" => Display::Flex,
         "grid" | "inline-grid" => Display::Grid,
         "block" | "table" | "table-row" | "table-cell" | "flow-root" => Display::Block,
@@ -1372,6 +1380,8 @@ fn parse_inset(v: &str, em_base: f32) -> Option<Len> {
         "em" => Len::Px((num * em_base).round() as i32),
         "rem" => Len::Px((num * 16.0).round() as i32),
         "pt" => Len::Px((num * 96.0 / 72.0).round() as i32),
+        "vw" | "vmax" => Len::Vw(num),
+        "vh" | "vmin" => Len::Vh(num),
         _ => return None,
     })
 }
