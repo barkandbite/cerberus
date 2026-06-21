@@ -15,7 +15,7 @@ use cerberus_dom::NodeId;
 use cerberus_paint::{DecodedImage, DisplayItem, DisplayList, GlyphBox, TextShaper};
 use cerberus_style::{
     AlignItems, ComputedStyle, Display, FlexDirection, JustifyContent, Len, StyledChild, StyledDom,
-    StyledNode, TextAlign, Track, TrackMax,
+    StyledNode, TextAlign, TextTransform, Track, TrackMax,
 };
 use cerberus_types::{Color, FontStyle, Point, Rect, Size};
 use std::sync::Arc;
@@ -765,7 +765,37 @@ impl<'a> Ctx<'a> {
         }
     }
 
+    /// Shape a run and apply `letter-spacing` (px, may be negative) to advances,
+    /// returning the glyphs and their total width (ADR-0041).
+    fn shape_run(&self, text: &str, px: u32, style: &ComputedStyle) -> (Vec<GlyphBox>, u32) {
+        let mut glyphs = self.shaper.shape(text, px);
+        if style.letter_spacing != 0 {
+            for g in &mut glyphs {
+                g.advance = (g.advance as i32 + style.letter_spacing).max(0) as u32;
+            }
+        }
+        let w = glyphs.iter().map(|g| g.advance).sum();
+        (glyphs, w)
+    }
+
     fn add_text(&mut self, text: &str, style: &ComputedStyle, href: Option<&str>) {
+        // `text-transform` rewrites the run before shaping (transient String).
+        let transformed;
+        let text = match style.text_transform {
+            TextTransform::None => text,
+            TextTransform::Uppercase => {
+                transformed = text.to_uppercase();
+                transformed.as_str()
+            }
+            TextTransform::Lowercase => {
+                transformed = text.to_lowercase();
+                transformed.as_str()
+            }
+            TextTransform::Capitalize => {
+                transformed = capitalize_words(text);
+                transformed.as_str()
+            }
+        };
         if style.preformatted {
             let mut first = true;
             for line in text.split('\n') {
@@ -786,8 +816,7 @@ impl<'a> Ctx<'a> {
 
     fn add_word(&mut self, word: &str, style: &ComputedStyle, href: Option<&str>) {
         let px = style.font_size.max(1);
-        let glyphs = self.shaper.shape(word, px);
-        let w: u32 = glyphs.iter().map(|g| g.advance).sum();
+        let (glyphs, w) = self.shape_run(word, px, style);
         let gap = if self.x == self.left {
             0
         } else {
@@ -803,8 +832,7 @@ impl<'a> Ctx<'a> {
 
     fn add_run(&mut self, text: &str, style: &ComputedStyle, href: Option<&str>) {
         let px = style.font_size.max(1);
-        let glyphs = self.shaper.shape(text, px);
-        let w: u32 = glyphs.iter().map(|g| g.advance).sum();
+        let (glyphs, w) = self.shape_run(text, px, style);
         self.push_piece(px, w, glyphs, style, href);
     }
 
@@ -830,7 +858,8 @@ impl<'a> Ctx<'a> {
         });
         self.x += w as i32;
         self.max_x = self.max_x.max(self.x);
-        self.line_h = self.line_h.max(line_height(px));
+        let lh = style.line_height.unwrap_or_else(|| line_height(px));
+        self.line_h = self.line_h.max(lh);
     }
 
     /// Lay out an `<img>`: draw the decoded image if ready, else a sized
@@ -2064,6 +2093,25 @@ impl<'a> Ctx<'a> {
     }
 }
 
+/// Uppercase the first letter of each whitespace-separated word (`text-transform:
+/// capitalize`) — ADR-0041.
+fn capitalize_words(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut at_word_start = true;
+    for c in s.chars() {
+        if c.is_whitespace() {
+            at_word_start = true;
+            out.push(c);
+        } else if at_word_start {
+            at_word_start = false;
+            out.extend(c.to_uppercase());
+        } else {
+            out.push(c);
+        }
+    }
+    out
+}
+
 fn line_height(px: u32) -> i32 {
     px as i32 + px as i32 / 2
 }
@@ -3033,6 +3081,39 @@ mod tests {
             "content-box adds padding to width: {}",
             fill_rects(&cb)[0].w
         );
+    }
+
+    #[test]
+    fn line_height_controls_row_pitch() {
+        let normal = lay("<p>one</p><p>two</p>", 400);
+        let tall = lay(
+            "<p style='line-height:48px'>one</p><p style='line-height:48px'>two</p>",
+            400,
+        );
+        assert!(
+            *glyph_ys(&tall).iter().max().unwrap() > *glyph_ys(&normal).iter().max().unwrap(),
+            "larger line-height increases row pitch"
+        );
+    }
+
+    #[test]
+    fn letter_spacing_widens_a_run() {
+        let normal = lay(
+            "<div style='display:flex'><div style='background:#ff0000'>iiiii</div></div>",
+            800,
+        );
+        let spaced = lay(
+            "<div style='display:flex'><div style='background:#ff0000;letter-spacing:8px'>iiiii</div></div>",
+            800,
+        );
+        let (nw, sw) = (fill_rects(&normal)[0].w, fill_rects(&spaced)[0].w);
+        assert!(sw > nw + 20, "letter-spacing widens the run: {sw} vs {nw}");
+    }
+
+    #[test]
+    fn capitalize_words_uppercases_each_word() {
+        assert_eq!(capitalize_words("hello world foo"), "Hello World Foo");
+        assert_eq!(capitalize_words("  spaced  out "), "  Spaced  Out ");
     }
 
     #[test]

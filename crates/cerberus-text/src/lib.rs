@@ -51,6 +51,11 @@ impl TextEngine {
         } else {
             &self.font
         };
+        // Synthetic styling — memory-first, no extra font faces (real weight/slant
+        // faces would be a drop-in asset swap behind this path). Faux-bold smears a
+        // second sample 1px right; faux-italic shears each scanline rightward above
+        // the baseline (~12°).
+        let slant = if style.italic { 0.21f32 } else { 0.0 };
         for g in glyphs {
             let scale = PxScale::from(g.px.max(1) as f32);
             let scaled = font.as_scaled(scale);
@@ -60,11 +65,15 @@ impl TextEngine {
             if let Some(outlined) = font.outline_glyph(glyph) {
                 let bounds = outlined.px_bounds();
                 outlined.draw(|gx, gy, coverage| {
-                    let x = bounds.min.x as i32 + gx as i32;
                     let y = bounds.min.y as i32 + gy as i32;
+                    let shear = if slant != 0.0 {
+                        (slant * (baseline - y as f32)) as i32
+                    } else {
+                        0
+                    };
+                    let x = bounds.min.x as i32 + gx as i32 + shear;
                     target.blend_pixel(x, y, color, coverage);
-                    // Faux-bold: smear one pixel to the right. (Real bold/italic
-                    // fonts are a later asset swap behind this same path.)
+                    // Faux-bold: smear one pixel to the right.
                     if style.bold {
                         target.blend_pixel(x + 1, y, color, coverage);
                     }

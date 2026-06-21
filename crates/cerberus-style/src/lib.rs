@@ -41,6 +41,16 @@ impl Len {
     }
 }
 
+/// CSS `text-transform` (ADR-0041). Inherited.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub enum TextTransform {
+    #[default]
+    None,
+    Uppercase,
+    Lowercase,
+    Capitalize,
+}
+
 /// CSS `box-sizing` — whether `width`/`height` include padding + border
 /// (`border-box`) or just the content (`content-box`, the default) — ADR-0040.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
@@ -192,6 +202,12 @@ pub struct ComputedStyle {
     pub font: FontStyle,
     pub text_align: TextAlign,
     pub underline: bool,
+    /// `line-height` resolved to px (`None` = `normal`, the 1.5× default);
+    /// `text-transform`; `letter-spacing` in px (may be negative). Inherited text
+    /// properties (ADR-0041).
+    pub line_height: Option<i32>,
+    pub text_transform: TextTransform,
+    pub letter_spacing: i32,
     pub margin_top: i32,
     pub margin_bottom: i32,
     pub margin_left: i32,
@@ -287,6 +303,9 @@ impl ComputedStyle {
             font: FontStyle::REGULAR,
             text_align: TextAlign::Left,
             underline: false,
+            line_height: None,
+            text_transform: TextTransform::None,
+            letter_spacing: 0,
             margin_top: 0,
             margin_bottom: 0,
             margin_left: 0,
@@ -347,6 +366,9 @@ impl ComputedStyle {
             font: self.font,
             text_align: self.text_align,
             underline: self.underline,
+            line_height: self.line_height,
+            text_transform: self.text_transform,
+            letter_spacing: self.letter_spacing,
             preformatted: self.preformatted,
             visibility: self.visibility,
             // Reset per element:

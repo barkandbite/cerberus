@@ -15,7 +15,7 @@ use cerberus_dom::{Document, NodeRef};
 use cerberus_style::{
     AlignItems, AlignSelf, BoxSizing, Clear, ComputedStyle, Display, ExternalSheets, FlexBasis,
     FlexDirection, Float, JustifyContent, Len, Position, StyleEngine, StyledChild, StyledDom,
-    StyledNode, TextAlign, Track, TrackMax, Visibility,
+    StyledNode, TextAlign, TextTransform, Track, TrackMax, Visibility,
 };
 use cerberus_types::Color;
 use parser::{
@@ -637,6 +637,22 @@ fn apply_declarations(
                     "right" | "end" => TextAlign::Right,
                     "left" | "start" => TextAlign::Left,
                     _ => style.text_align,
+                }
+            }
+            "line-height" => style.line_height = parse_line_height(v, style.font_size),
+            "text-transform" => {
+                style.text_transform = match v.trim().to_ascii_lowercase().as_str() {
+                    "uppercase" => TextTransform::Uppercase,
+                    "lowercase" => TextTransform::Lowercase,
+                    "capitalize" => TextTransform::Capitalize,
+                    _ => TextTransform::None,
+                }
+            }
+            "letter-spacing" => {
+                if v.trim().eq_ignore_ascii_case("normal") {
+                    style.letter_spacing = 0;
+                } else if let Some(px) = parse_len(v, style.font_size as f32) {
+                    style.letter_spacing = px;
                 }
             }
             "text-decoration" | "text-decoration-line" => {
@@ -1290,6 +1306,26 @@ fn apply_flex_shorthand(style: &mut ComputedStyle, v: &str, em: f32) {
         None if nums.is_empty() => FlexBasis::Auto,
         None => FlexBasis::Px(0),
     };
+}
+
+/// Resolve `line-height` to px against `font_size`: `normal` → `None` (engine
+/// default), a unitless number → `n × font-size`, `%` → `pct × font-size`, else a
+/// length (ADR-0041).
+fn parse_line_height(v: &str, font_size: u32) -> Option<i32> {
+    let t = v.trim().to_ascii_lowercase();
+    if t == "normal" || t.is_empty() {
+        return None;
+    }
+    if let Some(pct) = t
+        .strip_suffix('%')
+        .and_then(|n| n.trim().parse::<f32>().ok())
+    {
+        return Some((pct / 100.0 * font_size as f32).round().max(0.0) as i32);
+    }
+    if let Ok(n) = t.parse::<f32>() {
+        return Some((n * font_size as f32).round().max(0.0) as i32);
+    }
+    parse_len(&t, font_size as f32).map(|px| px.max(0))
 }
 
 /// Set a px field from a length value (no-op if it doesn't parse), clamped ≥ 0.
