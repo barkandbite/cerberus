@@ -13,7 +13,10 @@ use std::sync::Arc;
 #[derive(Clone, Debug)]
 pub enum DisplayItem {
     /// A solid-filled rectangle.
-    Rect { rect: Rect, color: Color },
+    Rect {
+        rect: Rect,
+        color: Color,
+    },
     /// A solid fill with uniform rounded corners (ADR-0041).
     RoundRect {
         rect: Rect,
@@ -30,7 +33,11 @@ pub enum DisplayItem {
         radius: u16,
     },
     /// A soft outer drop shadow with `blur`-px falloff (ADR-0041).
-    Shadow { rect: Rect, blur: u16, color: Color },
+    Shadow {
+        rect: Rect,
+        blur: u16,
+        color: Color,
+    },
     /// A run of shaped glyphs anchored at `origin` (top-left of the first box).
     Glyphs {
         origin: Point,
@@ -52,6 +59,12 @@ pub enum DisplayItem {
         width: u32,
         color: Color,
     },
+    /// Push a clip rectangle (intersected with the current clip); items paint
+    /// only inside it until the matching [`DisplayItem::ClipPop`] — ADR-0043.
+    ClipPush {
+        rect: Rect,
+    },
+    ClipPop,
 }
 
 /// A flat, ordered list of paint primitives produced by layout.
@@ -117,6 +130,8 @@ impl DisplayList {
                     blur: su(*blur as u32) as u16,
                     color: *color,
                 },
+                DisplayItem::ClipPush { rect } => DisplayItem::ClipPush { rect: sr(*rect) },
+                DisplayItem::ClipPop => DisplayItem::ClipPop,
                 DisplayItem::Image { rect, image } => DisplayItem::Image {
                     rect: sr(*rect),
                     image: image.clone(),
@@ -175,6 +190,8 @@ pub struct GlyphBox {
 pub struct Framebuffer {
     pub size: Size,
     pub rgba: Vec<u8>,
+    /// Current clip rect; writes outside it are dropped (`overflow` — ADR-0043).
+    clip: Option<Rect>,
 }
 
 impl Framebuffer {
@@ -184,6 +201,22 @@ impl Framebuffer {
         Self {
             size,
             rgba: vec![0; len],
+            clip: None,
+        }
+    }
+
+    /// Set the active clip rect (`None` = unclipped). Writes outside it are
+    /// dropped — used by the rasterizer's clip stack (ADR-0043).
+    pub fn set_clip(&mut self, clip: Option<Rect>) {
+        self.clip = clip;
+    }
+
+    /// Whether `(x, y)` is inside the active clip (always true when unclipped).
+    #[inline]
+    fn in_clip(&self, x: i32, y: i32) -> bool {
+        match self.clip {
+            None => true,
+            Some(c) => x >= c.x && y >= c.y && x < c.x + c.w as i32 && y < c.y + c.h as i32,
         }
     }
 
@@ -203,8 +236,18 @@ impl Framebuffer {
         let y0 = rect.y.max(0) as u32;
         let x1 = ((rect.x + rect.w as i32).max(0) as u32).min(self.size.w);
         let y1 = ((rect.y + rect.h as i32).max(0) as u32).min(self.size.h);
+        // Fast path: the whole rect is inside the clip (or there is none).
+        let clipped = self.clip.is_some_and(|cl| {
+            !(x0 as i32 >= cl.x
+                && y0 as i32 >= cl.y
+                && x1 as i32 <= cl.x + cl.w as i32
+                && y1 as i32 <= cl.y + cl.h as i32)
+        });
         for y in y0..y1 {
             for x in x0..x1 {
+                if clipped && !self.in_clip(x as i32, y as i32) {
+                    continue;
+                }
                 let idx = ((y * self.size.w + x) * 4) as usize;
                 self.rgba[idx] = c.r;
                 self.rgba[idx + 1] = c.g;
@@ -252,6 +295,9 @@ impl Framebuffer {
     /// (0.0..=1.0). Used by the glyph rasterizer for anti-aliased text.
     pub fn blend_pixel(&mut self, x: i32, y: i32, color: Color, alpha: f32) {
         if x < 0 || y < 0 || x as u32 >= self.size.w || y as u32 >= self.size.h {
+            return;
+        }
+        if !self.in_clip(x, y) {
             return;
         }
         let a = alpha.clamp(0.0, 1.0);
@@ -364,10 +410,13 @@ impl Rasterizer for BoxRasterizer {
                     target.fill_rect(*rect, Color::rgb(192, 192, 192));
                 }
                 // The placeholder approximates fills as solid and ignores
-                // shadows/lines.
+                // shadows/clips/lines.
                 DisplayItem::RoundRect { rect, color, .. } => target.fill_rect(*rect, *color),
                 DisplayItem::Gradient { rect, start, .. } => target.fill_rect(*rect, *start),
-                DisplayItem::Shadow { .. } | DisplayItem::Line { .. } => {}
+                DisplayItem::Shadow { .. }
+                | DisplayItem::Line { .. }
+                | DisplayItem::ClipPush { .. }
+                | DisplayItem::ClipPop => {}
             }
         }
     }

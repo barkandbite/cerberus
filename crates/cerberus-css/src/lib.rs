@@ -737,6 +737,17 @@ fn apply_declarations(
                     BoxSizing::ContentBox
                 }
             }
+            "overflow" | "overflow-x" | "overflow-y" => {
+                // hidden/clip/scroll/auto all clip (we don't scroll); visible doesn't.
+                if matches!(
+                    v.trim().to_ascii_lowercase().as_str(),
+                    "hidden" | "clip" | "scroll" | "auto"
+                ) {
+                    style.overflow_clip = true;
+                } else if v.trim().eq_ignore_ascii_case("visible") {
+                    style.overflow_clip = false;
+                }
+            }
             "padding" => apply_box_shorthand(
                 v,
                 style.font_size as f32,

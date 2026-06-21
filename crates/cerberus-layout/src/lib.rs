@@ -599,7 +599,7 @@ impl<'a> Ctx<'a> {
         // Float band state: consecutive `float` children pack left-to-right and
         // wrap (the common column-grid pattern); a non-float child, text, or
         // `clear` drops below the band (ADR-0039). Text wrap-around is not modeled.
-        let mut fb = FloatBand::new(self.left, self.y);
+        let mut fb = FloatBand::new(self.left, self.right, self.y);
         for child in &node.children {
             match child {
                 StyledChild::Text(t) => {
@@ -1481,7 +1481,7 @@ impl<'a> Ctx<'a> {
                 (rect.h as i32 - bx.bt - bx.bb).max(0) as u32,
             );
             let inner_r = (radius as i32 - bx.bl.max(bx.br).max(bx.bt).max(bx.bb)).max(0) as u16;
-            self.fill_box(idx, style, inner, inner_r);
+            idx = self.fill_box(idx, style, inner, inner_r);
         } else {
             idx = self.fill_box(idx, style, rect, 0);
             let col = style.border_color;
@@ -1525,15 +1525,32 @@ impl<'a> Ctx<'a> {
                         color: col,
                     },
                 );
+                idx += 1;
             }
+        }
+        // `overflow` clips the content (laid before this call, now at `idx..`) to
+        // the padding box (ADR-0043).
+        if style.overflow_clip && self.display.items.len() > idx {
+            let clip = Rect::new(
+                rect.x + bx.bl,
+                rect.y + bx.bt,
+                (rect.w as i32 - bx.bl - bx.br).max(0) as u32,
+                (rect.h as i32 - bx.bt - bx.bb).max(0) as u32,
+            );
+            self.display
+                .items
+                .insert(idx, DisplayItem::ClipPush { rect: clip });
+            self.display.items.push(DisplayItem::ClipPop);
         }
     }
 
     /// Place one `float` child into the current float band: pack left-to-right,
     /// wrapping to a new row when it doesn't fit, sizing it from its
-    /// `width`/`max-width` (else shrink-to-fit) — ADR-0039. (Right floats are
-    /// left-packed; text wrap-around is not modeled.)
+    /// `width`/`max-width` (else shrink-to-fit) — ADR-0039/0043. `float:left`
+    /// packs from the left, `float:right` from the right; text wrap-around is not
+    /// modeled (following in-flow content drops below the band).
     fn place_float(&mut self, e: &StyledNode, in_link: Option<&str>, fb: &mut FloatBand) {
+        let is_right = e.style.float == cerberus_style::Float::Right;
         let avail = (self.right - self.left).max(1);
         let explicit = resolve_block_width(&e.style, avail, self.vw, self.vh);
         let w = explicit
@@ -1543,25 +1560,30 @@ impl<'a> Ctx<'a> {
             fb.active = true;
             fb.row_top = self.y;
             fb.x = fb.left;
+            fb.right_x = fb.right;
             fb.row_h = 0;
             fb.bottom = self.y;
         }
-        // Wrap to a new band row when the float won't fit beside the previous one.
-        if fb.x != fb.left && fb.x + w > self.right {
+        // Wrap to a new band row when the float won't fit between the left and
+        // right cursors.
+        let at_row_start = fb.x == fb.left && fb.right_x == fb.right;
+        if !at_row_start && w > (fb.right_x - fb.x).max(0) {
             fb.row_top += fb.row_h;
             fb.x = fb.left;
+            fb.right_x = fb.right;
             fb.row_h = 0;
         }
+        let place_x = if is_right { fb.right_x - w } else { fb.x };
         // An explicit-width float gets the full avail (so `walk` resolves its
         // width% against the container); a shrink-to-fit float is bounded to its
-        // content. Either way its box lands in `[fb.x, fb.x + w]`.
+        // content. Either way its box lands in `[place_x, place_x + w]`.
         let sub_right = if explicit.is_some() {
-            fb.x + avail
+            place_x + avail
         } else {
-            fb.x + w
+            place_x + w
         };
         let mut sub = Ctx::sub(
-            fb.x,
+            place_x,
             sub_right,
             fb.row_top,
             self.shaper,
@@ -1576,7 +1598,11 @@ impl<'a> Ctx<'a> {
         let h = (sub.y - fb.row_top).max(1);
         self.merge_sub(sub, 0, 0);
         fb.row_h = fb.row_h.max(h);
-        fb.x += w;
+        if is_right {
+            fb.right_x -= w;
+        } else {
+            fb.x += w;
+        }
         fb.bottom = fb.bottom.max(fb.row_top + fb.row_h);
     }
 
@@ -1586,7 +1612,7 @@ impl<'a> Ctx<'a> {
         if fb.active {
             self.y = self.y.max(fb.bottom);
             self.x = self.left;
-            *fb = FloatBand::new(fb.left, self.y);
+            *fb = FloatBand::new(fb.left, fb.right, self.y);
         }
     }
 
@@ -2348,6 +2374,7 @@ fn translate_item(item: &mut DisplayItem, dx: i32, dy: i32) {
         | DisplayItem::RoundRect { rect, .. }
         | DisplayItem::Gradient { rect, .. }
         | DisplayItem::Shadow { rect, .. }
+        | DisplayItem::ClipPush { rect }
         | DisplayItem::Image { rect, .. } => {
             *rect = offset_rect(*rect, dx, dy);
         }
@@ -2356,6 +2383,7 @@ fn translate_item(item: &mut DisplayItem, dx: i32, dy: i32) {
             *a = offset_point(*a, dx, dy);
             *b = offset_point(*b, dx, dy);
         }
+        DisplayItem::ClipPop => {}
     }
 }
 
@@ -2410,8 +2438,12 @@ fn resolve_border_box_width(
 struct FloatBand {
     /// The container's content-left (where each band row starts).
     left: i32,
-    /// Next float x within the current row.
+    /// The container's content-right (where right floats start).
+    right: i32,
+    /// Next left-float x within the current row.
     x: i32,
+    /// Next right-float right-edge within the current row.
+    right_x: i32,
     /// Top y of the current band row.
     row_top: i32,
     /// Height of the tallest float in the current row.
@@ -2423,10 +2455,12 @@ struct FloatBand {
 }
 
 impl FloatBand {
-    fn new(left: i32, y: i32) -> Self {
+    fn new(left: i32, right: i32, y: i32) -> Self {
         Self {
             left,
+            right,
             x: left,
+            right_x: right,
             row_top: y,
             row_h: 0,
             active: false,
@@ -3268,6 +3302,19 @@ mod tests {
     }
 
     #[test]
+    fn float_right_packs_from_the_right_edge() {
+        let laid = lay(
+            "<div><div style='float:right;width:100px;background:#ff0000'>R</div>\
+             <div style='float:left;width:100px;background:#00ff00'>L</div></div>",
+            600,
+        );
+        let r = fill_rects(&laid);
+        assert_eq!(r.len(), 2);
+        assert!(r[0].x <= 12, "left float at the left edge: {}", r[0].x);
+        assert!(r[1].x >= 480, "right float at the right edge: {}", r[1].x);
+    }
+
+    #[test]
     fn clear_drops_below_floats() {
         // A cleared block starts below the float row, not beside it.
         let laid = lay(
@@ -3371,6 +3418,25 @@ mod tests {
                 .iter()
                 .any(|i| matches!(i, DisplayItem::RoundRect { .. })),
             "rounded border paints an outer round rect"
+        );
+    }
+
+    #[test]
+    fn overflow_hidden_emits_clip_markers() {
+        let laid = lay(
+            "<div style='overflow:hidden;height:40px'>a<br>b<br>c<br>d<br>e<br>f</div>",
+            400,
+        );
+        let items = &laid.display.items;
+        assert!(
+            items
+                .iter()
+                .any(|i| matches!(i, DisplayItem::ClipPush { .. })),
+            "overflow:hidden pushes a clip"
+        );
+        assert!(
+            items.iter().any(|i| matches!(i, DisplayItem::ClipPop)),
+            "and pops it"
         );
     }
 

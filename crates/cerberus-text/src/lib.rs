@@ -339,6 +339,8 @@ fn draw_shadow(rect: Rect, blur: i32, color: Color, target: &mut Framebuffer) {
 
 impl Rasterizer for TextEngine {
     fn rasterize(&self, list: &DisplayList, target: &mut Framebuffer) {
+        // Clip stack: each push intersects with the current clip (ADR-0043).
+        let mut clips: Vec<Rect> = Vec::new();
         for item in &list.items {
             match item {
                 DisplayItem::Rect { rect, color } => target.fill_rect(*rect, *color),
@@ -367,9 +369,30 @@ impl Rasterizer for TextEngine {
                 DisplayItem::Line { a, b, width, color } => {
                     self.draw_line(*a, *b, *width, *color, target)
                 }
+                DisplayItem::ClipPush { rect } => {
+                    let r = clips
+                        .last()
+                        .map_or(*rect, |prev| intersect_rect(*prev, *rect));
+                    clips.push(r);
+                    target.set_clip(Some(r));
+                }
+                DisplayItem::ClipPop => {
+                    clips.pop();
+                    target.set_clip(clips.last().copied());
+                }
             }
         }
+        target.set_clip(None);
     }
+}
+
+/// The intersection of two rects (empty if they don't overlap).
+fn intersect_rect(a: Rect, b: Rect) -> Rect {
+    let x0 = a.x.max(b.x);
+    let y0 = a.y.max(b.y);
+    let x1 = (a.x + a.w as i32).min(b.x + b.w as i32);
+    let y1 = (a.y + a.h as i32).min(b.y + b.h as i32);
+    Rect::new(x0, y0, (x1 - x0).max(0) as u32, (y1 - y0).max(0) as u32)
 }
 
 #[cfg(test)]
@@ -407,6 +430,35 @@ mod tests {
         assert!(
             bottom > top + 150,
             "bottom is lighter than top: {top} -> {bottom}"
+        );
+    }
+
+    #[test]
+    fn clip_drops_content_outside_the_box() {
+        let mut fb = Framebuffer::new(Size::new(40, 40));
+        fb.fill_rect(Rect::new(0, 0, 40, 40), Color::WHITE);
+        let list = DisplayList {
+            items: vec![
+                DisplayItem::ClipPush {
+                    rect: Rect::new(0, 0, 20, 20),
+                },
+                DisplayItem::Rect {
+                    rect: Rect::new(0, 0, 40, 40),
+                    color: Color::rgb(255, 0, 0),
+                },
+                DisplayItem::ClipPop,
+            ],
+        };
+        TextEngine::new().rasterize(&list, &mut fb);
+        assert_eq!(
+            fb.pixel(5, 5).unwrap(),
+            Color::rgb(255, 0, 0),
+            "inside clip painted"
+        );
+        assert_eq!(
+            fb.pixel(30, 30).unwrap(),
+            Color::WHITE,
+            "outside clip dropped"
         );
     }
 
