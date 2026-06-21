@@ -41,6 +41,25 @@ impl Len {
     }
 }
 
+/// A two-stop linear gradient background (`linear-gradient`) — start→end along
+/// the vertical (default) or horizontal axis. Multi-stop gradients collapse to
+/// their first/last stop (ADR-0041).
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Gradient {
+    pub start: Color,
+    pub end: Color,
+    pub vertical: bool,
+}
+
+/// A `box-shadow` (outer, single layer): offset, blur radius, color (ADR-0041).
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct BoxShadow {
+    pub dx: i32,
+    pub dy: i32,
+    pub blur: i32,
+    pub color: Color,
+}
+
 /// CSS `text-transform` (ADR-0041). Inherited.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
 pub enum TextTransform {
@@ -238,6 +257,12 @@ pub struct ComputedStyle {
     pub border_color: Color,
     /// `box-sizing` (ADR-0040). Not inherited.
     pub box_sizing: BoxSizing,
+    /// `border-radius` (px, uniform), `background: linear-gradient(...)`, and
+    /// `box-shadow` (ADR-0041). The rare gradient/shadow are boxed so the common
+    /// element (neither) pays only a null pointer. Not inherited.
+    pub border_radius: u16,
+    pub background_gradient: Option<Box<Gradient>>,
+    pub box_shadow: Option<Box<BoxShadow>>,
     /// Preserve whitespace/newlines (`<pre>`); otherwise collapse + wrap.
     pub preformatted: bool,
     /// `visibility: hidden` — laid out but not painted. Inherited.
@@ -326,6 +351,9 @@ impl ComputedStyle {
             border_left: 0,
             border_color: Color::BLACK,
             box_sizing: BoxSizing::ContentBox,
+            border_radius: 0,
+            background_gradient: None,
+            box_shadow: None,
             preformatted: false,
             visibility: Visibility::Visible,
             opacity: 1.0,
@@ -396,6 +424,9 @@ impl ComputedStyle {
             border_left: 0,
             border_color: Color::BLACK,
             box_sizing: BoxSizing::ContentBox,
+            border_radius: 0,
+            background_gradient: None,
+            box_shadow: None,
             flex_direction: FlexDirection::Row,
             flex_reverse: false,
             flex_wrap: false,

@@ -1306,18 +1306,34 @@ impl<'a> Ctx<'a> {
         width
     }
 
-    /// Merge a finished sub-context's output into this one, shifting it down by
-    /// `dy` (cross-axis alignment). All sub items are already in absolute coords.
-    /// Paint an element's background — solid color then `background-image` — at
-    /// `bg_index`, behind its content. The image (if fetched) is stretched to the
-    /// box; a not-yet-available image simply doesn't paint (ADR-0038). Returns the
-    /// next insert index (after the painted layers).
-    fn paint_background(&mut self, bg_index: usize, style: &ComputedStyle, rect: Rect) -> usize {
-        let mut idx = bg_index;
-        if let Some(color) = style.background {
-            self.display
-                .items
-                .insert(idx, DisplayItem::Rect { rect, color });
+    /// Insert a box's fill at `idx` — a `linear-gradient`, else a solid color
+    /// (rounded when `radius > 0`), then any `background-image` — returning the
+    /// next index (ADR-0038/0041).
+    fn fill_box(&mut self, idx0: usize, style: &ComputedStyle, rect: Rect, radius: u16) -> usize {
+        let mut idx = idx0;
+        if let Some(g) = style.background_gradient.as_deref() {
+            self.display.items.insert(
+                idx,
+                DisplayItem::Gradient {
+                    rect,
+                    start: g.start,
+                    end: g.end,
+                    vertical: g.vertical,
+                    radius,
+                },
+            );
+            idx += 1;
+        } else if let Some(color) = style.background {
+            let item = if radius > 0 {
+                DisplayItem::RoundRect {
+                    rect,
+                    color,
+                    radius,
+                }
+            } else {
+                DisplayItem::Rect { rect, color }
+            };
+            self.display.items.insert(idx, item);
             idx += 1;
         }
         if let Some(url) = &style.background_image {
@@ -1331,34 +1347,90 @@ impl<'a> Ctx<'a> {
         idx
     }
 
-    /// Paint a block's background/image then its border (4 solid edge rects) over
-    /// the border box, behind content (ADR-0040).
+    /// Paint a block's box behind content (ADR-0040/0041): the drop shadow, then
+    /// the background (color/gradient/image), then the border. With a corner
+    /// radius the border is an outer rounded rect under the inset rounded fill;
+    /// otherwise it's four solid edge rects.
     fn paint_box(&mut self, bg_index: usize, style: &ComputedStyle, rect: Rect, bx: &BorderBox) {
-        let mut idx = self.paint_background(bg_index, style, rect);
-        let col = style.border_color;
-        let (l, t) = (rect.x, rect.y);
-        let (w, h) = (rect.w as i32, rect.h as i32);
-        let mut edge = |r: Rect| {
+        let mut idx = bg_index;
+        if let Some(sh) = style.box_shadow.as_deref() {
+            let srect = Rect::new(rect.x + sh.dx, rect.y + sh.dy, rect.w, rect.h);
             self.display.items.insert(
                 idx,
-                DisplayItem::Rect {
-                    rect: r,
-                    color: col,
+                DisplayItem::Shadow {
+                    rect: srect,
+                    blur: sh.blur.max(0) as u16,
+                    color: sh.color,
                 },
             );
             idx += 1;
-        };
-        if bx.bt > 0 {
-            edge(Rect::new(l, t, w.max(0) as u32, bx.bt as u32));
         }
-        if bx.bb > 0 {
-            edge(Rect::new(l, t + h - bx.bb, w.max(0) as u32, bx.bb as u32));
-        }
-        if bx.bl > 0 {
-            edge(Rect::new(l, t, bx.bl as u32, h.max(0) as u32));
-        }
-        if bx.br > 0 {
-            edge(Rect::new(l + w - bx.br, t, bx.br as u32, h.max(0) as u32));
+        let radius = style.border_radius;
+        let has_border = bx.bt > 0 || bx.br > 0 || bx.bb > 0 || bx.bl > 0;
+        if radius > 0 {
+            if has_border {
+                self.display.items.insert(
+                    idx,
+                    DisplayItem::RoundRect {
+                        rect,
+                        color: style.border_color,
+                        radius,
+                    },
+                );
+                idx += 1;
+            }
+            let inner = Rect::new(
+                rect.x + bx.bl,
+                rect.y + bx.bt,
+                (rect.w as i32 - bx.bl - bx.br).max(0) as u32,
+                (rect.h as i32 - bx.bt - bx.bb).max(0) as u32,
+            );
+            let inner_r = (radius as i32 - bx.bl.max(bx.br).max(bx.bt).max(bx.bb)).max(0) as u16;
+            self.fill_box(idx, style, inner, inner_r);
+        } else {
+            idx = self.fill_box(idx, style, rect, 0);
+            let col = style.border_color;
+            let (l, t) = (rect.x, rect.y);
+            let (w, h) = (rect.w as i32, rect.h as i32);
+            if bx.bt > 0 {
+                self.display.items.insert(
+                    idx,
+                    DisplayItem::Rect {
+                        rect: Rect::new(l, t, w.max(0) as u32, bx.bt as u32),
+                        color: col,
+                    },
+                );
+                idx += 1;
+            }
+            if bx.bb > 0 {
+                self.display.items.insert(
+                    idx,
+                    DisplayItem::Rect {
+                        rect: Rect::new(l, t + h - bx.bb, w.max(0) as u32, bx.bb as u32),
+                        color: col,
+                    },
+                );
+                idx += 1;
+            }
+            if bx.bl > 0 {
+                self.display.items.insert(
+                    idx,
+                    DisplayItem::Rect {
+                        rect: Rect::new(l, t, bx.bl as u32, h.max(0) as u32),
+                        color: col,
+                    },
+                );
+                idx += 1;
+            }
+            if bx.br > 0 {
+                self.display.items.insert(
+                    idx,
+                    DisplayItem::Rect {
+                        rect: Rect::new(l + w - bx.br, t, bx.br as u32, h.max(0) as u32),
+                        color: col,
+                    },
+                );
+            }
         }
     }
 
@@ -2128,7 +2200,11 @@ fn offset_point(p: Point, dx: i32, dy: i32) -> Point {
 /// Translate a display item in place by `(dx, dy)` (ADR-0034 positioning).
 fn translate_item(item: &mut DisplayItem, dx: i32, dy: i32) {
     match item {
-        DisplayItem::Rect { rect, .. } | DisplayItem::Image { rect, .. } => {
+        DisplayItem::Rect { rect, .. }
+        | DisplayItem::RoundRect { rect, .. }
+        | DisplayItem::Gradient { rect, .. }
+        | DisplayItem::Shadow { rect, .. }
+        | DisplayItem::Image { rect, .. } => {
             *rect = offset_rect(*rect, dx, dy);
         }
         DisplayItem::Glyphs { origin, .. } => *origin = offset_point(*origin, dx, dy),
@@ -3080,6 +3156,43 @@ mod tests {
             (fill_rects(&cb)[0].w as i32 - 240).abs() <= 2,
             "content-box adds padding to width: {}",
             fill_rects(&cb)[0].w
+        );
+    }
+
+    #[test]
+    fn gradient_radius_shadow_emit_paint_items() {
+        let laid = lay(
+            "<div style='background:linear-gradient(#ff0000,#0000ff);border-radius:10px;\
+             box-shadow:0 4px 8px rgba(0,0,0,0.3)'>hi</div>",
+            400,
+        );
+        let items = &laid.display.items;
+        assert!(
+            items
+                .iter()
+                .any(|i| matches!(i, DisplayItem::Gradient { .. })),
+            "gradient item"
+        );
+        assert!(
+            items
+                .iter()
+                .any(|i| matches!(i, DisplayItem::Shadow { .. })),
+            "shadow item"
+        );
+    }
+
+    #[test]
+    fn rounded_border_emits_outer_round_rect() {
+        let laid = lay(
+            "<div style='border:2px solid #000000;border-radius:6px'>hi</div>",
+            400,
+        );
+        assert!(
+            laid.display
+                .items
+                .iter()
+                .any(|i| matches!(i, DisplayItem::RoundRect { .. })),
+            "rounded border paints an outer round rect"
         );
     }
 

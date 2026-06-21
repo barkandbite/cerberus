@@ -14,6 +14,23 @@ use std::sync::Arc;
 pub enum DisplayItem {
     /// A solid-filled rectangle.
     Rect { rect: Rect, color: Color },
+    /// A solid fill with uniform rounded corners (ADR-0041).
+    RoundRect {
+        rect: Rect,
+        color: Color,
+        radius: u16,
+    },
+    /// A two-stop linear gradient fill (vertical or horizontal), optionally
+    /// rounded (ADR-0041).
+    Gradient {
+        rect: Rect,
+        start: Color,
+        end: Color,
+        vertical: bool,
+        radius: u16,
+    },
+    /// A soft outer drop shadow with `blur`-px falloff (ADR-0041).
+    Shadow { rect: Rect, blur: u16, color: Color },
     /// A run of shaped glyphs anchored at `origin` (top-left of the first box).
     Glyphs {
         origin: Point,
@@ -71,6 +88,33 @@ impl DisplayList {
             .map(|item| match item {
                 DisplayItem::Rect { rect, color } => DisplayItem::Rect {
                     rect: sr(*rect),
+                    color: *color,
+                },
+                DisplayItem::RoundRect {
+                    rect,
+                    color,
+                    radius,
+                } => DisplayItem::RoundRect {
+                    rect: sr(*rect),
+                    color: *color,
+                    radius: su(*radius as u32) as u16,
+                },
+                DisplayItem::Gradient {
+                    rect,
+                    start,
+                    end,
+                    vertical,
+                    radius,
+                } => DisplayItem::Gradient {
+                    rect: sr(*rect),
+                    start: *start,
+                    end: *end,
+                    vertical: *vertical,
+                    radius: su(*radius as u32) as u16,
+                },
+                DisplayItem::Shadow { rect, blur, color } => DisplayItem::Shadow {
+                    rect: sr(*rect),
+                    blur: su(*blur as u32) as u16,
                     color: *color,
                 },
                 DisplayItem::Image { rect, image } => DisplayItem::Image {
@@ -319,8 +363,11 @@ impl Rasterizer for BoxRasterizer {
                 DisplayItem::Image { rect, .. } => {
                     target.fill_rect(*rect, Color::rgb(192, 192, 192));
                 }
-                // The placeholder rasterizer doesn't draw vector lines.
-                DisplayItem::Line { .. } => {}
+                // The placeholder approximates fills as solid and ignores
+                // shadows/lines.
+                DisplayItem::RoundRect { rect, color, .. } => target.fill_rect(*rect, *color),
+                DisplayItem::Gradient { rect, start, .. } => target.fill_rect(*rect, *start),
+                DisplayItem::Shadow { .. } | DisplayItem::Line { .. } => {}
             }
         }
     }

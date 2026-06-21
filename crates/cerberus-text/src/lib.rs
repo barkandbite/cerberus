@@ -177,11 +177,186 @@ impl TextShaper for TextEngine {
     }
 }
 
+/// Lerp two colors at `t` in `0..=1`.
+fn lerp_color(a: Color, b: Color, t: f32) -> Color {
+    let m = |x: u8, y: u8| (x as f32 + (y as f32 - x as f32) * t).round() as u8;
+    Color::rgba(m(a.r, b.r), m(a.g, b.g), m(a.b, b.b), m(a.a, b.a))
+}
+
+/// Fill a uniformly rounded rect (ADR-0041): the interior is opaque `fill_rect`
+/// (fast), only the four `r×r` corners are anti-aliased per-pixel.
+fn draw_round_rect(rect: Rect, color: Color, radius: i32, target: &mut Framebuffer) {
+    let r = radius.min(rect.w as i32 / 2).min(rect.h as i32 / 2).max(0);
+    if r == 0 {
+        target.fill_rect(rect, color);
+        return;
+    }
+    let (x0, y0) = (rect.x, rect.y);
+    let (x1, y1) = (rect.x + rect.w as i32, rect.y + rect.h as i32);
+    let mid_w = (rect.w as i32 - 2 * r).max(0) as u32;
+    target.fill_rect(
+        Rect::new(x0, y0 + r, rect.w, (rect.h as i32 - 2 * r).max(0) as u32),
+        color,
+    );
+    target.fill_rect(Rect::new(x0 + r, y0, mid_w, r as u32), color);
+    target.fill_rect(Rect::new(x0 + r, y1 - r, mid_w, r as u32), color);
+    let alpha = color.a as f32 / 255.0;
+    let rf = r as f32;
+    // (corner-square origin, circle center)
+    for &(sx, sy, cx, cy) in &[
+        (x0, y0, x0 + r, y0 + r),
+        (x1 - r, y0, x1 - r, y0 + r),
+        (x0, y1 - r, x0 + r, y1 - r),
+        (x1 - r, y1 - r, x1 - r, y1 - r),
+    ] {
+        for py in sy..sy + r {
+            for px in sx..sx + r {
+                let d = (((px as f32 + 0.5) - cx as f32).powi(2)
+                    + ((py as f32 + 0.5) - cy as f32).powi(2))
+                .sqrt();
+                let cov = (rf - d + 0.5).clamp(0.0, 1.0);
+                if cov > 0.0 {
+                    target.blend_pixel(px, py, color, cov * alpha);
+                }
+            }
+        }
+    }
+}
+
+/// Fill a two-stop linear gradient (ADR-0041). The unrounded case fills one
+/// opaque scanline (row or column) per step — fast; a rounded gradient falls back
+/// to per-pixel with corner anti-aliasing.
+fn draw_gradient(
+    rect: Rect,
+    start: Color,
+    end: Color,
+    vertical: bool,
+    radius: i32,
+    target: &mut Framebuffer,
+) {
+    let (w, h) = (rect.w as i32, rect.h as i32);
+    if w <= 0 || h <= 0 {
+        return;
+    }
+    let r = radius.min(w / 2).min(h / 2).max(0);
+    if r == 0 {
+        if vertical {
+            for row in 0..h {
+                let t = row as f32 / (h - 1).max(1) as f32;
+                target.fill_rect(
+                    Rect::new(rect.x, rect.y + row, rect.w, 1),
+                    lerp_color(start, end, t),
+                );
+            }
+        } else {
+            for col in 0..w {
+                let t = col as f32 / (w - 1).max(1) as f32;
+                target.fill_rect(
+                    Rect::new(rect.x + col, rect.y, 1, rect.h),
+                    lerp_color(start, end, t),
+                );
+            }
+        }
+        return;
+    }
+    // Rounded gradient: per-pixel color + corner coverage.
+    let (x0, y0) = (rect.x, rect.y);
+    let rf = r as f32;
+    for row in 0..h {
+        for col in 0..w {
+            let t = if vertical {
+                row as f32 / (h - 1).max(1) as f32
+            } else {
+                col as f32 / (w - 1).max(1) as f32
+            };
+            let cov = corner_coverage(col, row, w, h, rf);
+            if cov > 0.0 {
+                target.blend_pixel(x0 + col, y0 + row, lerp_color(start, end, t), cov);
+            }
+        }
+    }
+}
+
+/// Coverage in `0..=1` for a pixel at `(col,row)` inside a `w×h` box rounded by
+/// `r` (1 in the interior, anti-aliased in the corners).
+fn corner_coverage(col: i32, row: i32, w: i32, h: i32, r: f32) -> f32 {
+    let (x, y) = (col as f32 + 0.5, row as f32 + 0.5);
+    let cx = if x < r {
+        r
+    } else if x > w as f32 - r {
+        w as f32 - r
+    } else {
+        return 1.0;
+    };
+    let cy = if y < r {
+        r
+    } else if y > h as f32 - r {
+        h as f32 - r
+    } else {
+        return 1.0;
+    };
+    (r - ((x - cx).powi(2) + (y - cy).powi(2)).sqrt() + 0.5).clamp(0.0, 1.0)
+}
+
+/// Paint a soft outer drop shadow: only the ring outside `rect` (the box covers
+/// the interior), alpha falling off quadratically over `blur` px (ADR-0041).
+fn draw_shadow(rect: Rect, blur: i32, color: Color, target: &mut Framebuffer) {
+    let b = blur.clamp(1, 40);
+    let (x0, y0) = (rect.x, rect.y);
+    let (x1, y1) = (rect.x + rect.w as i32, rect.y + rect.h as i32);
+    let base = color.a as f32 / 255.0;
+    for py in (y0 - b)..(y1 + b) {
+        for px in (x0 - b)..(x1 + b) {
+            let dx = if px < x0 {
+                x0 - px
+            } else if px >= x1 {
+                px - x1 + 1
+            } else {
+                0
+            };
+            let dy = if py < y0 {
+                y0 - py
+            } else if py >= y1 {
+                py - y1 + 1
+            } else {
+                0
+            };
+            if dx == 0 && dy == 0 {
+                continue; // interior is covered by the box
+            }
+            let d = ((dx * dx + dy * dy) as f32).sqrt();
+            if d >= b as f32 {
+                continue;
+            }
+            let t = 1.0 - d / b as f32;
+            let a = base * t * t * 0.6;
+            if a > 0.003 {
+                target.blend_pixel(px, py, color, a);
+            }
+        }
+    }
+}
+
 impl Rasterizer for TextEngine {
     fn rasterize(&self, list: &DisplayList, target: &mut Framebuffer) {
         for item in &list.items {
             match item {
                 DisplayItem::Rect { rect, color } => target.fill_rect(*rect, *color),
+                DisplayItem::RoundRect {
+                    rect,
+                    color,
+                    radius,
+                } => draw_round_rect(*rect, *color, *radius as i32, target),
+                DisplayItem::Gradient {
+                    rect,
+                    start,
+                    end,
+                    vertical,
+                    radius,
+                } => draw_gradient(*rect, *start, *end, *vertical, *radius as i32, target),
+                DisplayItem::Shadow { rect, blur, color } => {
+                    draw_shadow(*rect, *blur as i32, *color, target)
+                }
                 DisplayItem::Image { rect, image } => self.draw_image(*rect, image, target),
                 DisplayItem::Glyphs {
                     origin,
@@ -201,6 +376,58 @@ impl Rasterizer for TextEngine {
 mod tests {
     use super::*;
     use cerberus_types::Size;
+
+    #[test]
+    fn round_rect_clears_corners_keeps_center() {
+        let mut fb = Framebuffer::new(Size::new(20, 20));
+        fb.fill_rect(Rect::new(0, 0, 20, 20), Color::WHITE);
+        draw_round_rect(Rect::new(0, 0, 20, 20), Color::rgb(0, 0, 0), 8, &mut fb);
+        assert!(fb.pixel(0, 0).unwrap().r > 200, "corner stays background");
+        assert_eq!(
+            fb.pixel(10, 10).unwrap(),
+            Color::rgb(0, 0, 0),
+            "center filled"
+        );
+    }
+
+    #[test]
+    fn vertical_gradient_interpolates_top_to_bottom() {
+        let mut fb = Framebuffer::new(Size::new(4, 10));
+        fb.fill_rect(Rect::new(0, 0, 4, 10), Color::BLACK);
+        draw_gradient(
+            Rect::new(0, 0, 4, 10),
+            Color::rgb(0, 0, 0),
+            Color::rgb(255, 255, 255),
+            true,
+            0,
+            &mut fb,
+        );
+        let top = fb.pixel(0, 0).unwrap().r;
+        let bottom = fb.pixel(0, 9).unwrap().r;
+        assert!(
+            bottom > top + 150,
+            "bottom is lighter than top: {top} -> {bottom}"
+        );
+    }
+
+    #[test]
+    fn shadow_inks_the_ring_not_center() {
+        let mut fb = Framebuffer::new(Size::new(60, 60));
+        fb.fill_rect(Rect::new(0, 0, 60, 60), Color::WHITE);
+        draw_shadow(
+            Rect::new(20, 20, 20, 20),
+            8,
+            Color::rgba(0, 0, 0, 255),
+            &mut fb,
+        );
+        // A pixel just outside the box is darkened; the interior is untouched.
+        assert!(fb.pixel(15, 30).unwrap().r < 250, "shadow darkens the ring");
+        assert_eq!(
+            fb.pixel(30, 30).unwrap(),
+            Color::WHITE,
+            "interior untouched"
+        );
+    }
 
     #[test]
     fn shapes_glyph_ids_and_advances() {

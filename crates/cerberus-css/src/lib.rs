@@ -13,9 +13,9 @@ pub use color::parse_color;
 
 use cerberus_dom::{Document, NodeRef};
 use cerberus_style::{
-    AlignItems, AlignSelf, BoxSizing, Clear, ComputedStyle, Display, ExternalSheets, FlexBasis,
-    FlexDirection, Float, JustifyContent, Len, Position, StyleEngine, StyledChild, StyledDom,
-    StyledNode, TextAlign, TextTransform, Track, TrackMax, Visibility,
+    AlignItems, AlignSelf, BoxShadow, BoxSizing, Clear, ComputedStyle, Display, ExternalSheets,
+    FlexBasis, FlexDirection, Float, Gradient, JustifyContent, Len, Position, StyleEngine,
+    StyledChild, StyledDom, StyledNode, TextAlign, TextTransform, Track, TrackMax, Visibility,
 };
 use cerberus_types::Color;
 use parser::{
@@ -605,14 +605,27 @@ fn apply_declarations(
                 if let Some(c) = parse_bg_color(v) {
                     style.background = (c.a != 0).then_some(c);
                 }
-                // The `background` shorthand may also carry an image; `none`
-                // clears it.
+                // The `background` shorthand may also carry an image or gradient.
                 if prop == "background" {
                     style.background_image = parse_url_value(v);
+                    style.background_gradient = parse_gradient(v).map(Box::new);
                 }
             }
             "background-image" => {
                 style.background_image = parse_url_value(v);
+                style.background_gradient = parse_gradient(v).map(Box::new);
+            }
+            "border-radius" => {
+                // Uniform radius (first value of the 1–4 corner shorthand).
+                style.border_radius = v
+                    .split_whitespace()
+                    .next()
+                    .and_then(|t| parse_len(t, style.font_size as f32))
+                    .map(|n| n.clamp(0, u16::MAX as i32) as u16)
+                    .unwrap_or(0);
+            }
+            "box-shadow" => {
+                style.box_shadow = parse_box_shadow(v, style.font_size as f32).map(Box::new);
             }
             "font-size" => {
                 if let Some(px) = parse_size(v, parent_font_size) {
@@ -1080,6 +1093,132 @@ fn parse_track_max(tok: &str, em_base: f32) -> TrackMax {
         Some(px) => TrackMax::Px(px.max(0) as u32),
         None => TrackMax::Auto,
     }
+}
+
+/// Split on top-level commas, keeping `func(…)` groups (which contain commas,
+/// e.g. `rgba(…)`) intact.
+fn split_top_commas(v: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut depth = 0i32;
+    let mut cur = String::new();
+    for c in v.chars() {
+        match c {
+            '(' => {
+                depth += 1;
+                cur.push(c);
+            }
+            ')' => {
+                depth -= 1;
+                cur.push(c);
+            }
+            ',' if depth == 0 => out.push(std::mem::take(&mut cur)),
+            _ => cur.push(c),
+        }
+    }
+    if !cur.trim().is_empty() {
+        out.push(cur);
+    }
+    out
+}
+
+/// Parse a `linear-gradient`/`radial-gradient` (incl. vendor prefixes) into a
+/// two-stop [`Gradient`] — first/last stop colors, vertical unless the direction
+/// is horizontal (ADR-0041). Returns `None` if there's no gradient or no colors.
+fn parse_gradient(v: &str) -> Option<Gradient> {
+    let low = v.to_ascii_lowercase();
+    let start_idx = low
+        .find("linear-gradient(")
+        .or_else(|| low.find("radial-gradient("))?;
+    let open = low[start_idx..].find('(')? + start_idx;
+    let is_radial = low[..open].ends_with("radial-gradient");
+    // Match the gradient's closing paren.
+    let inner = {
+        let after = &v[open + 1..];
+        let mut depth = 1i32;
+        let mut end = after.len();
+        for (i, c) in after.char_indices() {
+            match c {
+                '(' => depth += 1,
+                ')' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        end = i;
+                        break;
+                    }
+                }
+                _ => {}
+            }
+        }
+        &after[..end]
+    };
+    let parts = split_top_commas(inner);
+    if parts.is_empty() {
+        return None;
+    }
+    // A leading direction (`to …`/angle) is not a stop.
+    let first = parts[0].trim().to_ascii_lowercase();
+    let (vertical, stops) = if first.starts_with("to ")
+        || first.ends_with("deg")
+        || first.ends_with("turn")
+        || first.ends_with("rad")
+    {
+        (is_radial || !direction_is_horizontal(&first), &parts[1..])
+    } else {
+        (true, &parts[..])
+    };
+    // The color is the first whitespace token of a stop (the rest is a position).
+    let color_of = |stop: &str| parse_color(split_top(stop.trim()).first().map(String::as_str)?);
+    let start = color_of(stops.first()?)?;
+    let end = color_of(stops.last()?).unwrap_or(start);
+    Some(Gradient {
+        start,
+        end,
+        vertical: if is_radial { true } else { vertical },
+    })
+}
+
+/// Whether a `linear-gradient` direction points mostly horizontally (`to
+/// left/right`, or an angle near 90°/270°).
+fn direction_is_horizontal(dir: &str) -> bool {
+    if dir.contains("right") || dir.contains("left") {
+        return !dir.contains("top") && !dir.contains("bottom");
+    }
+    if let Some(deg) = dir
+        .strip_suffix("deg")
+        .and_then(|n| n.trim().parse::<f32>().ok())
+    {
+        let m = deg.rem_euclid(180.0);
+        return (45.0..135.0).contains(&m);
+    }
+    false
+}
+
+/// Parse a `box-shadow` (outer, first layer): leading lengths are dx/dy/blur, a
+/// color anywhere; `inset`/`none` → `None` (ADR-0041).
+fn parse_box_shadow(v: &str, em: f32) -> Option<BoxShadow> {
+    let v = v.trim();
+    if v.is_empty() || v.eq_ignore_ascii_case("none") {
+        return None;
+    }
+    let first = split_top_commas(v).into_iter().next()?;
+    let mut lens: Vec<i32> = Vec::new();
+    let mut color = None;
+    for tok in split_top(first.trim()) {
+        if tok.eq_ignore_ascii_case("inset") {
+            return None; // inner shadows aren't modeled
+        }
+        if let Some(c) = parse_color(&tok) {
+            color = Some(c);
+        } else if let Some(n) = parse_len(&tok, em) {
+            lens.push(n);
+        }
+    }
+    Some(BoxShadow {
+        dx: lens.first().copied().unwrap_or(0),
+        dy: lens.get(1).copied().unwrap_or(0),
+        blur: lens.get(2).copied().unwrap_or(0).max(0),
+        color: color.unwrap_or(cerberus_types::Color::rgba(0, 0, 0, 64)),
+    })
 }
 
 /// Extract the URL from the first `url(...)` in a value (e.g. a `background` /
@@ -1747,6 +1886,36 @@ mod tests {
         let s = &first(&dom2.root, "div").unwrap().style;
         assert_eq!(s.background_image.as_deref(), Some("bg.png"));
         assert_eq!(s.background, Some(Color::rgb(255, 255, 255)));
+    }
+
+    #[test]
+    fn gradient_radius_shadow_parse() {
+        let dom = CssEngine::new().style(&parse_html(
+            "<div style='background:linear-gradient(to right, #ff0000, #0000ff);\
+             border-radius:8px; box-shadow:0 2px 6px rgba(0,0,0,0.3)'>x</div>",
+        ));
+        let s = &first(&dom.root, "div").unwrap().style;
+        let g = s.background_gradient.as_deref().expect("gradient parsed");
+        assert_eq!(g.start, Color::rgb(0xff, 0, 0));
+        assert_eq!(g.end, Color::rgb(0, 0, 0xff));
+        assert!(!g.vertical, "`to right` is horizontal");
+        assert_eq!(s.border_radius, 8);
+        let sh = s.box_shadow.as_deref().expect("shadow parsed");
+        assert_eq!((sh.dx, sh.dy, sh.blur), (0, 2, 6));
+        assert_eq!(sh.color.a, 77); // rgba(...,0.3) -> round(0.3*255)
+                                    // A vertical default-direction gradient.
+        let dom2 = CssEngine::new().style(&parse_html(
+            "<div style='background:linear-gradient(#fff,#000)'>x</div>",
+        ));
+        assert!(
+            first(&dom2.root, "div")
+                .unwrap()
+                .style
+                .background_gradient
+                .as_deref()
+                .unwrap()
+                .vertical
+        );
     }
 
     #[test]
