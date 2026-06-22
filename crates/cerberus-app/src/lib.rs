@@ -95,6 +95,9 @@ pub struct RenderConfig {
     pub proxy: Option<String>,
     /// Collect per-stage timings into [`RenderOutcome::timings`] (`--timers`).
     pub timers: bool,
+    /// "Allow all sites": permit third-party subresources/cookies without
+    /// prompting (the "stop bugging me" mode). Off by default (privacy-first).
+    pub allow_all: bool,
 }
 
 impl Default for RenderConfig {
@@ -109,6 +112,7 @@ impl Default for RenderConfig {
             dump_text: false,
             proxy: None,
             timers: false,
+            allow_all: false,
         }
     }
 }
@@ -843,6 +847,9 @@ pub fn render(config: &RenderConfig) -> Result<RenderOutcome, AppError> {
         if let Ok(text) = std::fs::read_to_string(Path::new(dir).join(CONSENT_RULES_FILE)) {
             policy.load_rules(&text);
         }
+    }
+    if config.allow_all {
+        policy.set_allow_all(true);
     }
     let consent = Arc::new(Mutex::new(policy));
     let cookie_policy = Arc::new(Mutex::new(load_cookie_policy(
@@ -3796,6 +3803,17 @@ impl FrameApp for BrowserApp {
         }
         if self.settings_open {
             let vault_locked = self.storage.locked().vault_locked();
+            let site = self
+                .current_url
+                .as_ref()
+                .and_then(first_party_of)
+                .map(|o| o.site());
+            let (allow_all, exempt) = {
+                let c = self.consent.locked();
+                let ex = site.as_deref().map(|s| c.is_exempt(s)).unwrap_or(false);
+                (c.allow_all(), ex)
+            };
+            let exempt_site = site.as_deref().map(|s| (s, exempt));
             paint_settings_overlay(
                 &mut fb,
                 logical,
@@ -3805,6 +3823,8 @@ impl FrameApp for BrowserApp {
                 self.vault_input.chars().count(),
                 self.vault_msg.as_deref(),
                 self.hud_on,
+                allow_all,
+                exempt_site,
                 scale,
             );
         }
@@ -3917,6 +3937,40 @@ impl FrameApp for BrowserApp {
             // Toggle the performance HUD.
             if point_in_rect(settings_timers_rect(self.last_size), x, y) {
                 self.hud_on = !self.hud_on;
+                return true;
+            }
+            // Toggle the global "allow all sites" switch (stop bugging me).
+            if point_in_rect(settings_allowall_rect(self.last_size), x, y) {
+                let on = {
+                    let mut c = self.consent.locked();
+                    let on = !c.allow_all();
+                    c.set_allow_all(on);
+                    on
+                };
+                self.save_consent_rules();
+                // Clear any pending prompts and re-fetch now-permitted assets so
+                // the page reflows immediately.
+                if on {
+                    self.consent_prompts.clear();
+                }
+                self.request_page_images();
+                self.request_page_stylesheets();
+                return true;
+            }
+            // Toggle the current site's exemption from the global policy.
+            if point_in_rect(settings_exempt_rect(self.last_size), x, y) {
+                if let Some(site) = self
+                    .current_url
+                    .as_ref()
+                    .and_then(first_party_of)
+                    .map(|o| o.site())
+                {
+                    self.consent.locked().toggle_exempt(&site);
+                    self.save_consent_rules();
+                    self.consent_prompts.clear();
+                    self.request_page_images();
+                    self.request_page_stylesheets();
+                }
                 return true;
             }
             // Clicks inside the panel stay in the panel (passphrase entry);
@@ -4665,6 +4719,19 @@ fn settings_timers_rect(size: Size) -> Rect {
     Rect::new(p.x + 12, p.y + 204, 220, 22)
 }
 
+/// The clickable "allow all sites" (stop-bugging-me) toggle row.
+fn settings_allowall_rect(size: Size) -> Rect {
+    let p = settings_panel_rect(size);
+    Rect::new(p.x + 12, p.y + 232, 280, 22)
+}
+
+/// The clickable "exempt this site" row (inverts the global policy for the
+/// current site); only meaningful when a site is loaded.
+fn settings_exempt_rect(size: Size) -> Rect {
+    let p = settings_panel_rect(size);
+    Rect::new(p.x + 12, p.y + 260, 280, 22)
+}
+
 /// Paint the centered settings panel: vault state + passphrase entry.
 #[allow(clippy::too_many_arguments)]
 fn paint_settings_overlay(
@@ -4676,6 +4743,8 @@ fn paint_settings_overlay(
     input_chars: usize,
     vault_msg: Option<&str>,
     hud_on: bool,
+    allow_all: bool,
+    exempt_site: Option<(&str, bool)>,
     scale: f32,
 ) {
     let panel = settings_panel_rect(size);
@@ -4768,6 +4837,46 @@ fn paint_settings_overlay(
         color: Color::rgb(0x20, 0x40, 0x70),
         style: FontStyle::REGULAR,
     });
+    // "Stop bugging me": global allow-all toggle.
+    let ar = settings_allowall_rect(size);
+    list.push(DisplayItem::Rect {
+        rect: ar,
+        color: Color::rgb(0xE6, 0xEE, 0xF6),
+    });
+    list.push(DisplayItem::Glyphs {
+        origin: Point::new(ar.x + 6, ar.y + 16),
+        glyphs: shaper.shape(
+            if allow_all {
+                "allow all sites (stop bugging me): on"
+            } else {
+                "allow all sites (stop bugging me): off"
+            },
+            14,
+        ),
+        color: Color::rgb(0x20, 0x40, 0x70),
+        style: FontStyle::REGULAR,
+    });
+    // Per-site exemption (inverts the global switch for the current site).
+    if let Some((site, exempt)) = exempt_site {
+        let er = settings_exempt_rect(size);
+        list.push(DisplayItem::Rect {
+            rect: er,
+            color: Color::rgb(0xF0, 0xE9, 0xE9),
+        });
+        // Describe the *effective* state for this site so the label is unambiguous.
+        let effective_allow = allow_all ^ exempt;
+        let label = format!(
+            "{site}: {} ({})",
+            if exempt { "exempt" } else { "follows global" },
+            if effective_allow { "allowed" } else { "strict" },
+        );
+        list.push(DisplayItem::Glyphs {
+            origin: Point::new(er.x + 6, er.y + 16),
+            glyphs: shaper.shape(&label, 13),
+            color: Color::rgb(0x70, 0x30, 0x30),
+            style: FontStyle::REGULAR,
+        });
+    }
     raster.rasterize(&list.scaled(scale), fb);
 }
 
@@ -5026,6 +5135,35 @@ mod tests {
         assert_eq!(outcome.third_party_decision, Decision::Deny);
         // A frame was produced at the requested size.
         assert_eq!(outcome.framebuffer.size, RenderConfig::default().viewport);
+    }
+
+    #[test]
+    fn allow_all_and_exempt_toggles_flip_the_consent_policy() {
+        let mut app = BrowserApp::new();
+        app.current_url = parse_url("https://news.example.com/").ok();
+        app.settings_open = true;
+        let size = Size::new(900, 700);
+        let _ = app.render_frame(size); // sets last_size
+
+        // Privacy-first default: allow-all is off.
+        assert!(!app.consent.locked().allow_all());
+
+        // Clicking the "allow all sites" row turns the global switch on.
+        let ar = settings_allowall_rect(app.last_size);
+        assert!(app.pointer_down(ar.x + 5, ar.y + 5));
+        assert!(app.consent.locked().allow_all(), "allow-all toggled on");
+
+        // Clicking "exempt this site" exempts the current site (inverting the
+        // global switch back to strict for it).
+        let er = settings_exempt_rect(app.last_size);
+        assert!(app.pointer_down(er.x + 5, er.y + 5));
+        let site = first_party_of(app.current_url.as_ref().unwrap())
+            .unwrap()
+            .site();
+        assert!(
+            app.consent.locked().is_exempt(&site),
+            "current site exempted"
+        );
     }
 
     #[test]
