@@ -597,13 +597,14 @@ impl<'a> Ctx<'a> {
         let saved_opacity_hidden = self.opacity_hidden;
         self.opacity_hidden = subtree_hidden;
         // Float band state: consecutive `float` children pack left-to-right and
-        // wrap (the common column-grid pattern); a non-float child, text, or
-        // `clear` drops below the band (ADR-0039). Text wrap-around is not modeled.
+        // wrap (the common column-grid pattern). Following in-flow content wraps
+        // *beside* the floats when enough width remains, else drops below the band
+        // (a `clear` always drops) — ADR-0039/0049.
         let mut fb = FloatBand::new(self.left, self.right, self.y);
         for child in &node.children {
             match child {
                 StyledChild::Text(t) => {
-                    self.flush_floats(&mut fb);
+                    self.flow_among_floats(&mut fb);
                     if visible {
                         self.add_text(t, style, href);
                     }
@@ -612,18 +613,28 @@ impl<'a> Ctx<'a> {
                     if e.style.float != cerberus_style::Float::None
                         && e.style.display != Display::None =>
                 {
+                    // Floats size against the container's full content box, never a
+                    // width left narrowed by an earlier wrap.
+                    self.left = fb.left;
+                    self.right = fb.right;
                     self.place_float(e, href, &mut fb);
                 }
                 StyledChild::Element(e) => {
                     if e.style.clear != cerberus_style::Clear::None {
                         self.flush_floats(&mut fb);
+                        self.left = fb.left;
+                        self.right = fb.right;
+                        self.x = self.left;
+                    } else {
+                        self.flow_among_floats(&mut fb);
                     }
-                    self.flush_floats(&mut fb);
                     self.walk(e, href);
                 }
             }
         }
         self.flush_floats(&mut fb);
+        self.left = fb.left;
+        self.right = fb.right;
         self.opacity_hidden = saved_opacity_hidden;
 
         if is_block {
@@ -1631,6 +1642,30 @@ impl<'a> Ctx<'a> {
         }
     }
 
+    /// Lay the next in-flow child among open floats. While a float still occupies
+    /// this band (`self.y` above its bottom) and enough width remains beside it,
+    /// narrow the content box so the child wraps *alongside* the float — the
+    /// floated-infobox / pull-quote pattern that otherwise pushed a page's whole
+    /// body below a tall sidebar (ADR-0049). Without room (e.g. a full-width float
+    /// row), it drops below the band as before, restoring the full width.
+    fn flow_among_floats(&mut self, fb: &mut FloatBand) {
+        if !fb.active {
+            return;
+        }
+        let free = (fb.right_x - fb.x).max(0);
+        if !self.measuring && self.y < fb.bottom && free >= MIN_FLOAT_WRAP_WIDTH {
+            // Wrap beside the float(s): the free band between left and right floats.
+            self.left = fb.x;
+            self.right = fb.right_x;
+            self.x = self.left;
+        } else {
+            self.flush_floats(fb);
+            self.left = fb.left;
+            self.right = fb.right;
+            self.x = self.left;
+        }
+    }
+
     fn merge_sub(&mut self, sub: Ctx<'a>, dx: i32, dy: i32) {
         for mut item in sub.display.items {
             if dx != 0 || dy != 0 {
@@ -2448,6 +2483,10 @@ fn resolve_border_box_width(
         cerberus_style::BoxSizing::ContentBox => raw + h_extra,
     })
 }
+
+/// Minimum width that must remain beside a float before in-flow content wraps
+/// alongside it; below this it drops under the float instead (ADR-0049).
+const MIN_FLOAT_WRAP_WIDTH: i32 = 120;
 
 /// State for packing a run of `float` siblings into rows (ADR-0039).
 struct FloatBand {
@@ -3493,6 +3532,41 @@ mod tests {
             r[1].w as i32 > 400,
             "cleared block spans the full width: {}",
             r[1].w
+        );
+    }
+
+    #[test]
+    fn content_wraps_beside_a_tall_right_float() {
+        // A tall float:right (infobox) followed by a body block: the body wraps to
+        // its left at the same height, not pushed ~400px below it (ADR-0049).
+        let laid = lay(
+            "<div><div style='float:right;width:200px;height:400px;background:#ff0000'>BOX</div>\
+             <div style='background:#00ff00'>body beside the float</div></div>",
+            600,
+        );
+        let r = fill_rects(&laid);
+        assert_eq!(r.len(), 2);
+        let (float_box, body) = if r[0].h >= 300 {
+            (r[0], r[1])
+        } else {
+            (r[1], r[0])
+        };
+        assert!(
+            float_box.x >= 380,
+            "right float near the right edge: {}",
+            float_box.x
+        );
+        assert!(
+            body.y < float_box.y + 100,
+            "body wraps beside the float, not below it: body.y={} float.y={}",
+            body.y,
+            float_box.y
+        );
+        assert!(
+            body.x + body.w as i32 <= float_box.x + 1,
+            "body stays left of the right float: {} vs {}",
+            body.x + body.w as i32,
+            float_box.x
         );
     }
 
