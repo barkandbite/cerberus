@@ -41,8 +41,8 @@ use cerberus_js_dom::{
 };
 use cerberus_js_quickjs::QuickJsEngineFactory;
 use cerberus_layout::{
-    BlockLayout, ElementBox, FieldKind, FormFieldBox, FormState, ImageProvider, LayoutEngine,
-    LinkBox, NoForms, NoImages,
+    pick_img_url, BlockLayout, ElementBox, FieldKind, FormFieldBox, FormState, ImageProvider,
+    LayoutEngine, LinkBox, NoForms, NoImages,
 };
 use cerberus_net::{
     parse_proxy, BuiltinHttpClient, CookieJar, FallbackResolver, FetchContext, FetchKind,
@@ -984,6 +984,7 @@ pub fn render(config: &RenderConfig) -> Result<RenderOutcome, AppError> {
             &sub_ctx,
             &consent,
             &first_party,
+            config.viewport.w,
         ),
         None => HashMap::new(),
     };
@@ -1485,6 +1486,7 @@ impl FetchClient for SyncFetchClient<'_> {
 /// versus ~101 MB unbounded, while leaving light pages untouched.
 const IMAGE_DECODE_BUDGET_BYTES: usize = 16 * 1024 * 1024;
 
+#[allow(clippy::too_many_arguments)]
 fn fetch_images_sync(
     document: &Document,
     styled: &StyledDom,
@@ -1493,9 +1495,10 @@ fn fetch_images_sync(
     ctx: &FetchContext,
     policy: &Mutex<DefaultDenyPolicy>,
     first_party: &Origin,
+    viewport_w: u32,
 ) -> HashMap<String, ImageState> {
     let mut srcs = Vec::new();
-    collect_image_urls(document.root(), &mut srcs);
+    collect_image_urls(document.root(), &mut srcs, viewport_w);
     collect_bg_image_urls(&styled.root, &mut srcs);
 
     let mut urls: Vec<String> = Vec::new();
@@ -1614,17 +1617,18 @@ fn visible_text(node: NodeRef<'_>) -> String {
     out
 }
 
-/// Collect `<img>` sources from an element subtree, preferring `data-src` (the
-/// real URL behind lazy-loaders) over `src`.
-fn collect_image_urls(node: NodeRef<'_>, out: &mut Vec<String>) {
+/// Collect `<img>` sources from an element subtree, resolving `srcset`/`sizes`/
+/// `data-src` to the same URL layout will draw (ADR-0046), so the fetched bytes
+/// are the ones the page looks up. `viewport_w` is the layout viewport width.
+fn collect_image_urls(node: NodeRef<'_>, out: &mut Vec<String>, viewport_w: u32) {
     if node.tag() == "img" {
-        if let Some(src) = node.attr("data-src").or_else(|| node.attr("src")) {
-            out.push(src.to_string());
+        if let Some(src) = pick_img_url(|n| node.attr(n), viewport_w) {
+            out.push(src);
         }
     }
     for child in node.children() {
         if child.is_element() {
-            collect_image_urls(child, out);
+            collect_image_urls(child, out, viewport_w);
         }
     }
 }
@@ -2633,7 +2637,10 @@ impl BrowserApp {
         let first_party = self.current_url.as_ref().and_then(first_party_of);
         let instance = self.heads.active().instance;
         let mut srcs = Vec::new();
-        collect_image_urls(self.document.root(), &mut srcs);
+        // The same viewport width layout uses (ADR-0046), so srcset selection at
+        // fetch time and at draw time agree.
+        let viewport_w = self.toolbar.content_size(self.last_size).w;
+        collect_image_urls(self.document.root(), &mut srcs, viewport_w);
         collect_bg_image_urls(&self.styled.root, &mut srcs);
         for src in srcs {
             let abs = resolve_subresource(self.current_url.as_ref(), &src);

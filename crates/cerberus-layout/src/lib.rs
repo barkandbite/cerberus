@@ -956,11 +956,13 @@ impl<'a> Ctx<'a> {
     /// Lay out an `<img>`: draw the decoded image if ready, else a sized
     /// placeholder, else the alt text. Lazy-loading is ignored (raw render).
     fn image(&mut self, node: &StyledNode, in_link: Option<&str>) {
-        // Prefer data-src (the real URL behind lazy-loaders) over a placeholder src.
-        let Some(src) = node.attr("data-src").or_else(|| node.attr("src")) else {
+        // Resolve srcset/sizes/data-src to one URL (ADR-0046), using the same
+        // viewport width the fetch-time collector used, so the lookup hits.
+        let Some(src) = pick_img_url(|n| node.attr(n), self.vw.max(0) as u32) else {
             self.image_alt(node, in_link);
             return;
         };
+        let src = src.as_str();
         let attr_w = node.attr("width").and_then(parse_dim);
         let attr_h = node.attr("height").and_then(parse_dim);
 
@@ -2780,6 +2782,141 @@ fn parse_dim(v: &str) -> Option<u32> {
     v.trim().trim_end_matches("px").trim().parse().ok()
 }
 
+/// Choose the URL to fetch and draw for an `<img>` (ADR-0046): the explicit
+/// `data-src` lazy alias wins; otherwise the best `srcset` candidate (honoring
+/// `sizes`); otherwise plain `src`. Both the fetch-time collector and layout call
+/// this with the same viewport width, so they agree on which candidate to use.
+pub fn pick_img_url<'a>(attr: impl Fn(&str) -> Option<&'a str>, viewport_w: u32) -> Option<String> {
+    if let Some(d) = attr("data-src") {
+        return Some(d.to_string());
+    }
+    if let Some(ss) = attr("data-srcset").or_else(|| attr("srcset")) {
+        if let Some(u) = select_srcset(ss, attr("sizes"), viewport_w) {
+            return Some(u);
+        }
+    }
+    attr("src").map(str::to_string)
+}
+
+/// Pick one URL from an `srcset` candidate list (ADR-0046). Width (`w`) candidates
+/// pick the smallest whose width covers the `sizes`-resolved target (bandwidth-
+/// first, at device-pixel-ratio 1); density (`x`/bare) candidates pick `1x` (we
+/// render at 1x). `None` for an empty/unparseable list (caller falls back to `src`).
+pub fn select_srcset(srcset: &str, sizes: Option<&str>, viewport_w: u32) -> Option<String> {
+    let mut width: Vec<(u32, &str)> = Vec::new();
+    let mut density: Vec<(f32, &str)> = Vec::new();
+    for cand in srcset.split(',') {
+        let mut toks = cand.split_whitespace();
+        let Some(url) = toks.next() else { continue };
+        match toks.next() {
+            Some(d) if d.ends_with('w') => {
+                if let Ok(w) = d[..d.len() - 1].parse::<u32>() {
+                    width.push((w, url));
+                }
+            }
+            Some(d) if d.ends_with('x') => {
+                if let Ok(x) = d[..d.len() - 1].parse::<f32>() {
+                    density.push((x, url));
+                }
+            }
+            Some(_) => continue,              // unknown descriptor
+            None => density.push((1.0, url)), // a bare candidate is 1x
+        }
+    }
+    if !width.is_empty() {
+        let target = resolve_sizes(sizes, viewport_w);
+        width.sort_by_key(|(w, _)| *w);
+        // Smallest candidate that covers the target, else the largest available.
+        let chosen = width
+            .iter()
+            .find(|(w, _)| *w >= target)
+            .or_else(|| width.last())?;
+        return Some(chosen.1.to_string());
+    }
+    if !density.is_empty() {
+        density.sort_by(|a, b| a.0.total_cmp(&b.0));
+        // Smallest density >= 1 (1x preferred), else the largest.
+        let chosen = density
+            .iter()
+            .find(|(x, _)| *x >= 1.0)
+            .or_else(|| density.last())?;
+        return Some(chosen.1.to_string());
+    }
+    None
+}
+
+/// Resolve a `sizes` attribute to a target width in CSS px. The first entry whose
+/// media condition matches the viewport wins; a trailing entry with no condition is
+/// the default. Absent/unparseable → the full viewport width (`100vw`).
+fn resolve_sizes(sizes: Option<&str>, viewport_w: u32) -> u32 {
+    let Some(sizes) = sizes else {
+        return viewport_w;
+    };
+    for entry in sizes.split(',') {
+        let entry = entry.trim();
+        if entry.is_empty() {
+            continue;
+        }
+        // The length is the final whitespace token; anything before it is the
+        // (optional) media condition.
+        let (cond, len) = match entry.rfind(char::is_whitespace) {
+            Some(i) => (entry[..i].trim(), entry[i..].trim()),
+            None => ("", entry),
+        };
+        if cond.is_empty() || sizes_media_matches(cond, viewport_w) {
+            if let Some(px) = resolve_sizes_len(len, viewport_w) {
+                return px;
+            }
+        }
+    }
+    viewport_w
+}
+
+/// Resolve one `sizes` length token (`px`/`vw`/`%`) to CSS px against the viewport.
+/// `em`/`calc()`/etc. return `None` so the caller falls back.
+fn resolve_sizes_len(len: &str, viewport_w: u32) -> Option<u32> {
+    let len = len.trim();
+    let vwf = viewport_w as f32;
+    if let Some(n) = len.strip_suffix("px") {
+        n.trim().parse::<f32>().ok().map(|v| v.max(0.0) as u32)
+    } else if let Some(n) = len.strip_suffix("vw") {
+        n.trim()
+            .parse::<f32>()
+            .ok()
+            .map(|v| (v / 100.0 * vwf).max(0.0) as u32)
+    } else if let Some(n) = len.strip_suffix('%') {
+        n.trim()
+            .parse::<f32>()
+            .ok()
+            .map(|v| (v / 100.0 * vwf).max(0.0) as u32)
+    } else {
+        None
+    }
+}
+
+/// Match a `sizes` media condition (`(max-width: Npx)` / `(min-width: Npx)`, joined
+/// by `and`) against the viewport width. Unrecognized conditions don't match.
+fn sizes_media_matches(cond: &str, viewport_w: u32) -> bool {
+    let mut matched_any = false;
+    for clause in cond.split("and") {
+        let c = clause.trim().trim_start_matches('(').trim_end_matches(')');
+        let Some((k, v)) = c.split_once(':') else {
+            continue; // e.g. a bare `screen` media type — ignore
+        };
+        let Some(px) = resolve_sizes_len(v.trim(), viewport_w) else {
+            return false;
+        };
+        matched_any = true;
+        match k.trim() {
+            "max-width" if viewport_w > px => return false,
+            "min-width" if viewport_w < px => return false,
+            "max-width" | "min-width" => {}
+            _ => return false,
+        }
+    }
+    matched_any
+}
+
 // --- Form-control styling (UA defaults; CSS overrides are a later slice). ---
 /// Inner padding for form controls, in pixels.
 const FIELD_PAD: i32 = 4;
@@ -2894,6 +3031,15 @@ mod tests {
     impl ImageProvider for OneImage {
         fn get(&self, _src: &str) -> Option<Arc<DecodedImage>> {
             Some(self.0.clone())
+        }
+    }
+
+    /// Returns the image only for one exact URL — so an emitted `Image` proves the
+    /// srcset selection resolved to that key.
+    struct KeyedImage(&'static str, Arc<DecodedImage>);
+    impl ImageProvider for KeyedImage {
+        fn get(&self, src: &str) -> Option<Arc<DecodedImage>> {
+            (src == self.0).then(|| self.1.clone())
         }
     }
 
@@ -3752,6 +3898,98 @@ mod tests {
         );
         // `<img>` default object-position is center.
         assert_eq!(pos_of("<img src='pic.png'>"), Some(ImagePos::CENTER));
+    }
+
+    #[test]
+    fn srcset_density_and_width_selection() {
+        // Density: 1x preferred (we render at 1x); bare candidate counts as 1x.
+        assert_eq!(
+            select_srcset("a.png 1x, b.png 2x", None, 1000).as_deref(),
+            Some("a.png")
+        );
+        assert_eq!(
+            select_srcset("a.png, b.png 2x", None, 1000).as_deref(),
+            Some("a.png")
+        );
+        // All densities > 1 → the smallest.
+        assert_eq!(
+            select_srcset("b.png 2x, c.png 3x", None, 1000).as_deref(),
+            Some("b.png")
+        );
+        // Width: smallest candidate covering the sizes target.
+        let ss = "s.png 480w, m.png 800w, l.png 1200w";
+        let sizes = Some("(max-width: 600px) 480px, 1000px");
+        assert_eq!(
+            select_srcset(ss, sizes, 500).as_deref(),
+            Some("s.png"),
+            "narrow viewport matches the 480px branch"
+        );
+        assert_eq!(
+            select_srcset(ss, sizes, 1000).as_deref(),
+            Some("l.png"),
+            "wide viewport uses the 1000px default → 1200w"
+        );
+        // No sizes → 100vw default.
+        assert_eq!(
+            select_srcset("s.png 480w, l.png 1200w", None, 400).as_deref(),
+            Some("s.png")
+        );
+        // None covers the target → the largest available.
+        assert_eq!(
+            select_srcset("s.png 480w", None, 2000).as_deref(),
+            Some("s.png")
+        );
+        assert_eq!(select_srcset("", None, 800), None);
+    }
+
+    #[test]
+    fn pick_img_url_precedence() {
+        let pick = |pairs: &[(&'static str, &'static str)], vw: u32| {
+            pick_img_url(|n| pairs.iter().find(|(k, _)| *k == n).map(|(_, v)| *v), vw)
+        };
+        // data-src wins outright.
+        assert_eq!(
+            pick(&[("data-src", "lazy.png"), ("srcset", "a.png 2x")], 800).as_deref(),
+            Some("lazy.png")
+        );
+        // srcset chosen over plain src.
+        assert_eq!(
+            pick(&[("srcset", "a.png 1x, b.png 2x"), ("src", "x.png")], 800).as_deref(),
+            Some("a.png")
+        );
+        // Plain src is the fallback.
+        assert_eq!(
+            pick(&[("src", "only.png")], 800).as_deref(),
+            Some("only.png")
+        );
+        assert_eq!(pick(&[], 800), None);
+    }
+
+    #[test]
+    fn img_srcset_resolves_to_the_selected_url() {
+        // Laid out at viewport 800 with sizes:400px → target 400 → 480w "small.png".
+        // The provider only serves "small.png", so an Image item proves selection.
+        let styled = CssEngine::new().style(&parse_html(
+            "<img src='fallback.png' srcset='small.png 480w, big.png 1200w' sizes='400px'>",
+        ));
+        let img = Arc::new(DecodedImage {
+            size: Size::new(20, 10),
+            rgba: vec![255; 20 * 10 * 4],
+        });
+        let laid = BlockLayout::default().layout(
+            &styled,
+            Size::new(800, 2000),
+            &MonoShaper,
+            &KeyedImage("small.png", img),
+            &NoForms,
+        );
+        assert!(
+            laid.display
+                .items
+                .iter()
+                .any(|i| matches!(i, DisplayItem::Image { .. })),
+            "srcset selected small.png (the only key the provider serves)"
+        );
     }
 
     #[test]
