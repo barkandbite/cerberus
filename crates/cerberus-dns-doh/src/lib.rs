@@ -61,6 +61,28 @@ impl DohResolver {
             "/dns-query",
         )
     }
+
+    /// Cloudflare (1.1.1.1). A second encrypted resolver so a network that
+    /// blocks or mangles one DoH provider can still resolve via another before
+    /// any plaintext fallback (ADR-0006).
+    pub fn cloudflare(tls: Box<dyn TlsProvider>) -> Self {
+        Self::new(
+            tls,
+            IpAddr::V4(Ipv4Addr::new(1, 1, 1, 1)),
+            "cloudflare-dns.com",
+            "/dns-query",
+        )
+    }
+
+    /// Google Public DNS (8.8.8.8). A third encrypted resolver for resilience.
+    pub fn google(tls: Box<dyn TlsProvider>) -> Self {
+        Self::new(
+            tls,
+            IpAddr::V4(Ipv4Addr::new(8, 8, 8, 8)),
+            "dns.google",
+            "/dns-query",
+        )
+    }
 }
 
 impl DnsResolver for DohResolver {

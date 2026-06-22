@@ -1,44 +1,23 @@
-//! Randomness for nonces and salts — `/dev/urandom`, std-only.
+//! Randomness for salts, nonces, instance IDs, and farbling seeds — the OS
+//! CSPRNG via the audited `getrandom` crate (ADR-0033).
+//!
+//! This is the single entropy source for everything security-critical, so it
+//! **fails closed**: if the OS RNG is unavailable it panics rather than falling
+//! back to a predictable stream. A predictable salt/nonce/seed would defeat the
+//! vault (AEAD nonce reuse), the seal (instance id), and unlinkability (farbling
+//! seed) — the exact failures `SECURITY.md` puts in scope (issue #9).
 
-use std::io::Read;
-
-/// `n` random bytes from the OS CSPRNG.
+/// `n` cryptographically-secure random bytes from the OS RNG.
 ///
-/// Falls back to a SplitMix64 stream seeded from time/PID/address entropy on
-/// platforms without `/dev/urandom`. The fallback is NOT cryptographically
-/// strong; it exists so non-Unix dev builds run. Every platform we ship
-/// (PLAN §8 targets) has a real entropy device, and XChaCha20's 24-byte nonce
-/// space keeps even the fallback collision-safe for at-rest blob counts.
+/// Panics (fail-closed) if the OS CSPRNG cannot be read — better to abort than
+/// to mint predictable key material. Every shipped platform exposes a real RNG
+/// (`getrandom`: `getrandom`/`/dev/urandom` on Unix, `ProcessPrng`/`BCrypt` on
+/// Windows, `getentropy` on macOS).
 pub(crate) fn random_bytes(n: usize) -> Vec<u8> {
     let mut out = vec![0u8; n];
-    if let Ok(mut f) = std::fs::File::open("/dev/urandom") {
-        if f.read_exact(&mut out).is_ok() {
-            return out;
-        }
-    }
-    let mut state = fallback_seed();
-    for b in &mut out {
-        state = splitmix64(state);
-        *b = (state >> 56) as u8;
-    }
+    getrandom::fill(&mut out)
+        .expect("OS CSPRNG (getrandom) unavailable; refusing to produce predictable key material");
     out
-}
-
-fn fallback_seed() -> u64 {
-    let t = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_nanos() as u64)
-        .unwrap_or(0);
-    let pid = std::process::id() as u64;
-    let stack_probe = &t as *const _ as u64;
-    t ^ pid.rotate_left(32) ^ stack_probe
-}
-
-fn splitmix64(state: u64) -> u64 {
-    let mut z = state.wrapping_add(0x9E37_79B9_7F4A_7C15);
-    z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
-    z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
-    z ^ (z >> 31)
 }
 
 #[cfg(test)]
@@ -52,5 +31,11 @@ mod tests {
         assert_eq!(a.len(), 24);
         // 24 random bytes colliding is beyond astronomically unlikely.
         assert_ne!(a, b);
+    }
+
+    #[test]
+    fn random_bytes_are_not_all_zero() {
+        // A trivial sanity check that we got real entropy, not a zeroed buffer.
+        assert!(random_bytes(32).iter().any(|&b| b != 0));
     }
 }

@@ -1,0 +1,28 @@
+Icon font: icomoon.ttf — IcoMoon Free
+=====================================
+
+A subset of the "IcoMoon Free" icon set, exported via IcoMoon
+(https://icomoon.io/app) and bundled for Cerberus's toolbar and cookie-manager
+icons.
+
+License: Creative Commons Attribution 4.0 (CC BY 4.0)
+  https://creativecommons.org/licenses/by/4.0/
+  (IcoMoon Free is dual-offered under CC BY 4.0 or the GPL.)
+
+Attribution (required by CC BY 4.0):
+  "IcoMoon Free" by Keyamoon — https://icomoon.io
+  Source: https://github.com/Keyamoon/IcoMoon-Free
+  Changes: subset to the glyphs Cerberus uses; embedded as a binary asset.
+
+Codepoints in use (Unicode Private Use Area):
+  e972  users        (MIRC — multi-identity control)
+  e984  reload / refresh
+  e994  cog / settings
+  ea38  arrow-left   (Back)
+  ea34  arrow-right  (Forward)
+  ea0f  cross / close (Stop, dismiss)
+  e9ce  eye          (cookie "reveal value")
+  e9ac  bin / trash  (cookie "delete")
+
+The file also contains other IcoMoon Free glyphs (book, single user, database,
+floppy-disk, …) that are not currently referenced.

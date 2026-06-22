@@ -6,14 +6,38 @@
 //! approved crates land at M2; this crate ships only the traits plus deliberately
 //! trivial built-in stubs so the M0 render path is end-to-end.
 
-use cerberus_types::{Color, FontStyle, Point, Rect, Size};
+use cerberus_types::{Color, FontStyle, ImageFit, ImagePos, Point, Rect, Size};
 use std::sync::Arc;
 
 /// One drawing primitive in a resolution-independent display list.
 #[derive(Clone, Debug)]
 pub enum DisplayItem {
     /// A solid-filled rectangle.
-    Rect { rect: Rect, color: Color },
+    Rect {
+        rect: Rect,
+        color: Color,
+    },
+    /// A solid fill with uniform rounded corners (ADR-0041).
+    RoundRect {
+        rect: Rect,
+        color: Color,
+        radius: u16,
+    },
+    /// A two-stop linear gradient fill (vertical or horizontal), optionally
+    /// rounded (ADR-0041).
+    Gradient {
+        rect: Rect,
+        start: Color,
+        end: Color,
+        vertical: bool,
+        radius: u16,
+    },
+    /// A soft outer drop shadow with `blur`-px falloff (ADR-0041).
+    Shadow {
+        rect: Rect,
+        blur: u16,
+        color: Color,
+    },
     /// A run of shaped glyphs anchored at `origin` (top-left of the first box).
     Glyphs {
         origin: Point,
@@ -21,11 +45,29 @@ pub enum DisplayItem {
         color: Color,
         style: FontStyle,
     },
-    /// A decoded image (shared) to draw into `rect`.
+    /// A decoded image (shared) to draw into `rect` with the given fit and
+    /// position (where a `Cover`/`Contain` image anchors — ADR-0045).
     Image {
         rect: Rect,
         image: Arc<DecodedImage>,
+        fit: ImageFit,
+        pos: ImagePos,
     },
+    /// An anti-aliased, round-capped line segment of the given stroke width.
+    /// Vector UI (icons) is built from these, so it scales crisply with
+    /// [`DisplayList::scaled`].
+    Line {
+        a: Point,
+        b: Point,
+        width: u32,
+        color: Color,
+    },
+    /// Push a clip rectangle (intersected with the current clip); items paint
+    /// only inside it until the matching [`DisplayItem::ClipPop`] — ADR-0043.
+    ClipPush {
+        rect: Rect,
+    },
+    ClipPop,
 }
 
 /// A flat, ordered list of paint primitives produced by layout.
@@ -43,6 +85,96 @@ impl DisplayList {
     /// Append an item.
     pub fn push(&mut self, item: DisplayItem) {
         self.items.push(item);
+    }
+
+    /// A copy with every coordinate, size, and glyph pixel-size multiplied by
+    /// `scale`. Glyph runs are re-scaled (`px` + `advance`), so the rasterizer
+    /// re-outlines them at the larger size — **crisp**, not a bitmap upscale.
+    /// Used to paint a logical-pixel UI onto a HiDPI (physical-pixel) surface.
+    pub fn scaled(&self, scale: f32) -> DisplayList {
+        if (scale - 1.0).abs() < f32::EPSILON {
+            return self.clone();
+        }
+        let si = |v: i32| (v as f32 * scale).round() as i32;
+        let su = |v: u32| (v as f32 * scale).round() as u32;
+        let sr = |r: Rect| Rect::new(si(r.x), si(r.y), su(r.w), su(r.h));
+        let items = self
+            .items
+            .iter()
+            .map(|item| match item {
+                DisplayItem::Rect { rect, color } => DisplayItem::Rect {
+                    rect: sr(*rect),
+                    color: *color,
+                },
+                DisplayItem::RoundRect {
+                    rect,
+                    color,
+                    radius,
+                } => DisplayItem::RoundRect {
+                    rect: sr(*rect),
+                    color: *color,
+                    radius: su(*radius as u32) as u16,
+                },
+                DisplayItem::Gradient {
+                    rect,
+                    start,
+                    end,
+                    vertical,
+                    radius,
+                } => DisplayItem::Gradient {
+                    rect: sr(*rect),
+                    start: *start,
+                    end: *end,
+                    vertical: *vertical,
+                    radius: su(*radius as u32) as u16,
+                },
+                DisplayItem::Shadow { rect, blur, color } => DisplayItem::Shadow {
+                    rect: sr(*rect),
+                    blur: su(*blur as u32) as u16,
+                    color: *color,
+                },
+                DisplayItem::ClipPush { rect } => DisplayItem::ClipPush { rect: sr(*rect) },
+                DisplayItem::ClipPop => DisplayItem::ClipPop,
+                DisplayItem::Image {
+                    rect,
+                    image,
+                    fit,
+                    pos,
+                } => DisplayItem::Image {
+                    rect: sr(*rect),
+                    image: image.clone(),
+                    fit: *fit,
+                    pos: *pos,
+                },
+                DisplayItem::Line { a, b, width, color } => DisplayItem::Line {
+                    a: Point::new(si(a.x), si(a.y)),
+                    b: Point::new(si(b.x), si(b.y)),
+                    width: su(*width),
+                    color: *color,
+                },
+                DisplayItem::Glyphs {
+                    origin,
+                    glyphs,
+                    color,
+                    style,
+                } => DisplayItem::Glyphs {
+                    origin: Point::new(si(origin.x), si(origin.y)),
+                    glyphs: glyphs
+                        .iter()
+                        .map(|g| GlyphBox {
+                            advance: su(g.advance),
+                            w: su(g.w),
+                            h: su(g.h),
+                            id: g.id,
+                            px: su(g.px).max(1),
+                        })
+                        .collect(),
+                    color: *color,
+                    style: *style,
+                },
+            })
+            .collect();
+        DisplayList { items }
     }
 }
 
@@ -68,6 +200,8 @@ pub struct GlyphBox {
 pub struct Framebuffer {
     pub size: Size,
     pub rgba: Vec<u8>,
+    /// Current clip rect; writes outside it are dropped (`overflow` — ADR-0043).
+    clip: Option<Rect>,
 }
 
 impl Framebuffer {
@@ -77,6 +211,22 @@ impl Framebuffer {
         Self {
             size,
             rgba: vec![0; len],
+            clip: None,
+        }
+    }
+
+    /// Set the active clip rect (`None` = unclipped). Writes outside it are
+    /// dropped — used by the rasterizer's clip stack (ADR-0043).
+    pub fn set_clip(&mut self, clip: Option<Rect>) {
+        self.clip = clip;
+    }
+
+    /// Whether `(x, y)` is inside the active clip (always true when unclipped).
+    #[inline]
+    fn in_clip(&self, x: i32, y: i32) -> bool {
+        match self.clip {
+            None => true,
+            Some(c) => x >= c.x && y >= c.y && x < c.x + c.w as i32 && y < c.y + c.h as i32,
         }
     }
 
@@ -96,8 +246,18 @@ impl Framebuffer {
         let y0 = rect.y.max(0) as u32;
         let x1 = ((rect.x + rect.w as i32).max(0) as u32).min(self.size.w);
         let y1 = ((rect.y + rect.h as i32).max(0) as u32).min(self.size.h);
+        // Fast path: the whole rect is inside the clip (or there is none).
+        let clipped = self.clip.is_some_and(|cl| {
+            !(x0 as i32 >= cl.x
+                && y0 as i32 >= cl.y
+                && x1 as i32 <= cl.x + cl.w as i32
+                && y1 as i32 <= cl.y + cl.h as i32)
+        });
         for y in y0..y1 {
             for x in x0..x1 {
+                if clipped && !self.in_clip(x as i32, y as i32) {
+                    continue;
+                }
                 let idx = ((y * self.size.w + x) * 4) as usize;
                 self.rgba[idx] = c.r;
                 self.rgba[idx + 1] = c.g;
@@ -147,6 +307,9 @@ impl Framebuffer {
         if x < 0 || y < 0 || x as u32 >= self.size.w || y as u32 >= self.size.h {
             return;
         }
+        if !self.in_clip(x, y) {
+            return;
+        }
         let a = alpha.clamp(0.0, 1.0);
         let idx = ((y as u32 * self.size.w + x as u32) * 4) as usize;
         for (i, channel) in [color.r, color.g, color.b].into_iter().enumerate() {
@@ -181,6 +344,13 @@ pub trait Rasterizer: Send {
 pub trait TextShaper: Send + Sync {
     /// Shape `text` at the given pixel size into glyph boxes.
     fn shape(&self, text: &str, px: u32) -> Vec<GlyphBox>;
+
+    /// Shape a single icon glyph (a codepoint in the bundled icon font), to be
+    /// painted in a run styled [`FontStyle::ICON`]. Default: no glyph (a shaper
+    /// without an icon font draws nothing).
+    fn shape_icon(&self, _ch: char, _px: u32) -> Vec<GlyphBox> {
+        Vec::new()
+    }
 }
 
 /// Decodes image bytes. Wraps image decoders (M2) — a historically large CVE
@@ -249,6 +419,14 @@ impl Rasterizer for BoxRasterizer {
                 DisplayItem::Image { rect, .. } => {
                     target.fill_rect(*rect, Color::rgb(192, 192, 192));
                 }
+                // The placeholder approximates fills as solid and ignores
+                // shadows/clips/lines.
+                DisplayItem::RoundRect { rect, color, .. } => target.fill_rect(*rect, *color),
+                DisplayItem::Gradient { rect, start, .. } => target.fill_rect(*rect, *start),
+                DisplayItem::Shadow { .. }
+                | DisplayItem::Line { .. }
+                | DisplayItem::ClipPush { .. }
+                | DisplayItem::ClipPop => {}
             }
         }
     }
@@ -266,6 +444,45 @@ mod tests {
         assert_eq!(fb.pixel(0, 0), Some(Color::BLACK));
         assert_eq!(fb.pixel(3, 3), Some(Color::WHITE));
         assert_eq!(fb.pixel(4, 4), None);
+    }
+
+    #[test]
+    fn scaled_multiplies_geometry_and_glyph_pixels() {
+        let mut list = DisplayList::new();
+        list.push(DisplayItem::Rect {
+            rect: Rect::new(3, 4, 10, 20),
+            color: Color::BLACK,
+        });
+        list.push(DisplayItem::Glyphs {
+            origin: Point::new(5, 6),
+            glyphs: vec![GlyphBox {
+                advance: 8,
+                w: 0,
+                h: 0,
+                id: 42,
+                px: 16,
+            }],
+            color: Color::BLACK,
+            style: FontStyle::REGULAR,
+        });
+        let s = list.scaled(2.0);
+        match &s.items[0] {
+            DisplayItem::Rect { rect, .. } => {
+                assert_eq!((rect.x, rect.y, rect.w, rect.h), (6, 8, 20, 40));
+            }
+            _ => panic!("expected rect"),
+        }
+        match &s.items[1] {
+            DisplayItem::Glyphs { origin, glyphs, .. } => {
+                assert_eq!((origin.x, origin.y), (10, 12));
+                assert_eq!(glyphs[0].px, 32);
+                assert_eq!(glyphs[0].advance, 16);
+                assert_eq!(glyphs[0].id, 42, "glyph id is preserved (re-outlined)");
+            }
+            _ => panic!("expected glyphs"),
+        }
+        // Scale 1.0 is an identity copy.
+        assert_eq!(list.scaled(1.0).items.len(), 2);
     }
 
     #[test]

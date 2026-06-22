@@ -33,6 +33,7 @@ use cerberus_dom::{parse_html, Document, DocumentBuilder, NodeId, NodeRef};
 use cerberus_headless::render_document;
 use cerberus_identity::{Head, HeadManager};
 use cerberus_image::ImageCodec;
+use cerberus_js::JsEngineFactory;
 use cerberus_js_dom::{
     dispatch_event, fire_load, install_page, reject_fetch, resolve_fetch, run_event_loop,
     run_page_scripts, run_page_scripts_with_fetch, serialize_dom, set_node_value, take_fetches,
@@ -40,12 +41,12 @@ use cerberus_js_dom::{
 };
 use cerberus_js_quickjs::QuickJsEngineFactory;
 use cerberus_layout::{
-    BlockLayout, ElementBox, FieldKind, FormFieldBox, FormState, ImageProvider, LayoutEngine,
-    LinkBox, NoForms, NoImages,
+    pick_img_url, BlockLayout, ElementBox, FieldKind, FormFieldBox, FormState, ImageProvider,
+    LayoutEngine, LinkBox, NoForms, NoImages,
 };
 use cerberus_net::{
-    parse_proxy, BuiltinHttpClient, CookieJar, FetchContext, FetchKind, HttpCache, HttpClient,
-    HttpResponse, ProxyConfig, Router, DEFAULT_USER_AGENT,
+    parse_proxy, BuiltinHttpClient, CookieJar, FallbackResolver, FetchContext, FetchKind,
+    HttpCache, HttpClient, HttpResponse, ProxyConfig, Router, SystemResolver, DEFAULT_USER_AGENT,
 };
 use cerberus_paint::{
     DecodedImage, DisplayItem, DisplayList, Framebuffer, ImageDecoder, Rasterizer, TextShaper,
@@ -55,13 +56,13 @@ use cerberus_storage::{
     atomic_write, parse_set_cookie, random_bytes, CookieDisposition, CookiePolicy, CookieView,
     EncryptedVault, Group, StorageEnvironment, DEFAULT_TIMED_SECS,
 };
-use cerberus_style::{StyleEngine, StyledDom};
+use cerberus_style::{ExternalSheets, StyleEngine, StyledChild, StyledDom, StyledNode};
 use cerberus_text::TextEngine;
 use cerberus_tls_rustls::RustlsProvider;
 use cerberus_types::{Color, FontStyle, HeadId, InstanceId, Origin, Point, RealmId, Rect, Size};
 use cerberus_ui::{
-    BannerAction, ConsentBanner, CookieAction, CookieManager, CookieRow, PerfHud, Toolbar,
-    ToolbarAction, BANNER_HEIGHT,
+    BannerAction, ConsentBanner, CookieAction, CookieManager, CookieRow, MircAction, MircPanel,
+    MircRow, MircState, PerfHud, Toolbar, ToolbarAction, BANNER_HEIGHT,
 };
 use cerberus_url::{join as join_url, parse as parse_url, Url};
 use std::collections::HashMap;
@@ -422,6 +423,102 @@ pub fn profile_admin(
     Ok(profile_lines(identity, &head.label, &load(&mut env)))
 }
 
+/// The no-frills CSV template (`profile --template`): header + example rows, in
+/// the chosen delimiter. Needs no vault — it is pure text.
+pub fn profile_csv_template(delim: char) -> String {
+    cerberus_autofill::csv_template(delim)
+}
+
+/// Export every identity's sealed autofill profile to `file` as CSV
+/// (`profile --export`), using `delim`. Unlocks the vault with `passphrase`.
+/// Returns the number of identities written. An identity with no stored profile
+/// is written as an empty row, so the export doubles as a labeled template.
+pub fn profile_export(
+    dir: &str,
+    file: &str,
+    passphrase: &str,
+    delim: char,
+) -> Result<usize, String> {
+    let path = Path::new(dir);
+    let heads = load_heads(path)
+        .map(|(h, _)| h)
+        .unwrap_or_else(default_heads);
+    let mut env = open_profile_storage(path).map_err(|e| e.to_string())?;
+    env.unlock_vault(&Secret::from_passphrase(passphrase))
+        .map_err(|e| format!("vault unlock failed: {e:?}"))?;
+
+    let rows: Vec<(String, cerberus_autofill::Profile)> = heads
+        .iter()
+        .map(|h| {
+            let profile = env
+                .load_blob(h.instance, AUTOFILL_PROFILE_KEY)
+                .ok()
+                .flatten()
+                .and_then(|b| cerberus_autofill::Profile::from_bytes(&b))
+                .unwrap_or_default();
+            (h.label.clone(), profile)
+        })
+        .collect();
+    let csv = cerberus_autofill::profiles_to_csv(&rows, delim);
+    std::fs::write(file, csv).map_err(|e| e.to_string())?;
+    Ok(rows.len())
+}
+
+/// Import autofill profiles from a CSV `file` (`profile --import`), sealing each
+/// in the vault. Rows map to identities by the `identity` label; a label with no
+/// existing identity is **created** (minted like `identities --add`), so a filled
+/// template sets up many identities at once. The delimiter is auto-detected.
+/// Returns a human-readable report (one line per row).
+pub fn profile_import(dir: &str, file: &str, passphrase: &str) -> Result<Vec<String>, String> {
+    let path = Path::new(dir);
+    std::fs::create_dir_all(path).map_err(|e| e.to_string())?;
+    let text = std::fs::read_to_string(file).map_err(|e| format!("cannot read {file}: {e}"))?;
+    let rows = cerberus_autofill::profiles_from_csv(&text)?;
+    if rows.is_empty() {
+        return Err("no identity rows found in the CSV".into());
+    }
+    // Each identity label must be unique within the file (else a later row would
+    // silently clobber an earlier one).
+    for (i, (label, _)) in rows.iter().enumerate() {
+        if rows[..i].iter().any(|(l, _)| l == label) {
+            return Err(format!("duplicate identity {label:?} in the CSV"));
+        }
+    }
+
+    let (mut heads, active) = load_heads(path).unwrap_or_else(|| (fresh_profile_heads(), 0));
+    let mut env = open_profile_storage(path).map_err(|e| e.to_string())?;
+    env.unlock_vault(&Secret::from_passphrase(passphrase))
+        .map_err(|e| format!("vault unlock failed: {e:?}"))?;
+
+    let mut report = Vec::new();
+    let mut created_any = false;
+    for (label, profile) in &rows {
+        let idx = match heads.iter().position(|h| &h.label == label) {
+            Some(i) => i,
+            None => {
+                let index = heads.len() as u64 + 1;
+                heads.push(mint_head(label, index));
+                created_any = true;
+                report.push(format!("created identity {label:?}"));
+                heads.len() - 1
+            }
+        };
+        env.store_blob(
+            heads[idx].instance,
+            AUTOFILL_PROFILE_KEY,
+            &profile.to_bytes(),
+        )
+        .map_err(|e| format!("{e:?}"))?;
+        report.push(format!("set profile for {label:?}"));
+    }
+    env.save(path).map_err(|e| e.to_string())?;
+    if created_any {
+        save_heads(path, &heads, active).map_err(|e| e.to_string())?;
+    }
+    report.push(format!("imported {} identities", rows.len()));
+    Ok(report)
+}
+
 /// Apply a `key=value;key=value` spec to a profile (used by `profile --set`).
 fn apply_profile_fields(p: &mut cerberus_autofill::Profile, spec: &str) -> Result<(), String> {
     for pair in spec.split(';') {
@@ -450,6 +547,8 @@ fn apply_profile_fields(p: &mut cerberus_autofill::Profile, spec: &str) -> Resul
             "card.exp_month" => p.card.exp_month = v,
             "card.exp_year" => p.card.exp_year = v,
             "card.cvv" => p.card.cvv = v,
+            // The host this profile's secrets are bound to (issue #12).
+            "origin" => p.origin = v,
             other => return Err(format!("unknown field {other:?}")),
         }
     }
@@ -489,6 +588,14 @@ fn profile_lines(identity: usize, label: &str, p: &cerberus_autofill::Profile) -
             p.card.exp_month, p.card.exp_year
         ),
         format!("  card.cvv         : {}", redact(&p.card.cvv)),
+        format!(
+            "  origin           : {}",
+            if p.origin.is_empty() {
+                "(unbound — secrets won't autofill)"
+            } else {
+                &p.origin
+            }
+        ),
     ]
 }
 
@@ -574,12 +681,18 @@ pub fn network_client(
             RustlsProvider::new()
         }
     };
-    Router::with_options(
-        Box::new(provider()),
+    // Multi-DoH then a system fallback (ADR-0006): try the encrypted resolvers
+    // in order, and only if every one is unreachable fall back to the OS
+    // resolver — so a network that blocks or mangles our DoH (e.g. answers the
+    // POST with HTTP 505) can still browse. The system path is the only one that
+    // exposes lookups to the local network, hence it is tried last.
+    let dns = FallbackResolver::new(vec![
         Box::new(DohResolver::quad9(Box::new(provider()))),
-        jar,
-        proxy,
-    )
+        Box::new(DohResolver::cloudflare(Box::new(provider()))),
+        Box::new(DohResolver::google(Box::new(provider()))),
+        Box::new(SystemResolver),
+    ]);
+    Router::with_options(Box::new(provider()), Box::new(dns), jar, proxy)
 }
 
 /// The cookie seam over sealed storage: attaches only what
@@ -837,24 +950,42 @@ pub fn render(config: &RenderConfig) -> Result<RenderOutcome, AppError> {
     let engines_live = heads.engines_live();
     timings.record("scripts", scripts_t.elapsed());
 
-    let style_t = Instant::now();
-    let styled = CssEngine::new().style(&document);
-    timings.record("style", style_t.elapsed());
-
-    // Fetch + decode this page's images up front (the one-shot path is
-    // synchronous; the interactive browser fetches them on its worker), in the
-    // page's subresource context so image fetches carry/capture cookies under
-    // the same first party. Built-in pages reference no network images.
+    // Subresource context (sealed jar + consent) shared by this page's external
+    // CSS and images, so both carry/capture cookies under the same first party.
     let sub_ctx = FetchContext {
         instance: active_instance,
         kind: FetchKind::Subresource {
             first_party: first_party.clone(),
         },
     };
-    let images = match &client {
+
+    // External `<link>` stylesheets are fetched up front (render-blocking) so the
+    // cascade sees them before styling — the one-shot path is synchronous, and
+    // third-party sheets are consent-gated like any other subresource (ADR-0037).
+    let sheets = match &client {
         Some(client) => {
-            fetch_images_sync(&document, &url, client, &sub_ctx, &consent, &first_party)
+            fetch_stylesheets_sync(&document, &url, client, &sub_ctx, &consent, &first_party)
         }
+        None => ExternalSheets::new(),
+    };
+    let style_t = Instant::now();
+    let styled = CssEngine::new().style_with_sheets(&document, &sheets);
+    timings.record("style", style_t.elapsed());
+
+    // Fetch + decode this page's images up front (the one-shot path is
+    // synchronous; the interactive browser fetches them on its worker). Built-in
+    // pages reference no network images.
+    let images = match &client {
+        Some(client) => fetch_images_sync(
+            &document,
+            &styled,
+            &url,
+            client,
+            &sub_ctx,
+            &consent,
+            &first_party,
+            config.viewport.w,
+        ),
         None => HashMap::new(),
     };
     let subresources_blocked = images
@@ -1049,11 +1180,23 @@ struct FetchedPage {
 }
 
 /// In-flight navigation bookkeeping.
+/// A request body for a POST navigation (form submission). GET navigations carry
+/// `None`; the data then rides in the URL query instead.
+#[derive(Clone, Debug)]
+struct PostBody {
+    content_type: String,
+    body: Vec<u8>,
+}
+
 struct Pending {
     id: u64,
     /// If this load is an https upgrade of an `http` URL, the original URL — so a
     /// failure can offer the risk prompt.
     http_fallback: Option<String>,
+    /// The POST body, if this navigation is a form POST (so the load goes through
+    /// `fetch_in` with a body instead of a cacheable GET, and an https-upgrade
+    /// fallback can re-POST).
+    post: Option<PostBody>,
 }
 
 /// A job for the network worker. The `FetchContext` travels by value: it must
@@ -1063,6 +1206,7 @@ enum Job {
     Page {
         id: u64,
         url: String,
+        post: Option<PostBody>,
         ctx: FetchContext,
     },
     Sub {
@@ -1097,8 +1241,9 @@ enum Done {
 /// Performs page + sub-resource loads off the UI thread. Abstracted so the load
 /// state machine is testable without the network (see `FakeLoader` in tests).
 trait PageLoader {
-    /// Queue a page navigation in an identity context.
-    fn request(&self, id: u64, url: String, ctx: FetchContext);
+    /// Queue a page navigation in an identity context. `post` is `Some` for a
+    /// form POST (sent as a body), `None` for a GET.
+    fn request(&self, id: u64, url: String, post: Option<PostBody>, ctx: FetchContext);
     /// Queue an image sub-resource fetch (absolute URL) in an identity context.
     fn request_subresource(&self, url: String, ctx: FetchContext);
     /// Queue a JS `fetch` (absolute URL in `req.url`) in an identity context.
@@ -1114,7 +1259,7 @@ struct NetLoader {
     tx: Sender<Job>,
     rx: Receiver<Done>,
     waker: Arc<Mutex<Option<Arc<dyn Waker>>>>,
-    _worker: JoinHandle<()>,
+    _workers: Vec<JoinHandle<()>>,
 }
 
 impl NetLoader {
@@ -1126,56 +1271,77 @@ impl NetLoader {
         let (req_tx, req_rx) = std::sync::mpsc::channel::<Job>();
         let (out_tx, out_rx) = std::sync::mpsc::channel::<Done>();
         let waker: Arc<Mutex<Option<Arc<dyn Waker>>>> = Arc::new(Mutex::new(None));
-        let worker_waker = waker.clone();
 
-        let worker = std::thread::spawn(move || {
-            // Build the network client (rustls config) once, on the worker.
-            let client = network_client(system_roots, jar, proxy);
-            while let Ok(job) = req_rx.recv() {
-                let done = match job {
-                    Job::Page { id, url, ctx } => {
-                        let result = fetch_page(&client, &url, &ctx);
-                        Done::Page {
-                            id,
-                            requested_url: url,
-                            result,
+        // A small pool of workers shares one job queue, so a page's many
+        // subresources fetch concurrently instead of one-at-a-time (a single
+        // worker made image-heavy pages crawl). Each worker owns its client
+        // (rustls config) and dequeues under a short-held lock, then fetches
+        // unlocked — so a burst of queued jobs runs in parallel.
+        const WORKERS: usize = 4;
+        let req_rx = Arc::new(Mutex::new(req_rx));
+        let workers = (0..WORKERS)
+            .map(|_| {
+                let req_rx = req_rx.clone();
+                let out_tx = out_tx.clone();
+                let worker_waker = waker.clone();
+                let jar = jar.clone();
+                let proxy = proxy.clone();
+                std::thread::spawn(move || {
+                    let client = network_client(system_roots, jar, proxy);
+                    loop {
+                        // Hold the lock only for the dequeue (released at the `;`),
+                        // then fetch unlocked so other workers proceed in parallel.
+                        let job = req_rx.locked().recv();
+                        let job = match job {
+                            Ok(job) => job,
+                            Err(_) => break, // all senders dropped
+                        };
+                        let done = match job {
+                            Job::Page { id, url, post, ctx } => {
+                                let result = fetch_page(&client, &url, post.as_ref(), &ctx);
+                                Done::Page {
+                                    id,
+                                    requested_url: url,
+                                    result,
+                                }
+                            }
+                            Job::Sub { url, ctx } => {
+                                let t = std::time::Instant::now();
+                                let bytes = fetch_bytes(&client, &url, &ctx);
+                                Done::Sub {
+                                    url,
+                                    bytes,
+                                    elapsed: t.elapsed(),
+                                }
+                            }
+                            Job::Fetch { id, req, ctx } => {
+                                let result = perform_fetch(&client, &req.url, &req, &ctx);
+                                Done::Fetch { id, result }
+                            }
+                        };
+                        if out_tx.send(done).is_err() {
+                            break;
+                        }
+                        if let Some(w) = worker_waker.locked().clone() {
+                            w.wake();
                         }
                     }
-                    Job::Sub { url, ctx } => {
-                        let t = std::time::Instant::now();
-                        let bytes = fetch_bytes(&client, &url, &ctx);
-                        Done::Sub {
-                            url,
-                            bytes,
-                            elapsed: t.elapsed(),
-                        }
-                    }
-                    Job::Fetch { id, req, ctx } => {
-                        let result = perform_fetch(&client, &req.url, &req, &ctx);
-                        Done::Fetch { id, result }
-                    }
-                };
-                if out_tx.send(done).is_err() {
-                    break;
-                }
-                if let Some(w) = worker_waker.locked().clone() {
-                    w.wake();
-                }
-            }
-        });
+                })
+            })
+            .collect();
 
         Self {
             tx: req_tx,
             rx: out_rx,
             waker,
-            _worker: worker,
+            _workers: workers,
         }
     }
 }
 
 impl PageLoader for NetLoader {
-    fn request(&self, id: u64, url: String, ctx: FetchContext) {
-        let _ = self.tx.send(Job::Page { id, url, ctx });
+    fn request(&self, id: u64, url: String, post: Option<PostBody>, ctx: FetchContext) {
+        let _ = self.tx.send(Job::Page { id, url, post, ctx });
     }
     fn request_subresource(&self, url: String, ctx: FetchContext) {
         let _ = self.tx.send(Job::Sub { url, ctx });
@@ -1191,10 +1357,25 @@ impl PageLoader for NetLoader {
     }
 }
 
-fn fetch_page(client: &Router, url: &str, ctx: &FetchContext) -> Result<FetchedPage, String> {
+fn fetch_page(
+    client: &Router,
+    url: &str,
+    post: Option<&PostBody>,
+    ctx: &FetchContext,
+) -> Result<FetchedPage, String> {
     let parsed = parse_url(url).map_err(|e| e.to_string())?;
     let t = std::time::Instant::now();
-    let resp = client.get_in(&parsed, ctx).map_err(|e| format!("{e:?}"))?;
+    // A form POST sends a body through `fetch_in` (the same path JS `fetch` uses);
+    // a normal navigation is a cacheable GET.
+    let resp = match post {
+        Some(post) => {
+            let headers = vec![("content-type".to_string(), post.content_type.clone())];
+            client
+                .fetch_in(&parsed, "POST", &headers, &post.body, ctx)
+                .map_err(|e| format!("{e:?}"))?
+        }
+        None => client.get_in(&parsed, ctx).map_err(|e| format!("{e:?}"))?,
+    };
     let elapsed = t.elapsed();
     let user_agent = client.user_agent_for(&parsed);
     Ok(FetchedPage {
@@ -1305,16 +1486,20 @@ impl FetchClient for SyncFetchClient<'_> {
 /// versus ~101 MB unbounded, while leaving light pages untouched.
 const IMAGE_DECODE_BUDGET_BYTES: usize = 16 * 1024 * 1024;
 
+#[allow(clippy::too_many_arguments)]
 fn fetch_images_sync(
     document: &Document,
+    styled: &StyledDom,
     base: &Url,
     client: &Router,
     ctx: &FetchContext,
     policy: &Mutex<DefaultDenyPolicy>,
     first_party: &Origin,
+    viewport_w: u32,
 ) -> HashMap<String, ImageState> {
     let mut srcs = Vec::new();
-    collect_image_urls(document.root(), &mut srcs);
+    collect_image_urls(document.root(), &mut srcs, viewport_w);
+    collect_bg_image_urls(&styled.root, &mut srcs);
 
     let mut urls: Vec<String> = Vec::new();
     for src in srcs {
@@ -1432,19 +1617,185 @@ fn visible_text(node: NodeRef<'_>) -> String {
     out
 }
 
-/// Collect `<img>` sources from an element subtree, preferring `data-src` (the
-/// real URL behind lazy-loaders) over `src`.
-fn collect_image_urls(node: NodeRef<'_>, out: &mut Vec<String>) {
+/// Collect `<img>` sources from an element subtree, resolving `srcset`/`sizes`/
+/// `data-src` to the same URL layout will draw (ADR-0046), so the fetched bytes
+/// are the ones the page looks up. `viewport_w` is the layout viewport width.
+fn collect_image_urls(node: NodeRef<'_>, out: &mut Vec<String>, viewport_w: u32) {
     if node.tag() == "img" {
-        if let Some(src) = node.attr("data-src").or_else(|| node.attr("src")) {
-            out.push(src.to_string());
+        if let Some(src) = pick_img_url(|n| node.attr(n), viewport_w) {
+            out.push(src);
         }
     }
     for child in node.children() {
         if child.is_element() {
-            collect_image_urls(child, out);
+            collect_image_urls(child, out, viewport_w);
         }
     }
+}
+
+/// Collect `background-image` URLs from the styled tree (they live in computed
+/// style, not the DOM), so they fetch through the same image pipeline (ADR-0038).
+fn collect_bg_image_urls(node: &StyledNode, out: &mut Vec<String>) {
+    if let Some(url) = &node.style.background_image {
+        out.push(url.clone());
+    }
+    for c in &node.children {
+        if let StyledChild::Element(e) = c {
+            collect_bg_image_urls(e, out);
+        }
+    }
+}
+
+/// Collect the `href`s (as written) of every `<link rel="stylesheet">`, in
+/// document order. The raw href is the key the cascade looks up, so it is kept
+/// verbatim here and resolved to an absolute URL only for fetching (ADR-0037).
+fn collect_stylesheet_links(node: NodeRef<'_>, out: &mut Vec<String>) {
+    if node.tag() == "link" && link_is_stylesheet(node) {
+        if let Some(href) = node.attr("href") {
+            out.push(href.to_string());
+        }
+    }
+    for child in node.children() {
+        if child.is_element() {
+            collect_stylesheet_links(child, out);
+        }
+    }
+}
+
+/// Whether a `<link>` is a stylesheet (`rel` is a case-insensitive token list).
+fn link_is_stylesheet(node: NodeRef<'_>) -> bool {
+    node.attr("rel").is_some_and(|rel| {
+        rel.split_whitespace()
+            .any(|t| t.eq_ignore_ascii_case("stylesheet"))
+    })
+}
+
+/// Synchronously fetch every `<link rel="stylesheet">` body, keyed by the link's
+/// raw `href` (what the cascade looks up). Used by the one-shot [`render`] (the
+/// interactive browser fetches them on its worker). Third-party sheets are
+/// consent-gated like images; a blocked or failed sheet simply contributes no
+/// CSS. Builds no client and returns empty when there are no http(s) links.
+fn fetch_stylesheets_sync(
+    document: &Document,
+    base: &Url,
+    client: &Router,
+    ctx: &FetchContext,
+    policy: &Mutex<DefaultDenyPolicy>,
+    first_party: &Origin,
+) -> ExternalSheets {
+    let mut hrefs = Vec::new();
+    collect_stylesheet_links(document.root(), &mut hrefs);
+    let mut sheets = ExternalSheets::new();
+    for href in hrefs {
+        if sheets.contains_key(&href) {
+            continue;
+        }
+        let abs = resolve_subresource(Some(base), &href);
+        if !(abs.starts_with("http://") || abs.starts_with("https://")) {
+            continue;
+        }
+        // Consent gate: unruled third-party stylesheets never hit the network.
+        if !subresource_allowed(&abs, policy, ctx.instance, first_party) {
+            continue;
+        }
+        if let Ok(bytes) = fetch_bytes(client, &abs, ctx) {
+            let text = String::from_utf8_lossy(&bytes).into_owned();
+            // Resolve any `@import`ed sheets (relative to this sheet) and inline
+            // them ahead of this sheet's own rules (ADR-0038).
+            let text = inline_imports(&text, &abs, client, ctx, policy, first_party, 0);
+            sheets.insert(href, text);
+        }
+    }
+    sheets
+}
+
+/// Whether a subresource at `abs` is allowed under the consent policy (same-origin
+/// first-party loads; cross-site needs an Allow rule).
+fn subresource_allowed(
+    abs: &str,
+    policy: &Mutex<DefaultDenyPolicy>,
+    instance: InstanceId,
+    first_party: &Origin,
+) -> bool {
+    parse_url(abs)
+        .ok()
+        .and_then(|u| u.origin())
+        .is_some_and(|origin| {
+            policy
+                .locked()
+                .evaluate(instance, &origin, first_party)
+                .decision
+                == Decision::Allow
+        })
+}
+
+/// Recursively inline `@import`ed stylesheets, resolved against `base` and
+/// consent-gated, ahead of the importing sheet's rules (bounded depth). Imports
+/// we can't fetch are dropped; the cascade parser skips any leftover `@import`.
+fn inline_imports(
+    css: &str,
+    base: &str,
+    client: &Router,
+    ctx: &FetchContext,
+    policy: &Mutex<DefaultDenyPolicy>,
+    first_party: &Origin,
+    depth: usize,
+) -> String {
+    if depth >= 4 || !css.contains("@import") {
+        return css.to_string();
+    }
+    let base_url = parse_url(base).ok();
+    let mut out = String::new();
+    let mut rest = css;
+    while let Some(pos) = rest.find("@import") {
+        out.push_str(&rest[..pos]);
+        let stmt_end = rest[pos..]
+            .find(';')
+            .map(|s| pos + s + 1)
+            .unwrap_or(rest.len());
+        if let Some(url) = parse_import_url(&rest[pos..stmt_end]) {
+            let abs = resolve_subresource(base_url.as_ref(), &url);
+            if (abs.starts_with("http://") || abs.starts_with("https://"))
+                && subresource_allowed(&abs, policy, ctx.instance, first_party)
+            {
+                if let Ok(bytes) = fetch_bytes(client, &abs, ctx) {
+                    let text = String::from_utf8_lossy(&bytes).into_owned();
+                    out.push_str(&inline_imports(
+                        &text,
+                        &abs,
+                        client,
+                        ctx,
+                        policy,
+                        first_party,
+                        depth + 1,
+                    ));
+                    out.push('\n');
+                }
+            }
+        }
+        rest = &rest[stmt_end..];
+    }
+    out.push_str(rest);
+    out
+}
+
+/// Extract the URL from an `@import url("…")` / `@import "…"` statement.
+fn parse_import_url(stmt: &str) -> Option<String> {
+    let s = stmt.trim().strip_prefix("@import")?.trim();
+    if let Some(start) = s.find("url(") {
+        let inner = &s[start + 4..];
+        let end = inner.find(')')?;
+        let u = inner[..end]
+            .trim()
+            .trim_matches(|c| c == '"' || c == '\'')
+            .trim();
+        return (!u.is_empty()).then(|| u.to_string());
+    }
+    // Bare-string form: @import "x.css";
+    let s = s.trim_start_matches(['"', '\'']);
+    let end = s.find(['"', '\'']).unwrap_or(s.len());
+    let u = s[..end].trim();
+    (!u.is_empty()).then(|| u.to_string())
 }
 
 /// Live, per-page state of the interactive form controls, keyed by the field id
@@ -1498,6 +1849,14 @@ pub struct BrowserApp {
     style_engine: CssEngine,
     image_codec: ImageCodec,
     images: HashMap<String, ImageState>,
+    /// Fetched external `<link>` stylesheets, keyed by the link's raw `href`
+    /// (what the cascade looks up). Re-styled into `styled` as sheets arrive
+    /// (ADR-0037).
+    sheets: ExternalSheets,
+    /// In-flight stylesheet fetches: resolved absolute URL → raw `href`, so a
+    /// `Done::Sub` response can be routed to CSS (vs. an image) and stored under
+    /// the href the cascade keys on.
+    pending_sheets: HashMap<String, String>,
     history: Vec<String>,
     index: usize,
     document: Document,
@@ -1532,11 +1891,16 @@ pub struct BrowserApp {
     next_id: u64,
     /// When `Some`, an `http` URL is awaiting the user's risk confirmation.
     insecure_prompt: Option<String>,
+    /// The POST body to replay if the awaiting `insecure_prompt` is confirmed
+    /// (so "Load anyway" re-POSTs a form over http instead of GETting it).
+    insecure_post: Option<PostBody>,
     /// Hit region of the "Load anyway" button while the prompt is shown.
     insecure_button: Option<Rect>,
     settings_open: bool,
     background: Color,
     last_size: Size,
+    /// HiDPI scale factor (physical ÷ logical px). 1.0 unless the shell sets it.
+    scale: f32,
     /// Consent policy shared with the worker-side cookie jar.
     consent: Arc<Mutex<DefaultDenyPolicy>>,
     /// Per-cookie disposition policy, shared with the worker's `SealedJar`.
@@ -1563,6 +1927,13 @@ pub struct BrowserApp {
     timings: Timings,
     /// Whether the performance HUD is shown.
     hud_on: bool,
+    /// Whether the MIRC control panel overlay is open (the SYNC button).
+    mirc_open: bool,
+    /// Top row offset of the MIRC roster list.
+    mirc_scroll: usize,
+    /// A transient status line shown under the MIRC control bar (e.g. the result
+    /// of a bulk action), cleared on the next panel interaction.
+    mirc_status: Option<String>,
 }
 
 impl BrowserApp {
@@ -1680,6 +2051,8 @@ impl BrowserApp {
             style_engine,
             image_codec: ImageCodec::new(),
             images: HashMap::new(),
+            sheets: ExternalSheets::new(),
+            pending_sheets: HashMap::new(),
             history: Vec::new(),
             index: 0,
             document: empty_document(),
@@ -1697,10 +2070,12 @@ impl BrowserApp {
             pending: None,
             next_id: 1,
             insecure_prompt: None,
+            insecure_post: None,
             insecure_button: None,
             settings_open: false,
             background: Color::WHITE,
             last_size: Size::new(800, 600),
+            scale: 1.0,
             consent: Arc::new(Mutex::new(DefaultDenyPolicy::new(true))),
             cookie_policy: Arc::new(Mutex::new(CookiePolicy::new())),
             pending_consent: Arc::new(Mutex::new(Vec::new())),
@@ -1714,7 +2089,12 @@ impl BrowserApp {
             cookie_ttl_edit: None,
             timings: Timings::new(),
             hud_on: false,
+            mirc_open: false,
+            mirc_scroll: 0,
+            mirc_status: None,
         };
+        // The SYNC button shows how many identities/sessions it can drive.
+        app.toolbar.sync_count = app.heads.heads().len();
         app.navigate("cerberus:home");
         app
     }
@@ -1734,12 +2114,46 @@ impl BrowserApp {
         self.status
     }
 
-    /// Begin loading `url`: built-in pages synchronously; http(s) on the worker,
-    /// upgrading `http`→`https` first.
+    /// The current page's rendered text content (automation/inspection hook, the
+    /// live-window parallel of `render --dump-text`).
+    pub fn page_text(&self) -> String {
+        self.document.root().text_content()
+    }
+
+    /// Whether a navigation is in flight (no response committed yet).
+    pub fn is_loading(&self) -> bool {
+        self.pending.is_some()
+    }
+
+    /// Click points (centers) of the current page's text fields, from the last
+    /// rendered frame — an automation hook (used by the forms example).
+    pub fn text_field_centers(&self) -> Vec<(i32, i32)> {
+        self.form_fields
+            .iter()
+            .filter(|f| matches!(f.kind, FieldKind::Text | FieldKind::Textarea))
+            .map(|f| {
+                (
+                    f.rect.x + f.rect.w as i32 / 2,
+                    f.rect.y + f.rect.h as i32 / 2,
+                )
+            })
+            .collect()
+    }
+
+    /// Begin loading `url` (a GET): built-in pages synchronously; http(s) on the
+    /// worker, upgrading `http`→`https` first.
     fn start_load(&mut self, url: &str) {
+        self.begin_load(url, None);
+    }
+
+    /// Begin loading `url` with an optional form `post` body. With `Some`, the
+    /// load is a POST (the body is sent instead of a URL query); with `None`, a
+    /// normal GET. Shared prelude for both navigation kinds.
+    fn begin_load(&mut self, url: &str, post: Option<PostBody>) {
         self.insecure_prompt = None;
+        self.insecure_post = None;
         self.insecure_button = None;
-        self.toolbar.url_focused = false;
+        self.toolbar.blur_url();
         // New page: reset the performance table and stamp the clock (M11).
         self.timings.begin_navigation();
         // Drop the previous page's images: the store only ever holds the
@@ -1751,7 +2165,7 @@ impl BrowserApp {
         self.form_fields.clear();
 
         if url.starts_with("cerberus:") {
-            self.load_builtin(url);
+            self.load_builtin(url); // built-in pages are GET-only; ignore any body
             return;
         }
         let (target, http_fallback) = if url.starts_with("http://") {
@@ -1762,34 +2176,42 @@ impl BrowserApp {
         } else {
             (url.to_string(), None)
         };
-        self.dispatch(target, http_fallback);
+        self.dispatch(target, http_fallback, post);
     }
 
-    /// Serve from cache if fresh, else queue a background fetch.
-    fn dispatch(&mut self, target: String, http_fallback: Option<String>) {
+    /// Serve from cache if fresh, else queue a background fetch. A POST (`post`
+    /// is `Some`) always hits the network — it is neither read from nor written
+    /// to the cache (POST is not idempotent).
+    fn dispatch(&mut self, target: String, http_fallback: Option<String>, post: Option<PostBody>) {
         let instance = self.heads.active().instance;
-        if let Some(resp) = self.cache.get(instance, &target) {
-            self.commit_response(
-                &target,
-                resp.status,
-                &resp.headers,
-                &resp.body,
-                DEFAULT_USER_AGENT,
-                false,
-            );
-            return;
+        if post.is_none() {
+            if let Some(resp) = self.cache.get(instance, &target) {
+                self.commit_response(
+                    &target,
+                    resp.status,
+                    &resp.headers,
+                    &resp.body,
+                    DEFAULT_USER_AGENT,
+                    false,
+                );
+                return;
+            }
         }
         self.toolbar.url_text = target.clone();
         self.toolbar.loading = true;
         self.set_document(loading_document(&target));
         let id = self.next_id;
         self.next_id += 1;
-        self.pending = Some(Pending { id, http_fallback });
+        self.pending = Some(Pending {
+            id,
+            http_fallback,
+            post: post.clone(),
+        });
         let ctx = FetchContext {
             instance,
             kind: FetchKind::Navigation,
         };
-        self.loader.request(id, target, ctx);
+        self.loader.request(id, target, post, ctx);
     }
 
     fn load_builtin(&mut self, url: &str) {
@@ -1819,12 +2241,27 @@ impl BrowserApp {
         let doc = self.run_scripts(doc);
         self.timings.record("scripts", t.elapsed());
         self.page_title = doc.title();
+        // New page: drop the previous page's external stylesheets. The first
+        // cascade uses inline CSS only; external `<link>` sheets fetch on the
+        // worker and re-style as they arrive (ADR-0037).
+        self.sheets.clear();
+        self.pending_sheets.clear();
         let t = Instant::now();
         self.styled = self.style_engine.style(&doc);
         self.timings.record("style", t.elapsed());
         self.document = doc;
         // Dispatch any fetches the page scheduled at load to the worker (async).
         self.pump_fetches();
+    }
+
+    /// Re-run the cascade with the external stylesheets fetched so far, splicing
+    /// each in at its `<link>`'s position. Called as sheets arrive (ADR-0037).
+    fn restyle_with_sheets(&mut self) {
+        let t = Instant::now();
+        self.styled = self
+            .style_engine
+            .style_with_sheets(&self.document, &self.sheets);
+        self.timings.record("style", t.elapsed());
     }
 
     /// Run the document's inline scripts against the active head's engine and
@@ -1907,13 +2344,56 @@ impl BrowserApp {
         self.toolbar.url_text = url.to_string();
         self.toolbar.loading = false;
         self.insecure_prompt = None;
+        self.insecure_post = None;
 
         self.request_page_images();
+        self.request_page_stylesheets();
         self.update_nav();
         // Page-load total covers fetch → parse → scripts → style (M11);
         // layout+paint is timed per frame in render_frame.
         self.timings.record_page_load();
         self.persist();
+    }
+
+    /// The directory downloads are saved to: `<data-dir>/downloads` for a
+    /// persistent profile, else the OS `~/Downloads`, else a temp dir.
+    fn downloads_dir(&self) -> PathBuf {
+        if let Some(dir) = &self.data_dir {
+            return dir.join("downloads");
+        }
+        if let Some(home) = std::env::var_os("HOME").or_else(|| std::env::var_os("USERPROFILE")) {
+            return PathBuf::from(home).join("Downloads");
+        }
+        std::env::temp_dir().join("cerberus-downloads")
+    }
+
+    /// Save a downloaded response body to the downloads directory and show a
+    /// "download complete" page. The file is written under a unique name (never
+    /// overwriting), and the response is not cached or parsed as a page.
+    fn commit_download(&mut self, url: &str, filename: &str, body: &[u8]) {
+        let dir = self.downloads_dir();
+        let outcome = match std::fs::create_dir_all(&dir) {
+            Ok(()) => {
+                let path = unique_download_path(&dir, filename);
+                match std::fs::write(&path, body) {
+                    Ok(()) => Ok(path),
+                    Err(e) => Err(e.to_string()),
+                }
+            }
+            Err(e) => Err(e.to_string()),
+        };
+        self.status = 200;
+        self.toolbar.loading = false;
+        self.current_url = parse_url(url).ok();
+        match outcome {
+            Ok(path) => {
+                self.set_document(download_done_document(filename, body.len(), &path));
+            }
+            Err(e) => {
+                self.set_document(error_document(url, &format!("download failed: {e}")));
+            }
+        }
+        self.update_nav();
     }
 
     fn show_error(&mut self, url: &str, message: &str) {
@@ -1940,38 +2420,63 @@ impl BrowserApp {
             return false; // stale: superseded by Stop or a newer navigation
         }
         let http_fallback = pending.http_fallback.clone();
+        let post = pending.post.clone();
+        let is_post = post.is_some();
         self.pending = None;
         match result {
             Ok(page) => {
                 // Server response time for the navigation (M11).
+                let verb = if is_post { "POST" } else { "GET" };
                 let label = parse_url(&page.url)
                     .ok()
-                    .map(|u| format!("GET {}", u.host))
-                    .unwrap_or_else(|| "GET".into());
+                    .map(|u| format!("{verb} {}", u.host))
+                    .unwrap_or_else(|| verb.to_string());
                 self.timings.record(label, page.elapsed);
-                self.commit_response(
-                    &page.url,
-                    page.status,
-                    &page.headers,
-                    &page.body,
-                    &page.user_agent,
-                    true,
-                )
+                // A response the server marks as a download (Content-Disposition:
+                // attachment, or a non-renderable content type) is saved to disk
+                // instead of being parsed as a page.
+                if let Some(filename) = download_target(&page.headers, &page.url) {
+                    self.commit_download(&page.url, &filename, &page.body);
+                } else {
+                    // A POST response is not cacheable (not idempotent).
+                    self.commit_response(
+                        &page.url,
+                        page.status,
+                        &page.headers,
+                        &page.body,
+                        &page.user_agent,
+                        !is_post,
+                    )
+                }
             }
             Err(err) => match http_fallback {
-                Some(http_url) => {
-                    // The https upgrade failed; offer the plaintext risk prompt.
+                // The https upgrade failed at the connection/cert layer; http may
+                // still serve the page, so offer the plaintext risk prompt. A DNS
+                // failure is different — the name didn't resolve, so http can't
+                // help either — report the real cause instead of the misleading
+                // "doesn't support HTTPS" prompt.
+                Some(http_url) if !is_dns_failure(&err) => {
                     self.toolbar.loading = false;
                     self.set_document(insecure_prompt_document(&http_url, &err));
                     self.insecure_prompt = Some(http_url);
+                    // Preserve any POST body so "Load anyway" re-POSTs over http.
+                    self.insecure_post = post;
                 }
-                None => self.show_error(&requested_url, &err),
+                _ => {
+                    let msg = if is_dns_failure(&err) {
+                        format!("This site's address could not be resolved (DNS). {err}")
+                    } else {
+                        err
+                    };
+                    self.show_error(&requested_url, &msg);
+                }
             },
         }
         true
     }
 
-    /// Apply a decoded image sub-resource (or its failure) to the store.
+    /// Apply a completed sub-resource. A response for a pending stylesheet URL is
+    /// routed to the cascade (ADR-0037); everything else is decoded as an image.
     fn handle_subresource(
         &mut self,
         url: String,
@@ -1981,6 +2486,9 @@ impl BrowserApp {
         // Subresources are aggregated into one stable row so an image-heavy
         // page doesn't flood (and reflow) the HUD.
         self.timings.add("subresources", elapsed);
+        if self.pending_sheets.contains_key(&url) {
+            return self.handle_stylesheet(url, bytes);
+        }
         let state =
             match bytes.and_then(|b| self.image_codec.decode(&b).map_err(|e| format!("{e:?}"))) {
                 Ok(img) => ImageState::Ready(Arc::new(img)),
@@ -1988,6 +2496,29 @@ impl BrowserApp {
             };
         self.images.insert(url, state);
         true // a newly-decoded image changes layout — redraw
+    }
+
+    /// Store a fetched external stylesheet (under the `<link>`'s raw href) and,
+    /// once every in-flight sheet has resolved, re-run the cascade so they all
+    /// apply in one pass (ADR-0037). A failed fetch simply contributes no CSS.
+    fn handle_stylesheet(&mut self, url: String, bytes: Result<Vec<u8>, String>) -> bool {
+        let Some(href) = self.pending_sheets.remove(&url) else {
+            return false;
+        };
+        if let Ok(b) = bytes {
+            self.sheets
+                .insert(href, String::from_utf8_lossy(&b).into_owned());
+        }
+        // Re-style once the last pending sheet arrives, so the page doesn't
+        // re-cascade once per sheet on a multi-stylesheet page.
+        if self.pending_sheets.is_empty() {
+            self.restyle_with_sheets();
+            // External CSS can introduce new background-images; fetch them now.
+            self.request_page_images();
+            true
+        } else {
+            false
+        }
     }
 
     /// Drain the realm's JS-`fetch` queue and dispatch each request to the
@@ -2106,7 +2637,11 @@ impl BrowserApp {
         let first_party = self.current_url.as_ref().and_then(first_party_of);
         let instance = self.heads.active().instance;
         let mut srcs = Vec::new();
-        collect_image_urls(self.document.root(), &mut srcs);
+        // The same viewport width layout uses (ADR-0046), so srcset selection at
+        // fetch time and at draw time agree.
+        let viewport_w = self.toolbar.content_size(self.last_size).w;
+        collect_image_urls(self.document.root(), &mut srcs, viewport_w);
+        collect_bg_image_urls(&self.styled.root, &mut srcs);
         for src in srcs {
             let abs = resolve_subresource(self.current_url.as_ref(), &src);
             // Only http(s) sub-resources go to the network worker.
@@ -2127,6 +2662,41 @@ impl BrowserApp {
                 continue;
             }
             self.images.insert(abs.clone(), ImageState::Pending);
+            self.loader.request_subresource(
+                abs,
+                FetchContext {
+                    instance,
+                    kind: FetchKind::Subresource { first_party },
+                },
+            );
+        }
+    }
+
+    /// Scan the current document for `<link rel="stylesheet">` and queue a
+    /// background fetch for each new http(s) sheet, consent-gated like an image.
+    /// Responses route to the cascade in `handle_stylesheet` (ADR-0037).
+    fn request_page_stylesheets(&mut self) {
+        let first_party = self.current_url.as_ref().and_then(first_party_of);
+        let instance = self.heads.active().instance;
+        let mut hrefs = Vec::new();
+        collect_stylesheet_links(self.document.root(), &mut hrefs);
+        for href in hrefs {
+            let abs = resolve_subresource(self.current_url.as_ref(), &href);
+            if !(abs.starts_with("http://") || abs.starts_with("https://")) {
+                continue;
+            }
+            // One fetch per distinct URL per page (already fetched or in flight).
+            if self.sheets.contains_key(&href) || self.pending_sheets.contains_key(&abs) {
+                continue;
+            }
+            let Some(first_party) = first_party.clone() else {
+                continue;
+            };
+            // Consent gate: a third-party stylesheet needs an Allow rule.
+            if self.gate_subresource(&abs, &first_party) != Decision::Allow {
+                continue;
+            }
+            self.pending_sheets.insert(abs.clone(), href);
             self.loader.request_subresource(
                 abs,
                 FetchContext {
@@ -2349,6 +2919,8 @@ impl BrowserApp {
             self.images.remove(&url);
         }
         self.request_page_images();
+        // A stylesheet from the newly-allowed site can now be fetched too.
+        self.request_page_stylesheets();
     }
 
     /// Persist the standing consent rules into the profile (if any).
@@ -2363,7 +2935,8 @@ impl BrowserApp {
     /// Confirm the risk prompt: load the original `http` URL in plaintext.
     fn confirm_insecure(&mut self) {
         if let Some(http_url) = self.insecure_prompt.take() {
-            self.dispatch(http_url, None);
+            let post = self.insecure_post.take();
+            self.dispatch(http_url, None, post);
         }
     }
 
@@ -2420,7 +2993,7 @@ impl BrowserApp {
         match field.kind {
             FieldKind::Text | FieldKind::Textarea => {
                 self.focused_field = Some(field.id);
-                self.toolbar.url_focused = false;
+                self.toolbar.blur_url();
             }
             FieldKind::Checkbox => {
                 let now = !self.forms.checked(field.id);
@@ -2565,15 +3138,55 @@ impl BrowserApp {
         let Some(this) = controls.iter().find(|c| c.id == id) else {
             return;
         };
-        // The enclosing <form> (if any) supplies the action/method; its absence
-        // means the whole document is treated as one big form.
+        // The enclosing <form> (if any) supplies the action/method/enctype; its
+        // absence means the whole document is treated as one big form.
         let form_el = this.form;
-        let query = build_query(&controls, form_el, &self.forms);
         let action = form_el.and_then(|f| f.attr("action")).unwrap_or("");
-        // Method: GET today; POST falls back to a GET of the action.
-        // TODO POST: send the body instead of a query once the net layer allows.
-        let target = self.resolve_action(action, &query);
-        self.navigate(&target);
+        let is_post = form_el
+            .and_then(|f| f.attr("method"))
+            .is_some_and(|m| m.trim().eq_ignore_ascii_case("post"));
+        // multipart/form-data only applies to POST (HTML ignores enctype for GET).
+        let multipart = is_post
+            && form_el
+                .and_then(|f| f.attr("enctype"))
+                .is_some_and(|e| e.trim().eq_ignore_ascii_case("multipart/form-data"));
+
+        if multipart {
+            // POST a multipart body — the only encoding that carries file uploads.
+            let target = self.resolve_action_base(action);
+            let (content_type, body) = build_multipart(&controls, form_el, &self.forms);
+            self.begin_load(&target, Some(PostBody { content_type, body }));
+            return;
+        }
+        // Otherwise the controls serialize as application/x-www-form-urlencoded —
+        // the URL query for GET, or the request body for POST.
+        let encoded = build_query(&controls, form_el, &self.forms);
+        if is_post {
+            let target = self.resolve_action_base(action);
+            self.begin_load(
+                &target,
+                Some(PostBody {
+                    content_type: "application/x-www-form-urlencoded".to_string(),
+                    body: encoded.into_bytes(),
+                }),
+            );
+        } else {
+            let target = self.resolve_action(action, &encoded);
+            self.navigate(&target);
+        }
+    }
+
+    /// Resolve a form `action` against the current URL, **without** touching its
+    /// query (POST carries the data in the body, so the action's own query — if
+    /// any — is preserved).
+    fn resolve_action_base(&self, action: &str) -> String {
+        match &self.current_url {
+            Some(base) if !action.is_empty() => join_url(base, action)
+                .map(|u| u.to_string())
+                .unwrap_or_else(|_| action.to_string()),
+            Some(base) => base.to_string(),
+            None => action.to_string(),
+        }
     }
 
     /// Resolve a form `action` against the current URL and append `?query`.
@@ -2605,7 +3218,7 @@ impl BrowserApp {
     /// line of that, which is exact for the single-line editing we support today
     /// (newlines can't be typed — Enter submits). The caret is always clamped
     /// inside the box.
-    fn paint_caret(&self, page: &mut Framebuffer, origin: Point) {
+    fn paint_caret(&self, page: &mut Framebuffer, origin: Point, scale: f32) {
         let Some(id) = self.focused_field else {
             return;
         };
@@ -2643,7 +3256,7 @@ impl BrowserApp {
             rect: Rect::new(caret_x, ly + FIELD_PAD, 1, px),
             color: Color::rgb(0x22, 0x22, 0x22),
         });
-        self.text.rasterize(&list, page);
+        self.text.rasterize(&list.scaled(scale), page);
     }
 
     /// Attempt a vault unlock with the passphrase typed into the settings
@@ -2683,12 +3296,40 @@ impl BrowserApp {
 
     fn navigate(&mut self, input: &str) {
         let url = normalize_url(input);
+        // Same-document navigation — only the #fragment differs from the page
+        // we're on (an in-page anchor like `#maincontent`). Record history and
+        // update the address bar, but DON'T refetch the page. (Scrolling to the
+        // anchor is a future enhancement; for now the page simply stays put.)
+        let same_document = self.is_same_document(&url);
         if !self.history.is_empty() {
             self.history.truncate(self.index + 1);
         }
         self.history.push(url.clone());
         self.index = self.history.len() - 1;
-        self.start_load(&url);
+        if same_document {
+            self.current_url = parse_url(&url).ok();
+            self.toolbar.url_text = url.clone();
+            self.toolbar.blur_url();
+            self.update_nav();
+        } else {
+            self.start_load(&url);
+        }
+    }
+
+    /// Whether `url` targets the current document, differing only by its
+    /// `#fragment` (an in-page anchor) — which needs no network refetch.
+    fn is_same_document(&self, url: &str) -> bool {
+        let (Some(current), Ok(next)) = (self.current_url.as_ref(), parse_url(url)) else {
+            return false;
+        };
+        let norm = |p: &str| if p.is_empty() { "/" } else { p }.to_string();
+        next.fragment.is_some()
+            && next.scheme == current.scheme
+            && next.host == current.host
+            && next.port == current.port
+            && next.opaque == current.opaque
+            && norm(&next.path) == norm(&current.path)
+            && next.query == current.query
     }
 
     fn back(&mut self) -> bool {
@@ -2737,6 +3378,124 @@ impl BrowserApp {
         self.persist();
     }
 
+    /// The current page's site (host), for the MIRC panel subtitle/roster.
+    /// Empty for built-in pages or before the first navigation.
+    fn current_site(&self) -> String {
+        self.current_url
+            .as_ref()
+            .map(|u| u.host.clone())
+            .filter(|h| !h.is_empty())
+            .unwrap_or_default()
+    }
+
+    /// Build the MIRC roster from the identities ("heads"). Phase 2a is a
+    /// read-only prototype: the active head is shown live and the rest dormant;
+    /// `account` is the identity's stored login (when the vault is unlocked) or a
+    /// sealed-session tag, and `logged_in` reflects whether that sealed session
+    /// actually holds cookies for the current site.
+    fn mirc_rows(&self) -> Vec<MircRow> {
+        let site = self.current_site();
+        let active = self.heads.active_index();
+        let heads: Vec<(usize, InstanceId, String)> = self
+            .heads
+            .heads()
+            .iter()
+            .enumerate()
+            .map(|(i, h)| (i, h.instance, h.label.clone()))
+            .collect();
+        let mut env = self.storage.locked();
+        heads
+            .into_iter()
+            .map(|(i, instance, label)| {
+                let logged_in = !site.is_empty()
+                    && env
+                        .instance(instance)
+                        .cookie_views()
+                        .iter()
+                        .any(|v| v.fp_site == site);
+                let username = env
+                    .load_blob(instance, AUTOFILL_PROFILE_KEY)
+                    .ok()
+                    .flatten()
+                    .and_then(|b| cerberus_autofill::Profile::from_bytes(&b))
+                    .map(|p| p.login.username.clone())
+                    .filter(|u| !u.is_empty());
+                let account = username.unwrap_or_else(|| {
+                    let b = instance.0.as_bytes();
+                    format!("sealed session {:02x}{:02x}", b[14], b[15])
+                });
+                let state = if i == active {
+                    MircState::Live
+                } else {
+                    MircState::Dormant
+                };
+                MircRow {
+                    label,
+                    account,
+                    state,
+                    logged_in,
+                }
+            })
+            .collect()
+    }
+
+    /// Apply a MIRC panel click. Phase 2a wires the panel chrome — close,
+    /// broadcast on/off, scroll, and open-a-session (which surfaces that identity
+    /// in this window via the existing head switch). The bulk verbs
+    /// (navigate-all / login-all) are acknowledged with a status note until the
+    /// single-window app drives a live [`MirrorGroup`].
+    fn apply_mirc_action(&mut self, action: MircAction) {
+        match action {
+            MircAction::Close => {
+                self.mirc_open = false;
+                self.mirc_status = None;
+            }
+            MircAction::ToggleBroadcast => {
+                self.toolbar.broadcasting = !self.toolbar.broadcasting;
+                self.mirc_status = Some(if self.toolbar.broadcasting {
+                    "broadcast on — master actions will drive every session".to_string()
+                } else {
+                    "broadcast off — only this session is driven".to_string()
+                });
+            }
+            MircAction::NavigateAll => {
+                self.mirc_status =
+                    Some("navigate all: lands with the live mirror group (next phase)".to_string());
+            }
+            MircAction::LoginAll => {
+                self.mirc_status =
+                    Some("login all: lands with the live mirror group (next phase)".to_string());
+            }
+            MircAction::Open(idx) => {
+                // The lazy "select → render" gesture: surface that identity in
+                // this window. Today that is the head switch; with a live group
+                // it becomes a focus of the chosen instance.
+                if idx < self.heads.heads().len() && idx != self.heads.active_index() {
+                    let _ = self.heads.switch_to(idx);
+                    self.toolbar.head_label = self.heads.active().label.clone();
+                    let _ = self.heads.engine();
+                    if let Some(dir) = self.data_dir.clone() {
+                        let _ = save_heads(&dir, self.heads.heads(), self.heads.active_index());
+                    }
+                }
+                self.mirc_open = false;
+                self.mirc_status = None;
+            }
+            MircAction::ScrollUp => {
+                self.mirc_scroll = self.mirc_scroll.saturating_sub(1);
+            }
+            MircAction::ScrollDown => {
+                let len = self.heads.heads().len();
+                let visible = MircPanel::visible_rows(self.last_size);
+                let max = len.saturating_sub(visible);
+                if self.mirc_scroll < max {
+                    self.mirc_scroll += 1;
+                }
+            }
+            MircAction::None => {}
+        }
+    }
+
     fn handle(&mut self, action: ToolbarAction) -> bool {
         match action {
             ToolbarAction::Back => self.back(),
@@ -2753,7 +3512,7 @@ impl BrowserApp {
                 true
             }
             ToolbarAction::FocusUrl => {
-                self.toolbar.url_focused = true;
+                self.toolbar.focus_url();
                 true
             }
             ToolbarAction::Navigate(url) => {
@@ -2766,6 +3525,15 @@ impl BrowserApp {
             }
             ToolbarAction::OpenSettings => {
                 self.settings_open = !self.settings_open;
+                true
+            }
+            ToolbarAction::OpenSync => {
+                // Open the MIRC control panel (Phase 2a: a rendered roster of the
+                // identities/sessions with status; broadcast/open are wired, the
+                // bulk verbs land next on the MirrorGroup seam).
+                self.mirc_open = true;
+                self.mirc_scroll = 0;
+                self.mirc_status = None;
                 true
             }
             ToolbarAction::None => false,
@@ -2800,6 +3568,7 @@ fn computed_css(s: &cerberus_style::ComputedStyle) -> Vec<(String, String)> {
     let display = match s.display {
         cerberus_style::Display::Block => "block",
         cerberus_style::Display::Inline => "inline",
+        cerberus_style::Display::InlineBlock => "inline-block",
         cerberus_style::Display::ListItem => "list-item",
         cerberus_style::Display::Flex => "flex",
         cerberus_style::Display::Grid => "grid",
@@ -2880,6 +3649,10 @@ impl FrameApp for BrowserApp {
         self.loader.set_waker(waker);
     }
 
+    fn set_scale_factor(&mut self, scale: f32) {
+        self.scale = scale.max(1.0);
+    }
+
     fn poll(&mut self) -> bool {
         let mut redraw = false;
         // Worker-side consent events (cookie capture) surface in the banner.
@@ -2907,13 +3680,24 @@ impl FrameApp for BrowserApp {
     }
 
     fn render_frame(&mut self, size: Size) -> Framebuffer {
-        self.last_size = size;
+        // `size` is the physical surface. Lay out and hit-test in *logical*
+        // pixels (physical / scale) and scale the paint up, so a HiDPI display
+        // renders crisp (re-outlined glyphs) rather than a bitmap upscale. At
+        // scale 1.0 (the default, and all tests) this is the identity.
+        let scale = self.scale;
+        let logical = Size::new(
+            ((size.w as f32 / scale).round() as u32).max(1),
+            ((size.h as f32 / scale).round() as u32).max(1),
+        );
+        self.last_size = logical;
+        let si = |v: i32| (v as f32 * scale).round() as i32;
+        let su = |v: u32| ((v as f32 * scale).round() as u32).max(1);
         let banner_h = if self.consent_prompts.is_empty() {
             0
         } else {
             BANNER_HEIGHT
         };
-        let mut content = self.toolbar.content_size(size);
+        let mut content = self.toolbar.content_size(logical);
         content.h = content.h.saturating_sub(banner_h);
         let mut origin = self.toolbar.content_origin();
         origin.y += banner_h as i32;
@@ -2928,9 +3712,9 @@ impl FrameApp for BrowserApp {
             };
             let mut layout = BlockLayout::default();
             let laid = layout.layout(&self.styled, content, &self.text, &provider, &self.forms);
-            let mut page = Framebuffer::new(content);
+            let mut page = Framebuffer::new(Size::new(su(content.w), su(content.h)));
             page.clear(self.background);
-            self.text.rasterize(&laid.display, &mut page);
+            self.text.rasterize(&laid.display.scaled(scale), &mut page);
             (laid, page)
         };
         self.timings.record("layout+paint", t.elapsed());
@@ -2993,43 +3777,47 @@ impl FrameApp for BrowserApp {
 
         // Draw a caret at the end of the focused text field's value. The field's
         // own value is already painted by layout into `page`; we just add the bar.
-        self.paint_caret(&mut page, origin);
+        self.paint_caret(&mut page, origin, scale);
 
         let mut fb = Framebuffer::new(size);
         fb.clear(self.background);
-        fb.blit(origin, &page);
-        self.text
-            .rasterize(&self.toolbar.paint(size, &self.text), &mut fb);
+        fb.blit(Point::new(si(origin.x), si(origin.y)), &page);
+        self.text.rasterize(
+            &self.toolbar.paint(logical, &self.text).scaled(scale),
+            &mut fb,
+        );
         if let Some(event) = self.consent_prompts.first() {
             let banner = ConsentBanner::new(event.request.site(), self.consent_prompts.len() - 1);
             self.text
-                .rasterize(&banner.paint(size, &self.text), &mut fb);
+                .rasterize(&banner.paint(logical, &self.text).scaled(scale), &mut fb);
         }
         if self.insecure_prompt.is_some() {
-            self.insecure_button = Some(paint_insecure_button(&mut fb, &self.text));
+            self.insecure_button = Some(paint_insecure_button(&mut fb, &self.text, scale));
         }
         if self.settings_open {
             let vault_locked = self.storage.locked().vault_locked();
             paint_settings_overlay(
                 &mut fb,
-                size,
+                logical,
                 &self.text,
                 &self.text,
                 vault_locked,
                 self.vault_input.chars().count(),
                 self.vault_msg.as_deref(),
                 self.hud_on,
+                scale,
             );
         }
         if self.cookie_manager_open {
             let global = self.cookie_policy.locked().global().label();
             let rows: Vec<CookieRow> = self.cookie_rows().into_iter().map(|(_, _, r)| r).collect();
             self.text.rasterize(
-                &CookieManager::paint(size, &self.text, &global, &rows, self.cookie_scroll),
+                &CookieManager::paint(logical, &self.text, &global, &rows, self.cookie_scroll)
+                    .scaled(scale),
                 &mut fb,
             );
             if let Some((_, _, buf)) = &self.cookie_ttl_edit {
-                let p = CookieManager::panel_rect(size);
+                let p = CookieManager::panel_rect(logical);
                 let mut list = DisplayList::new();
                 list.push(DisplayItem::Glyphs {
                     origin: Point::new(p.x + 12, p.y + p.h as i32 - 14),
@@ -3039,14 +3827,44 @@ impl FrameApp for BrowserApp {
                     color: Color::rgb(0x20, 0x40, 0x70),
                     style: FontStyle::REGULAR,
                 });
-                self.text.rasterize(&list, &mut fb);
+                self.text.rasterize(&list.scaled(scale), &mut fb);
+            }
+        }
+        if self.mirc_open {
+            let rows = self.mirc_rows();
+            let site = self.current_site();
+            self.text.rasterize(
+                &MircPanel::paint(
+                    logical,
+                    &self.text,
+                    self.toolbar.broadcasting,
+                    &site,
+                    &rows,
+                    self.mirc_scroll,
+                )
+                .scaled(scale),
+                &mut fb,
+            );
+            // A transient status note under the control bar (bulk-verb feedback).
+            if let Some(msg) = &self.mirc_status {
+                let p = MircPanel::panel_rect(logical);
+                let mut list = DisplayList::new();
+                list.push(DisplayItem::Glyphs {
+                    origin: Point::new(p.x + 16, p.y + 122),
+                    glyphs: self.text.shape(msg, 12),
+                    color: Color::rgb(0x20, 0x40, 0x70),
+                    style: FontStyle::REGULAR,
+                });
+                self.text.rasterize(&list.scaled(scale), &mut fb);
             }
         }
         // Performance HUD on top of everything, when enabled (M11).
         if self.hud_on {
             let rows = self.timings.display_rows();
-            self.text
-                .rasterize(&PerfHud::paint(size, &self.text, &rows), &mut fb);
+            self.text.rasterize(
+                &PerfHud::paint(logical, &self.text, &rows).scaled(scale),
+                &mut fb,
+            );
         }
         fb
     }
@@ -3059,6 +3877,19 @@ impl FrameApp for BrowserApp {
                     return true;
                 }
             }
+        }
+        if self.mirc_open {
+            // The MIRC panel owns all clicks while open; a click outside it (but
+            // not on a control) closes it.
+            if point_in_rect(MircPanel::panel_rect(self.last_size), x, y) {
+                let len = self.heads.heads().len();
+                let action = MircPanel::hit_test(self.last_size, len, self.mirc_scroll, x, y);
+                self.apply_mirc_action(action);
+            } else {
+                self.mirc_open = false;
+                self.mirc_status = None;
+            }
+            return true;
         }
         if self.cookie_manager_open {
             // The inspector owns all clicks while open. Commit any pending TTL
@@ -3148,13 +3979,18 @@ impl FrameApp for BrowserApp {
         }
         let action = self.toolbar.hit_test(self.last_size, x, y);
         if action == ToolbarAction::None && self.toolbar.url_focused {
-            self.toolbar.url_focused = false;
+            self.toolbar.blur_url();
             return true;
         }
         self.handle(action)
     }
 
     fn text_input(&mut self, c: char) -> bool {
+        // The MIRC panel is read-only (no text entry yet); it swallows typing so
+        // keystrokes don't leak to the URL box or page behind it.
+        if self.mirc_open {
+            return true;
+        }
         // The cookie inspector's TTL editor captures digits.
         if self.cookie_manager_open {
             if let Some((_, _, buf)) = &mut self.cookie_ttl_edit {
@@ -3188,6 +4024,9 @@ impl FrameApp for BrowserApp {
     }
 
     fn submit(&mut self) -> bool {
+        if self.mirc_open {
+            return true;
+        }
         if self.cookie_manager_open {
             self.commit_ttl_edit();
             return true;
@@ -3209,6 +4048,9 @@ impl FrameApp for BrowserApp {
     }
 
     fn backspace(&mut self) -> bool {
+        if self.mirc_open {
+            return true;
+        }
         if self.cookie_manager_open {
             if let Some((_, _, buf)) = &mut self.cookie_ttl_edit {
                 buf.pop();
@@ -3246,6 +4088,119 @@ fn first_party_of(url: &cerberus_url::Url) -> Option<Origin> {
             .as_ref()
             .map(|o| Origin::new(url.scheme.clone(), o.clone(), None))
     })
+}
+
+/// Whether a fetch-error string (the `Debug` of a `NetError`, as stringified by
+/// `fetch_page`) is a DNS-resolution failure. Switching an https upgrade to
+/// plaintext http can't fix a name that never resolved, so these are reported
+/// with their real cause rather than the misleading "doesn't support HTTPS"
+/// prompt.
+fn is_dns_failure(err: &str) -> bool {
+    err.starts_with("Dns(")
+}
+
+/// Decide whether a response is a download (and its filename) rather than a page
+/// to render. A download is signalled by `Content-Disposition: attachment`, or by
+/// a content type we don't render (anything that isn't HTML/XML/plain text). The
+/// filename comes from the `Content-Disposition` `filename=`, else the URL's last
+/// path segment, else a generic name.
+fn download_target(headers: &[(String, String)], url: &str) -> Option<String> {
+    let header = |name: &str| {
+        headers
+            .iter()
+            .find(|(k, _)| k.eq_ignore_ascii_case(name))
+            .map(|(_, v)| v.as_str())
+    };
+    let disposition = header("content-disposition").unwrap_or("");
+    let is_attachment = disposition.to_ascii_lowercase().contains("attachment");
+
+    let content_type = header("content-type").unwrap_or("");
+    let mime = content_type
+        .split(';')
+        .next()
+        .unwrap_or("")
+        .trim()
+        .to_ascii_lowercase();
+    // We render HTML/XHTML/XML and plain text; everything else (zip, pdf, octet-
+    // stream, …) is a download. An empty/absent type defaults to renderable so a
+    // misconfigured page isn't force-downloaded.
+    let renderable = mime.is_empty()
+        || mime == "text/html"
+        || mime == "application/xhtml+xml"
+        || mime == "text/plain"
+        || mime == "text/xml"
+        || mime == "application/xml";
+    if !is_attachment && renderable {
+        return None;
+    }
+
+    let from_disposition = disposition
+        .split(';')
+        .filter_map(|p| p.trim().strip_prefix("filename="))
+        .map(|v| v.trim().trim_matches('"').to_string())
+        .find(|v| !v.is_empty());
+    let from_url = parse_url(url)
+        .ok()
+        .and_then(|u| u.path.rsplit('/').next().map(str::to_string))
+        .filter(|s| !s.is_empty());
+    Some(sanitize_filename(
+        &from_disposition
+            .or(from_url)
+            .unwrap_or_else(|| "download".to_string()),
+    ))
+}
+
+/// Strip any directory components and parent refs from a filename so a server
+/// can't write outside the downloads directory.
+fn sanitize_filename(name: &str) -> String {
+    let base = name.rsplit(['/', '\\']).next().unwrap_or(name).trim();
+    let cleaned: String = base
+        .chars()
+        .filter(|c| !c.is_control() && *c != '/' && *c != '\\')
+        .collect();
+    let cleaned = cleaned.trim_matches('.').trim();
+    if cleaned.is_empty() {
+        "download".to_string()
+    } else {
+        cleaned.to_string()
+    }
+}
+
+/// A path in `dir` for `filename` that doesn't exist yet: `name`, then
+/// `name (1)`, `name (2)`, … so a download never overwrites an existing file.
+fn unique_download_path(dir: &Path, filename: &str) -> PathBuf {
+    let first = dir.join(filename);
+    if !first.exists() {
+        return first;
+    }
+    let (stem, ext) = match filename.rsplit_once('.') {
+        Some((s, e)) if !s.is_empty() => (s.to_string(), format!(".{e}")),
+        _ => (filename.to_string(), String::new()),
+    };
+    for n in 1.. {
+        let candidate = dir.join(format!("{stem} ({n}){ext}"));
+        if !candidate.exists() {
+            return candidate;
+        }
+    }
+    first
+}
+
+/// The "download complete" page shown after a file is saved.
+fn download_done_document(filename: &str, size: usize, path: &Path) -> Document {
+    let mut b = DocumentBuilder::new();
+    let mut kids = Vec::new();
+    for (tag, text) in [
+        ("h1", "Download complete".to_string()),
+        ("p", format!("Saved {filename} ({} bytes)", size)),
+        ("p", format!("to {}", path.display())),
+    ] {
+        let t = b.text(text);
+        kids.push(b.element(tag, [t]));
+    }
+    let body = b.element("body", kids);
+    let root = b.element("#root", [body]);
+    b.finish(root)
 }
 
 fn error_document(url: &str, message: &str) -> Document {
@@ -3456,6 +4411,134 @@ fn build_query(
     pairs.join("&")
 }
 
+/// Whether a control is a file input (`<input type=file>`).
+fn is_file_input(el: NodeRef<'_>) -> bool {
+    el.tag() == "input"
+        && el
+            .attr("type")
+            .is_some_and(|t| t.trim().eq_ignore_ascii_case("file"))
+}
+
+/// Build a `multipart/form-data` body for the form's successful controls,
+/// returning `(content_type_with_boundary, body)`. Text controls become text
+/// parts; a file input's value is read as a **filesystem path** (typed into the
+/// field, or set programmatically by the mirror driver) and sent as a file part.
+/// Filling-only: no file is read unless the user/automation supplied its path.
+fn build_multipart(
+    controls: &[ControlRef<'_>],
+    form: Option<NodeRef<'_>>,
+    store: &FormStore,
+) -> (String, Vec<u8>) {
+    // A unique boundary that won't collide with the data.
+    let boundary = format!(
+        "----CerberusFormBoundary{}",
+        random_bytes(12)
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect::<String>()
+    );
+    let mut body = Vec::new();
+    for c in controls.iter().filter(|c| same_form(c.form, form)) {
+        let Some(name) = c.el.attr("name").filter(|n| !n.is_empty()) else {
+            continue;
+        };
+        if is_file_input(c.el) {
+            // The field value is a path; an empty path sends an empty file part
+            // (matches browsers, which still send the part with a blank filename).
+            let path = store
+                .value(c.id)
+                .map(str::to_string)
+                .unwrap_or_else(|| c.el.attr("value").unwrap_or("").to_string());
+            let (filename, ctype, bytes) = if path.is_empty() {
+                (String::new(), "application/octet-stream", Vec::new())
+            } else {
+                let filename = path.rsplit(['/', '\\']).next().unwrap_or(&path).to_string();
+                // An unreadable path still sends the part (empty) so the server
+                // sees the field — the upload just carries no bytes.
+                match std::fs::read(&path) {
+                    Ok(bytes) => (
+                        filename.clone(),
+                        guess_upload_content_type(&filename),
+                        bytes,
+                    ),
+                    Err(_) => (filename, "application/octet-stream", Vec::new()),
+                }
+            };
+            write_file_part(&mut body, &boundary, name, &filename, ctype, &bytes);
+        } else {
+            for value in control_values(c, store) {
+                write_text_part(&mut body, &boundary, name, &value);
+            }
+        }
+    }
+    body.extend_from_slice(format!("--{boundary}--\r\n").as_bytes());
+    (format!("multipart/form-data; boundary={boundary}"), body)
+}
+
+/// Write one text part to a multipart `body`.
+fn write_text_part(body: &mut Vec<u8>, boundary: &str, name: &str, value: &str) {
+    body.extend_from_slice(format!("--{boundary}\r\n").as_bytes());
+    body.extend_from_slice(
+        format!(
+            "Content-Disposition: form-data; name=\"{}\"\r\n\r\n",
+            escape_quotes(name)
+        )
+        .as_bytes(),
+    );
+    body.extend_from_slice(value.as_bytes());
+    body.extend_from_slice(b"\r\n");
+}
+
+/// Write one file part (with a filename + content type) to a multipart `body`.
+fn write_file_part(
+    body: &mut Vec<u8>,
+    boundary: &str,
+    name: &str,
+    filename: &str,
+    content_type: &str,
+    bytes: &[u8],
+) {
+    body.extend_from_slice(format!("--{boundary}\r\n").as_bytes());
+    body.extend_from_slice(
+        format!(
+            "Content-Disposition: form-data; name=\"{}\"; filename=\"{}\"\r\n",
+            escape_quotes(name),
+            escape_quotes(filename)
+        )
+        .as_bytes(),
+    );
+    body.extend_from_slice(format!("Content-Type: {content_type}\r\n\r\n").as_bytes());
+    body.extend_from_slice(bytes);
+    body.extend_from_slice(b"\r\n");
+}
+
+/// Escape `"` and CR/LF in a multipart header parameter (name/filename).
+fn escape_quotes(s: &str) -> String {
+    s.replace('"', "%22").replace(['\r', '\n'], "")
+}
+
+/// Guess an upload part's `Content-Type` from a filename extension (a small,
+/// common set; anything else is the generic binary type).
+fn guess_upload_content_type(filename: &str) -> &'static str {
+    let ext = filename
+        .rsplit_once('.')
+        .map(|(_, e)| e.to_ascii_lowercase())
+        .unwrap_or_default();
+    match ext.as_str() {
+        "txt" | "csv" | "text" => "text/plain",
+        "html" | "htm" => "text/html",
+        "json" => "application/json",
+        "pdf" => "application/pdf",
+        "png" => "image/png",
+        "jpg" | "jpeg" => "image/jpeg",
+        "gif" => "image/gif",
+        "webp" => "image/webp",
+        "svg" => "image/svg+xml",
+        "zip" => "application/zip",
+        _ => "application/octet-stream",
+    }
+}
+
 /// The submitted value(s) of one control (empty if it is not successful, e.g. an
 /// unchecked box or a button).
 fn control_values(c: &ControlRef<'_>, store: &FormStore) -> Vec<String> {
@@ -3542,7 +4625,9 @@ fn hex_digit(n: u8) -> char {
 
 /// Paint the "Load anyway (insecure)" button into the content area; return its
 /// hit rect.
-fn paint_insecure_button(fb: &mut Framebuffer, text: &TextEngine) -> Rect {
+fn paint_insecure_button(fb: &mut Framebuffer, text: &TextEngine, scale: f32) -> Rect {
+    // `rect` is logical (returned for hit-testing, which works in logical px);
+    // the painted list is scaled to the physical surface.
     let rect = Rect::new(12, cerberus_ui::TOOLBAR_HEIGHT as i32 + 96, 240, 32);
     let mut list = DisplayList::new();
     list.push(DisplayItem::Rect {
@@ -3555,7 +4640,7 @@ fn paint_insecure_button(fb: &mut Framebuffer, text: &TextEngine) -> Rect {
         color: Color::WHITE,
         style: FontStyle::REGULAR,
     });
-    text.rasterize(&list, fb);
+    text.rasterize(&list.scaled(scale), fb);
     rect
 }
 
@@ -3591,6 +4676,7 @@ fn paint_settings_overlay(
     input_chars: usize,
     vault_msg: Option<&str>,
     hud_on: bool,
+    scale: f32,
 ) {
     let panel = settings_panel_rect(size);
     let (px, py, pw, ph) = (panel.x, panel.y, panel.w, panel.h);
@@ -3682,7 +4768,7 @@ fn paint_settings_overlay(
         color: Color::rgb(0x20, 0x40, 0x70),
         style: FontStyle::REGULAR,
     });
-    raster.rasterize(&list, fb);
+    raster.rasterize(&list.scaled(scale), fb);
 }
 
 /// One pipeline-stage benchmark result.
@@ -3831,6 +4917,73 @@ pub fn head_switch_rss(switches: usize) -> Option<(u64, u64)> {
     Some((before, after))
 }
 
+/// Result of [`mirror_bench`]: the large-N mirror-group gate (E3/ADR-0026).
+pub struct MirrorBench {
+    /// How many sealed instances the group held.
+    pub instances: usize,
+    /// Time to focus every instance once from cold (each rebuilds from the log).
+    pub cold_sweep_ms: f64,
+    /// Time to re-focus every instance — converged, resident snapshots are
+    /// reused without a rebuild (E2), so this should be far below the cold sweep.
+    pub warm_sweep_ms: f64,
+    /// Resident set after dropping dormant snapshots, or `None` off-procfs.
+    pub peak_rss_kb: Option<u64>,
+}
+
+/// Large-N mirror-group benchmark/gate (E3/ADR-0026): build a group of `n`
+/// sealed instances over a built-in page, drive a fixed action, then sweep focus
+/// across every instance twice — cold (each rebuilds) and warm (each reuses its
+/// converged snapshot) — and read resident memory after releasing the dormant
+/// snapshots. Guards the catch-up perf (E1/E2) and the bounded-memory model that
+/// keeps thousands of profiles affordable (PLAN §1).
+pub fn mirror_bench(n: usize) -> Result<MirrorBench, String> {
+    let members: Vec<(InstanceId, String)> = (0..n)
+        .map(|i| (InstanceId::from_u64_pair(0, i as u64 + 1), format!("id{i}")))
+        .collect();
+    let engine = QuickJsEngineFactory
+        .instantiate()
+        .map_err(|e| format!("{e:?}"))?;
+    let mut group = cerberus_mirror::MirrorGroup::new(
+        engine,
+        Box::new(mirror::AppPageSource::builtin_only()),
+        members,
+        (1280, 800),
+        DEFAULT_USER_AGENT,
+    )
+    .map_err(|e| e.to_string())?;
+
+    group
+        .act(cerberus_mirror::Action::Navigate("cerberus:about".into()))
+        .map_err(|e| e.to_string())?;
+
+    // Cold sweep: the first focus of each instance rebuilds it from the log.
+    let t = Instant::now();
+    for i in 0..n {
+        group.focus(i).map_err(|e| e.to_string())?;
+    }
+    let cold_sweep_ms = t.elapsed().as_secs_f64() * 1000.0;
+
+    // Warm sweep: every instance is now a converged, resident snapshot, so
+    // re-focusing reuses it without a realm rebuild or page reload (E2).
+    let t = Instant::now();
+    for i in 0..n {
+        group.focus(i).map_err(|e| e.to_string())?;
+    }
+    let warm_sweep_ms = t.elapsed().as_secs_f64() * 1000.0;
+
+    // Drop dormant snapshots — the model that keeps resident memory ~one live
+    // document regardless of N.
+    group.release_dormant();
+    let peak_rss_kb = resident_set_kb();
+
+    Ok(MirrorBench {
+        instances: n,
+        cold_sweep_ms,
+        warm_sweep_ms,
+        peak_rss_kb,
+    })
+}
+
 /// Process resident set size in kilobytes, via the [`cerberus_sysmem`] adapter
 /// (procfs on Linux, the Win32 working set on Windows, `None` elsewhere —
 /// ADR-0015). `mem-gate` degrades gracefully when this is `None`.
@@ -3839,6 +4992,24 @@ pub use cerberus_sysmem::resident_set_kb;
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn mirror_bench_drives_many_instances_within_budget() {
+        // A modest N keeps the test fast; the CLI gate uses 256/1024.
+        let bench = mirror_bench(8).expect("mirror-bench runs");
+        assert_eq!(bench.instances, 8);
+        // Both sweeps completed; the warm sweep reuses converged snapshots, so it
+        // is no slower than the cold sweep (E2) — allow slack for timer noise.
+        assert!(bench.warm_sweep_ms <= bench.cold_sweep_ms + 5.0);
+        // Resident memory after releasing dormant snapshots is well within budget.
+        if let Some(kb) = bench.peak_rss_kb {
+            assert!(
+                kb as f64 / 1024.0 <= 64.0,
+                "resident {:.1} MB exceeds the 64 MB budget",
+                kb as f64 / 1024.0
+            );
+        }
+    }
 
     #[test]
     fn renders_builtin_home_end_to_end() {
@@ -3855,6 +5026,61 @@ mod tests {
         assert_eq!(outcome.third_party_decision, Decision::Deny);
         // A frame was produced at the requested size.
         assert_eq!(outcome.framebuffer.size, RenderConfig::default().viewport);
+    }
+
+    #[test]
+    fn mirc_panel_opens_lists_identities_broadcasts_and_closes() {
+        let mut app = BrowserApp::new();
+        // The SYNC button advertises one driver per identity.
+        let n = app.heads.heads().len();
+        assert!(n >= 1);
+        assert_eq!(app.toolbar.sync_count, n);
+
+        // The SYNC action opens the MIRC panel (it no longer toggles broadcast).
+        assert!(!app.mirc_open);
+        assert!(app.handle(ToolbarAction::OpenSync));
+        assert!(app.mirc_open);
+        assert!(
+            !app.toolbar.broadcasting,
+            "opening the panel doesn't broadcast"
+        );
+
+        // The roster has one row per identity; exactly the active head is live,
+        // and on a built-in page (no site) nothing reads as logged in.
+        let rows = app.mirc_rows();
+        assert_eq!(rows.len(), n);
+        assert_eq!(
+            rows.iter().filter(|r| r.state == MircState::Live).count(),
+            1
+        );
+        assert_eq!(rows[app.heads.active_index()].state, MircState::Live);
+        assert!(rows.iter().all(|r| !r.account.is_empty()));
+        assert!(rows.iter().all(|r| !r.logged_in));
+
+        // The panel paints over a frame without panicking (sets last_size).
+        let size = Size::new(1000, 700);
+        let _ = app.render_frame(size);
+
+        // Broadcast toggles from the panel now (it moved off the toolbar button).
+        app.apply_mirc_action(MircAction::ToggleBroadcast);
+        assert!(app.toolbar.broadcasting);
+        app.apply_mirc_action(MircAction::ToggleBroadcast);
+        assert!(!app.toolbar.broadcasting);
+
+        // A click outside the panel dismisses it.
+        let p = MircPanel::panel_rect(size);
+        assert!(app.pointer_down((p.x - 5).max(0), p.y + 5));
+        assert!(!app.mirc_open);
+
+        // Opening a *different* identity surfaces it (becomes the active head)
+        // and closes the panel — the lazy "select → render" gesture.
+        if n >= 2 {
+            app.handle(ToolbarAction::OpenSync);
+            let other = (app.heads.active_index() + 1) % n;
+            app.apply_mirc_action(MircAction::Open(other));
+            assert_eq!(app.heads.active_index(), other);
+            assert!(!app.mirc_open);
+        }
     }
 
     // ---- Persistent profile helpers ----
@@ -3898,6 +5124,47 @@ mod tests {
         let _env = open_profile_storage(&dir).unwrap();
         let salt2 = std::fs::read(dir.join(VAULT_SALT_FILE)).unwrap();
         assert_eq!(salt1, salt2, "salt must be stable across opens");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn profile_csv_import_creates_identities_and_round_trips_export() {
+        let dir = std::env::temp_dir().join(format!("cerb-csv-test-{}", std::process::id()));
+        std::fs::remove_dir_all(&dir).ok();
+        std::fs::create_dir_all(&dir).unwrap();
+        let dir_s = dir.to_str().unwrap();
+
+        // One existing default label ("work") + one brand-new identity.
+        // (Quoting/delimiter edge cases are covered by the cerberus-autofill csv
+        // unit tests; this test exercises the vault round-trip + identity creation.)
+        let csv = "identity:login.username:login.password:address.city:card.number\n\
+                   work:ada:pw1:London:4111111111111111\n\
+                   agent-x:bob:pw2:Paris:\n";
+        let in_file = dir.join("in.csv");
+        std::fs::write(&in_file, csv).unwrap();
+
+        let report = profile_import(dir_s, in_file.to_str().unwrap(), "pass").expect("import");
+        assert!(report
+            .iter()
+            .any(|l| l.contains("created identity \"agent-x\"")));
+        // The new identity was persisted as a real head.
+        let (heads, _) = load_heads(&dir).expect("heads saved");
+        assert!(heads.iter().any(|h| h.label == "agent-x"));
+
+        // Export and confirm the values survived the sealed vault round-trip.
+        let out_file = dir.join("out.csv");
+        let n = profile_export(dir_s, out_file.to_str().unwrap(), "pass", ':').expect("export");
+        assert!(n >= 4, "3 defaults + agent-x");
+        let text = std::fs::read_to_string(&out_file).unwrap();
+        let rows = cerberus_autofill::profiles_from_csv(&text).unwrap();
+        let work = rows.iter().find(|(l, _)| l == "work").unwrap();
+        assert_eq!(work.1.login.username, "ada");
+        assert_eq!(work.1.login.password, "pw1");
+        assert_eq!(work.1.address.city, "London");
+        assert_eq!(work.1.card.number, "4111111111111111");
+        let ax = rows.iter().find(|(l, _)| l == "agent-x").unwrap();
+        assert_eq!(ax.1.login.username, "bob");
+
         std::fs::remove_dir_all(&dir).ok();
     }
 
@@ -4102,7 +5369,7 @@ mod tests {
     }
 
     #[test]
-    fn cookie_inspector_cycles_deletes_and_edits_ttl() {
+    fn cookie_inspector_cycles_and_deletes() {
         let mut app = fake_app(vec![(
             "cerberus:home",
             Ok(page("cerberus:home", 200, None, "<p>hi</p>")),
@@ -4127,7 +5394,7 @@ mod tests {
         app.apply_cookie_action(CookieAction::Reveal(0));
         assert!(app.cookie_rows()[0].2.primary.contains("sid=v"));
 
-        // Cycle: Allow → Session.
+        // The chip is now a clear three-state cycle: Allow → Session → Block.
         app.apply_cookie_action(CookieAction::Cycle(0));
         assert_eq!(
             app.cookie_policy
@@ -4135,20 +5402,7 @@ mod tests {
                 .resolve("https://example.com", "sid"),
             CookieDisposition::Session
         );
-        // Cycle again: Session → Timed(default), which opens the TTL editor.
-        app.apply_cookie_action(CookieAction::Cycle(0));
-        assert!(app.cookie_ttl_edit.is_some());
-        // Type a new TTL and commit.
-        if let Some((_, _, buf)) = &mut app.cookie_ttl_edit {
-            *buf = "90".to_string();
-        }
-        app.commit_ttl_edit();
-        assert_eq!(
-            app.cookie_policy
-                .locked()
-                .resolve("https://example.com", "sid"),
-            CookieDisposition::Timed(90)
-        );
+        assert_eq!(app.cookie_rows().len(), 1, "session keeps the cookie");
 
         // Delete removes the cookie and records a Block override.
         app.apply_cookie_action(CookieAction::Delete(0));
@@ -4307,6 +5561,9 @@ mod tests {
     use std::cell::RefCell;
     use std::collections::{HashMap, VecDeque};
 
+    /// `(url, post-body)` of each page request the fake loader saw, in order.
+    type SeenRequests = Arc<Mutex<Vec<(String, Option<PostBody>)>>>;
+
     struct FakeLoader {
         responses: HashMap<String, Result<FetchedPage, String>>,
         images: HashMap<String, Result<Vec<u8>, String>>,
@@ -4314,6 +5571,8 @@ mod tests {
         queue: RefCell<VecDeque<Done>>,
         /// Instances seen on page requests, in order (head-switch tests).
         seen_instances: Arc<Mutex<Vec<InstanceId>>>,
+        /// `(url, post)` of each page request, in order (form GET/POST tests).
+        seen_requests: SeenRequests,
     }
 
     impl FakeLoader {
@@ -4327,6 +5586,7 @@ mod tests {
                 fetches: HashMap::new(),
                 queue: RefCell::new(VecDeque::new()),
                 seen_instances: Arc::new(Mutex::new(Vec::new())),
+                seen_requests: Arc::new(Mutex::new(Vec::new())),
             }
         }
 
@@ -4348,8 +5608,9 @@ mod tests {
     }
 
     impl PageLoader for FakeLoader {
-        fn request(&self, id: u64, url: String, ctx: FetchContext) {
+        fn request(&self, id: u64, url: String, post: Option<PostBody>, ctx: FetchContext) {
             self.seen_instances.locked().push(ctx.instance);
+            self.seen_requests.locked().push((url.clone(), post));
             let result = self
                 .responses
                 .get(&url)
@@ -4581,6 +5842,50 @@ mod tests {
     }
 
     #[test]
+    fn browser_dns_failure_during_upgrade_reports_cause_not_https_prompt() {
+        // A DNS failure (the name never resolved) must NOT be misreported as the
+        // site lacking HTTPS — switching to plaintext can't help — so we show the
+        // real cause and offer no insecure prompt.
+        let mut b = fake_app(vec![(
+            "https://nx.test/",
+            Err("Dns(\"system DNS: no records for nx.test\")".to_string()),
+        )]);
+        b.navigate("http://nx.test/");
+        assert!(b.poll());
+        assert!(
+            b.insecure_prompt.is_none(),
+            "a DNS failure must not offer the plaintext prompt"
+        );
+        let text = b.document.root().text_content();
+        assert!(text.contains("Cannot load page"), "got {text:?}");
+        assert!(
+            !text.contains("doesn't support HTTPS"),
+            "DNS failure misreported as no-HTTPS: {text:?}"
+        );
+    }
+
+    #[test]
+    fn fragment_navigation_does_not_refetch() {
+        let mut b = fake_app(vec![(
+            "https://ex.test/",
+            Ok(page("https://ex.test/", 200, None, "<h1>Home</h1>")),
+        )]);
+        b.navigate("https://ex.test/");
+        assert!(b.poll());
+        let before = b.document.root().text_content();
+        // In-page anchor: same document, only the #fragment differs.
+        b.navigate("https://ex.test/#section");
+        assert!(b.pending.is_none(), "fragment nav must not start a fetch");
+        assert_eq!(b.toolbar.url_text, "https://ex.test/#section");
+        assert_eq!(
+            b.document.root().text_content(),
+            before,
+            "document is unchanged by a fragment navigation"
+        );
+        assert!(b.toolbar.can_back, "fragment nav still records history");
+    }
+
+    #[test]
     fn browser_cache_serves_repeat_without_a_new_request() {
         let mut b = fake_app(vec![(
             "https://c.test/",
@@ -4717,6 +6022,81 @@ mod tests {
         );
         // A frame renders without panicking now that an Image item is present.
         b.render_frame(Size::new(800, 600));
+    }
+
+    /// The `color` of the first `<p>` in a styled tree (helper for the external
+    /// stylesheet tests).
+    fn styled_p_color(node: &cerberus_style::StyledNode) -> Option<Color> {
+        if node.tag == "p" {
+            return Some(node.style.color);
+        }
+        node.children.iter().find_map(|c| match c {
+            cerberus_style::StyledChild::Element(e) => styled_p_color(e),
+            _ => None,
+        })
+    }
+
+    #[test]
+    fn external_stylesheet_loads_via_worker_and_restyles() {
+        // A first-party <link rel=stylesheet> is fetched on the worker, routed to
+        // the cascade (not the image decoder), and re-styles the page when it
+        // lands (ADR-0037).
+        let mut b = fake_app_img(
+            vec![(
+                "https://site.test/",
+                Ok(page(
+                    "https://site.test/",
+                    200,
+                    None,
+                    "<html><head><link rel=\"stylesheet\" href=\"/s.css\"></head>\
+                     <body><p>hi</p></body></html>",
+                )),
+            )],
+            vec![("https://site.test/s.css", Ok(b"p{color:#ff0000}".to_vec()))],
+        );
+        b.navigate("https://site.test/");
+        // One poll drains the page load (inline styling → UA-default black) and
+        // the stylesheet it queued (re-styles to red).
+        assert!(b.poll());
+        assert_eq!(
+            styled_p_color(&b.styled.root),
+            Some(Color::rgb(0xff, 0, 0)),
+            "external stylesheet applied via the async worker path"
+        );
+        // The sheet went to the cascade, not the image store, and none is left
+        // pending.
+        assert!(b.images.is_empty(), "stylesheet not stored as an image");
+        assert!(b.pending_sheets.is_empty(), "no stylesheet left pending");
+    }
+
+    #[test]
+    fn third_party_stylesheet_is_consent_blocked() {
+        // A cross-site stylesheet is gated by default-deny: never fetched, never
+        // applied — consistent with image subresources.
+        let mut b = fake_app_img(
+            vec![(
+                "https://site.test/",
+                Ok(page(
+                    "https://site.test/",
+                    200,
+                    None,
+                    "<html><head><link rel=\"stylesheet\" href=\"https://cdn.other/s.css\"></head>\
+                     <body><p>hi</p></body></html>",
+                )),
+            )],
+            vec![("https://cdn.other/s.css", Ok(b"p{color:#ff0000}".to_vec()))],
+        );
+        b.navigate("https://site.test/");
+        assert!(b.poll());
+        assert_eq!(
+            styled_p_color(&b.styled.root),
+            Some(Color::BLACK),
+            "third-party stylesheet must not apply without consent"
+        );
+        assert!(
+            b.pending_sheets.is_empty(),
+            "blocked sheet is never dispatched"
+        );
     }
 
     #[test]
@@ -4925,6 +6305,158 @@ mod tests {
         assert!(b.submit(), "submit consumed");
         assert!(b.pending.is_some(), "navigation started");
         assert_eq!(b.toolbar.url_text, "https://site.test/s?q=hi");
+    }
+
+    #[test]
+    fn post_form_submits_a_body_not_a_query() {
+        // A POST login form: the encoded controls must ride in the request body,
+        // and the URL must stay query-free (the old behavior downgraded to GET).
+        let responses = vec![
+            (
+                "https://site.test/",
+                Ok(page(
+                    "https://site.test/",
+                    200,
+                    None,
+                    "<form action='/login' method='POST'><input name='user'></form>",
+                )),
+            ),
+            (
+                "https://site.test/login",
+                Ok(page("https://site.test/login", 200, None, "welcome")),
+            ),
+        ];
+        let loader = FakeLoader::new(responses);
+        let seen = loader.seen_requests.clone();
+        let mut b = BrowserApp::with_loader(Box::new(loader));
+        b.navigate("https://site.test/");
+        assert!(b.poll(), "form page loaded");
+
+        b.render_frame(Size::new(800, 600));
+        let r = b.form_fields[0].rect;
+        assert!(b.pointer_down(r.x + 1, r.y + 1));
+        assert!(b.text_input('h'));
+        assert!(b.text_input('i'));
+        assert!(b.submit(), "submit consumed");
+
+        // The URL is the bare action — the data is NOT in the query.
+        assert_eq!(b.toolbar.url_text, "https://site.test/login");
+        // The loader received a POST whose body is the urlencoded controls.
+        let reqs = seen.locked().clone();
+        let (url, post) = reqs.last().expect("a page request");
+        assert_eq!(url, "https://site.test/login");
+        let post = post.as_ref().expect("a POST body, not a GET");
+        assert_eq!(post.content_type, "application/x-www-form-urlencoded");
+        assert_eq!(String::from_utf8_lossy(&post.body), "user=hi");
+
+        // The POST response renders (and is not cached).
+        assert!(b.poll(), "post response drained");
+        assert_eq!(b.status, 200);
+    }
+
+    #[test]
+    fn multipart_builds_text_and_file_parts() {
+        let dir = std::env::temp_dir().join(format!("cerb-upload-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("hello.txt");
+        std::fs::write(&file, b"FILE-CONTENTS").unwrap();
+
+        let doc = parse_html(
+            "<form method=\"post\" enctype=\"multipart/form-data\">\
+             <input name=\"note\" value=\"hi\"><input type=\"file\" name=\"upload\"></form>",
+        );
+        let controls = collect_controls(doc.root());
+        let form = controls[0].form;
+        let mut store = FormStore::default();
+        let file_id = controls.iter().find(|c| is_file_input(c.el)).unwrap().id;
+        store
+            .values
+            .insert(file_id, file.to_string_lossy().to_string());
+
+        let (ctype, body) = build_multipart(&controls, form, &store);
+        assert!(ctype.starts_with("multipart/form-data; boundary=----CerberusFormBoundary"));
+        let text = String::from_utf8_lossy(&body);
+        assert!(text.contains("name=\"note\""), "text part header");
+        assert!(text.contains("\r\n\r\nhi\r\n"), "text part value");
+        assert!(
+            text.contains("name=\"upload\"; filename=\"hello.txt\""),
+            "file part header"
+        );
+        assert!(text.contains("Content-Type: text/plain"), "guessed type");
+        assert!(text.contains("FILE-CONTENTS"), "file bytes inlined");
+        assert!(text.trim_end().ends_with("--"), "closing boundary");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn download_target_detects_attachments_and_binary_types() {
+        // Content-Disposition: attachment → download, filename from the header.
+        let h = vec![(
+            "Content-Disposition".to_string(),
+            "attachment; filename=\"report.csv\"".to_string(),
+        )];
+        assert_eq!(
+            download_target(&h, "https://x.test/gen"),
+            Some("report.csv".to_string())
+        );
+        // A non-renderable content type → download, filename from the URL.
+        let h = vec![("content-type".to_string(), "application/zip".to_string())];
+        assert_eq!(
+            download_target(&h, "https://x.test/files/pack.zip"),
+            Some("pack.zip".to_string())
+        );
+        // HTML / plain text render (not downloads).
+        let h = vec![(
+            "content-type".to_string(),
+            "text/html; charset=utf-8".to_string(),
+        )];
+        assert_eq!(download_target(&h, "https://x.test/"), None);
+        // Path traversal in the filename is stripped.
+        let h = vec![(
+            "Content-Disposition".to_string(),
+            "attachment; filename=\"../../etc/passwd\"".to_string(),
+        )];
+        assert_eq!(
+            download_target(&h, "https://x.test/x"),
+            Some("passwd".to_string())
+        );
+    }
+
+    #[test]
+    fn attachment_response_is_saved_to_the_downloads_dir() {
+        let dir = std::env::temp_dir().join(format!("cerb-dl-{}", std::process::id()));
+        std::fs::remove_dir_all(&dir).ok();
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let url = "https://files.test/export";
+        let body = b"id,amount\n1,42\n".to_vec();
+        let resp = FetchedPage {
+            url: url.to_string(),
+            status: 200,
+            headers: vec![(
+                "Content-Disposition".to_string(),
+                "attachment; filename=\"claims.csv\"".to_string(),
+            )],
+            body: body.clone(),
+            user_agent: DEFAULT_USER_AGENT.to_string(),
+            elapsed: Duration::from_millis(3),
+        };
+        let loader = FakeLoader::new(vec![(url, Ok(resp))]);
+        let mut app = BrowserApp::build(
+            Box::new(loader),
+            Arc::new(Mutex::new(StorageEnvironment::with_no_vault())),
+            default_heads(),
+            Some(dir.clone()),
+        );
+        app.navigate(url);
+        assert!(app.poll(), "download drained");
+
+        // The file was saved, and the page reports the download (not the bytes).
+        let saved = dir.join("downloads").join("claims.csv");
+        assert!(saved.exists(), "file written to downloads dir");
+        assert_eq!(std::fs::read(&saved).unwrap(), body);
+        assert!(app.page_text().contains("Download complete"));
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]

@@ -1,7 +1,12 @@
 //! Cerberus command-line entry point.
 //!
+//! With **no arguments** (e.g. double-clicking the .exe) a desktop build opens
+//! the browser window (`run`); a headless build renders the default page
+//! (`render`). See `default_command`.
+//!
 //! Subcommands (argument parsing is hand-rolled — no `clap` until approved):
-//!   render    Render a page to a PPM file and print a summary.
+//!   run       Open the browser in a window (desktop build).
+//!   render    Render a page to a PPM file and print a summary (headless).
 //!   mem-gate  Render, then assert resident memory is within budget (CI gate).
 //!   version   Print the version.
 //!   help      Print usage.
@@ -14,7 +19,10 @@ fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
     let (command, rest) = match args.split_first() {
         Some((cmd, rest)) => (cmd.as_str(), rest),
-        None => ("render", &[][..]),
+        // No arguments — e.g. double-clicking the .exe in a file manager. A
+        // desktop (windowing) build opens the browser window, which is what that
+        // gesture means to a user; a headless build renders the default page.
+        None => (default_command(), &[][..]),
     };
 
     match command {
@@ -22,6 +30,7 @@ fn main() -> ExitCode {
         "render" => cmd_render(rest),
         "mem-gate" => cmd_mem_gate(rest),
         "bench" => cmd_bench(rest),
+        "mirror-bench" => cmd_mirror_bench(rest),
         "cookies" => cmd_cookies(rest),
         "identities" => cmd_identities(rest),
         "profile" => cmd_profile(rest),
@@ -238,6 +247,53 @@ fn cmd_bench(args: &[String]) -> ExitCode {
     ExitCode::SUCCESS
 }
 
+/// `mirror-bench` — the large-N mirror-group gate (E3/ADR-0026): build a group of
+/// N sealed instances, sweep focus across all of them (cold then warm), and
+/// assert resident memory after releasing dormant snapshots stays within budget.
+fn cmd_mirror_bench(args: &[String]) -> ExitCode {
+    let n: usize = flag(args, "--instances")
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(256);
+    let budget_mb: f64 = flag(args, "--budget-mb")
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(64.0);
+
+    let bench = match cerberus_app::mirror_bench(n) {
+        Ok(b) => b,
+        Err(e) => {
+            eprintln!("mirror-bench failed: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    println!("mirror-bench ({} instances):", bench.instances);
+    println!(
+        "  cold focus sweep : {:>8.2} ms ({:.3} ms/instance)",
+        bench.cold_sweep_ms,
+        bench.cold_sweep_ms / n.max(1) as f64
+    );
+    println!(
+        "  warm focus sweep : {:>8.2} ms (re-focus reuses converged snapshots)",
+        bench.warm_sweep_ms
+    );
+    match bench.peak_rss_kb {
+        Some(kb) => {
+            let mb = kb as f64 / 1024.0;
+            println!("  resident (after release_dormant): {mb:.1} MB");
+            if mb > budget_mb {
+                eprintln!(
+                    "mirror-bench FAIL: resident {mb:.1} MB > budget {budget_mb:.1} MB (N={n})"
+                );
+                return ExitCode::FAILURE;
+            }
+            println!("mirror-bench PASS: resident {mb:.1} MB <= budget {budget_mb:.1} MB (N={n})");
+        }
+        None => {
+            println!("  resident memory unavailable on this platform; skipping budget check");
+        }
+    }
+    ExitCode::SUCCESS
+}
+
 /// `cookies` — inspect and retune the per-cookie disposition policy of a
 /// persistent profile, headlessly.
 fn cmd_cookies(args: &[String]) -> ExitCode {
@@ -289,23 +345,118 @@ fn cmd_identities(args: &[String]) -> ExitCode {
     }
 }
 
-/// `profile` — show, or with `--set "key=value;…"`, update an identity's autofill
-/// profile (login/address/card), sealed in the encrypted vault. The vault
-/// passphrase comes from `CERBERUS_VAULT_PASS` (never an argument, to keep it out
-/// of shell history).
+/// Resolve a `--delimiter` value to a single char. Accepts a literal char or a
+/// name (`tab`/`colon`/`comma`/`semicolon`/`pipe`/`space`), since a tab can't be
+/// typed as an argument. The quote char is reserved for field quoting.
+fn parse_delimiter(s: &str) -> Result<char, String> {
+    let d = match s {
+        "tab" => '\t',
+        "colon" => ':',
+        "comma" => ',',
+        "semicolon" => ';',
+        "pipe" => '|',
+        "space" => ' ',
+        _ => {
+            let mut it = s.chars();
+            match (it.next(), it.next()) {
+                (Some(c), None) => c,
+                _ => return Err(format!("--delimiter must be one char or a name, got {s:?}")),
+            }
+        }
+    };
+    if d == '"' {
+        return Err("--delimiter cannot be the quote character".into());
+    }
+    Ok(d)
+}
+
+/// `profile` — manage identities' autofill profiles (login/address/card), sealed
+/// in the encrypted vault. Modes:
+///   --template <FILE|->        write a no-frills CSV template (no vault needed)
+///   --export   <FILE>          export every identity's profile to CSV
+///   --import   <FILE>          import profiles from CSV (creates missing ids)
+///   --set "key=value;…"        update one identity's profile (--identity N)
+///   (default)                  show one identity's profile (--identity N)
+/// `--delimiter <CHAR|name>` selects the CSV delimiter (default `:`; import
+/// auto-detects). The vault passphrase comes from `CERBERUS_VAULT_PASS` (never an
+/// argument, to keep it out of shell history) for every mode except --template.
 fn cmd_profile(args: &[String]) -> ExitCode {
+    let delim = match flag(args, "--delimiter").as_deref() {
+        Some(s) => match parse_delimiter(s) {
+            Ok(d) => d,
+            Err(e) => {
+                eprintln!("profile: {e}");
+                return ExitCode::FAILURE;
+            }
+        },
+        None => ':',
+    };
+
+    // --template needs no profile dir or vault: it is pure text.
+    if let Some(file) = flag(args, "--template") {
+        let text = cerberus_app::profile_csv_template(delim);
+        let res = if file == "-" {
+            use std::io::Write;
+            std::io::stdout()
+                .write_all(text.as_bytes())
+                .map_err(|e| e.to_string())
+        } else {
+            std::fs::write(&file, &text).map_err(|e| e.to_string())
+        };
+        return match res {
+            Ok(()) => {
+                if file != "-" {
+                    println!("profile: wrote CSV template to {file}");
+                }
+                ExitCode::SUCCESS
+            }
+            Err(e) => {
+                eprintln!("profile: {e}");
+                ExitCode::FAILURE
+            }
+        };
+    }
+
     let Some(dir) = flag(args, "--data-dir") else {
         eprintln!("profile: --data-dir <DIR> is required");
         return ExitCode::FAILURE;
     };
-    let identity = flag(args, "--identity")
-        .and_then(|s| s.parse::<usize>().ok())
-        .unwrap_or(0);
-    let set = flag(args, "--set");
     let Ok(passphrase) = std::env::var("CERBERUS_VAULT_PASS") else {
         eprintln!("profile: set CERBERUS_VAULT_PASS to the vault passphrase");
         return ExitCode::FAILURE;
     };
+
+    if let Some(file) = flag(args, "--export") {
+        return match cerberus_app::profile_export(&dir, &file, &passphrase, delim) {
+            Ok(n) => {
+                println!("profile: exported {n} identities to {file}");
+                ExitCode::SUCCESS
+            }
+            Err(e) => {
+                eprintln!("profile: {e}");
+                ExitCode::FAILURE
+            }
+        };
+    }
+    if let Some(file) = flag(args, "--import") {
+        return match cerberus_app::profile_import(&dir, &file, &passphrase) {
+            Ok(lines) => {
+                for line in lines {
+                    println!("{line}");
+                }
+                ExitCode::SUCCESS
+            }
+            Err(e) => {
+                eprintln!("profile: {e}");
+                ExitCode::FAILURE
+            }
+        };
+    }
+
+    let identity = flag(args, "--identity")
+        .and_then(|s| s.parse::<usize>().ok())
+        .unwrap_or(0);
+    let set = flag(args, "--set");
     match cerberus_app::profile_admin(&dir, identity, set.as_deref(), &passphrase) {
         Ok(lines) => {
             for line in lines {
@@ -322,18 +473,22 @@ fn cmd_profile(args: &[String]) -> ExitCode {
 
 fn print_usage() {
     println!(
-        "cerberus — a privacy-first, memory-lean browser (M0 scaffold)\n\n\
+        "cerberus — a privacy-first, memory-lean browser\n\n\
          USAGE:\n\
-         \x20 cerberus <command> [options]\n\n\
+         \x20 cerberus <command> [options]\n\
+         \x20 cerberus                  (no command: opens the browser on a desktop build)\n\n\
          COMMANDS:\n\
          \x20 run        Open the browser in a window (needs a display)\n\
          \x20 render     Render a page to PPM and print a summary (headless)\n\
          \x20 mem-gate   Render and assert resident memory within budget\n\
          \x20 bench      Time the render pipeline stages (see --assert-total-ms)\n\
+         \x20 mirror-bench  Large-N mirror gate: focus-sweep N instances, assert RSS\n\
          \x20 cookies    Inspect/retune a profile's cookie dispositions (--data-dir)\n\
          \x20 identities Manage a profile's identities (--data-dir; --add/--remove)\n\
-         \x20 profile    Show/set an identity's autofill profile (--data-dir;\n\
-         \x20            --identity N; --set \"key=value;...\"; CERBERUS_VAULT_PASS)\n\
+         \x20 profile    Show/set an identity's autofill profile, or bulk\n\
+         \x20            import/export via CSV (--data-dir; --identity N;\n\
+         \x20            --set \"key=value;...\"; --template/--export/--import\n\
+         \x20            <FILE>; --delimiter <CHAR|name>; CERBERUS_VAULT_PASS)\n\
          \x20 version    Print the version\n\
          \x20 help       Print this help\n\n\
          RUN OPTIONS:\n\
@@ -357,8 +512,24 @@ fn print_usage() {
          \x20 (--out extension selects the format: .ppm, .png, or .pdf)\n\n\
          MEM-GATE OPTIONS:\n\
          \x20 --budget-mb <MB>     default: 64\n\
-         \x20 --switches <N>       also assert RSS within +10% after N head switches"
+         \x20 --switches <N>       also assert RSS within +10% after N head switches\n\n\
+         MIRROR-BENCH OPTIONS:\n\
+         \x20 --instances <N>      number of sealed instances to drive (default: 256)\n\
+         \x20 --budget-mb <MB>     resident budget after releasing dormant (default: 64)"
     );
+}
+
+/// The command used when the binary is launched with no arguments. A desktop
+/// (windowing) build opens the browser — what double-clicking the .exe is meant
+/// to do — while a headless build (`--no-default-features`) renders the default
+/// page. Previously this was always `render`, so double-clicking the desktop
+/// binary only flashed a console and wrote a `.ppm`.
+const fn default_command() -> &'static str {
+    if cfg!(feature = "windowing") {
+        "run"
+    } else {
+        "render"
+    }
 }
 
 /// Read `--key value` from args.

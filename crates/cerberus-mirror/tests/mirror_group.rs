@@ -220,6 +220,41 @@ fn dormant_instances_release_dom_and_rematerialize_on_focus() {
     assert!(g.live_realms() <= 1);
 }
 
+#[test]
+fn refocusing_a_converged_instance_reuses_its_snapshot() {
+    let seen = Rc::new(RefCell::new(Vec::new()));
+    let (mut g, _master, follower) = group(true, seen.clone());
+
+    g.act(Action::Navigate(URL.into())).unwrap();
+    g.act(Action::Click(Target::Id("btn".into()))).unwrap();
+
+    // How many times the follower's own session was loaded from the source.
+    let loads = || seen.borrow().iter().filter(|(i, _)| *i == follower).count();
+
+    // First focus builds the follower once (one page load for its session).
+    g.focus(1).unwrap();
+    assert_eq!(loads(), 1, "follower built once on first focus");
+    assert_eq!(g.instance(1).unwrap().cursor(), g.log().len());
+
+    // Switching away and back reuses the resident, converged snapshot — no realm
+    // rebuild and no second page load (E2).
+    g.focus(0).unwrap();
+    g.focus(1).unwrap();
+    assert_eq!(loads(), 1, "re-focus reused the snapshot, no rebuild");
+    assert_eq!(g.instance(1).unwrap().cursor(), g.log().len());
+    assert!(g.live_realms() <= 1);
+
+    // Releasing the dormant snapshot forces a rebuild on the next focus.
+    g.focus(0).unwrap();
+    g.release_dormant();
+    g.focus(1).unwrap();
+    assert_eq!(loads(), 2, "a released snapshot rebuilds from the log");
+    assert_eq!(
+        g.instance(1).unwrap().text_of_id("out").as_deref(),
+        Some("clicked")
+    );
+}
+
 /// A login form whose `input` event mirrors the typed value into #out, so a
 /// test can observe what each window actually filled.
 struct FillForm;
@@ -247,6 +282,7 @@ impl FillProvider for PerProfileFill {
         instance: InstanceId,
         _kind: FillKind,
         doc: &Document,
+        _page_host: &str,
     ) -> Vec<(NodeId, String)> {
         fn find(n: NodeRef<'_>, id: &str) -> Option<NodeId> {
             if n.attr("id") == Some(id) {
@@ -264,6 +300,71 @@ impl FillProvider for PerProfileFill {
             .map(|nid| vec![(nid, value.to_string())])
             .unwrap_or_default()
     }
+}
+
+#[test]
+fn typing_coalesces_into_one_input_and_followers_converge() {
+    let master = InstanceId::from_u64_pair(0, 1);
+    let follower = InstanceId::from_u64_pair(0, 2);
+    let engine = QuickJsEngineFactory.instantiate().unwrap();
+    let members = vec![
+        (master, "master".to_string()),
+        (follower, "follower".to_string()),
+    ];
+    let mut g = MirrorGroup::new(engine, Box::new(FillForm), members, (1024, 768), UA).unwrap();
+
+    g.act(Action::Navigate(URL.into())).unwrap();
+    let after_nav = g.log().len();
+
+    // Type "abc" a character at a time; each keystroke carries the whole value.
+    let user = Target::Id("user".into());
+    for text in ["a", "ab", "abc"] {
+        g.act(Action::Input {
+            target: user.clone(),
+            text: text.into(),
+        })
+        .unwrap();
+    }
+
+    // The run of keystrokes collapsed to a single log entry with the final value.
+    assert_eq!(
+        g.log().len(),
+        after_nav + 1,
+        "consecutive same-target inputs coalesce into one entry"
+    );
+    assert_eq!(
+        g.log().actions().last(),
+        Some(&Action::Input {
+            target: user.clone(),
+            text: "abc".into()
+        })
+    );
+    // The master's own input handler observed the final value.
+    assert_eq!(g.master().text_of_id("out").as_deref(), Some("abc"));
+
+    // A non-input action breaks the run, so the next keystroke starts fresh.
+    g.act(Action::Click(Target::Id("out".into()))).unwrap();
+    g.act(Action::Input {
+        target: user.clone(),
+        text: "abcd".into(),
+    })
+    .unwrap();
+    assert_eq!(
+        g.log().len(),
+        after_nav + 3,
+        "an intervening action prevents coalescing across it"
+    );
+
+    // The follower replays the coalesced log in its own session and converges.
+    g.focus(1).unwrap();
+    assert_eq!(
+        g.instance(1).unwrap().text_of_id("out").as_deref(),
+        Some("abcd"),
+        "the follower typed the final value in its own session"
+    );
+    assert_eq!(g.instance(1).unwrap().cursor(), g.log().len());
+    assert!(g.instance(1).unwrap().diverged().is_none());
+    assert!(g.live_realms() <= 1);
 }
 
 #[test]

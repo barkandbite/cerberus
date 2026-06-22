@@ -14,3 +14,7 @@ workspace = true
 [dependencies]
 cerberus-types = { path = "../cerberus-types" }
 cerberus-crypto = { path = "../cerberus-crypto" }
+# OS CSPRNG for salts, nonces, instance IDs, and farbling seeds. Audited,
+# std-backed, already in the dependency tree transitively; the fail-closed
+# entropy source replacing the SplitMix64 fallback (ADR-0033, issue #9).
+getrandom = "0.3"

@@ -83,6 +83,11 @@ jobs:
         with:
           tag_name: ${{ github.event.inputs.tag || github.ref_name }}
           name: ${{ github.event.inputs.tag || github.ref_name }}
+          # Create the tag at the dispatched commit, not the default branch.
+          # Without this, a workflow_dispatch release from a feature branch tags
+          # `main` (action-gh-release's default target_commitish), so the tag and
+          # source snapshot would not match the binaries built from this commit.
+          target_commitish: ${{ github.sha }}
           body_path: CHANGELOG.md
           files: dist/*
           fail_on_unmatched_files: true

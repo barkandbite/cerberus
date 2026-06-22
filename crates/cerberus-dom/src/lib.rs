@@ -57,6 +57,13 @@ impl Document {
         }
     }
 
+    /// A cursor at the node with arena id `id`, or `None` if it is out of range.
+    /// Lets callers that already hold a [`NodeId`] (e.g. layout hit boxes) read a
+    /// node's tag and attributes without re-walking the tree from the root.
+    pub fn node(&self, id: NodeId) -> Option<NodeRef<'_>> {
+        ((id as usize) < self.nodes.len()).then_some(NodeRef { doc: self, id })
+    }
+
     /// Inline `<script>` sources (elements without a `src` attribute), in
     /// document order. The text is the raw script body, undecoded — it is *not*
     /// part of the render tree and never appears in [`NodeRef::text_content`].
@@ -722,26 +729,138 @@ fn decode_entities(s: &str) -> String {
 }
 
 fn decode_one(entity: &str) -> Option<char> {
-    match entity {
-        "amp" => Some('&'),
-        "lt" => Some('<'),
-        "gt" => Some('>'),
-        "quot" => Some('"'),
-        "apos" => Some('\''),
-        "nbsp" => Some('\u{00A0}'),
-        _ => {
-            if let Some(hex) = entity
-                .strip_prefix("#x")
-                .or_else(|| entity.strip_prefix("#X"))
-            {
-                u32::from_str_radix(hex, 16).ok().and_then(char::from_u32)
-            } else if let Some(dec) = entity.strip_prefix('#') {
-                dec.parse::<u32>().ok().and_then(char::from_u32)
-            } else {
-                None
-            }
-        }
+    // Numeric character references first: &#123; and &#x1F600;.
+    if let Some(hex) = entity
+        .strip_prefix("#x")
+        .or_else(|| entity.strip_prefix("#X"))
+    {
+        return u32::from_str_radix(hex, 16).ok().and_then(char::from_u32);
     }
+    if let Some(dec) = entity.strip_prefix('#') {
+        return dec.parse::<u32>().ok().and_then(char::from_u32);
+    }
+    // Named references — the common subset of the HTML5 list (not exhaustive;
+    // numeric refs above cover the long tail). No external crate (dep policy).
+    let c = match entity {
+        // Core markup
+        "amp" => '&',
+        "lt" => '<',
+        "gt" => '>',
+        "quot" => '"',
+        "apos" => '\'',
+        // Spaces, dashes, punctuation
+        "nbsp" => '\u{00A0}',
+        "ensp" => '\u{2002}',
+        "emsp" => '\u{2003}',
+        "thinsp" => '\u{2009}',
+        "shy" => '\u{00AD}',
+        "ndash" => '\u{2013}',
+        "mdash" => '\u{2014}',
+        "hellip" => '\u{2026}',
+        "middot" => '\u{00B7}',
+        "bull" => '\u{2022}',
+        "lsquo" => '\u{2018}',
+        "rsquo" => '\u{2019}',
+        "sbquo" => '\u{201A}',
+        "ldquo" => '\u{201C}',
+        "rdquo" => '\u{201D}',
+        "bdquo" => '\u{201E}',
+        "laquo" => '\u{00AB}',
+        "raquo" => '\u{00BB}',
+        "dagger" => '\u{2020}',
+        "Dagger" => '\u{2021}',
+        "prime" => '\u{2032}',
+        "Prime" => '\u{2033}',
+        // Symbols and currency
+        "copy" => '\u{00A9}',
+        "reg" => '\u{00AE}',
+        "trade" => '\u{2122}',
+        "sect" => '\u{00A7}',
+        "para" => '\u{00B6}',
+        "deg" => '\u{00B0}',
+        "plusmn" => '\u{00B1}',
+        "times" => '\u{00D7}',
+        "divide" => '\u{00F7}',
+        "micro" => '\u{00B5}',
+        "sup1" => '\u{00B9}',
+        "sup2" => '\u{00B2}',
+        "sup3" => '\u{00B3}',
+        "frac12" => '\u{00BD}',
+        "frac14" => '\u{00BC}',
+        "frac34" => '\u{00BE}',
+        "cent" => '\u{00A2}',
+        "pound" => '\u{00A3}',
+        "curren" => '\u{00A4}',
+        "yen" => '\u{00A5}',
+        "euro" => '\u{20AC}',
+        "iexcl" => '\u{00A1}',
+        "iquest" => '\u{00BF}',
+        "infin" => '\u{221E}',
+        "ne" => '\u{2260}',
+        "le" => '\u{2264}',
+        "ge" => '\u{2265}',
+        "larr" => '\u{2190}',
+        "uarr" => '\u{2191}',
+        "rarr" => '\u{2192}',
+        "darr" => '\u{2193}',
+        "harr" => '\u{2194}',
+        // Common accented Latin letters
+        "agrave" => '\u{00E0}',
+        "aacute" => '\u{00E1}',
+        "acirc" => '\u{00E2}',
+        "atilde" => '\u{00E3}',
+        "auml" => '\u{00E4}',
+        "aring" => '\u{00E5}',
+        "aelig" => '\u{00E6}',
+        "ccedil" => '\u{00E7}',
+        "egrave" => '\u{00E8}',
+        "eacute" => '\u{00E9}',
+        "ecirc" => '\u{00EA}',
+        "euml" => '\u{00EB}',
+        "igrave" => '\u{00EC}',
+        "iacute" => '\u{00ED}',
+        "icirc" => '\u{00EE}',
+        "iuml" => '\u{00EF}',
+        "ntilde" => '\u{00F1}',
+        "ograve" => '\u{00F2}',
+        "oacute" => '\u{00F3}',
+        "ocirc" => '\u{00F4}',
+        "otilde" => '\u{00F5}',
+        "ouml" => '\u{00F6}',
+        "oslash" => '\u{00F8}',
+        "ugrave" => '\u{00F9}',
+        "uacute" => '\u{00FA}',
+        "ucirc" => '\u{00FB}',
+        "uuml" => '\u{00FC}',
+        "yacute" => '\u{00FD}',
+        "yuml" => '\u{00FF}',
+        "szlig" => '\u{00DF}',
+        "Agrave" => '\u{00C0}',
+        "Aacute" => '\u{00C1}',
+        "Acirc" => '\u{00C2}',
+        "Atilde" => '\u{00C3}',
+        "Auml" => '\u{00C4}',
+        "Aring" => '\u{00C5}',
+        "AElig" => '\u{00C6}',
+        "Ccedil" => '\u{00C7}',
+        "Egrave" => '\u{00C8}',
+        "Eacute" => '\u{00C9}',
+        "Ecirc" => '\u{00CA}',
+        "Euml" => '\u{00CB}',
+        "Ntilde" => '\u{00D1}',
+        "Ograve" => '\u{00D2}',
+        "Oacute" => '\u{00D3}',
+        "Ocirc" => '\u{00D4}',
+        "Otilde" => '\u{00D5}',
+        "Ouml" => '\u{00D6}',
+        "Oslash" => '\u{00D8}',
+        "Ugrave" => '\u{00D9}',
+        "Uacute" => '\u{00DA}',
+        "Ucirc" => '\u{00DB}',
+        "Uuml" => '\u{00DC}',
+        _ => return None,
+    };
+    Some(c)
 }
 
 #[cfg(test)]
@@ -804,6 +923,24 @@ mod tests {
         assert!(text.contains("done"));
         // The inline script body is captured separately, rawtext (undecoded).
         assert_eq!(doc.scripts(), &["if (x<1){ y }".to_string()]);
+    }
+
+    #[test]
+    fn decodes_common_named_and_numeric_entities() {
+        let doc = parse_html(
+            "<p>&copy; 2026 &mdash; caf&eacute; &amp; r&eacute;sum&eacute; \
+             &bull; &#169; &#x2764;</p>",
+        );
+        let text = doc.root().text_content();
+        assert!(text.contains("© 2026 — café & résumé"), "got {text:?}");
+        assert!(text.contains('•'), "bull decoded; got {text:?}");
+        assert!(text.contains('©'), "numeric decimal decoded; got {text:?}");
+        assert!(text.contains('❤'), "numeric hex decoded; got {text:?}");
+        // An unknown entity is left verbatim (no over-eager consumption).
+        assert!(parse_html("<p>&notareal;</p>")
+            .root()
+            .text_content()
+            .contains("&notareal;"));
     }
 
     #[test]

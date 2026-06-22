@@ -96,14 +96,16 @@ impl CookieDisposition {
         }
     }
 
-    /// Next disposition for a UI chip click (wraps).
+    /// Next disposition for a UI chip click (wraps). The everyday UI exposes a
+    /// clear three-state cycle — Allow → Session → Block — so the control reads
+    /// plainly. `Timed`/`AllowOnce` remain in the model (encode/decode, the CLI,
+    /// and any programmatic use) but are normalized back into the cycle here.
     pub fn cycle(self) -> Self {
         match self {
             Self::Allow => Self::Session,
-            Self::Session => Self::Timed(DEFAULT_TIMED_SECS),
-            Self::Timed(_) => Self::Block,
-            Self::Block => Self::AllowOnce,
-            Self::AllowOnce => Self::Allow,
+            Self::Session => Self::Block,
+            // Block, and any advanced/legacy state, return to Allow.
+            _ => Self::Allow,
         }
     }
 
@@ -274,19 +276,19 @@ mod tests {
     }
 
     #[test]
-    fn cycle_visits_every_mode() {
-        let mut d = CookieDisposition::Allow;
-        let mut seen = vec![d];
-        for _ in 0..4 {
-            d = d.cycle();
-            seen.push(d);
-        }
-        assert_eq!(d.cycle(), CookieDisposition::Allow); // wraps
-        assert!(seen.contains(&CookieDisposition::Session));
-        assert!(seen.contains(&CookieDisposition::Block));
-        assert!(seen
-            .iter()
-            .any(|d| matches!(d, CookieDisposition::Timed(_))));
+    fn cycle_is_a_clear_three_state_loop() {
+        // Allow → Session → Block → Allow. Advanced/legacy states normalize in.
+        assert_eq!(CookieDisposition::Allow.cycle(), CookieDisposition::Session);
+        assert_eq!(CookieDisposition::Session.cycle(), CookieDisposition::Block);
+        assert_eq!(CookieDisposition::Block.cycle(), CookieDisposition::Allow);
+        assert_eq!(
+            CookieDisposition::Timed(3600).cycle(),
+            CookieDisposition::Allow
+        );
+        assert_eq!(
+            CookieDisposition::AllowOnce.cycle(),
+            CookieDisposition::Allow
+        );
     }
 
     #[test]

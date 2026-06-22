@@ -33,8 +33,16 @@ use crate::MirrorError;
 /// so a single master [`Action::Fill`] fills every window with its **own**
 /// credentials.
 pub trait FillProvider {
-    /// The `(NodeId, value)` pairs to set for `kind` in `instance`'s `doc`.
-    fn fills(&self, instance: InstanceId, kind: FillKind, doc: &Document) -> Vec<(NodeId, String)>;
+    /// The `(NodeId, value)` pairs to set for `kind` in `instance`'s `doc`, for a
+    /// page on `page_host`. Secret fields (password/card) must only be returned
+    /// when the identity's profile is bound to `page_host` (issue #12).
+    fn fills(
+        &self,
+        instance: InstanceId,
+        kind: FillKind,
+        doc: &Document,
+        page_host: &str,
+    ) -> Vec<(NodeId, String)>;
 }
 
 /// A set of mirrored windows of one site driven from a single master.
@@ -134,8 +142,12 @@ impl MirrorGroup {
     /// N-can-be-thousands case) — focusing a released instance re-materializes
     /// it via catch-up. Safe to call any time; the live instance is untouched.
     pub fn release_dormant(&mut self) {
-        for instance in &mut self.instances {
-            if !instance.live {
+        let focused = self.focused_idx;
+        for (idx, instance) in self.instances.iter_mut().enumerate() {
+            // Keep the focused window's snapshot even when it holds no realm — the
+            // shell renders it from that snapshot (E2 leaves viewed-only windows
+            // live-realm-free but resident).
+            if !instance.live && idx != focused {
                 instance.release();
             }
         }
@@ -169,9 +181,28 @@ impl MirrorGroup {
     /// it to the log.
     pub fn act(&mut self, action: Action) -> Result<(), MirrorError> {
         let master = self.master_idx;
-        self.focus(master)?;
+        // Driving needs a populated realm, so always make the master truly live
+        // (a viewing-only `focus` may have left it without one).
+        self.ensure_live(master)?;
         self.apply_logged(master, &action)?;
-        self.log.push(action);
+        // Coalesce a run of keystrokes into one log entry: if this is an `Input`
+        // to the same target as the trailing action, replace it instead of
+        // appending. Each keystroke already carries the whole field value, so a
+        // follower replaying the single coalesced entry converges identically —
+        // and per-character typing does not grow the log (catch-up stays cheap).
+        let coalesce = if let Action::Input { target, .. } = &action {
+            matches!(
+                self.log.actions().last(),
+                Some(Action::Input { target: prev, .. }) if prev == target
+            )
+        } else {
+            false
+        };
+        if coalesce {
+            self.log.replace_last(action);
+        } else {
+            self.log.push(action);
+        }
         self.instances[master].cursor = self.log.len();
         Ok(())
     }
@@ -192,12 +223,44 @@ impl MirrorGroup {
         }
     }
 
+    /// Focus instance `idx` for **viewing**, converged to the master.
+    ///
+    /// A window is rendered from its serialized snapshot, not its realm, so an
+    /// instance whose snapshot is already converged *and still resident* needs no
+    /// work: drop any live realm and just mark it focused — no realm rebuild, no
+    /// page reload (E2/ADR-0026). Otherwise fall back to a full
+    /// [`ensure_live`](Self::ensure_live) catch-up. Driving the instance later
+    /// (via [`act`](Self::act)) rebuilds its realm on demand.
+    pub fn focus(&mut self, idx: usize) -> Result<(), MirrorError> {
+        if idx >= self.instances.len() {
+            return Err(MirrorError::NoSuchInstance(idx));
+        }
+        if self.instances[idx].live && self.focused_idx == idx {
+            return Ok(());
+        }
+        // Fast path: a resident, converged snapshot is viewable as-is.
+        if !self.instances[idx].live
+            && !self.instances[idx].released
+            && self.instances[idx].cursor == self.log.len()
+        {
+            if let Some(cur) = self.live_index() {
+                let realm = self.realm_of(cur);
+                let _ = self.engine.destroy_realm(realm);
+                self.instances[cur].live = false;
+            }
+            self.focused_idx = idx;
+            return Ok(());
+        }
+        self.ensure_live(idx)
+    }
+
     /// Make instance `idx` the live, focused window, converged to the master.
     ///
     /// Tears down whatever realm is live (preserving the ≤1 invariant), then
     /// instantiates `idx`'s realm and fast-forwards it through the action log in
-    /// its own session.
-    pub fn focus(&mut self, idx: usize) -> Result<(), MirrorError> {
+    /// its own session. Unlike [`focus`](Self::focus) this always leaves `idx`
+    /// holding a populated realm — required before applying a new action to it.
+    fn ensure_live(&mut self, idx: usize) -> Result<(), MirrorError> {
         if idx >= self.instances.len() {
             return Err(MirrorError::NoSuchInstance(idx));
         }
@@ -226,6 +289,7 @@ impl MirrorGroup {
         let realm = self.realm_of(idx);
         self.engine.create_realm(realm)?;
         self.instances[idx].live = true;
+        self.instances[idx].released = false;
         self.instances[idx].diverged = None;
 
         let head = self.log.len();
@@ -333,8 +397,9 @@ impl MirrorGroup {
                 return Ok(());
             };
             let inst = &self.instances[idx];
+            let host = inst.url.as_deref().map(host_of).unwrap_or("");
             provider
-                .fills(inst.id, kind, &inst.doc)
+                .fills(inst.id, kind, &inst.doc, host)
                 .into_iter()
                 .filter_map(|(node, value)| inst.node_to_js.get(&node).map(|&js| (js, value)))
                 .collect()
@@ -375,4 +440,17 @@ impl MirrorGroup {
             user_agent: self.user_agent.clone(),
         }
     }
+}
+
+/// The host of a URL string (`scheme://[userinfo@]host[:port]/…`), for binding
+/// autofill secrets to an origin (issue #12). Userinfo is stripped so a crafted
+/// `https://trusted@evil.test/` resolves to the real host (`evil.test`).
+fn host_of(url: &str) -> &str {
+    let after_scheme = url.split_once("://").map(|(_, r)| r).unwrap_or(url);
+    let authority = after_scheme
+        .split(['/', '?', '#'])
+        .next()
+        .unwrap_or(after_scheme);
+    let host_port = authority.rsplit('@').next().unwrap_or(authority);
+    host_port.split(':').next().unwrap_or(host_port)
 }

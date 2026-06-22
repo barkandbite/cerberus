@@ -20,6 +20,20 @@ with the code so the reasoning travels with the repo.
 | [0010](0010-vault-format-and-profile-layout.md) | Vault on-disk format & persistent-profile layout | Accepted |
 | [0011](0011-cookie-dispositions-and-timing-hud.md) | Per-cookie dispositions & the Rust-side timing HUD | Accepted |
 | [0012](0012-persistent-realm-and-incremental-sync.md) | Persistent JS realm & incremental DOM sync (evolves 0008) | Accepted |
+| [0013](0013-bounded-event-loop.md) | Bounded virtual-clock event loop (evolves 0002 speed-first) | Accepted |
+| [0014](0014-fetch-over-eval-seam.md) | `fetch` over the eval-only seam (bounded host-drained I/O) | Accepted |
+| [0015](0015-windows-port.md) | Windows port (baseline) + `cerberus-sysmem` RSS adapter | Accepted |
+| [0016](0016-content-addressed-cache-interning.md) | Content-addressed cache body interning (shared memory) | Accepted |
+| [0017](0017-concurrent-multi-window-mirror-groups.md) | Concurrent multi-window mirror groups | Accepted |
+| [0018](0018-mirror-group-app-integration.md) | Mirror-group app integration | Accepted |
+| [0019](0019-css-selectors-media-visibility-opacity.md) | CSS selectors, `@media`, visibility/opacity | Accepted |
+| [0020](0020-gzip-deflate-decompression.md) | gzip/deflate response decompression | Accepted |
+| [0021](0021-layout-measurement-bridge.md) | Layout-measurement JS bridge (getBoundingClientRect, …) | Accepted |
+| [0022](0022-autofill.md) | Autofill engine (field detection + fill plan) | Accepted |
+| [0023](0023-flexbox-grid.md) | Flexbox + Grid v1 | Accepted |
+| [0024](0024-autofill-app-integration.md) | Autofill app integration (per-identity fill across a mirror) | Accepted |
+| [0025](0025-multi-identity-ux.md) | Multi-identity UX — drivable mirror typing + driven badge | Accepted |
+| [0026](0026-mirror-layout-efficiency.md) | Mirror & layout efficiency — scratch reuse, refocus skip, large-N gate | Accepted |
 
 ## When to write one
 
