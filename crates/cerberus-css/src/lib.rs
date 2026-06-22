@@ -17,7 +17,7 @@ use cerberus_style::{
     FlexBasis, FlexDirection, Float, Gradient, JustifyContent, Len, Position, StyleEngine,
     StyledChild, StyledDom, StyledNode, TextAlign, TextTransform, Track, TrackMax, Visibility,
 };
-use cerberus_types::{Color, ImageFit};
+use cerberus_types::{Color, ImageFit, ImagePos};
 use parser::{
     parse_declaration_block, parse_stylesheet, ElemRef, MediaContext, SiblingRef, Specificity,
     Stylesheet,
@@ -605,10 +605,13 @@ fn apply_declarations(
                 if let Some(c) = parse_bg_color(v) {
                     style.background = (c.a != 0).then_some(c);
                 }
-                // The `background` shorthand may also carry an image or gradient.
+                // The `background` shorthand may also carry an image/gradient and,
+                // crucially for real sites, a `<position> / <size>` group such as
+                // `center / cover` (ADR-0044/0045).
                 if prop == "background" {
                     style.background_image = parse_url_value(v);
                     style.background_gradient = parse_gradient(v).map(Box::new);
+                    apply_background_shorthand_geometry(style, v);
                 }
             }
             "background-image" => {
@@ -619,6 +622,19 @@ fn apply_declarations(
             // sizes and `auto`/`100%` fall through to `Fill` (stretch) — ADR-0044.
             "object-fit" => style.object_fit = parse_image_fit(v),
             "background-size" => style.background_size = parse_image_fit(v),
+            // `object-position`/`background-position` (keywords + percentages;
+            // lengths are ignored — they only matter for sprites we don't tile) —
+            // ADR-0045.
+            "object-position" => {
+                if let Some(p) = parse_image_pos(v) {
+                    style.object_position = p;
+                }
+            }
+            "background-position" => {
+                if let Some(p) = parse_image_pos(v) {
+                    style.background_position = p;
+                }
+            }
             "border-radius" => {
                 // Uniform radius (first value of the 1–4 corner shorthand).
                 style.border_radius = v
@@ -1244,9 +1260,6 @@ fn parse_box_shadow(v: &str, em: f32) -> Option<BoxShadow> {
     })
 }
 
-/// Extract the URL from the first `url(...)` in a value (e.g. a `background` /
-/// `background-image`), stripping quotes. Returns `None` for `none`, gradients,
-/// or a missing/`data:` url — i.e. only fetchable image URLs (ADR-0038).
 /// Map `object-fit`/`background-size` to an [`ImageFit`]. Only the aspect-ratio
 /// keywords matter to the rasterizer: `cover` crops to fill, `contain` (and the
 /// no-upscale `scale-down`) letterbox. `fill`, `none`, explicit sizes (`100%`,
@@ -1259,6 +1272,107 @@ fn parse_image_fit(v: &str) -> ImageFit {
     }
 }
 
+/// Classify one `object-position`/`background-position` token into an axis hint
+/// and a fraction: `0` horizontal, `1` vertical, `2` either (percentage/center).
+/// Lengths and unknown tokens return `None` (ignored) — ADR-0045.
+fn classify_pos_tok(t: &str) -> Option<(u8, f32)> {
+    match t.trim().to_ascii_lowercase().as_str() {
+        "left" => Some((0, 0.0)),
+        "right" => Some((0, 1.0)),
+        "top" => Some((1, 0.0)),
+        "bottom" => Some((1, 1.0)),
+        "center" => Some((2, 0.5)),
+        s if s.ends_with('%') => s[..s.len() - 1]
+            .trim()
+            .parse::<f32>()
+            .ok()
+            .map(|p| (2, p / 100.0)),
+        _ => None,
+    }
+}
+
+/// Combine up to two classified position tokens into an [`ImagePos`], honoring the
+/// keyword-order swap (`top left` == `left top`) — ADR-0045.
+fn combine_pos(parts: &[(u8, f32)]) -> Option<ImagePos> {
+    match parts {
+        [] => None,
+        [(a, f)] => Some(if *a == 1 {
+            ImagePos { x: 0.5, y: *f }
+        } else {
+            ImagePos { x: *f, y: 0.5 }
+        }),
+        [(a0, f0), (a1, f1), ..] => {
+            // Swap when the order is vertical-first or horizontal-second.
+            if *a0 == 1 || *a1 == 0 {
+                Some(ImagePos { x: *f1, y: *f0 })
+            } else {
+                Some(ImagePos { x: *f0, y: *f1 })
+            }
+        }
+    }
+}
+
+/// Parse a standalone `object-position`/`background-position` value.
+fn parse_image_pos(v: &str) -> Option<ImagePos> {
+    let parts: Vec<(u8, f32)> = v
+        .split_whitespace()
+        .filter_map(classify_pos_tok)
+        .take(2)
+        .collect();
+    combine_pos(&parts)
+}
+
+/// Pull a `<position> / <size>` group (or a bare `cover`/`contain`) out of the
+/// `background` shorthand. Parenthesized spans (`url(...)`, `linear-gradient(...)`)
+/// are masked first, so a `/` inside a URL or a `%` in a gradient stop is never
+/// read as geometry — ADR-0045.
+fn apply_background_shorthand_geometry(style: &mut ComputedStyle, v: &str) {
+    let masked = mask_parens(v);
+    if let Some(slash) = masked.find('/') {
+        if let Some(tok) = masked[slash + 1..].split_whitespace().next() {
+            style.background_size = parse_image_fit(tok);
+        }
+        let parts: Vec<(u8, f32)> = masked[..slash]
+            .split_whitespace()
+            .filter_map(classify_pos_tok)
+            .collect();
+        if let Some(p) = combine_pos(&parts[parts.len().saturating_sub(2)..]) {
+            style.background_position = p;
+        }
+    } else if let Some(f) = masked
+        .split_whitespace()
+        .map(parse_image_fit)
+        .find(|f| *f != ImageFit::Fill)
+    {
+        style.background_size = f;
+    }
+}
+
+/// Replace parenthesized spans with spaces (keeping the rest) so top-level tokens
+/// can be scanned without tripping on `url(...)`/`gradient(...)` innards.
+fn mask_parens(v: &str) -> String {
+    let mut depth = 0i32;
+    let mut out = String::with_capacity(v.len());
+    for c in v.chars() {
+        match c {
+            '(' => {
+                depth += 1;
+                out.push(' ');
+            }
+            ')' => {
+                depth = (depth - 1).max(0);
+                out.push(' ');
+            }
+            _ if depth > 0 => out.push(' '),
+            _ => out.push(c),
+        }
+    }
+    out
+}
+
+/// Extract the URL from the first `url(...)` in a value (e.g. a `background` /
+/// `background-image`), stripping quotes. Returns `None` for `none`, gradients,
+/// or a missing/`data:` url — i.e. only fetchable image URLs (ADR-0038).
 fn parse_url_value(v: &str) -> Option<String> {
     let start = v.find("url(")? + 4;
     let rest = &v[start..];
@@ -1955,6 +2069,67 @@ mod tests {
         let s = &first(&dom.root, "img").unwrap().style;
         assert_eq!(s.object_fit, ImageFit::Cover);
         assert_eq!(s.background_size, ImageFit::Contain);
+    }
+
+    #[test]
+    fn object_position_parse() {
+        let pos = |css: &str| {
+            let dom = CssEngine::new().style(&parse_html(&format!("<img style='{css}'>")));
+            first(&dom.root, "img").unwrap().style.object_position
+        };
+        // Default is center.
+        assert_eq!(pos(""), ImagePos::CENTER);
+        // One value: the other axis stays center.
+        assert_eq!(pos("object-position: right"), ImagePos { x: 1.0, y: 0.5 });
+        assert_eq!(pos("object-position: top"), ImagePos { x: 0.5, y: 0.0 });
+        assert_eq!(pos("object-position: 25%"), ImagePos { x: 0.25, y: 0.5 });
+        // Two values, and the keyword-order swap.
+        assert_eq!(
+            pos("object-position: 25% 75%"),
+            ImagePos { x: 0.25, y: 0.75 }
+        );
+        assert_eq!(
+            pos("object-position: bottom right"),
+            ImagePos { x: 1.0, y: 1.0 },
+            "vertical-first keywords swap to (x,y)"
+        );
+        // Lengths are ignored (no box at parse time) — falls back to default.
+        assert_eq!(pos("object-position: 10px 20px"), ImagePos::CENTER);
+    }
+
+    #[test]
+    fn background_shorthand_position_and_size() {
+        let s = |css: &str| {
+            let dom = CssEngine::new().style(&parse_html(&format!("<div style='{css}'>x</div>")));
+            first(&dom.root, "div").unwrap().style.clone()
+        };
+        // The ubiquitous `<position> / cover` group, masked past url()/keywords.
+        let a = s("background: #fff url(bg.png) center / cover no-repeat");
+        assert_eq!(a.background_size, ImageFit::Cover);
+        assert_eq!(a.background_position, ImagePos::CENTER);
+        assert_eq!(a.background_image.as_deref(), Some("bg.png"));
+
+        let b = s("background: url(/img/a.png) left top / contain");
+        assert_eq!(b.background_size, ImageFit::Contain);
+        assert_eq!(b.background_position, ImagePos { x: 0.0, y: 0.0 });
+        assert_eq!(
+            b.background_image.as_deref(),
+            Some("/img/a.png"),
+            "the slash inside url() is not mistaken for a size separator"
+        );
+
+        // A bare `cover` keyword (no slash) still sets the size.
+        assert_eq!(
+            s("background: url(x.png) cover").background_size,
+            ImageFit::Cover
+        );
+
+        // A gradient's internal `%` stops are masked, not read as a position; with
+        // no slash the size stays the Fill default.
+        let g = s("background: linear-gradient(red 50%, blue)");
+        assert_eq!(g.background_size, ImageFit::Fill);
+        assert_eq!(g.background_position, ImagePos::TOP_LEFT);
+        assert!(g.background_gradient.is_some());
     }
 
     #[test]

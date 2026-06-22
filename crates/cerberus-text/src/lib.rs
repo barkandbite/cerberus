@@ -14,7 +14,7 @@ use ab_glyph::{point, Font, FontRef, GlyphId, PxScale, ScaleFont};
 use cerberus_paint::{
     DecodedImage, DisplayItem, DisplayList, Framebuffer, GlyphBox, Rasterizer, TextShaper,
 };
-use cerberus_types::{Color, FontStyle, ImageFit, Point, Rect};
+use cerberus_types::{Color, FontStyle, ImageFit, ImagePos, Point, Rect};
 
 /// The bundled font (Roboto Regular, Apache-2.0). See `assets/Roboto-LICENSE.txt`.
 const FONT_BYTES: &[u8] = include_bytes!("../assets/Roboto-Regular.ttf");
@@ -85,12 +85,14 @@ impl TextEngine {
 
     /// Draw a decoded image into `rect` (nearest-neighbor, alpha-blended) with the
     /// given fit: `Fill` stretches; `Cover` scales to cover and crops; `Contain`
-    /// fits inside and letterboxes (ADR-0044).
+    /// fits inside and letterboxes (ADR-0044). `pos` anchors a `Cover`/`Contain`
+    /// image in its box (`0.0`=left/top … `1.0`=right/bottom — ADR-0045).
     fn draw_image(
         &self,
         rect: Rect,
         image: &DecodedImage,
         fit: ImageFit,
+        pos: ImagePos,
         target: &mut Framebuffer,
     ) {
         if rect.w == 0 || rect.h == 0 || image.size.w == 0 || image.size.h == 0 {
@@ -98,17 +100,29 @@ impl TextEngine {
         }
         let (rw, rh) = (rect.w as f32, rect.h as f32);
         let (iw, ih) = (image.size.w as f32, image.size.h as f32);
-        // Per-axis scale (px of source per px of dest) and a centering offset in
-        // dest space; `Fill` is the stretch identity.
+        // Per-axis scale (px of source per px of dest) and an anchoring offset in
+        // dest space; `Fill` is the stretch identity. The offset places the scaled
+        // image so `pos` (0..1) of the leftover space is on the left/top — center
+        // (0.5) reproduces the old centered crop/letterbox.
         let (sxr, syr, off_x, off_y) = match fit {
             ImageFit::Fill => (iw / rw, ih / rh, 0.0, 0.0),
             ImageFit::Cover => {
                 let s = (rw / iw).max(rh / ih); // dest px per source px
-                (1.0 / s, 1.0 / s, (rw - iw * s) / 2.0, (rh - ih * s) / 2.0)
+                (
+                    1.0 / s,
+                    1.0 / s,
+                    pos.x * (rw - iw * s),
+                    pos.y * (rh - ih * s),
+                )
             }
             ImageFit::Contain => {
                 let s = (rw / iw).min(rh / ih);
-                (1.0 / s, 1.0 / s, (rw - iw * s) / 2.0, (rh - ih * s) / 2.0)
+                (
+                    1.0 / s,
+                    1.0 / s,
+                    pos.x * (rw - iw * s),
+                    pos.y * (rh - ih * s),
+                )
             }
         };
         for dy in 0..rect.h {
@@ -391,9 +405,12 @@ impl Rasterizer for TextEngine {
                 DisplayItem::Shadow { rect, blur, color } => {
                     draw_shadow(*rect, *blur as i32, *color, target)
                 }
-                DisplayItem::Image { rect, image, fit } => {
-                    self.draw_image(*rect, image, *fit, target)
-                }
+                DisplayItem::Image {
+                    rect,
+                    image,
+                    fit,
+                    pos,
+                } => self.draw_image(*rect, image, *fit, *pos, target),
                 DisplayItem::Glyphs {
                     origin,
                     glyphs,
@@ -455,7 +472,13 @@ mod tests {
         let draw = |fit: ImageFit| {
             let mut fb = Framebuffer::new(Size::new(20, 20));
             fb.fill_rect(Rect::new(0, 0, 20, 20), Color::WHITE);
-            TextEngine::new().draw_image(Rect::new(0, 0, 20, 20), &image, fit, &mut fb);
+            TextEngine::new().draw_image(
+                Rect::new(0, 0, 20, 20),
+                &image,
+                fit,
+                ImagePos::CENTER,
+                &mut fb,
+            );
             fb
         };
         // Fill stretches the whole source in: the left edge column (green) shows.
@@ -489,6 +512,67 @@ mod tests {
             contain.pixel(10, 10).unwrap(),
             Color::rgb(255, 0, 0),
             "contain: image painted in the middle band"
+        );
+    }
+
+    #[test]
+    fn image_position_shifts_cover_crop_and_contain_letterbox() {
+        // Same wide 20x10 source: column 0 green, the rest red.
+        let mut rgba = vec![0u8; 20 * 10 * 4];
+        for y in 0..10 {
+            for x in 0..20 {
+                let i = (y * 20 + x) * 4;
+                let (r, g) = if x == 0 { (0, 255) } else { (255, 0) };
+                rgba[i] = r;
+                rgba[i + 1] = g;
+                rgba[i + 3] = 255;
+            }
+        }
+        let image = DecodedImage {
+            size: Size::new(20, 10),
+            rgba,
+        };
+        let draw = |fit: ImageFit, pos: ImagePos| {
+            let mut fb = Framebuffer::new(Size::new(20, 20));
+            fb.fill_rect(Rect::new(0, 0, 20, 20), Color::WHITE);
+            TextEngine::new().draw_image(Rect::new(0, 0, 20, 20), &image, fit, pos, &mut fb);
+            fb
+        };
+        // Cover anchored left keeps the green left edge; centered crops it away.
+        let left = draw(ImageFit::Cover, ImagePos { x: 0.0, y: 0.5 });
+        assert_eq!(
+            left.pixel(0, 10).unwrap(),
+            Color::rgb(0, 255, 0),
+            "cover left: source left edge shown"
+        );
+        let center = draw(ImageFit::Cover, ImagePos::CENTER);
+        assert_eq!(
+            center.pixel(0, 10).unwrap(),
+            Color::rgb(255, 0, 0),
+            "cover center: left edge cropped"
+        );
+        // Contain top paints the top band and letterboxes the bottom; bottom flips it.
+        let top = draw(ImageFit::Contain, ImagePos { x: 0.5, y: 0.0 });
+        assert_eq!(
+            top.pixel(10, 1).unwrap(),
+            Color::rgb(255, 0, 0),
+            "contain top"
+        );
+        assert_eq!(
+            top.pixel(10, 18).unwrap(),
+            Color::WHITE,
+            "contain top: bottom band"
+        );
+        let bottom = draw(ImageFit::Contain, ImagePos { x: 0.5, y: 1.0 });
+        assert_eq!(
+            bottom.pixel(10, 1).unwrap(),
+            Color::WHITE,
+            "contain bottom: top band"
+        );
+        assert_eq!(
+            bottom.pixel(10, 18).unwrap(),
+            Color::rgb(255, 0, 0),
+            "contain bottom"
         );
     }
 

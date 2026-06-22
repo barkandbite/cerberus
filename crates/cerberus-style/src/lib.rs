@@ -6,7 +6,7 @@
 //! reimplemented without touching layout. Layout consumes only these types.
 
 use cerberus_dom::{Document, NodeId};
-use cerberus_types::{Color, FontStyle, ImageFit};
+use cerberus_types::{Color, FontStyle, ImageFit, ImagePos};
 
 /// CSS `position`. `Static` is normal flow; the rest are positioned.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
@@ -294,6 +294,11 @@ pub struct ComputedStyle {
     /// Not inherited.
     pub object_fit: ImageFit,
     pub background_size: ImageFit,
+    /// `object-position` (default center) / `background-position` (default
+    /// top-left) — where a `Cover`/`Contain` image anchors in its box
+    /// (ADR-0045). Plain values (8 bytes each), not inherited.
+    pub object_position: ImagePos,
+    pub background_position: ImagePos,
     /// Preserve whitespace/newlines (`<pre>`); otherwise collapse + wrap.
     pub preformatted: bool,
     /// `visibility: hidden` — laid out but not painted. Inherited.
@@ -391,6 +396,8 @@ impl ComputedStyle {
             box_shadow: None,
             object_fit: ImageFit::Fill,
             background_size: ImageFit::Fill,
+            object_position: ImagePos::CENTER,
+            background_position: ImagePos::TOP_LEFT,
             preformatted: false,
             visibility: Visibility::Visible,
             opacity: 1.0,
@@ -468,9 +475,11 @@ impl ComputedStyle {
             border_radius: 0,
             background_gradient: None,
             box_shadow: None,
-            // object-fit / background-size are not inherited.
+            // object-fit/-position and background-size/-position are not inherited.
             object_fit: ImageFit::Fill,
             background_size: ImageFit::Fill,
+            object_position: ImagePos::CENTER,
+            background_position: ImagePos::TOP_LEFT,
             flex_direction: FlexDirection::Row,
             flex_reverse: false,
             flex_wrap: false,

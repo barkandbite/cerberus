@@ -977,7 +977,13 @@ impl<'a> Ctx<'a> {
             self.place_box(w, h.max(1));
             let rect = Rect::new(self.x, self.y, w, h.max(1));
             let fit = node.style.object_fit;
-            self.display.push(DisplayItem::Image { rect, image, fit });
+            let pos = node.style.object_position;
+            self.display.push(DisplayItem::Image {
+                rect,
+                image,
+                fit,
+                pos,
+            });
             self.advance_box(w, h);
         } else if let (Some(w), Some(h)) = (attr_w, attr_h) {
             // Not decoded yet: reserve the declared box so layout doesn't reflow.
@@ -1440,6 +1446,7 @@ impl<'a> Ctx<'a> {
                         rect,
                         image: img,
                         fit: style.background_size,
+                        pos: style.background_position,
                     },
                 );
                 idx += 1;
@@ -2870,7 +2877,7 @@ mod tests {
     use cerberus_dom::parse_html;
     use cerberus_paint::MonoShaper;
     use cerberus_style::StyleEngine;
-    use cerberus_types::ImageFit;
+    use cerberus_types::{ImageFit, ImagePos};
 
     fn lay(html: &str, width: u32) -> LaidOut {
         let styled = CssEngine::new().style(&parse_html(html));
@@ -3712,6 +3719,39 @@ mod tests {
             Some(ImageFit::Fill),
             "default object-fit is Fill (stretch)"
         );
+    }
+
+    #[test]
+    fn object_and_background_position_reach_the_image_item() {
+        let pos_of = |html: &str| {
+            let styled = CssEngine::new().style(&parse_html(html));
+            let img = Arc::new(DecodedImage {
+                size: Size::new(20, 10),
+                rgba: vec![255; 20 * 10 * 4],
+            });
+            let laid = BlockLayout::default().layout(
+                &styled,
+                Size::new(400, 2000),
+                &MonoShaper,
+                &OneImage(img),
+                &NoForms,
+            );
+            laid.display.items.iter().find_map(|i| match i {
+                DisplayItem::Image { pos, .. } => Some(*pos),
+                _ => None,
+            })
+        };
+        assert_eq!(
+            pos_of("<img src='pic.png' style='object-position:right'>"),
+            Some(ImagePos { x: 1.0, y: 0.5 })
+        );
+        // `<position>/<size>` in the background shorthand reaches the bg image.
+        assert_eq!(
+            pos_of("<div style='background:url(bg.png) left top / cover'>x</div>"),
+            Some(ImagePos { x: 0.0, y: 0.0 })
+        );
+        // `<img>` default object-position is center.
+        assert_eq!(pos_of("<img src='pic.png'>"), Some(ImagePos::CENTER));
     }
 
     #[test]

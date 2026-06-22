@@ -6,7 +6,7 @@
 //! approved crates land at M2; this crate ships only the traits plus deliberately
 //! trivial built-in stubs so the M0 render path is end-to-end.
 
-use cerberus_types::{Color, FontStyle, ImageFit, Point, Rect, Size};
+use cerberus_types::{Color, FontStyle, ImageFit, ImagePos, Point, Rect, Size};
 use std::sync::Arc;
 
 /// One drawing primitive in a resolution-independent display list.
@@ -45,11 +45,13 @@ pub enum DisplayItem {
         color: Color,
         style: FontStyle,
     },
-    /// A decoded image (shared) to draw into `rect` with the given fit.
+    /// A decoded image (shared) to draw into `rect` with the given fit and
+    /// position (where a `Cover`/`Contain` image anchors — ADR-0045).
     Image {
         rect: Rect,
         image: Arc<DecodedImage>,
         fit: ImageFit,
+        pos: ImagePos,
     },
     /// An anti-aliased, round-capped line segment of the given stroke width.
     /// Vector UI (icons) is built from these, so it scales crisply with
@@ -133,10 +135,16 @@ impl DisplayList {
                 },
                 DisplayItem::ClipPush { rect } => DisplayItem::ClipPush { rect: sr(*rect) },
                 DisplayItem::ClipPop => DisplayItem::ClipPop,
-                DisplayItem::Image { rect, image, fit } => DisplayItem::Image {
+                DisplayItem::Image {
+                    rect,
+                    image,
+                    fit,
+                    pos,
+                } => DisplayItem::Image {
                     rect: sr(*rect),
                     image: image.clone(),
                     fit: *fit,
+                    pos: *pos,
                 },
                 DisplayItem::Line { a, b, width, color } => DisplayItem::Line {
                     a: Point::new(si(a.x), si(a.y)),

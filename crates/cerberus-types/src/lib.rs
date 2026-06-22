@@ -174,6 +174,23 @@ pub enum ImageFit {
     Contain,
 }
 
+/// Where a scaled image sits in its box (`object-position` /
+/// `background-position`) — ADR-0045. Each axis is a fraction: `0.0` =
+/// left/top, `0.5` = center, `1.0` = right/bottom. Only meaningful with
+/// `ImageFit::Cover`/`Contain` (a `Fill` image already fills the box exactly).
+#[derive(Clone, Copy, PartialEq, Debug)]
+pub struct ImagePos {
+    pub x: f32,
+    pub y: f32,
+}
+
+impl ImagePos {
+    /// `50% 50%` — the `object-position` initial value.
+    pub const CENTER: ImagePos = ImagePos { x: 0.5, y: 0.5 };
+    /// `0% 0%` — the `background-position` initial value.
+    pub const TOP_LEFT: ImagePos = ImagePos { x: 0.0, y: 0.0 };
+}
+
 /// A straight RGBA color, 8 bits per channel.
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
 pub struct Color {
