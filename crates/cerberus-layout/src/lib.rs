@@ -596,15 +596,15 @@ impl<'a> Ctx<'a> {
 
         let saved_opacity_hidden = self.opacity_hidden;
         self.opacity_hidden = subtree_hidden;
-        // Float band state: consecutive `float` children pack left-to-right and
-        // wrap (the common column-grid pattern). Following in-flow content wraps
-        // *beside* the floats when enough width remains, else drops below the band
-        // (a `clear` always drops) — ADR-0039/0049.
-        let mut fb = FloatBand::new(self.left, self.right, self.y);
+        // Float context: each float records its inner edge + bottom, so in-flow
+        // content wraps *beside* floats (the floated-infobox pattern) and reclaims
+        // the full width once flow passes a float's bottom; a `clear` (or the
+        // container's end) drops below them — ADR-0039/0049.
+        let mut floats = Floats::new(self.left, self.right);
         for child in &node.children {
             match child {
                 StyledChild::Text(t) => {
-                    self.flow_among_floats(&mut fb);
+                    self.flow_among_floats(&floats);
                     if visible {
                         self.add_text(t, style, href);
                     }
@@ -613,28 +613,27 @@ impl<'a> Ctx<'a> {
                     if e.style.float != cerberus_style::Float::None
                         && e.style.display != Display::None =>
                 {
-                    // Floats size against the container's full content box, never a
-                    // width left narrowed by an earlier wrap.
-                    self.left = fb.left;
-                    self.right = fb.right;
-                    self.place_float(e, href, &mut fb);
+                    // Floats size against the container's full content box.
+                    self.left = floats.cont_left;
+                    self.right = floats.cont_right;
+                    self.place_float(e, href, &mut floats);
                 }
                 StyledChild::Element(e) => {
                     if e.style.clear != cerberus_style::Clear::None {
-                        self.flush_floats(&mut fb);
-                        self.left = fb.left;
-                        self.right = fb.right;
+                        self.flush_floats(&mut floats);
+                        self.left = floats.cont_left;
+                        self.right = floats.cont_right;
                         self.x = self.left;
                     } else {
-                        self.flow_among_floats(&mut fb);
+                        self.flow_among_floats(&floats);
                     }
                     self.walk(e, href);
                 }
             }
         }
-        self.flush_floats(&mut fb);
-        self.left = fb.left;
-        self.right = fb.right;
+        self.flush_floats(&mut floats);
+        self.left = floats.cont_left;
+        self.right = floats.cont_right;
         self.opacity_hidden = saved_opacity_hidden;
 
         if is_block {
@@ -1570,48 +1569,46 @@ impl<'a> Ctx<'a> {
         }
     }
 
-    /// Place one `float` child into the current float band: pack left-to-right,
-    /// wrapping to a new row when it doesn't fit, sizing it from its
-    /// `width`/`max-width` (else shrink-to-fit) — ADR-0039/0043. `float:left`
-    /// packs from the left, `float:right` from the right; text wrap-around is not
-    /// modeled (following in-flow content drops below the band).
-    fn place_float(&mut self, e: &StyledNode, in_link: Option<&str>, fb: &mut FloatBand) {
+    /// Place one `float` child: size it from its `width`/`max-width` (else
+    /// shrink-to-fit), drop to the first `y` where it fits the band, and record it
+    /// so later content wraps beside it until flow passes its bottom — ADR-0049.
+    /// `float:left` packs from the left, `float:right` from the right.
+    fn place_float(&mut self, e: &StyledNode, in_link: Option<&str>, floats: &mut Floats) {
         let is_right = e.style.float == cerberus_style::Float::Right;
-        let avail = (self.right - self.left).max(1);
-        let explicit = resolve_block_width(&e.style, avail, self.vw, self.vh);
+        let cont_w = (floats.cont_right - floats.cont_left).max(1);
+        let explicit = resolve_block_width(&e.style, cont_w, self.vw, self.vh);
         let w = explicit
-            .unwrap_or_else(|| self.measure_intrinsic_width(e).min(avail))
-            .clamp(1, avail);
-        if !fb.active {
-            fb.active = true;
-            fb.row_top = self.y;
-            fb.x = fb.left;
-            fb.right_x = fb.right;
-            fb.row_h = 0;
-            fb.bottom = self.y;
+            .unwrap_or_else(|| self.measure_intrinsic_width(e).min(cont_w))
+            .clamp(1, cont_w);
+
+        // Drop to the first y (at or below the cursor) whose band fits the float.
+        let mut place_y = self.y;
+        if !self.measuring {
+            loop {
+                let (bl, br) = floats.band(place_y);
+                if br - bl >= w || (bl == floats.cont_left && br == floats.cont_right) {
+                    break;
+                }
+                match floats.next_step(place_y) {
+                    Some(step) => place_y = step,
+                    None => break,
+                }
+            }
         }
-        // Wrap to a new band row when the float won't fit between the left and
-        // right cursors.
-        let at_row_start = fb.x == fb.left && fb.right_x == fb.right;
-        if !at_row_start && w > (fb.right_x - fb.x).max(0) {
-            fb.row_top += fb.row_h;
-            fb.x = fb.left;
-            fb.right_x = fb.right;
-            fb.row_h = 0;
-        }
-        let place_x = if is_right { fb.right_x - w } else { fb.x };
-        // An explicit-width float gets the full avail (so `walk` resolves its
-        // width% against the container); a shrink-to-fit float is bounded to its
-        // content. Either way its box lands in `[place_x, place_x + w]`.
+        let (bl, br) = floats.band(place_y);
+        let place_x = if is_right { (br - w).max(bl) } else { bl };
+
+        // An explicit-width float gets the full container (so `%` children resolve
+        // against it); a shrink-to-fit float is bounded to its content.
         let sub_right = if explicit.is_some() {
-            place_x + avail
+            place_x + cont_w
         } else {
             place_x + w
         };
         let mut sub = Ctx::sub(
             place_x,
             sub_right,
-            fb.row_top,
+            place_y,
             self.shaper,
             self.images,
             self.forms,
@@ -1621,48 +1618,61 @@ impl<'a> Ctx<'a> {
         sub.walk(e, in_link);
         sub.flush_line();
         self.field_id = sub.field_id;
-        let h = (sub.y - fb.row_top).max(1);
+        let bottom = place_y + (sub.y - place_y).max(1);
         self.merge_sub(sub, 0, 0);
-        fb.row_h = fb.row_h.max(h);
         if is_right {
-            fb.right_x -= w;
+            floats.rights.push((place_x, bottom));
         } else {
-            fb.x += w;
+            floats.lefts.push((place_x + w, bottom));
         }
-        fb.bottom = fb.bottom.max(fb.row_top + fb.row_h);
     }
 
-    /// Close the float band: drop the flow below the floats (also handles `clear`
-    /// and any in-flow content following floats) — ADR-0039.
-    fn flush_floats(&mut self, fb: &mut FloatBand) {
-        if fb.active {
-            self.y = self.y.max(fb.bottom);
+    /// Drop the flow below every active float and clear them (used for `clear` and
+    /// at a container's end so it contains its floats) — ADR-0039.
+    fn flush_floats(&mut self, floats: &mut Floats) {
+        if floats.active() {
+            self.y = floats.clear_y(self.y);
             self.x = self.left;
-            *fb = FloatBand::new(fb.left, fb.right, self.y);
+            floats.lefts.clear();
+            floats.rights.clear();
         }
     }
 
-    /// Lay the next in-flow child among open floats. While a float still occupies
-    /// this band (`self.y` above its bottom) and enough width remains beside it,
-    /// narrow the content box so the child wraps *alongside* the float — the
-    /// floated-infobox / pull-quote pattern that otherwise pushed a page's whole
-    /// body below a tall sidebar (ADR-0049). Without room (e.g. a full-width float
-    /// row), it drops below the band as before, restoring the full width.
-    fn flow_among_floats(&mut self, fb: &mut FloatBand) {
-        if !fb.active {
+    /// Set the content box for the next in-flow child to the width available beside
+    /// the active floats at the current `y`. If too little remains, step `y` down
+    /// past floats until the band is wide enough (or fully clear) — so content
+    /// wraps alongside a float and reclaims the full width below it (ADR-0049).
+    fn flow_among_floats(&mut self, floats: &Floats) {
+        if !floats.active() {
             return;
         }
-        let free = (fb.right_x - fb.x).max(0);
-        if !self.measuring && self.y < fb.bottom && free >= MIN_FLOAT_WRAP_WIDTH {
-            // Wrap beside the float(s): the free band between left and right floats.
-            self.left = fb.x;
-            self.right = fb.right_x;
+        if self.measuring {
+            self.left = floats.cont_left;
+            self.right = floats.cont_right;
             self.x = self.left;
-        } else {
-            self.flush_floats(fb);
-            self.left = fb.left;
-            self.right = fb.right;
-            self.x = self.left;
+            return;
+        }
+        let mut y = self.y;
+        loop {
+            let (l, r) = floats.band(y);
+            let full = l == floats.cont_left && r == floats.cont_right;
+            if r - l >= MIN_FLOAT_WRAP_WIDTH || full {
+                self.y = y;
+                self.left = l;
+                self.right = r;
+                self.x = l;
+                return;
+            }
+            match floats.next_step(y) {
+                Some(step) => y = step,
+                None => {
+                    self.y = y;
+                    self.left = floats.cont_left;
+                    self.right = floats.cont_right;
+                    self.x = self.left;
+                    return;
+                }
+            }
         }
     }
 
@@ -2207,7 +2217,13 @@ impl<'a> Ctx<'a> {
     fn table(&mut self, node: &StyledNode) {
         self.flush_line();
         let left = self.left;
-        let right = self.right.max(left + 1);
+        let avail = (self.right - left).max(1);
+        // Respect the table's own width / max-width (e.g. an infobox's `width: 22em`)
+        // instead of always spanning the container; `auto` / `100%` still fill it.
+        let table_w = resolve_block_width(&node.style, avail, self.vw, self.vh)
+            .unwrap_or(avail)
+            .clamp(1, avail);
+        let right = (left + table_w).max(left + 1);
         self.line_align = node.style.text_align;
 
         // A caption (if any) renders as a single line above the grid.
@@ -2488,38 +2504,74 @@ fn resolve_border_box_width(
 /// alongside it; below this it drops under the float instead (ADR-0049).
 const MIN_FLOAT_WRAP_WIDTH: i32 = 120;
 
-/// State for packing a run of `float` siblings into rows (ADR-0039).
-struct FloatBand {
-    /// The container's content-left (where each band row starts).
-    left: i32,
-    /// The container's content-right (where right floats start).
-    right: i32,
-    /// Next left-float x within the current row.
-    x: i32,
-    /// Next right-float right-edge within the current row.
-    right_x: i32,
-    /// Top y of the current band row.
-    row_top: i32,
-    /// Height of the tallest float in the current row.
-    row_h: i32,
-    /// Whether any float is currently placed (the band is open).
-    active: bool,
-    /// The lowest point reached by any float (where flow resumes).
-    bottom: i32,
+/// The active floats in a block's formatting context. Each float is kept as its
+/// inner edge and the `y` it clears at, so the available width can be computed per
+/// line and a float stops constraining content once flow passes its bottom — the
+/// basis for both column-grid packing and text wrap-around (ADR-0039/0049).
+struct Floats {
+    /// Container content box (where unconstrained content / floats start).
+    cont_left: i32,
+    cont_right: i32,
+    /// Left floats as (right edge, bottom).
+    lefts: Vec<(i32, i32)>,
+    /// Right floats as (left edge, bottom).
+    rights: Vec<(i32, i32)>,
 }
 
-impl FloatBand {
-    fn new(left: i32, right: i32, y: i32) -> Self {
+impl Floats {
+    fn new(left: i32, right: i32) -> Self {
         Self {
-            left,
-            right,
-            x: left,
-            right_x: right,
-            row_top: y,
-            row_h: 0,
-            active: false,
-            bottom: y,
+            cont_left: left,
+            cont_right: right.max(left + 1),
+            lefts: Vec::new(),
+            rights: Vec::new(),
         }
+    }
+
+    /// Whether any float is still in play.
+    fn active(&self) -> bool {
+        !self.lefts.is_empty() || !self.rights.is_empty()
+    }
+
+    /// The available `[left, right]` at vertical position `y`: floats whose bottom
+    /// is at or above `y` push the edges in; expired ones no longer count.
+    fn band(&self, y: i32) -> (i32, i32) {
+        let l = self
+            .lefts
+            .iter()
+            .filter(|(_, b)| *b > y)
+            .map(|(e, _)| *e)
+            .max()
+            .unwrap_or(self.cont_left);
+        let r = self
+            .rights
+            .iter()
+            .filter(|(_, b)| *b > y)
+            .map(|(e, _)| *e)
+            .min()
+            .unwrap_or(self.cont_right);
+        (l, r.max(l + 1))
+    }
+
+    /// The next float bottom strictly below `y` (where the band first widens).
+    fn next_step(&self, y: i32) -> Option<i32> {
+        self.lefts
+            .iter()
+            .chain(self.rights.iter())
+            .map(|(_, b)| *b)
+            .filter(|b| *b > y)
+            .min()
+    }
+
+    /// The `y` at which all current floats have cleared (never above `y`).
+    fn clear_y(&self, y: i32) -> i32 {
+        self.lefts
+            .iter()
+            .chain(self.rights.iter())
+            .map(|(_, b)| *b)
+            .max()
+            .unwrap_or(y)
+            .max(y)
     }
 }
 

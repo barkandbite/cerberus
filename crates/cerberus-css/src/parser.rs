@@ -570,8 +570,9 @@ fn parse_compound(token: &str) -> Option<Compound> {
                 }
             }
             ':' => {
-                // Skip a second ':' (pseudo-element); we don't match those.
-                if i < chars.len() && chars[i] == ':' {
+                // A second ':' marks a pseudo-*element* (`::before`).
+                let double_colon = i < chars.len() && chars[i] == ':';
+                if double_colon {
                     i += 1;
                 }
                 let s = i;
@@ -597,7 +598,16 @@ fn parse_compound(token: &str) -> Option<Compound> {
                     arg = chars[s..i].iter().collect();
                     i += usize::from(i < chars.len()); // consume ')'
                 }
-                apply_pseudo(&mut c, &name, &arg);
+                // We don't generate pseudo-element boxes, so a selector targeting
+                // one must never match a real element — otherwise its declarations
+                // leak onto that element (e.g. `p::before{width:120pt}` was sizing
+                // every `<p>`). `::x` and the legacy `:before/:after/:first-line/
+                // :first-letter` are pseudo-elements; other `:x` are pseudo-classes.
+                if double_colon || is_pseudo_element(&name) {
+                    c.pseudos.push(Pseudo::Never);
+                } else {
+                    apply_pseudo(&mut c, &name, &arg);
+                }
             }
             '.' | '#' => {
                 let s = i;
@@ -648,6 +658,25 @@ fn apply_pseudo(c: &mut Compound, name: &str, arg: &str) {
         | "checked" | "disabled" | "enabled" => c.pseudos.push(Pseudo::Never),
         _ => {} // unknown pseudo — ignore (matches nothing extra)
     }
+}
+
+/// Whether a (single-colon) pseudo name denotes a pseudo-*element* rather than a
+/// pseudo-class. `::`-prefixed names are always pseudo-elements; these are the
+/// legacy single-colon forms plus the common `::`-only ones, so a selector ending
+/// in one never matches a real element (we don't box pseudo-elements).
+fn is_pseudo_element(name: &str) -> bool {
+    matches!(
+        name,
+        "before"
+            | "after"
+            | "first-line"
+            | "first-letter"
+            | "placeholder"
+            | "marker"
+            | "selection"
+            | "backdrop"
+            | "file-selector-button"
+    )
 }
 
 /// Parse the `An+B` microsyntax: `odd`, `even`, `3`, `2n`, `2n+1`, `-n+3`, `n`.
@@ -791,6 +820,27 @@ mod tests {
 
     fn matches(css: &str, path: &[ElemRef]) -> bool {
         parse_stylesheet(css).rules[0].matches(path).is_some()
+    }
+
+    #[test]
+    fn pseudo_elements_do_not_match_the_element() {
+        let p = chain(vec![sref("p", None, &[], &[])]);
+        // Pseudo-elements target a generated box we don't create, so they must not
+        // match the real element — otherwise their declarations leak onto it (the
+        // `p::before { width: 120pt }` that was sizing every paragraph).
+        assert!(!matches("p::before { width: 120pt }", &p));
+        assert!(!matches("p::after { x: y }", &p));
+        assert!(
+            !matches("p:before { x: y }", &p),
+            "legacy single-colon ::before"
+        );
+        assert!(!matches("p::first-line { x: y }", &p));
+        assert!(!matches("p:first-letter { x: y }", &p));
+        assert!(!matches("p::marker { x: y }", &p));
+        assert!(!matches("p::selection { x: y }", &p));
+        // Pseudo-*classes* still match the element.
+        assert!(matches("p:first-child { x: y }", &p));
+        assert!(matches("p { x: y }", &p));
     }
 
     #[test]

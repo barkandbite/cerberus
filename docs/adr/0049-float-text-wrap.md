@@ -17,23 +17,28 @@ page, and was independent of the consent/asset blocking fixed in ADR-0048.
 
 ## Decision
 
-Let in-flow content **wrap alongside** open floats instead of always dropping
-below them.
+Track each float individually (not one cumulative band) and let in-flow content
+**wrap alongside** the floats that still overlap the current line, reclaiming the
+full width once flow passes a float's bottom.
 
-- New `flow_among_floats` runs before each in-flow text/element child while a
-  float band is open. If the float still occupies this band (`self.y` is above
-  its bottom) and at least `MIN_FLOAT_WRAP_WIDTH` (120px) remains between the
-  left- and right-float cursors, it narrows the content box to that free band
-  (`[fb.x, fb.right_x]`) so the child flows beside the float. Otherwise it drops
-  below the band as before, restoring the full width.
-- A `clear` still drops below the band unconditionally.
-- Floats themselves are always sized against the container's full content box, so
-  an earlier wrap never shrinks a later float; the full width is restored when
-  the band closes.
-- `MIN_FLOAT_WRAP_WIDTH` preserves ADR-0039's column-grid behavior: when floats
-  fill the row (no meaningful free width) content still drops below. Wrapping is
-  also skipped during intrinsic-width measurement, so measured widths (an upper
-  bound) are unchanged.
+- `Floats` records every placed float as `(inner edge, bottom)` — left floats by
+  their right edge, right floats by their left edge — plus the container box.
+  `band(y)` returns the available `[left, right]` at vertical position `y`,
+  counting only floats whose `bottom > y`; expired floats no longer constrain.
+  This is the key correctness point: a tall lead infobox stops affecting
+  paragraphs once flow drops past it, instead of every float on the page
+  accumulating into one ever-narrowing band.
+- `place_float` sizes the float (explicit `width`/`max-width` else shrink-to-fit),
+  then drops to the first `y` whose `band` is wide enough (so a row of floats that
+  fills the width wraps the next one below — the column-grid pattern), and records
+  it.
+- `flow_among_floats` runs before each in-flow child: it sets the content box to
+  `band(self.y)`; if less than `MIN_FLOAT_WRAP_WIDTH` (120px) remains it steps `y`
+  down past floats until the band widens (or fully clears), so content wraps
+  beside a float and reclaims the full width below it.
+- A `clear` (and the container's end) drops below all floats. Floats size against
+  the container's full box; wrapping is skipped during intrinsic-width
+  measurement, so measured widths (an upper bound) are unchanged.
 
 ## Consequences
 
