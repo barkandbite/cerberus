@@ -9,6 +9,7 @@
 //! cascade. `@media` blocks are parsed and gated on the viewport; other `@`-rules
 //! are skipped.
 
+use std::collections::HashMap;
 use std::rc::Rc;
 
 /// `(ids, classes+attrs+pseudos, types)` specificity, compared as a tuple.
@@ -193,6 +194,19 @@ impl Selector {
         self.match_at(self.compounds.len() - 1, path, last, path[last].index)
     }
 
+    /// The bucket key for this selector's *subject* (rightmost compound): the most
+    /// selective of id > first class > tag, else universal. A necessary condition
+    /// for the selector to match, so indexing on it never drops a real match
+    /// (the full [`matches`](Self::matches) still runs on the candidates).
+    fn subject_key(&self) -> SubjectKey {
+        match self.compounds.last() {
+            Some(c) if c.id.is_some() => SubjectKey::Id(c.id.clone().unwrap()),
+            Some(c) if !c.classes.is_empty() => SubjectKey::Class(c.classes[0].clone()),
+            Some(c) if c.tag.is_some() => SubjectKey::Tag(c.tag.clone().unwrap()),
+            _ => SubjectKey::Universal,
+        }
+    }
+
     /// Recursive, backtracking match: compound `ci` against the element at
     /// path level `pi`, sibling index `sib`.
     fn match_at(&self, ci: usize, path: &[ElemRef], pi: usize, sib: usize) -> bool {
@@ -283,6 +297,73 @@ impl Rule {
 #[derive(Clone, Debug, Default)]
 pub struct Stylesheet {
     pub rules: Vec<Rule>,
+}
+
+/// The bucket a selector's subject keys into.
+enum SubjectKey {
+    Id(String),
+    Class(String),
+    Tag(String),
+    Universal,
+}
+
+/// A selector-subject index over a stylesheet's rules, so the cascade tests only
+/// rules whose subject can match a given element (by id/class/tag) plus the small
+/// universal bucket — turning per-element matching from O(all rules) into roughly
+/// O(rules keyed to this element). Rebuilt once per stylesheet, not per element.
+#[derive(Debug, Default)]
+pub struct RuleIndex {
+    by_id: HashMap<String, Vec<usize>>,
+    by_class: HashMap<String, Vec<usize>>,
+    by_tag: HashMap<String, Vec<usize>>,
+    /// Rules whose subject is `*` / attribute- or pseudo-only — always candidates.
+    universal: Vec<usize>,
+}
+
+impl RuleIndex {
+    /// Index `sheet`'s rules by each selector's subject key. A rule lands in every
+    /// bucket any of its selectors keys into (deduped), so `.a, #b` is found by an
+    /// element with class `a` *or* id `b`.
+    pub fn build(sheet: &Stylesheet) -> Self {
+        let mut idx = RuleIndex::default();
+        for (i, rule) in sheet.rules.iter().enumerate() {
+            for sel in &rule.selectors {
+                let bucket = match sel.subject_key() {
+                    SubjectKey::Id(s) => idx.by_id.entry(s).or_default(),
+                    SubjectKey::Class(s) => idx.by_class.entry(s).or_default(),
+                    SubjectKey::Tag(s) => idx.by_tag.entry(s).or_default(),
+                    SubjectKey::Universal => &mut idx.universal,
+                };
+                if bucket.last() != Some(&i) {
+                    bucket.push(i); // selectors of one rule are visited in order
+                }
+            }
+        }
+        idx
+    }
+
+    /// Candidate rule indices for `el`, in ascending source order (so the caller
+    /// keeps the cascade's source-order tiebreak). Deduped across buckets.
+    pub fn candidates(&self, el: &SiblingRef) -> Vec<usize> {
+        let mut out: Vec<usize> = Vec::new();
+        if let Some(id) = &el.id {
+            if let Some(v) = self.by_id.get(id) {
+                out.extend_from_slice(v);
+            }
+        }
+        for c in &el.classes {
+            if let Some(v) = self.by_class.get(c) {
+                out.extend_from_slice(v);
+            }
+        }
+        if let Some(v) = self.by_tag.get(&el.tag) {
+            out.extend_from_slice(v);
+        }
+        out.extend_from_slice(&self.universal);
+        out.sort_unstable();
+        out.dedup();
+        out
+    }
 }
 
 /// Parse a full stylesheet.

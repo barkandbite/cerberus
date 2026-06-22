@@ -19,8 +19,8 @@ use cerberus_style::{
 };
 use cerberus_types::{Color, ImageFit, ImagePos};
 use parser::{
-    parse_declaration_block, parse_stylesheet, ElemRef, MediaContext, SiblingRef, Specificity,
-    Stylesheet,
+    parse_declaration_block, parse_stylesheet, ElemRef, MediaContext, RuleIndex, SiblingRef,
+    Specificity, Stylesheet,
 };
 use std::collections::HashMap;
 use std::rc::Rc;
@@ -64,6 +64,8 @@ i, em, cite, var { font-style: italic; }
 /// CSS engine built on our parser + cascade.
 pub struct CssEngine {
     ua: Stylesheet,
+    /// Subject index over the UA sheet, built once (the UA sheet never changes).
+    ua_index: RuleIndex,
     media: MediaContext,
 }
 
@@ -76,8 +78,11 @@ impl CssEngine {
 
     /// Build an engine that evaluates `@media` queries against `width`×`height`.
     pub fn with_media(width: u32, height: u32) -> Self {
+        let ua = parse_stylesheet(UA_CSS);
+        let ua_index = RuleIndex::build(&ua);
         Self {
-            ua: parse_stylesheet(UA_CSS),
+            ua,
+            ua_index,
             media: MediaContext { width, height },
         }
     }
@@ -95,6 +100,7 @@ impl CssEngine {
         parent_vars: &Vars,
         path: &mut Vec<ElemRef>,
         author: &Stylesheet,
+        author_index: &RuleIndex,
     ) -> StyledNode {
         let is_root = node.tag() == "#root";
         let mut style = if is_root {
@@ -114,16 +120,23 @@ impl CssEngine {
 
         if !is_root {
             // Collect matching declarations: (origin, specificity, source-order),
-            // honoring @media against the engine's viewport.
+            // honoring @media against the engine's viewport. The subject index
+            // narrows each sheet to the rules that can match this element, instead
+            // of scanning every rule (ADR-0047) — `order` stays the rule's true
+            // source index so the cascade tiebreak is unchanged.
+            let el = &path[path.len() - 1];
+            let el = &el.siblings[el.index];
             let mut matched: Vec<MatchedRule<'_>> = Vec::new();
-            for (order, rule) in self.ua.rules.iter().enumerate() {
+            for order in self.ua_index.candidates(el) {
+                let rule = &self.ua.rules[order];
                 if rule.applies(self.media) {
                     if let Some(spec) = rule.matches(path) {
                         matched.push((0, spec, order, &rule.declarations));
                     }
                 }
             }
-            for (order, rule) in author.rules.iter().enumerate() {
+            for order in author_index.candidates(el) {
+                let rule = &author.rules[order];
                 if rule.applies(self.media) {
                     if let Some(spec) = rule.matches(path) {
                         matched.push((1, spec, order, &rule.declarations));
@@ -170,6 +183,7 @@ impl CssEngine {
                         &vars,
                         path,
                         author,
+                        author_index,
                     );
                     elem_index += 1;
                     StyledChild::Element(Box::new(styled))
@@ -203,6 +217,7 @@ impl StyleEngine for CssEngine {
         let mut css = String::new();
         collect_author_css(doc.root(), sheets, &mut css);
         let author = parse_stylesheet(&css);
+        let author_index = RuleIndex::build(&author);
         let mut path = Vec::new();
         let root = doc.root();
         let root_siblings: Rc<[SiblingRef]> = vec![sibling_ref(root)].into();
@@ -215,6 +230,7 @@ impl StyleEngine for CssEngine {
             &no_vars,
             &mut path,
             &author,
+            &author_index,
         );
         StyledDom { root: styled }
     }
