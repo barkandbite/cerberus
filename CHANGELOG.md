@@ -3,6 +3,24 @@
 All notable changes to Cerberus are recorded here. Versions are small while the
 browser is pre-1.0; this is the first tagged preview.
 
+## [0.0.5] — 2026-06-22
+
+Responsive-image fidelity: pictures now keep their aspect ratio, anchor where the
+design asks, and download an appropriately sized source.
+
+### Added
+- **`object-fit` / `background-size` — `cover` & `contain`.** Images are no longer
+  always stretched to their box; `cover` fills and crops, `contain` fits and
+  letterboxes, both preserving aspect ratio (ADR-0044).
+- **`object-position` / `background-position`.** Cover/contain images anchor by
+  keyword or percentage (e.g. a hero cropped to its top), and the ubiquitous
+  `background: url(…) center/cover` shorthand is now read, so cover/contain
+  actually trigger on real sites (ADR-0045).
+- **Responsive images — `srcset` / `sizes`.** `<img>` selects an appropriately
+  sized candidate (bandwidth-first, at device-pixel-ratio 1) instead of fetching a
+  blurry placeholder or an oversized original; fetch-time and draw-time agree on
+  the choice so the bytes fetched are the bytes drawn (ADR-0046).
+
 ## [0.0.4] — 2026-06-19
 
 UI polish + robustness: a real icon set, crisp hi-DPI text, a legible cookie
