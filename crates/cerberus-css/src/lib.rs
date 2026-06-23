@@ -87,6 +87,13 @@ impl CssEngine {
         }
     }
 
+    /// Point `@media` evaluation at a new viewport (e.g. on window resize), so
+    /// responsive rules re-resolve against the real width — cheap, keeps the UA
+    /// index. The viewport must track the actual layout width, not a fixed guess.
+    pub fn set_media(&mut self, width: u32, height: u32) {
+        self.media = MediaContext { width, height };
+    }
+
     // The cascade walker threads per-element context (siblings/index/parent/
     // custom-properties) plus the shared path & author sheet; these vary per call,
     // so bundling them wouldn't aid readability.
@@ -1971,6 +1978,30 @@ mod tests {
         // Wide viewport: it does not.
         let wide = CssEngine::with_media(1200, 800).style(&parse_html(html));
         assert_eq!(first(&wide.root, "p").unwrap().style.color, Color::BLACK);
+    }
+
+    #[test]
+    fn media_type_and_feature_combined_track_the_real_viewport() {
+        // `screen and (min-width: 1680px)` — media type + feature, the form the
+        // Vector skin uses for its desktop grid header. Must resolve against the
+        // engine's real viewport, not a fixed guess (ADR-0052).
+        let html =
+            "<style>@media screen and (min-width: 1680px) { p { color: #00ff00 } }</style><p>x</p>";
+        let small = CssEngine::with_media(1280, 800).style(&parse_html(html));
+        assert_eq!(first(&small.root, "p").unwrap().style.color, Color::BLACK);
+        let big = CssEngine::with_media(1920, 1080).style(&parse_html(html));
+        assert_eq!(
+            first(&big.root, "p").unwrap().style.color,
+            Color::rgb(0, 0xff, 0)
+        );
+        // `set_media` re-points evaluation (the resize path).
+        let mut eng = CssEngine::with_media(1280, 800);
+        eng.set_media(1920, 1080);
+        let re = eng.style(&parse_html(html));
+        assert_eq!(
+            first(&re.root, "p").unwrap().style.color,
+            Color::rgb(0, 0xff, 0)
+        );
     }
 
     // ---- CSS custom properties + var()/calc() (ADR-0035) ----

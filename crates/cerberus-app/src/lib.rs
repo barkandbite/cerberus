@@ -976,7 +976,8 @@ pub fn render(config: &RenderConfig) -> Result<RenderOutcome, AppError> {
         None => ExternalSheets::new(),
     };
     let style_t = Instant::now();
-    let styled = CssEngine::new().style_with_sheets(&document, &sheets);
+    let styled = CssEngine::with_media(config.viewport.w, config.viewport.h)
+        .style_with_sheets(&document, &sheets);
     timings.record("style", style_t.elapsed());
 
     // Fetch + decode this page's images up front (the one-shot path is
@@ -1906,6 +1907,9 @@ pub struct BrowserApp {
     settings_open: bool,
     background: Color,
     last_size: Size,
+    /// Content width the current `styled` tree's `@media` was resolved against, so
+    /// a resize across a breakpoint triggers a re-style (ADR-0052).
+    styled_w: u32,
     /// HiDPI scale factor (physical ÷ logical px). 1.0 unless the shell sets it.
     scale: f32,
     /// Consent policy shared with the worker-side cookie jar.
@@ -2082,6 +2086,7 @@ impl BrowserApp {
             settings_open: false,
             background: Color::WHITE,
             last_size: Size::new(800, 600),
+            styled_w: 0,
             scale: 1.0,
             consent: Arc::new(Mutex::new(DefaultDenyPolicy::new(true))),
             cookie_policy: Arc::new(Mutex::new(CookiePolicy::new())),
@@ -2253,6 +2258,7 @@ impl BrowserApp {
         // worker and re-style as they arrive (ADR-0037).
         self.sheets.clear();
         self.pending_sheets.clear();
+        self.update_media();
         let t = Instant::now();
         self.styled = self.style_engine.style(&doc);
         self.timings.record("style", t.elapsed());
@@ -2264,11 +2270,21 @@ impl BrowserApp {
     /// Re-run the cascade with the external stylesheets fetched so far, splicing
     /// each in at its `<link>`'s position. Called as sheets arrive (ADR-0037).
     fn restyle_with_sheets(&mut self) {
+        self.update_media();
         let t = Instant::now();
         self.styled = self
             .style_engine
             .style_with_sheets(&self.document, &self.sheets);
         self.timings.record("style", t.elapsed());
+    }
+
+    /// Point the cascade's `@media` viewport at the current content area so
+    /// responsive rules resolve against the real width, and remember that width
+    /// so a later resize across a breakpoint re-styles (ADR-0052).
+    fn update_media(&mut self) {
+        let c = self.toolbar.content_size(self.last_size);
+        self.style_engine.set_media(c.w.max(1), c.h.max(1));
+        self.styled_w = c.w.max(1);
     }
 
     /// Run the document's inline scripts against the active head's engine and
@@ -3708,6 +3724,11 @@ impl FrameApp for BrowserApp {
         content.h = content.h.saturating_sub(banner_h);
         let mut origin = self.toolbar.content_origin();
         origin.y += banner_h as i32;
+        // A resize across a media breakpoint must re-resolve `@media` (the cascade
+        // is otherwise cached); restyle when the content width changed (ADR-0052).
+        if self.styled_w != content.w.max(1) {
+            self.restyle_with_sheets();
+        }
 
         // Time layout+paint (M11). The image provider's borrow of `self` is
         // scoped to this block so the timing record (a `&mut self` op) is free.
