@@ -18,6 +18,7 @@ use cerberus_style::{
     StyledNode, TextAlign, TextTransform, Track, TrackMax,
 };
 use cerberus_types::{Color, FontStyle, Point, Rect, Size};
+use std::collections::HashMap;
 use std::sync::Arc;
 
 /// A clickable link region produced by layout (in layout-local coordinates).
@@ -2094,18 +2095,38 @@ impl<'a> Ctx<'a> {
             .max_by_key(|(_, w)| **w)
             .map(|(i, _)| i)
             .unwrap_or(0);
+        // Named template areas (`grid-template-areas` + item `grid-area: name`):
+        // place each named item into the rectangle its area spans (ADR-0051).
+        let area_map = build_grid_area_map(&node.style.grid_template_areas);
         for it in &items {
-            let rs = (it.style.grid_row_span as usize).max(1);
-            let (r0, c0, cs) = if it.style.grid_named_place {
-                let c0 = content_col;
-                (find_free_in_col(&mut occ, ncols, c0, rs), c0, 1)
+            let named = it
+                .style
+                .grid_area
+                .as_ref()
+                .and_then(|n| area_map.get(n))
+                .copied();
+            let (r0, c0, cs, rs) = if let Some((ar, ac, ars, acs)) = named {
+                let ac = ac.min(ncols - 1);
+                (ar, ac, acs.min(ncols - ac).max(1), ars.max(1))
+            } else if it.style.grid_named_place {
+                let rs = (it.style.grid_row_span as usize).max(1);
+                (
+                    find_free_in_col(&mut occ, ncols, content_col, rs),
+                    content_col,
+                    1,
+                    rs,
+                )
             } else {
+                let rs = (it.style.grid_row_span as usize).max(1);
                 let cs = (it.style.grid_column_span as usize).clamp(1, ncols);
                 let (r0, c0) = find_free_cell(&mut occ, ncols, cs, rs, cursor);
-                (r0, c0, cs)
+                (r0, c0, cs, rs)
             };
+            while occ.len() < r0 + rs {
+                occ.push(vec![false; ncols]);
+            }
             for row in occ.iter_mut().take(r0 + rs).skip(r0) {
-                for cell in row.iter_mut().take(c0 + cs).skip(c0) {
+                for cell in row.iter_mut().take((c0 + cs).min(ncols)).skip(c0) {
                     *cell = true;
                 }
             }
@@ -2644,6 +2665,33 @@ struct GridPlacement {
     c0: usize,
     cs: usize,
     rs: usize,
+}
+
+/// Map each `grid-template-areas` name to the `(row, col, row-span, col-span)`
+/// rectangle it spans (the bounding box of its cells) — ADR-0051.
+fn build_grid_area_map(areas: &[Vec<String>]) -> HashMap<String, (usize, usize, usize, usize)> {
+    // name -> (min_row, min_col, max_row, max_col)
+    let mut bounds: HashMap<String, (usize, usize, usize, usize)> = HashMap::new();
+    for (r, row) in areas.iter().enumerate() {
+        for (c, name) in row.iter().enumerate() {
+            if name.is_empty() {
+                continue;
+            }
+            bounds
+                .entry(name.clone())
+                .and_modify(|b| {
+                    b.0 = b.0.min(r);
+                    b.1 = b.1.min(c);
+                    b.2 = b.2.max(r);
+                    b.3 = b.3.max(c);
+                })
+                .or_insert((r, c, r, c));
+        }
+    }
+    bounds
+        .into_iter()
+        .map(|(name, (r0, c0, r1, c1))| (name, (r0, c0, r1 - r0 + 1, c1 - c0 + 1)))
+        .collect()
 }
 
 /// Find the first free `cs × rs` cell block scanning row-major from `cursor`,
@@ -3585,6 +3633,37 @@ mod tests {
             "cleared block spans the full width: {}",
             r[1].w
         );
+    }
+
+    #[test]
+    fn grid_named_areas_place_items_in_their_tracks() {
+        // The page-shell pattern: a fixed sidebar column + a flexible content
+        // column, items placed by name (ADR-0051).
+        let laid = lay(
+            "<div style=\"display:grid;grid-template-columns:100px 1fr;\
+               grid-template-areas:'side main'\">\
+               <div style='grid-area:main;background:#00ff00'>content</div>\
+               <div style='grid-area:side;background:#ff0000'>nav</div>\
+             </div>",
+            600,
+        );
+        let r = fill_rects(&laid);
+        let side = r.iter().find(|x| x.w <= 110).expect("100px sidebar");
+        let main = r.iter().find(|x| x.w > 110).expect("1fr content column");
+        assert!(
+            side.x < main.x,
+            "sidebar (area 'side') is left of content: side.x={} main.x={}",
+            side.x,
+            main.x
+        );
+        assert!(
+            main.x >= side.x + 100,
+            "content starts after the 100px sidebar: main.x={} side.x={}",
+            main.x,
+            side.x
+        );
+        // Source order is main-then-side, but named areas place them by column.
+        assert!((side.y - main.y).abs() <= 4, "both on the same grid row");
     }
 
     #[test]

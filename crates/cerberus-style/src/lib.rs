@@ -342,6 +342,13 @@ pub struct ComputedStyle {
     /// `grid-column: content`); layout places it in the container's widest
     /// (content) track rather than dumping it into a leading gutter (ADR-0038).
     pub grid_named_place: bool,
+    /// `grid-template-areas`: rows of cell names (an empty `.` cell is `String::new`).
+    /// A named container maps each `grid-area` item to the rectangle its name spans
+    /// — how modern page shells lay out sidebars + content (ADR-0051).
+    pub grid_template_areas: Vec<Vec<String>>,
+    /// The grid *item*'s `grid-area: <name>`, placed into the container's matching
+    /// template area (ADR-0051).
+    pub grid_area: Option<String>,
     /// `position` and its insets/`z-index` (ADR-0034). Insets resolve against the
     /// containing block at layout; `z_index` orders positioned layers in paint.
     pub position: Position,
@@ -420,6 +427,8 @@ impl ComputedStyle {
             grid_column_span: 1,
             grid_row_span: 1,
             grid_named_place: false,
+            grid_template_areas: Vec::new(),
+            grid_area: None,
             position: Position::Static,
             inset_top: Len::Auto,
             inset_right: Len::Auto,
@@ -500,6 +509,8 @@ impl ComputedStyle {
             grid_column_span: 1,
             grid_row_span: 1,
             grid_named_place: false,
+            grid_template_areas: Vec::new(),
+            grid_area: None,
             // Positioning is not inherited; every element starts in normal flow.
             position: Position::Static,
             inset_top: Len::Auto,

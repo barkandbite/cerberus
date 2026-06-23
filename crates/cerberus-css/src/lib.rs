@@ -965,10 +965,34 @@ fn apply_declarations(
             }
             "grid-row" => style.grid_row_span = parse_grid_span(v),
             "grid-area" => {
-                // `grid-area: name` (a named area/line) — we don't resolve areas,
-                // so flag it for content-track placement (ADR-0038).
-                if grid_line_is_named(v) {
+                // `grid-area: <name>` places the item into the container's matching
+                // `grid-template-areas` rectangle (ADR-0051). A line-number form
+                // (`a / b / c / d`) falls back to the content-track heuristic.
+                let t = v.trim();
+                if is_grid_area_name(t) {
+                    style.grid_area = Some(t.to_string());
+                } else if grid_line_is_named(v) {
                     style.grid_named_place = true;
+                }
+            }
+            "grid-template-areas" => {
+                style.grid_template_areas = parse_grid_template_areas(v);
+            }
+            "grid-template" | "grid" => {
+                // `grid-template: <rows> / <cols>` (and the inline-areas form). The
+                // common shells use this plus a separate `grid-template-areas`.
+                if v.contains('\'') || v.contains('"') {
+                    style.grid_template_areas = parse_grid_template_areas(v);
+                    if let Some((_, cols)) = split_top_once(v, '/') {
+                        let (tracks, auto_fill) = parse_grid_template(cols, style.font_size as f32);
+                        style.grid_template_columns = tracks;
+                        style.grid_auto_fill = auto_fill;
+                    }
+                } else if let Some((rows, cols)) = split_top_once(v, '/') {
+                    style.grid_template_rows = parse_tracks(rows, style.font_size as f32);
+                    let (tracks, auto_fill) = parse_grid_template(cols, style.font_size as f32);
+                    style.grid_template_columns = tracks;
+                    style.grid_auto_fill = auto_fill;
                 }
             }
             // Still ignored (no compositor/timeline): animation*, transition*,
@@ -1416,6 +1440,68 @@ fn grid_line_is_named(v: &str) -> bool {
                 && low != "auto"
                 && t.chars().next().is_some_and(|c| c.is_ascii_alphabetic())
         })
+}
+
+/// Whether `t` is a single `grid-area` *name* (an identifier), vs. a line-number
+/// placement (`1 / 2 / 3 / 4`) or `auto`.
+fn is_grid_area_name(t: &str) -> bool {
+    !t.is_empty()
+        && !t.eq_ignore_ascii_case("auto")
+        && t.chars().next().is_some_and(|c| c.is_ascii_alphabetic())
+        && t.chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+}
+
+/// Parse `grid-template-areas` into rows of cell names; a `.`-only cell is empty
+/// (`String::new`). e.g. `'a a' 'b c'` → `[[a,a],[b,c]]` (ADR-0051).
+fn parse_grid_template_areas(v: &str) -> Vec<Vec<String>> {
+    let mut rows = Vec::new();
+    let mut chars = v.chars().peekable();
+    while let Some(&c) = chars.peek() {
+        if c == '\'' || c == '"' {
+            chars.next();
+            let mut s = String::new();
+            for ch in chars.by_ref() {
+                if ch == c {
+                    break;
+                }
+                s.push(ch);
+            }
+            let cells: Vec<String> = s
+                .split_whitespace()
+                .map(|t| {
+                    if t.chars().all(|c| c == '.') {
+                        String::new()
+                    } else {
+                        t.to_string()
+                    }
+                })
+                .collect();
+            if !cells.is_empty() {
+                rows.push(cells);
+            }
+        } else {
+            chars.next();
+        }
+    }
+    rows
+}
+
+/// Split `v` once on the first top-level `sep` (not nested in `()`), trimming both
+/// sides — for `grid-template: <rows> / <cols>` where `<cols>` may hold `minmax()`.
+fn split_top_once(v: &str, sep: char) -> Option<(&str, &str)> {
+    let mut depth = 0i32;
+    for (i, c) in v.char_indices() {
+        match c {
+            '(' => depth += 1,
+            ')' => depth -= 1,
+            _ if c == sep && depth == 0 => {
+                return Some((v[..i].trim(), v[i + c.len_utf8()..].trim()));
+            }
+            _ => {}
+        }
+    }
+    None
 }
 
 /// Parse a `grid-column`/`grid-row` placement into a track *span* count:
