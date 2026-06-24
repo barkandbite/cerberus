@@ -997,10 +997,16 @@ impl<'a> Ctx<'a> {
         let attr_h = node.attr("height").and_then(parse_dim);
 
         if let Some(image) = self.images.get(src) {
-            let (mut w, mut h) = (
-                attr_w.filter(|v| *v > 0).unwrap_or(image.size.w),
-                attr_h.filter(|v| *v > 0).unwrap_or(image.size.h),
-            );
+            // Width/height attrs, preserving the intrinsic aspect ratio when only
+            // one is given (e.g. `<img height="60">` on a wide banner must not
+            // stretch to the natural width) — ADR-0056.
+            let (nat_w, nat_h) = (image.size.w.max(1), image.size.h.max(1));
+            let (mut w, mut h) = match (attr_w.filter(|v| *v > 0), attr_h.filter(|v| *v > 0)) {
+                (Some(aw), Some(ah)) => (aw, ah),
+                (Some(aw), None) => (aw, (aw * nat_h / nat_w).max(1)),
+                (None, Some(ah)) => ((ah * nat_w / nat_h).max(1), ah),
+                (None, None) => (nat_w, nat_h),
+            };
             let max_w = (self.right - self.left).max(1) as u32;
             if w > max_w {
                 h = (h as f32 * max_w as f32 / w as f32).round() as u32;
@@ -4164,6 +4170,39 @@ mod tests {
                 .iter()
                 .any(|i| matches!(i, DisplayItem::Image { .. })),
             "decoded image emitted"
+        );
+    }
+
+    #[test]
+    fn img_single_dimension_attr_preserves_aspect_ratio() {
+        // A 200x100 image with only `height=50` → width 100 (50 * 200/100), not
+        // the natural width 200 that would stretch it (ADR-0056).
+        let styled = CssEngine::new().style(&parse_html("<img src='b.png' height='50'>"));
+        let img = Arc::new(DecodedImage {
+            size: Size::new(200, 100),
+            rgba: vec![255; 200 * 100 * 4],
+        });
+        let laid = BlockLayout::default().layout(
+            &styled,
+            Size::new(800, 2000),
+            &MonoShaper,
+            &OneImage(img),
+            &NoForms,
+        );
+        let rect = laid
+            .display
+            .items
+            .iter()
+            .find_map(|i| match i {
+                DisplayItem::Image { rect, .. } => Some(*rect),
+                _ => None,
+            })
+            .expect("image emitted");
+        assert_eq!(rect.h, 50, "height honors the attr");
+        assert_eq!(
+            rect.w, 100,
+            "width derived from aspect ratio, not natural 200: {}",
+            rect.w
         );
     }
 
