@@ -330,6 +330,32 @@ fn query_selector_attribute_ops_pseudos_and_sibling_combinators() {
 }
 
 #[test]
+fn event_dispatch_runs_capture_target_then_bubble() {
+    // Capture-phase listeners (3rd arg true) were ignored. Full propagation must
+    // be: capture (root→target's parent), target (capture then bubble listeners),
+    // bubble (target's parent→root).
+    let doc = shell_with("result", "init");
+    let mut client = Stub::default();
+    let out = run(
+        &doc,
+        &["var outer = document.createElement('div'); var inner = document.createElement('span'); \
+           outer.appendChild(inner); document.body.appendChild(outer); var log = []; \
+           outer.addEventListener('click', function () { log.push('outer-cap'); }, true); \
+           outer.addEventListener('click', function () { log.push('outer-bub'); }, false); \
+           inner.addEventListener('click', function () { log.push('inner-cap'); }, true); \
+           inner.addEventListener('click', function () { log.push('inner-bub'); }); \
+           inner.dispatchEvent(new Event('click', { bubbles: true })); \
+           document.getElementById('result').textContent = log.join(',');"],
+        &mut client,
+    );
+    assert_eq!(
+        find_id(out.root(), "result").unwrap().text_content(),
+        "outer-cap,inner-cap,inner-bub,outer-bub",
+        "capture (outer) -> target (inner cap then bub) -> bubble (outer)"
+    );
+}
+
+#[test]
 fn performance_now_and_crypto_get_random_values_exist() {
     // The real sensor calls performance.now() and crypto.getRandomValues() early;
     // when they were missing it threw before doing anything. Assert the contract:

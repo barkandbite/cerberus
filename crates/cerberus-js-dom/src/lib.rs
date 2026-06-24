@@ -2154,22 +2154,74 @@ pub const DOM_MODEL_PRELUDE: &str = r##"
     // the bridge beyond DOMContentLoaded/load on document+window). __listeners
     // is created lazily on first addEventListener so listener-free nodes pay
     // nothing.
-    ELEMENT_PROTO.addEventListener = function (type, fn) {
+    // Capture-aware listener registry: bubble/target listeners live in
+    // __listeners, capture listeners in __capListeners (3rd arg `true` or
+    // {capture:true}). Shared by element/document/window.
+    function __addEL(node, type, fn, options) {
       type = String(type);
-      if (!this.__listeners) this.__listeners = Object.create(null);
-      if (!this.__listeners[type]) this.__listeners[type] = [];
-      if (typeof fn === "function") this.__listeners[type].push(fn);
-    };
-    ELEMENT_PROTO.removeEventListener = function (type, fn) {
-      type = String(type); if (!this.__listeners) return;
-      var arr = this.__listeners[type]; if (!arr) return;
+      var cap = options === true || (options && options.capture);
+      var bucket = cap ? "__capListeners" : "__listeners";
+      if (!node[bucket]) node[bucket] = Object.create(null);
+      if (!node[bucket][type]) node[bucket][type] = [];
+      if (typeof fn === "function") node[bucket][type].push(fn);
+    }
+    function __removeEL(node, type, fn, options) {
+      type = String(type);
+      var cap = options === true || (options && options.capture);
+      var bucket = cap ? "__capListeners" : "__listeners";
+      if (!node[bucket]) return;
+      var arr = node[bucket][type]; if (!arr) return;
       var i = arr.indexOf(fn); if (i !== -1) arr.splice(i, 1);
-    };
+    }
+    // Full 3-phase propagation (capture → target → bubble) for both host-driven
+    // events (__cerberusDispatch) and script dispatchEvent.
+    function __propagate(target, ev) {
+      var type = ev.type;
+      if (ev.target == null) ev.target = target;
+      var path;
+      if (target === g.window) { path = [g.window]; }
+      else if (target === g.document) { path = [g.document, g.window]; }
+      else {
+        path = [];
+        for (var n = target; n; n = n.__parent) path.push(n);
+        path.push(g.document); path.push(g.window);
+      }
+      function fire(node, arr, phase) {
+        if (!arr || !arr.length) return;
+        ev.currentTarget = node; ev.eventPhase = phase;
+        var c = arr.slice();
+        for (var j = 0; j < c.length; j++) {
+          try { c[j].call(node, ev); } catch (e) {}
+          if (ev.__stopImmediate) return;
+        }
+      }
+      // CAPTURING_PHASE: window → target's parent.
+      for (var i = path.length - 1; i >= 1; i--) {
+        if (ev.__stop) break;
+        fire(path[i], path[i].__capListeners ? path[i].__capListeners[type] : null, 1);
+      }
+      // AT_TARGET: target's capture then bubble listeners.
+      if (!ev.__stop) {
+        var tc = (target.__capListeners && target.__capListeners[type]) || [];
+        var tb = (target.__listeners && target.__listeners[type]) || [];
+        fire(target, tc.concat(tb), 2);
+      }
+      // BUBBLING_PHASE: target's parent → window (only if the event bubbles).
+      if (ev.bubbles && !ev.__stop) {
+        for (var i2 = 1; i2 < path.length; i2++) {
+          if (ev.__stop) break;
+          fire(path[i2], path[i2].__listeners ? path[i2].__listeners[type] : null, 3);
+        }
+      }
+      ev.eventPhase = 0; ev.currentTarget = null;
+    }
+    ELEMENT_PROTO.addEventListener = function (type, fn, options) { __addEL(this, type, fn, options); };
+    ELEMENT_PROTO.removeEventListener = function (type, fn, options) { __removeEL(this, type, fn, options); };
     ELEMENT_PROTO.dispatchEvent = function (ev) {
-      if (!this.__listeners) return true;
-      var arr = this.__listeners[ev && ev.type]; if (!arr) return true;
-      for (var i = 0; i < arr.slice().length; i++) { try { arr[i].call(this, ev); } catch (e) {} }
-      return true;
+      if (!ev) return true;
+      if (ev.__stop === undefined) { ev.__stop = false; ev.__stopImmediate = false; }
+      __propagate(this, ev);
+      return !ev.defaultPrevented;
     };
 
     // -- text nodes (TEXT_PROTO) --
@@ -2284,19 +2336,13 @@ pub const DOM_MODEL_PRELUDE: &str = r##"
       // but we model it as a bare element whose kids get re-parented on insert.
       return makeElement("#fragment");
     };
-    document.addEventListener = function (type, fn) {
-      type = String(type); if (!this.__listeners[type]) this.__listeners[type] = [];
-      if (typeof fn === "function") this.__listeners[type].push(fn);
-    };
-    document.removeEventListener = function (type, fn) {
-      type = String(type); var arr = this.__listeners[type]; if (!arr) return;
-      var i = arr.indexOf(fn); if (i !== -1) arr.splice(i, 1);
-    };
+    document.addEventListener = function (type, fn, options) { __addEL(this, type, fn, options); };
+    document.removeEventListener = function (type, fn, options) { __removeEL(this, type, fn, options); };
     document.dispatchEvent = function (ev) {
-      var arr = this.__listeners[ev && ev.type]; if (!arr) return true;
-      var copy = arr.slice();
-      for (var i = 0; i < copy.length; i++) { try { copy[i].call(this, ev); } catch (e) {} }
-      return true;
+      if (!ev) return true;
+      if (ev.__stop === undefined) { ev.__stop = false; ev.__stopImmediate = false; }
+      __propagate(this, ev);
+      return !ev.defaultPrevented;
     };
 
     g.document = document;
@@ -2306,19 +2352,13 @@ pub const DOM_MODEL_PRELUDE: &str = r##"
     g.self = g;
     window.document = document;
     if (!window.__listeners) window.__listeners = Object.create(null);
-    window.addEventListener = function (type, fn) {
-      type = String(type); if (!this.__listeners[type]) this.__listeners[type] = [];
-      if (typeof fn === "function") this.__listeners[type].push(fn);
-    };
-    window.removeEventListener = function (type, fn) {
-      type = String(type); var arr = this.__listeners[type]; if (!arr) return;
-      var i = arr.indexOf(fn); if (i !== -1) arr.splice(i, 1);
-    };
+    window.addEventListener = function (type, fn, options) { __addEL(this, type, fn, options); };
+    window.removeEventListener = function (type, fn, options) { __removeEL(this, type, fn, options); };
     window.dispatchEvent = function (ev) {
-      var arr = this.__listeners[ev && ev.type]; if (!arr) return true;
-      var copy = arr.slice();
-      for (var i = 0; i < copy.length; i++) { try { copy[i].call(this, ev); } catch (e) {} }
-      return true;
+      if (!ev) return true;
+      if (ev.__stop === undefined) { ev.__stop = false; ev.__stopImmediate = false; }
+      __propagate(this, ev);
+      return !ev.defaultPrevented;
     };
 
     // ---- ambient environment (location/navigator/screen/storage/…) -----
@@ -3193,10 +3233,10 @@ pub const DOM_MODEL_PRELUDE: &str = r##"
           isTrusted: true,
           timeStamp: 0,
           __stop: false,
-          __stopNow: false,
+          __stopImmediate: false,
           preventDefault: function () { if (this.cancelable) this.defaultPrevented = true; },
           stopPropagation: function () { this.__stop = true; },
-          stopImmediatePropagation: function () { this.__stop = true; this.__stopNow = true; },
+          stopImmediatePropagation: function () { this.__stop = true; this.__stopImmediate = true; },
         };
         // Copy caller-supplied fields (key, code, button, detail, …) without
         // clobbering the machinery above.
@@ -3206,28 +3246,8 @@ pub const DOM_MODEL_PRELUDE: &str = r##"
           }
         }
 
-        // Propagation path: target → ancestor elements → document → window.
-        var path = [];
-        for (var n = target; n; n = n.__parent) path.push(n);
-        if (ev.bubbles) { path.push(document); path.push(window); }
-
-        // Target phase (index 0) then bubbling; a non-bubbling event runs only
-        // the target's own listeners.
-        var limit = ev.bubbles ? path.length : 1;
-        for (var i = 0; i < limit; i++) {
-          var cur = path[i];
-          var arr = cur.__listeners ? cur.__listeners[type] : null;
-          if (arr && arr.length) {
-            ev.currentTarget = cur;
-            ev.eventPhase = (cur === target) ? 2 : 3; // AT_TARGET / BUBBLING_PHASE
-            var copy = arr.slice();
-            for (var j = 0; j < copy.length; j++) {
-              try { copy[j].call(cur, ev); } catch (e) {}
-              if (ev.__stopNow) break;
-            }
-          }
-          if (ev.__stop) break;
-        }
+        // Full capture → target → bubble propagation (shared with dispatchEvent).
+        __propagate(target, ev);
 
         return JSON.stringify({ dispatched: 1, defaultPrevented: ev.defaultPrevented ? 1 : 0 });
       } catch (e) {
