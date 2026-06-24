@@ -3000,6 +3000,8 @@ pub const DOM_MODEL_PRELUDE: &str = r##"
         if (!entry) return;
         delete g.__cerberusFetchPending[id];
         resp = resp || {};
+        // XHR rides the same queue but settles into its state machine, not a Promise.
+        if (entry.xhr) { entry.settle(resp); return; }
         var response = makeResponse(
           (typeof resp.status === "number") ? resp.status : 200,
           resp.statusText, resp.url, resp.headers, resp.body
@@ -3014,8 +3016,101 @@ pub const DOM_MODEL_PRELUDE: &str = r##"
         var entry = g.__cerberusFetchPending[id];
         if (!entry) return;
         delete g.__cerberusFetchPending[id];
+        if (entry.xhr) { entry.fail(String(message)); return; }
         entry.reject(new TypeError(String(message)));
       } catch (e) {}
+    };
+
+    // ---- XMLHttpRequest (async; rides the same fetch queue) -------------
+    // Older analytics/ad/bot libraries use XHR, not fetch. open/send enqueue a
+    // request like fetch(); the host's drain settles it into the XHR state
+    // machine, firing readystatechange/load/error/loadend.
+    g.XMLHttpRequest = function XMLHttpRequest() {
+      this.readyState = 0; this.status = 0; this.statusText = "";
+      this.responseText = ""; this.response = ""; this.responseType = ""; this.responseURL = "";
+      this.timeout = 0; this.withCredentials = false;
+      this.onreadystatechange = null; this.onload = null; this.onerror = null;
+      this.onloadend = null; this.onabort = null; this.ontimeout = null;
+      this.__method = "GET"; this.__url = ""; this.__reqHeaders = [];
+      this.__respHeaders = []; this.__listeners = {}; this.__sent = false;
+    };
+    var XHRP = g.XMLHttpRequest.prototype;
+    XHRP.UNSENT = 0; XHRP.OPENED = 1; XHRP.HEADERS_RECEIVED = 2; XHRP.LOADING = 3; XHRP.DONE = 4;
+    g.XMLHttpRequest.UNSENT = 0; g.XMLHttpRequest.OPENED = 1; g.XMLHttpRequest.HEADERS_RECEIVED = 2;
+    g.XMLHttpRequest.LOADING = 3; g.XMLHttpRequest.DONE = 4;
+    XHRP.open = function (method, url) {
+      this.__method = String(method || "GET").toUpperCase();
+      this.__url = String(url);
+      this.__reqHeaders = []; this.__sent = false;
+      this.readyState = 1; this.__fire("readystatechange");
+    };
+    XHRP.setRequestHeader = function (name, value) {
+      this.__reqHeaders.push([String(name), String(value)]);
+    };
+    XHRP.getResponseHeader = function (name) {
+      name = String(name).toLowerCase();
+      for (var i = 0; i < this.__respHeaders.length; i++) {
+        if (String(this.__respHeaders[i][0]).toLowerCase() === name) return this.__respHeaders[i][1];
+      }
+      return null;
+    };
+    XHRP.getAllResponseHeaders = function () {
+      var out = "";
+      for (var i = 0; i < this.__respHeaders.length; i++) {
+        out += this.__respHeaders[i][0] + ": " + this.__respHeaders[i][1] + "\r\n";
+      }
+      return out;
+    };
+    XHRP.addEventListener = function (t, fn) {
+      (this.__listeners[t] = this.__listeners[t] || []).push(fn);
+    };
+    XHRP.removeEventListener = function (t, fn) {
+      var l = this.__listeners[t]; if (!l) return;
+      var i = l.indexOf(fn); if (i !== -1) l.splice(i, 1);
+    };
+    XHRP.__fire = function (type) {
+      var ev = { type: type, target: this, currentTarget: this };
+      if (typeof this["on" + type] === "function") { try { this["on" + type].call(this, ev); } catch (e) {} }
+      var l = this.__listeners[type];
+      if (l) { var c = l.slice(); for (var i = 0; i < c.length; i++) { try { c[i].call(this, ev); } catch (e) {} } }
+    };
+    XHRP.send = function (body) {
+      var self = this;
+      if (this.readyState !== 1 || this.__sent) { throw new Error("XHR: invalid state for send()"); }
+      this.__sent = true;
+      var id = g.__cerberusFetchId++;
+      g.__cerberusFetchQueue.push({
+        id: id, url: this.__url, method: this.__method,
+        headers: this.__reqHeaders.slice(), body: (body != null ? String(body) : "")
+      });
+      g.__cerberusFetchPending[id] = {
+        xhr: true,
+        settle: function (resp) {
+          self.status = (typeof resp.status === "number") ? resp.status : 0;
+          self.statusText = resp.statusText || "";
+          self.responseURL = resp.url || self.__url;
+          self.__respHeaders = Array.isArray(resp.headers) ? resp.headers : [];
+          var text = (resp.body != null) ? String(resp.body) : "";
+          self.responseText = text;
+          if (self.responseType === "json") {
+            try { self.response = JSON.parse(text); } catch (e) { self.response = null; }
+          } else { self.response = text; }
+          self.readyState = 2; self.__fire("readystatechange");
+          self.readyState = 3; self.__fire("readystatechange");
+          self.readyState = 4; self.__fire("readystatechange");
+          self.__fire("load"); self.__fire("loadend");
+        },
+        fail: function () {
+          self.status = 0; self.readyState = 4; self.__fire("readystatechange");
+          self.__fire("error"); self.__fire("loadend");
+        }
+      };
+    };
+    XHRP.abort = function () {
+      if (this.readyState !== 0 && this.readyState !== 4) {
+        this.readyState = 4; this.status = 0;
+        this.__fire("readystatechange"); this.__fire("abort"); this.__fire("loadend");
+      }
     };
 
     // ---- serialize: JS tree -> wire JSON -------------------------------

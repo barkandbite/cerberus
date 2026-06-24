@@ -331,6 +331,51 @@ fn mutation_observer_delivers_childlist_and_attribute_records() {
 }
 
 #[test]
+fn xmlhttprequest_get_and_post_ride_the_fetch_queue() {
+    // XHR (previously absent) rides the same host-drained queue as fetch. A GET
+    // with responseType 'json' drives readystatechange to DONE and exposes
+    // status/responseText/response; a POST captures method, body, and a header.
+    let doc = shell_with("result", "init");
+    let mut client = Stub::default().route("/api", "application/json", "{\"v\":7}");
+    let out = run(
+        &doc,
+        &["var x = new XMLHttpRequest(); \
+           x.open('GET', '/api'); x.responseType = 'json'; \
+           x.onreadystatechange = function () { \
+             if (x.readyState === 4) { \
+               document.getElementById('result').textContent = \
+                 x.status + ':' + x.responseText + ':' + (x.response && x.response.v); } }; \
+           x.send();"],
+        &mut client,
+    );
+    assert_eq!(
+        find_id(out.root(), "result").unwrap().text_content(),
+        "200:{\"v\":7}:7",
+        "XHR GET reaches DONE with status + responseText + parsed json response"
+    );
+
+    let mut client2 = Stub::default().route("/submit", "text/plain", "ok");
+    let _ = run(
+        &doc,
+        &["var x = new XMLHttpRequest(); x.open('POST', '/submit'); \
+           x.setRequestHeader('X-T', '1'); x.send('payload');"],
+        &mut client2,
+    );
+    let req = client2
+        .seen
+        .iter()
+        .find(|r| r.url == "/submit")
+        .expect("the XHR POST was serviced");
+    assert_eq!(req.method, "POST");
+    assert_eq!(req.body, "payload");
+    assert!(
+        req.headers.iter().any(|(n, v)| n == "X-T" && v == "1"),
+        "the request header was captured, got {:?}",
+        req.headers
+    );
+}
+
+#[test]
 fn text_encoding_and_base64_round_trip_against_known_vectors() {
     // QuickJS ships none of these (not ECMAScript). Assert spec-correct UTF-8 +
     // base64 against known vectors, incl. a non-ASCII codepoint (U+20AC '€' ->
