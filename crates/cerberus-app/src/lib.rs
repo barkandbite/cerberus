@@ -1089,6 +1089,17 @@ pub fn render(config: &RenderConfig) -> Result<RenderOutcome, AppError> {
             }
         };
     }
+    // Apply cookies the page set via `document.cookie = …` to the real jar — same
+    // consent-gated, attribute-aware path as a `Set-Cookie` header — so a
+    // script-set token persists for subsequent requests. Only when a page model
+    // was installed (scripts ran); the script-less branch has no model to drain.
+    if scripts_ran > 0 {
+        if let Ok(writes) = cerberus_js_dom::take_cookie_writes(engine, base_realm) {
+            for raw in writes {
+                jar.set_cookie(active_instance, &url, &first_party, &raw);
+            }
+        }
+    }
     let engine_name = engine.name().to_string();
     let realms_live = engine.realm_count();
     let engines_live = heads.engines_live();

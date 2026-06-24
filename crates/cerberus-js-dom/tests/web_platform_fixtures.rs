@@ -18,7 +18,8 @@
 use cerberus_dom::{Document, DocumentBuilder, NodeRef};
 use cerberus_js::{JsEngine, JsEngineFactory};
 use cerberus_js_dom::{
-    run_page_scripts_with_fetch, FetchClient, FetchRequest, FetchResponse, PageEnv,
+    install_page, run_page_scripts_with_fetch, run_scripts, take_cookie_writes, FetchClient,
+    FetchRequest, FetchResponse, PageEnv,
 };
 use cerberus_js_quickjs::QuickJsEngineFactory;
 use cerberus_types::RealmId;
@@ -267,6 +268,34 @@ fn document_cookie_is_seeded_from_the_env_and_merges_writes() {
         find_id(out.root(), "result").unwrap().text_content(),
         "a=1; b=2 | a=99; b=2; sess=xyz",
         "read sees the seed; writes merge by name (a replaced, sess appended)"
+    );
+}
+
+#[test]
+fn document_cookie_writes_are_captured_for_the_host_to_apply() {
+    // The OUT half of the bridge: every `document.cookie = …` (raw, with
+    // attributes) is queued for the host to apply to the real consent-gated jar
+    // as a Set-Cookie. take_cookie_writes drains and empties the queue.
+    let (mut engine, realm) = engine_and_realm();
+    let doc = shell_with("result", "init");
+    install_page(engine.as_mut(), realm, &doc, &env()).expect("install");
+    run_scripts(
+        engine.as_mut(),
+        realm,
+        &["document.cookie = 'sid=abc; Path=/; HttpOnly'; document.cookie = 'p=1';".to_string()],
+    )
+    .expect("run");
+    let writes = take_cookie_writes(engine.as_mut(), realm).expect("take");
+    assert_eq!(
+        writes,
+        vec!["sid=abc; Path=/; HttpOnly".to_string(), "p=1".to_string()],
+        "both assignments captured verbatim, in order"
+    );
+    assert!(
+        take_cookie_writes(engine.as_mut(), realm)
+            .expect("take2")
+            .is_empty(),
+        "draining empties the queue"
     );
 }
 

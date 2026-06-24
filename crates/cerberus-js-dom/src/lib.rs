@@ -976,6 +976,32 @@ pub struct FetchStats {
 /// Drain the realm's pending `fetch` queue into Rust, returning the descriptors
 /// and clearing the queue.
 ///
+/// Drain the `document.cookie = …` assignments a script made this run, raw (with
+/// attributes), so the host can apply each to the real consent-gated jar as a
+/// `Set-Cookie`. Empty when the page set no cookies from script. Non-string
+/// entries are skipped rather than failing the drain.
+pub fn take_cookie_writes(
+    engine: &mut dyn JsEngine,
+    realm: RealmId,
+) -> Result<Vec<String>, BridgeError> {
+    let json = match engine.eval(realm, "__cerberusTakeCookieWrites()")? {
+        JsValue::Str(s) => s,
+        other => {
+            return Err(BridgeError::Structure(format!(
+                "__cerberusTakeCookieWrites did not return a string: {other:?}"
+            )))
+        }
+    };
+    let value = json::parse(&json).map_err(BridgeError::Json)?;
+    let items = value.as_array().ok_or_else(|| {
+        BridgeError::Structure("__cerberusTakeCookieWrites did not return an array".to_string())
+    })?;
+    Ok(items
+        .iter()
+        .filter_map(|v| v.as_str().map(str::to_string))
+        .collect())
+}
+
 /// Evals `__cerberusTakeFetches()` (which `JSON.stringify`s the queue then empties
 /// it) and parses the array of `{id,url,method,headers:[[n,v]…],body}` objects. An
 /// empty queue yields an empty `Vec`. A malformed entry is skipped rather than
@@ -2021,9 +2047,12 @@ pub const DOM_MODEL_PRELUDE: &str = r##"
     Object.defineProperty(document, "cookie", {
       get: function () { return this.__cookie; },
       set: function (v) {
-        // Minimal in-memory cookie jar: keep the first "name=value" pair,
-        // appending/replacing by name. Attributes (path, expires…) are ignored.
+        // Record the raw assignment (with attributes) for the host to apply to
+        // the real jar (Set-Cookie semantics: Path/Expires/Secure/SameSite). The
+        // in-page merge below keeps a readable name=value view for this run.
         var raw = String(v);
+        if (!this.__cookieWrites) { this.__cookieWrites = []; }
+        this.__cookieWrites.push(raw);
         var semi = raw.indexOf(";");
         var pair = (semi === -1 ? raw : raw.slice(0, semi)).trim();
         var eq = pair.indexOf("=");
@@ -2856,6 +2885,19 @@ pub const DOM_MODEL_PRELUDE: &str = r##"
         if (!Array.isArray(q) || q.length === 0) return "[]";
         g.__cerberusScriptQueue = [];
         return JSON.stringify(q);
+      } catch (e) {
+        return "[]";
+      }
+    };
+
+    // Drain script-set document.cookie assignments (raw, with attributes) so the
+    // host can apply them to the real consent-gated jar as Set-Cookie.
+    g.__cerberusTakeCookieWrites = function () {
+      try {
+        var w = (g.document && g.document.__cookieWrites) || [];
+        if (!Array.isArray(w) || w.length === 0) return "[]";
+        g.document.__cookieWrites = [];
+        return JSON.stringify(w);
       } catch (e) {
         return "[]";
       }
