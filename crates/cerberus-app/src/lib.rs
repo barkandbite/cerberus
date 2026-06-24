@@ -67,6 +67,7 @@ use cerberus_ui::{
 use cerberus_url::{join as join_url, parse as parse_url, Url};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::mpsc::{Receiver, Sender};
 use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
@@ -1616,6 +1617,12 @@ impl FetchClient for SyncFetchClient<'_> {
 /// versus ~101 MB unbounded, while leaving light pages untouched.
 const IMAGE_DECODE_BUDGET_BYTES: usize = 16 * 1024 * 1024;
 
+/// Concurrent image fetches in the one-shot render path. Images are independent
+/// GETs, so fetching them serially made wall-time scale with image count (a
+/// hundreds-of-images page paid a round-trip each, in series). A small bounded
+/// pool — browser-like — overlaps the network waits without unbounded sockets.
+const IMAGE_FETCH_CONCURRENCY: usize = 8;
+
 #[allow(clippy::too_many_arguments)]
 fn fetch_images_sync(
     document: &Document,
@@ -1642,42 +1649,71 @@ fn fetch_images_sync(
         return HashMap::new();
     }
 
-    let codec = ImageCodec::new();
-    let mut out = HashMap::with_capacity(urls.len());
-    let mut decoded_bytes = 0usize;
-    for url in urls {
-        // Consent gate: unruled third-party subresources never hit the network.
-        let allowed = parse_url(&url)
-            .ok()
-            .and_then(|u| u.origin())
-            .is_some_and(|origin| {
-                policy
-                    .locked()
-                    .evaluate(ctx.instance, &origin, first_party)
-                    .decision
-                    == Decision::Allow
-            });
-        if !allowed {
-            out.insert(url, ImageState::Blocked);
-            continue;
-        }
-        // Once the decoded-memory budget is spent, defer the remaining
-        // (off-screen) images: they aren't fetched or decoded, and lay out as
-        // their reserved/placeholder box instead of a resident bitmap.
-        if decoded_bytes >= IMAGE_DECODE_BUDGET_BYTES {
-            out.insert(url, ImageState::Pending);
-            continue;
-        }
-        let state = match fetch_bytes(client, &url, ctx)
-            .and_then(|b| codec.decode(&b).map_err(|e| format!("{e:?}")))
-        {
-            Ok(img) => {
-                decoded_bytes += img.rgba.len();
-                ImageState::Ready(Arc::new(img))
+    // Consent gate up front (one lock pass, in document order): unruled
+    // third-party subresources never hit the network and are recorded Blocked;
+    // the rest become the fetch work-list.
+    let mut out: HashMap<String, ImageState> = HashMap::with_capacity(urls.len());
+    let mut allowed: Vec<String> = Vec::with_capacity(urls.len());
+    {
+        let mut pol = policy.locked();
+        for url in urls {
+            let ok = parse_url(&url)
+                .ok()
+                .and_then(|u| u.origin())
+                .is_some_and(|origin| {
+                    pol.evaluate(ctx.instance, &origin, first_party).decision == Decision::Allow
+                });
+            if ok {
+                allowed.push(url);
+            } else {
+                out.insert(url, ImageState::Blocked);
             }
-            Err(_) => ImageState::Failed,
-        };
+        }
+    }
+    if allowed.is_empty() {
+        return out;
+    }
+
+    // Fetch + decode across a bounded worker pool. Workers pull URLs in document
+    // order; once the decoded-memory budget is spent, no new image is started, so
+    // the remaining (off-screen) ones are left Pending and lay out as their
+    // reserved/placeholder box instead of a resident bitmap. Same memory bound as
+    // before — the only change is overlapping the network waits (ADR-0065).
+    let next = AtomicUsize::new(0);
+    let decoded = AtomicUsize::new(0);
+    let results: Mutex<Vec<(String, ImageState)>> = Mutex::new(Vec::with_capacity(allowed.len()));
+    let workers = allowed.len().min(IMAGE_FETCH_CONCURRENCY);
+    std::thread::scope(|scope| {
+        for _ in 0..workers {
+            scope.spawn(|| {
+                let codec = ImageCodec::new();
+                loop {
+                    if decoded.load(Ordering::Relaxed) >= IMAGE_DECODE_BUDGET_BYTES {
+                        break;
+                    }
+                    let i = next.fetch_add(1, Ordering::Relaxed);
+                    let Some(url) = allowed.get(i) else { break };
+                    let state = match fetch_bytes(client, url, ctx)
+                        .and_then(|b| codec.decode(&b).map_err(|e| format!("{e:?}")))
+                    {
+                        Ok(img) => {
+                            decoded.fetch_add(img.rgba.len(), Ordering::Relaxed);
+                            ImageState::Ready(Arc::new(img))
+                        }
+                        Err(_) => ImageState::Failed,
+                    };
+                    results.locked().push((url.clone(), state));
+                }
+            });
+        }
+    });
+
+    for (url, state) in results.into_inner().unwrap_or_else(|e| e.into_inner()) {
         out.insert(url, state);
+    }
+    // Any allowed URL never started (budget reached) lays out as a placeholder.
+    for url in allowed {
+        out.entry(url).or_insert(ImageState::Pending);
     }
     out
 }
