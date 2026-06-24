@@ -14,6 +14,11 @@ pub struct Request<'a> {
     pub host: &'a str,
     pub path: &'a str,
     pub user_agent: &'a str,
+    /// The `Accept` header value. A real browser varies this by destination — an
+    /// HTML document negotiates differently than an image — so the caller picks the
+    /// value (a navigation sends the browser document `Accept`; a subresource `*/*`).
+    /// Uniform across users (no per-user entropy), like `Accept-Language`.
+    pub accept: &'a str,
     /// Extra headers (besides Host/User-Agent/Accept/Connection/Content-Length).
     pub headers: &'a [(&'a str, &'a str)],
     /// Request body (empty for GET).
@@ -22,12 +27,15 @@ pub struct Request<'a> {
 
 /// Write `req` to `stream` and read the full response.
 pub fn send(stream: &mut dyn ReadWrite, req: &Request<'_>) -> Result<HttpResponse, NetError> {
-    // `Accept-Language` is sent on every request and is uniform across all users
-    // (no per-user locale entropy); it matches the script-visible
-    // `navigator.language`/`languages` so the header and the DOM agree.
+    // `Accept`/`Accept-Language`/`Accept-Encoding` are sent on every request and are
+    // uniform across all users (no per-user locale/format entropy); `Accept-Language`
+    // matches the script-visible `navigator.language`/`languages` so the header and
+    // the DOM agree. `Accept` is caller-chosen so a document navigation looks like a
+    // browser navigation (not the `*/*` of an automation client) — a fidelity and
+    // anti-anomaly fix, never per-user fingerprint surface.
     let mut head = format!(
-        "{} {} HTTP/1.1\r\nHost: {}\r\nUser-Agent: {}\r\nAccept: */*\r\nAccept-Language: en-US,en;q=0.9\r\nAccept-Encoding: gzip, deflate\r\nConnection: close\r\n",
-        req.method, req.path, req.host, req.user_agent
+        "{} {} HTTP/1.1\r\nHost: {}\r\nUser-Agent: {}\r\nAccept: {}\r\nAccept-Language: en-US,en;q=0.9\r\nAccept-Encoding: gzip, deflate\r\nConnection: close\r\n",
+        req.method, req.path, req.host, req.user_agent, req.accept
     );
     for (k, v) in req.headers {
         head.push_str(&format!("{k}: {v}\r\n"));
@@ -242,6 +250,7 @@ mod tests {
                 host: "example.test",
                 path: "/p",
                 user_agent: "Cerberus/0.0",
+                accept: "text/html,application/xhtml+xml",
                 headers: &[],
                 body: &[],
             },
@@ -256,6 +265,12 @@ mod tests {
         );
         assert!(req.contains("Host: example.test\r\n"));
         assert!(req.contains("User-Agent: Cerberus/0.0\r\n"));
+        // The caller-chosen Accept is written verbatim (a navigation looks like a
+        // browser navigation, not an automation client's `*/*`).
+        assert!(
+            req.contains("Accept: text/html,application/xhtml+xml\r\n"),
+            "missing caller Accept: {req:?}"
+        );
         // Uniform locale, matching navigator.language/languages (no per-user
         // entropy) so the header and the script-visible identity agree.
         assert!(

@@ -133,10 +133,8 @@ impl DohResolver {
                 host: &self.server_name,
                 path: &self.path,
                 user_agent: cerberus_net::DEFAULT_USER_AGENT,
-                headers: &[
-                    ("Content-Type", "application/dns-message"),
-                    ("Accept", "application/dns-message"),
-                ],
+                accept: "application/dns-message",
+                headers: &[("Content-Type", "application/dns-message")],
                 body: query,
             },
         )

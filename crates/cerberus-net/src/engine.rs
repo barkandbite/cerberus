@@ -3,8 +3,8 @@
 //! resolver are injected behind the `TlsProvider`/`DnsResolver` traits.
 
 use crate::{
-    http1, BuiltinHttpClient, CookieJar, DnsResolver, FetchContext, HttpClient, HttpResponse,
-    NetError, ReadWrite, TlsProvider,
+    http1, BuiltinHttpClient, CookieJar, DnsResolver, FetchContext, FetchKind, HttpClient,
+    HttpResponse, NetError, ReadWrite, TlsProvider,
 };
 use cerberus_url::Url;
 use std::collections::HashMap;
@@ -218,6 +218,30 @@ impl HttpEngine {
         if let Some(value) = cookie_value.as_deref() {
             extra_headers.push(("Cookie", value));
         }
+        // A top-level document navigation should look like one on the wire: send the
+        // browser document `Accept` and the uniform `Sec-Fetch`/`Upgrade-Insecure-
+        // Requests` set a real browser sends, instead of the bare `*/*` of an
+        // automation client (a fidelity + anti-anomaly fix; all values are uniform
+        // across users, so no per-user fingerprint entropy is added). Subresources
+        // keep the generic `*/*` — their per-destination Accept isn't known here.
+        let is_navigation = matches!(ctx, Some(c) if matches!(c.kind, FetchKind::Navigation));
+        let accept = if is_navigation {
+            "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8"
+        } else {
+            "*/*"
+        };
+        if is_navigation {
+            // A user-initiated top-level navigation (typed URL / bookmark): `none`
+            // site, `?1` user. Only on navigations — a subresource's correct
+            // Sec-Fetch-Dest/Mode differ by destination, so omit rather than misstate.
+            extra_headers.push(("Sec-Fetch-Dest", "document"));
+            extra_headers.push(("Sec-Fetch-Mode", "navigate"));
+            extra_headers.push(("Sec-Fetch-Site", "none"));
+            extra_headers.push(("Sec-Fetch-User", "?1"));
+            if https {
+                extra_headers.push(("Upgrade-Insecure-Requests", "1"));
+            }
+        }
         // Caller headers (Content-Type, Accept, …) ride alongside, but the
         // privacy stack owns Host/User-Agent/Cookie — drop any caller attempt
         // to set those so the sealed identity can never be overridden.
@@ -236,6 +260,7 @@ impl HttpEngine {
                 host: &url.host,
                 path: &path,
                 user_agent,
+                accept,
                 headers: &extra_headers,
                 body,
             },
