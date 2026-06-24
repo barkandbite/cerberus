@@ -2331,6 +2331,134 @@ pub const DOM_MODEL_PRELUDE: &str = r##"
     g.CustomEvent.prototype = Object.create(g.Event.prototype);
     g.CustomEvent.prototype.constructor = g.CustomEvent;
 
+    // ---- URL / URLSearchParams -----------------------------------------
+    // `new URL(...)` and `URLSearchParams` are used pervasively (routing, link
+    // building, query parsing); their absence silently broke that code. A
+    // pragmatic (not full-WHATWG) parser handling absolute URLs + common relative
+    // resolution, with a spec-shaped URLSearchParams.
+    g.URLSearchParams = function URLSearchParams(init) {
+      this.__p = [];
+      var self = this;
+      if (init == null || init === "") return;
+      if (typeof init === "string") {
+        var s = init.charAt(0) === "?" ? init.slice(1) : init;
+        if (s) {
+          s.split("&").forEach(function (pair) {
+            if (!pair) return;
+            var eq = pair.indexOf("=");
+            var k = eq === -1 ? pair : pair.slice(0, eq);
+            var v = eq === -1 ? "" : pair.slice(eq + 1);
+            self.__p.push([decodeURIComponent(k.replace(/\+/g, " ")),
+                           decodeURIComponent(v.replace(/\+/g, " "))]);
+          });
+        }
+      } else if (typeof init.length === "number") {
+        for (var i = 0; i < init.length; i++) self.__p.push([String(init[i][0]), String(init[i][1])]);
+      } else if (typeof init === "object") {
+        for (var key in init) if (Object.prototype.hasOwnProperty.call(init, key)) {
+          self.__p.push([String(key), String(init[key])]);
+        }
+      }
+    };
+    var USP = g.URLSearchParams.prototype;
+    USP.append = function (k, v) { this.__p.push([String(k), String(v)]); };
+    USP.delete = function (k) { k = String(k); this.__p = this.__p.filter(function (e) { return e[0] !== k; }); };
+    USP.get = function (k) { k = String(k); for (var i = 0; i < this.__p.length; i++) if (this.__p[i][0] === k) return this.__p[i][1]; return null; };
+    USP.getAll = function (k) { k = String(k); return this.__p.filter(function (e) { return e[0] === k; }).map(function (e) { return e[1]; }); };
+    USP.has = function (k) { return this.get(String(k)) !== null; };
+    USP.set = function (k, v) {
+      k = String(k); v = String(v); var done = false, out = [];
+      for (var i = 0; i < this.__p.length; i++) {
+        if (this.__p[i][0] === k) { if (!done) { out.push([k, v]); done = true; } }
+        else out.push(this.__p[i]);
+      }
+      if (!done) out.push([k, v]);
+      this.__p = out;
+    };
+    USP.forEach = function (cb, t) { for (var i = 0; i < this.__p.length; i++) cb.call(t, this.__p[i][1], this.__p[i][0], this); };
+    USP.keys = function () { return this.__p.map(function (e) { return e[0]; }); };
+    USP.values = function () { return this.__p.map(function (e) { return e[1]; }); };
+    USP.entries = function () { return this.__p.map(function (e) { return [e[0], e[1]]; }); };
+    USP.sort = function () { this.__p.sort(function (a, b) { return a[0] < b[0] ? -1 : (a[0] > b[0] ? 1 : 0); }); };
+    USP.toString = function () {
+      return this.__p.map(function (e) { return encodeURIComponent(e[0]) + "=" + encodeURIComponent(e[1]); }).join("&");
+    };
+
+    function __normPath(p) {
+      var parts = p.split("/"), out = [];
+      for (var i = 0; i < parts.length; i++) {
+        if (parts[i] === "..") { if (out.length > 1) out.pop(); }
+        else if (parts[i] !== ".") out.push(parts[i]);
+      }
+      var r = out.join("/");
+      return r.charAt(0) === "/" ? r : "/" + r;
+    }
+    function __resolveRel(base, ref) {
+      ref = String(ref);
+      if (ref === "") return base;
+      if (ref.slice(0, 2) === "//") return (/^([a-zA-Z][\w+.\-]*:)/.exec(base) || ["", "https:"])[1] + ref;
+      var bm = /^([a-zA-Z][\w+.\-]*:)\/\/([^\/?#]*)([^?#]*)(\?[^#]*)?/.exec(base);
+      if (!bm) return ref;
+      var pre = bm[1] + "//" + bm[2], bpath = bm[3] || "/", bquery = bm[4] || "";
+      if (ref.charAt(0) === "#") return pre + bpath + bquery + ref;
+      if (ref.charAt(0) === "?") return pre + bpath + ref;
+      var split = ref.search(/[?#]/), tail = split === -1 ? "" : ref.slice(split);
+      var path = split === -1 ? ref : ref.slice(0, split);
+      if (path.charAt(0) !== "/") {
+        var dir = bpath.slice(0, bpath.lastIndexOf("/") + 1);
+        path = dir + path;
+      }
+      return pre + __normPath(path) + tail;
+    }
+    g.URL = function URL(url, base) {
+      var u = String(url);
+      if (!/^[a-zA-Z][\w+.\-]*:/.test(u)) {
+        if (base == null) throw new TypeError("Invalid URL: " + u);
+        u = __resolveRel(String(base), u);
+      }
+      var m = /^([a-zA-Z][\w+.\-]*:)(\/\/([^\/?#]*))?([^?#]*)(\?[^#]*)?(#.*)?$/.exec(u);
+      if (!m) throw new TypeError("Invalid URL: " + u);
+      var self = this, authority = m[3] || "";
+      this.protocol = m[1];
+      this.username = ""; this.password = "";
+      var host = authority, at = authority.lastIndexOf("@");
+      if (at !== -1) {
+        var cred = authority.slice(0, at); host = authority.slice(at + 1);
+        var ci = cred.indexOf(":");
+        if (ci !== -1) { this.username = cred.slice(0, ci); this.password = cred.slice(ci + 1); }
+        else this.username = cred;
+      }
+      this.hostname = host; this.port = "";
+      var pi = host.lastIndexOf(":");
+      if (pi !== -1 && /^\d+$/.test(host.slice(pi + 1))) { this.hostname = host.slice(0, pi); this.port = host.slice(pi + 1); }
+      if ((this.protocol === "http:" && this.port === "80") || (this.protocol === "https:" && this.port === "443")) this.port = "";
+      this.host = this.port ? this.hostname + ":" + this.port : this.hostname;
+      this.pathname = (m[4] || "") || (authority ? "/" : "");
+      this.hash = m[6] || "";
+      this.searchParams = new g.URLSearchParams(m[5] || "");
+      Object.defineProperty(this, "search", {
+        get: function () { var s = self.searchParams.toString(); return s ? "?" + s : ""; },
+        set: function (v) { self.searchParams = new g.URLSearchParams(String(v)); },
+        enumerable: true, configurable: true,
+      });
+      Object.defineProperty(this, "origin", {
+        get: function () {
+          return (self.protocol === "http:" || self.protocol === "https:") ? self.protocol + "//" + self.host : "null";
+        },
+        enumerable: true, configurable: true,
+      });
+      Object.defineProperty(this, "href", {
+        get: function () {
+          var auth = self.host;
+          if (self.username) auth = self.username + (self.password ? ":" + self.password : "") + "@" + auth;
+          return self.protocol + "//" + auth + self.pathname + self.search + self.hash;
+        },
+        enumerable: true, configurable: true,
+      });
+    };
+    g.URL.prototype.toString = function () { return this.href; };
+    g.URL.prototype.toJSON = function () { return this.href; };
+
     // ---- screen + window metrics ---------------------------------------
     g.screen = {
       width: vpW, height: vpH, availWidth: vpW, availHeight: vpH,

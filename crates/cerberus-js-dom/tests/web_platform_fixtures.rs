@@ -436,6 +436,33 @@ fn local_storage_has_real_storage_semantics() {
 }
 
 #[test]
+fn url_and_url_search_params_parse_and_resolve() {
+    // new URL(...) and URLSearchParams were absent (used pervasively). Cover
+    // absolute parse (incl. non-default port), relative resolution (../ collapse),
+    // and the URLSearchParams get/getAll/append/set/toString surface.
+    let doc = shell_with("result", "init");
+    let mut client = Stub::default();
+    let out = run(
+        &doc,
+        &[
+            "var u = new URL('https://ex.test:8443/p/q?x=1&y=two#frag'); \
+           var rel = new URL('../z?a=1', 'https://ex.test/p/q/'); \
+           var sp = new URLSearchParams('a=1&a=2&b=3'); sp.append('c', '4'); sp.set('a', '9'); \
+           document.getElementById('result').textContent = [ \
+             u.protocol, u.hostname, u.port, u.pathname, u.searchParams.get('x'), u.hash, \
+             rel.href, sp.get('a'), sp.getAll('b').join(','), sp.toString() \
+           ].join('|');",
+        ],
+        &mut client,
+    );
+    assert_eq!(
+        find_id(out.root(), "result").unwrap().text_content(),
+        "https:|ex.test|8443|/p/q|1|#frag|https://ex.test/p/z?a=1|9|3|a=9&b=3&c=4",
+        "URL parses components + resolves ../; URLSearchParams get/getAll/set/toString"
+    );
+}
+
+#[test]
 fn text_encoding_and_base64_round_trip_against_known_vectors() {
     // QuickJS ships none of these (not ECMAScript). Assert spec-correct UTF-8 +
     // base64 against known vectors, incl. a non-ASCII codepoint (U+20AC '€' ->
