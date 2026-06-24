@@ -964,6 +964,15 @@ fn apply_declarations(
                     .first()
                     .map(|t| parse_one_track(t, style.font_size as f32));
             }
+            "grid-auto-columns" => {
+                style.grid_auto_columns = split_top(v.trim())
+                    .first()
+                    .map(|t| parse_one_track(t, style.font_size as f32));
+            }
+            "grid-auto-flow" => {
+                // `column` / `column dense` → column-major auto-placement.
+                style.grid_auto_flow_column = v.to_ascii_lowercase().contains("column");
+            }
             "grid-column" => {
                 style.grid_column_span = parse_grid_span(v);
                 if grid_line_is_named(v) {
@@ -1609,6 +1618,7 @@ fn parse_css_px(v: &str, em_base: f32) -> Option<f32> {
         "pt" => num * 96.0 / 72.0,
         "%" => num / 100.0 * em_base,
         "ex" => num * em_base * 0.5,
+        "ch" => num * em_base * 0.5, // ~width of '0'; 0.5em is a good approximation
         _ => return None,
     })
 }

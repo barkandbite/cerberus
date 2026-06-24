@@ -2067,7 +2067,17 @@ impl<'a> Ctx<'a> {
         // used as a shrink-to-fit flex item (page-shell headers) sizes correctly
         // (ADR-0053). `repeat(auto-fill)` keeps the one-column heuristic (an
         // unbounded probe would otherwise fabricate thousands of columns).
-        let widths = if self.measuring {
+        // `grid-auto-flow: column` with no explicit columns places items down each
+        // implicit column (horizontal toolbars/chip rows) — one column per
+        // ceil(items / rows), each sized by `grid-auto-columns` (ADR-0054).
+        let auto_col =
+            node.style.grid_auto_flow_column && node.style.grid_template_columns.is_empty();
+        let auto_rows = node.style.grid_template_rows.len().max(1);
+        let widths = if auto_col && !items.is_empty() {
+            let ncols = items.len().div_ceil(auto_rows);
+            let cw = auto_column_px(&node.style, avail);
+            vec![cw; ncols]
+        } else if self.measuring {
             let max_item = items
                 .iter()
                 .map(|it| self.measure_intrinsic_width(it))
@@ -2116,14 +2126,17 @@ impl<'a> Ctx<'a> {
         // Named template areas (`grid-template-areas` + item `grid-area: name`):
         // place each named item into the rectangle its area spans (ADR-0051).
         let area_map = build_grid_area_map(&node.style.grid_template_areas);
-        for it in &items {
+        for (idx, it) in items.iter().enumerate() {
             let named = it
                 .style
                 .grid_area
                 .as_ref()
                 .and_then(|n| area_map.get(n))
                 .copied();
-            let (r0, c0, cs, rs) = if let Some((ar, ac, ars, acs)) = named {
+            let (r0, c0, cs, rs) = if auto_col {
+                // Column-major: fill down each implicit column, then move right.
+                (idx % auto_rows, idx / auto_rows, 1, 1)
+            } else if let Some((ar, ac, ars, acs)) = named {
                 let ac = ac.min(ncols - 1);
                 (ar, ac, acs.min(ncols - ac).max(1), ars.max(1))
             } else if it.style.grid_named_place {
@@ -2683,6 +2696,19 @@ struct GridPlacement {
     c0: usize,
     cs: usize,
     rs: usize,
+}
+
+/// The width of an implicitly-created grid column from `grid-auto-columns`
+/// (`grid-auto-flow: column`), clamped to the available width (ADR-0054).
+fn auto_column_px(style: &ComputedStyle, avail: i32) -> i32 {
+    use cerberus_style::{Track, TrackMax};
+    let w = match &style.grid_auto_columns {
+        Some(Track::Px(p)) => *p as i32,
+        Some(Track::MinMax(_, TrackMax::Px(p))) => *p as i32,
+        Some(Track::MinMax(min, _)) => (*min as i32).max(80),
+        _ => 80, // auto / fr / unset: a reasonable default chip width
+    };
+    w.clamp(1, avail.max(1))
 }
 
 /// Map each `grid-template-areas` name to the `(row, col, row-span, col-span)`
@@ -3672,6 +3698,32 @@ mod tests {
         assert!(
             span >= 160,
             "grid spans both columns (100+80), not one: span={span}"
+        );
+    }
+
+    #[test]
+    fn grid_auto_flow_column_lays_items_horizontally() {
+        // `grid-auto-flow: column` + `grid-auto-columns` places items side by side
+        // (a horizontal toolbar/chip row), not stacked (ADR-0054).
+        let laid = lay(
+            "<div style='display:grid;grid-auto-flow:column;grid-auto-columns:100px'>\
+               <div style='background:#ff0000'>a</div>\
+               <div style='background:#00ff00'>b</div>\
+               <div style='background:#0000ff'>c</div>\
+             </div>",
+            600,
+        );
+        let r = fill_rects(&laid);
+        assert_eq!(r.len(), 3);
+        assert!(
+            r.iter().all(|b| (b.y - r[0].y).abs() <= 2),
+            "all items share one row"
+        );
+        let mut xs: Vec<i32> = r.iter().map(|b| b.x).collect();
+        xs.sort_unstable();
+        assert!(
+            xs[1] >= xs[0] + 90 && xs[2] >= xs[1] + 90,
+            "items spaced ~100px apart horizontally: {xs:?}"
         );
     }
 

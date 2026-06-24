@@ -330,6 +330,11 @@ pub struct ComputedStyle {
     pub grid_auto_fill: Option<Track>,
     /// `grid-auto-rows` — size of implicitly-created rows (else content-sized).
     pub grid_auto_rows: Option<Track>,
+    /// `grid-auto-columns` — size of implicitly-created columns (ADR-0054).
+    pub grid_auto_columns: Option<Track>,
+    /// `grid-auto-flow: column` — auto-placed items flow down columns (horizontal
+    /// toolbars/chip rows) rather than the default row-major flow (ADR-0054).
+    pub grid_auto_flow_column: bool,
     /// The column template used named grid lines (`[name]`), i.e. the full-bleed
     /// centering pattern we don't resolve; layout collapses it to one full-width
     /// column so content stacks readably instead of landing in a gutter (ADR-0038).
@@ -423,6 +428,8 @@ impl ComputedStyle {
             grid_template_rows: Vec::new(),
             grid_auto_fill: None,
             grid_auto_rows: None,
+            grid_auto_columns: None,
+            grid_auto_flow_column: false,
             grid_cols_named: false,
             grid_column_span: 1,
             grid_row_span: 1,
@@ -505,6 +512,8 @@ impl ComputedStyle {
             grid_template_rows: Vec::new(),
             grid_auto_fill: None,
             grid_auto_rows: None,
+            grid_auto_columns: None,
+            grid_auto_flow_column: false,
             grid_cols_named: false,
             grid_column_span: 1,
             grid_row_span: 1,
