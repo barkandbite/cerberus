@@ -43,6 +43,16 @@ fn env() -> PageEnv {
         user_agent: "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 \
                      (KHTML, like Gecko) Chrome/142.0.0.0 Safari/537.36"
             .into(),
+        cookies: String::new(),
+    }
+}
+
+/// The shared `env()` with a specific `document.cookie` seed (the non-HttpOnly
+/// cookie string the host would compute from the jar).
+fn env_with_cookies(cookies: &str) -> PageEnv {
+    PageEnv {
+        cookies: cookies.into(),
+        ..env()
     }
 }
 
@@ -105,9 +115,13 @@ impl FetchClient for Stub {
 }
 
 fn run(doc: &Document, scripts: &[&str], client: &mut Stub) -> Document {
+    run_env(doc, scripts, env(), client)
+}
+
+fn run_env(doc: &Document, scripts: &[&str], env: PageEnv, client: &mut Stub) -> Document {
     let owned: Vec<String> = scripts.iter().map(|s| s.to_string()).collect();
     let (mut engine, realm) = engine_and_realm();
-    run_page_scripts_with_fetch(engine.as_mut(), realm, doc, &owned, &env(), client)
+    run_page_scripts_with_fetch(engine.as_mut(), realm, doc, &owned, &env, client)
         .expect("run page scripts")
 }
 
@@ -228,6 +242,31 @@ fn crypto_subtle_digest_sha256_matches_the_canonical_vector() {
         find_id(out.root(), "result").unwrap().text_content(),
         "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad",
         "crypto.subtle.digest('SHA-256', 'abc') must equal the FIPS 180-4 vector"
+    );
+}
+
+#[test]
+fn document_cookie_is_seeded_from_the_env_and_merges_writes() {
+    // The host seeds document.cookie with the origin's non-HttpOnly cookies
+    // (PageEnv.cookies); HttpOnly cookies are excluded upstream so they never
+    // reach script. A script read sees the seed; a write merges into the readable
+    // view by name.
+    let doc = shell_with("result", "init");
+    let mut client = Stub::default();
+    let out = run_env(
+        &doc,
+        &["var seeded = document.cookie; \
+           document.cookie = 'sess=xyz; Path=/; Secure'; \
+           document.cookie = 'a=99'; \
+           document.getElementById('result').textContent = \
+             seeded + ' | ' + document.cookie;"],
+        env_with_cookies("a=1; b=2"),
+        &mut client,
+    );
+    assert_eq!(
+        find_id(out.root(), "result").unwrap().text_content(),
+        "a=1; b=2 | a=99; b=2; sess=xyz",
+        "read sees the seed; writes merge by name (a replaced, sess appended)"
     );
 }
 

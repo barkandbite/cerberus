@@ -1014,10 +1014,25 @@ pub fn render(config: &RenderConfig) -> Result<RenderOutcome, AppError> {
             .eval(base_realm, "void 0")
             .map_err(|e| AppError::Js(format!("{e:?}")))?;
     } else {
+        // Seed document.cookie with this origin's NON-HttpOnly cookies from the
+        // sealed jar (HttpOnly cookies still ride requests, but are never exposed
+        // to script — closing the read-side HttpOnly gap). Script-set cookies are
+        // not yet written back to the jar (a follow-up); the read path is correct.
+        let doc_cookies = {
+            let mut s = storage.locked();
+            s.instance(active_instance)
+                .cookies_for_request(&first_party, &first_party)
+                .into_iter()
+                .filter(|c| !c.http_only)
+                .map(|c| format!("{}={}", c.name, c.value))
+                .collect::<Vec<_>>()
+                .join("; ")
+        };
         let env = PageEnv {
             url: config.url.clone(),
             viewport: (config.viewport.w, config.viewport.h),
             user_agent: active_ua,
+            cookies: doc_cookies,
         };
         // JS fetch() rides the page's subresource context (sealed jar + consent),
         // performed synchronously here (the one-shot path already blocks).
@@ -2462,6 +2477,9 @@ impl BrowserApp {
             url: self.toolbar.url_text.clone(),
             viewport: (self.last_size.w, self.last_size.h),
             user_agent: self.active_ua.clone(),
+            // Interactive path doesn't seed the cookie bridge yet (the headless
+            // render path does); follow-up wires it here too.
+            cookies: String::new(),
         };
         let engine = match self.heads.engine() {
             Ok(engine) => engine,
@@ -5178,6 +5196,7 @@ pub fn bench_pipeline(iters: usize) -> Vec<BenchStage> {
                 url: "https://bench.test/".into(),
                 viewport: (1280, 1024),
                 user_agent: DEFAULT_USER_AGENT.into(),
+                cookies: String::new(),
             };
             let bodies = cerberus_js_dom::resolve_scripts(document.scripts(), |_| None);
             std::hint::black_box(

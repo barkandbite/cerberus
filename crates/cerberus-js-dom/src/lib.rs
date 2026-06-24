@@ -486,6 +486,12 @@ pub struct PageEnv {
     /// when the honest-first ladder escalated for this site. Empty falls back to
     /// the honest default inside the prelude.
     pub user_agent: String,
+    /// The document's script-readable cookies: the current origin's
+    /// **non-HttpOnly** cookies as a `name=value; …` string, seeded into
+    /// `document.cookie`. The host excludes HttpOnly cookies here so script can
+    /// never read them (they still ride requests through the jar). Empty when
+    /// there are none — the default for built-in/cookieless pages.
+    pub cookies: String,
 }
 
 /// Encode `s` as a JS/JSON string literal (quotes included) suitable for
@@ -577,11 +583,12 @@ pub fn install_page(
 ) -> Result<(), BridgeError> {
     // Inject the ambient environment, then install the document model.
     let env_install = format!(
-        "globalThis.__CERBERUS_ENV__ = {{ url: {}, width: {}, height: {}, userAgent: {} }};",
+        "globalThis.__CERBERUS_ENV__ = {{ url: {}, width: {}, height: {}, userAgent: {}, cookies: {} }};",
         js_string(&env.url),
         env.viewport.0,
         env.viewport.1,
         js_string(&env.user_agent),
+        js_string(&env.cookies),
     );
     engine.eval(realm, &env_install)?;
     engine.eval(realm, DOM_MODEL_PRELUDE)?;
@@ -2095,6 +2102,10 @@ pub const DOM_MODEL_PRELUDE: &str = r##"
     // injected by run_page_scripts before this prelude. We never throw: a
     // missing/garbage env falls back to inert defaults.
     var env = (g.__CERBERUS_ENV__ && typeof g.__CERBERUS_ENV__ === "object") ? g.__CERBERUS_ENV__ : {};
+    // Seed document.cookie with the origin's non-HttpOnly cookies from the real
+    // jar (the host excludes HttpOnly, so script never sees them). Built-in /
+    // cookieless pages pass "" and keep the empty default.
+    if (typeof env.cookies === "string" && env.cookies) { document.__cookie = env.cookies; }
     var envUrl = (typeof env.url === "string") ? env.url : "about:blank";
     var vpW = (typeof env.width === "number") ? env.width : 0;
     var vpH = (typeof env.height === "number") ? env.height : 0;

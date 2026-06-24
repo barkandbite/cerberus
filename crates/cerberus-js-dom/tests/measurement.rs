@@ -28,6 +28,7 @@ fn geometry_styles_and_media_are_observable_from_js() {
         url: "https://t.test/".into(),
         viewport: (800, 600),
         user_agent: "ua".into(),
+        cookies: String::new(),
     };
     install_page(engine.as_mut(), realm, &doc, &env).expect("install");
     let id = node_id(&doc, "x");
