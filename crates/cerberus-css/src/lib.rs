@@ -1633,6 +1633,15 @@ fn parse_inset(v: &str, em_base: f32) -> Option<Len> {
     if v == "inherit" || v == "initial" {
         return None;
     }
+    // Intrinsic sizing keywords (resolved by measuring content at layout). The
+    // `fit-content(<len>)` function clamps to its content; we approximate it as
+    // max-content (ADR-0055).
+    if v == "max-content" || v == "-webkit-max-content" || v.starts_with("fit-content") {
+        return Some(Len::MaxContent);
+    }
+    if v == "min-content" || v == "-webkit-min-content" {
+        return Some(Len::MinContent);
+    }
     let (num, unit) = split_num_unit(&v)?;
     Some(match unit.as_str() {
         "%" => Len::Pct(num),

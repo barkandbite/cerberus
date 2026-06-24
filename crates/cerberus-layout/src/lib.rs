@@ -541,29 +541,48 @@ impl<'a> Ctx<'a> {
             let (pl, pr) = (style.padding_left, style.padding_right);
             let (bl, br) = (style.border_left, style.border_right);
             let h_extra = pl + pr + bl + br;
-            // Border-box width from width/max-width (box-sizing aware); `margin:
-            // auto` centers it, else margin-left offsets (ADR-0039/0040).
-            let (box_left, box_w) =
-                match resolve_border_box_width(style, avail, h_extra, self.vw, self.vh) {
-                    Some(bw) => {
-                        let bw = bw.clamp(1, avail);
-                        let extra = (avail - bw).max(0);
-                        let off = if style.margin_left_auto && style.margin_right_auto {
-                            extra / 2
-                        } else if style.margin_left_auto {
-                            extra
-                        } else if style.margin_right_auto {
-                            0
-                        } else {
-                            style.margin_left.clamp(0, extra)
-                        };
-                        (self.left + off, bw)
+            // `width: max-content|min-content|fit-content` is resolved here, where
+            // content can be measured (ADR-0055); otherwise width/max-width come
+            // from the containing block. `margin: auto` centers; else margin-left
+            // offsets (ADR-0039/0040).
+            // Not while measuring: measuring this very node would recurse back
+            // here. During the measuring pass the probe width already yields the
+            // content extent, so leave intrinsic widths to flow.
+            let intrinsic_w = if self.measuring {
+                None
+            } else {
+                match style.width {
+                    cerberus_style::Len::MaxContent => {
+                        Some((self.measure_intrinsic_width(node) + h_extra).clamp(1, avail))
                     }
-                    None => {
-                        let l = self.left + style.margin_left;
-                        (l, (self.right - l).max(1))
+                    cerberus_style::Len::MinContent => {
+                        Some((self.measure_min_content_width(node) + h_extra).clamp(1, avail))
                     }
-                };
+                    _ => None,
+                }
+            };
+            let (box_left, box_w) = match intrinsic_w
+                .or_else(|| resolve_border_box_width(style, avail, h_extra, self.vw, self.vh))
+            {
+                Some(bw) => {
+                    let bw = bw.clamp(1, avail);
+                    let extra = (avail - bw).max(0);
+                    let off = if style.margin_left_auto && style.margin_right_auto {
+                        extra / 2
+                    } else if style.margin_left_auto {
+                        extra
+                    } else if style.margin_right_auto {
+                        0
+                    } else {
+                        style.margin_left.clamp(0, extra)
+                    };
+                    (self.left + off, bw)
+                }
+                None => {
+                    let l = self.left + style.margin_left;
+                    (l, (self.right - l).max(1))
+                }
+            };
             bbox = Some(BorderBox {
                 left: box_left,
                 right: box_left + box_w,
@@ -2662,7 +2681,7 @@ fn resolve_block_height(
         Len::Px(p) => Some(p.max(0)),
         Len::Vw(f) => Some((f / 100.0 * vw as f32).round().max(0.0) as i32),
         Len::Vh(f) => Some((f / 100.0 * vh as f32).round().max(0.0) as i32),
-        Len::Auto | Len::Pct(_) => None,
+        Len::Auto | Len::Pct(_) | Len::MaxContent | Len::MinContent => None,
     };
     let adjust = |v: i32| match style.box_sizing {
         cerberus_style::BoxSizing::BorderBox => v,
@@ -3698,6 +3717,28 @@ mod tests {
         assert!(
             span >= 160,
             "grid spans both columns (100+80), not one: span={span}"
+        );
+    }
+
+    #[test]
+    fn width_intrinsic_keywords_size_to_content() {
+        // width:max-content shrinks the box to its one-line content; min-content
+        // to the longest unbreakable run (ADR-0055).
+        let txt = "hello world this is a wide line";
+        let maxc = lay(
+            &format!("<div style='width:max-content;background:#ff0000'>{txt}</div>"),
+            600,
+        );
+        let minc = lay(
+            &format!("<div style='width:min-content;background:#ff0000'>{txt}</div>"),
+            600,
+        );
+        let w = fill_rects(&maxc)[0].w as i32;
+        let n = fill_rects(&minc)[0].w as i32;
+        assert!(w < 590, "max-content shrinks below the 600 container: {w}");
+        assert!(
+            n < w,
+            "min-content (longest word) narrower than max-content: n={n} w={w}"
         );
     }
 

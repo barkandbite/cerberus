@@ -31,16 +31,27 @@ pub enum Len {
     /// Viewport-relative: percent of viewport width / height (ADR-0042).
     Vw(f32),
     Vh(f32),
+    /// `max-content` / `fit-content`: size to the content's max-content extent,
+    /// resolved at layout where intrinsic measurement is available (ADR-0055).
+    MaxContent,
+    /// `min-content`: size to the content's min-content extent (ADR-0055).
+    MinContent,
 }
 
 impl Len {
-    /// Resolve against a containing-block `extent` in px; `auto`/viewport units
+    /// Whether this is an intrinsic keyword (`max-content`/`min-content`) that
+    /// must be resolved by measuring the content rather than the containing block.
+    pub fn is_intrinsic(self) -> bool {
+        matches!(self, Len::MaxContent | Len::MinContent)
+    }
+
+    /// Resolve against a containing-block `extent` in px; `auto`/viewport/intrinsic
     /// → `None` (use [`Len::resolve_vp`] when the viewport is known).
     pub fn resolve(self, extent: i32) -> Option<i32> {
         match self {
             Len::Px(p) => Some(p),
             Len::Pct(f) => Some((f / 100.0 * extent as f32).round() as i32),
-            Len::Auto | Len::Vw(_) | Len::Vh(_) => None,
+            Len::Auto | Len::Vw(_) | Len::Vh(_) | Len::MaxContent | Len::MinContent => None,
         }
     }
 
