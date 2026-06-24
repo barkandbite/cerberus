@@ -1,0 +1,238 @@
+//! Phase 0 (epic GH #40, issue #41) — **offline web-platform fixtures**.
+//!
+//! These are the *authoritative correctness signal* for the web-platform epic:
+//! static pages that drive the real QuickJS realm + DOM bridge through
+//! [`run_page_scripts_with_fetch`] against a **stub network** (no external
+//! traffic), then assert the reconciled Rust DOM. They run in CI from a
+//! datacenter/cloud build environment with no reachability assumptions — the live
+//! `pokemoncenter.com` check (Imperva reese84) is a separate residential
+//! confirmation, because WAFs challenge datacenter IPs by reputation (ADR-0062),
+//! which is not an engine defect.
+//!
+//! The capstone fixture (`reese84_shaped_challenge_flow_runs_end_to_end`) mirrors
+//! the *structure* of the Imperva interstitial — an inline "initializeProtection"
+//! that dynamically injects an external sensor script, which reads Web APIs,
+//! POSTs a token, and reveals the page on success — so the challenge machinery is
+//! exercised end to end here, offline.
+
+use cerberus_dom::{Document, DocumentBuilder, NodeRef};
+use cerberus_js::{JsEngine, JsEngineFactory};
+use cerberus_js_dom::{
+    run_page_scripts_with_fetch, FetchClient, FetchRequest, FetchResponse, PageEnv,
+};
+use cerberus_js_quickjs::QuickJsEngineFactory;
+use cerberus_types::RealmId;
+use std::collections::HashMap;
+
+// --- harness ----------------------------------------------------------------
+
+/// A fresh QuickJS engine with one realm created, plus that realm's id.
+fn engine_and_realm() -> (Box<dyn JsEngine>, RealmId) {
+    let mut engine = QuickJsEngineFactory.instantiate().expect("instantiate");
+    let realm = RealmId::from_u64_pair(0, 1);
+    engine.create_realm(realm).expect("create realm");
+    (engine, realm)
+}
+
+/// A desktop-ish ambient environment with a concrete, coherent UA so the
+/// navigator/screen fixtures can assert the values the script actually reads.
+fn env() -> PageEnv {
+    PageEnv {
+        url: "https://fixture.test/page".into(),
+        viewport: (1280, 800),
+        user_agent: "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 \
+                     (KHTML, like Gecko) Chrome/142.0.0.0 Safari/537.36"
+            .into(),
+    }
+}
+
+/// DFS for the first element whose `id` matches.
+fn find_id<'a>(node: NodeRef<'a>, id: &str) -> Option<NodeRef<'a>> {
+    if node.is_element() && node.attr("id") == Some(id) {
+        return Some(node);
+    }
+    node.children().find_map(|c| find_id(c, id))
+}
+
+/// `<html><head></head><body><div id="result">init</div></body></html>` — the
+/// canonical fixture shell: scripts write their answer into `#result`.
+fn shell_with(id: &str, initial: &str) -> Document {
+    let mut b = DocumentBuilder::new();
+    let txt = b.text(initial);
+    let div = b.element_attrs("div", vec![("id".into(), id.into())], [txt]);
+    let body = b.element("body", [div]);
+    let head = b.element("head", []);
+    let html = b.element("html", [head, body]);
+    b.finish(html)
+}
+
+/// A multi-URL stub network seam: answers GET/POST by URL from a canned table and
+/// records every request (so a fixture can assert the sensor POST happened).
+#[derive(Default)]
+struct Stub {
+    responses: HashMap<String, (u16, String, String)>, // url -> (status, ctype, body)
+    seen: Vec<FetchRequest>,
+}
+
+impl Stub {
+    fn route(mut self, url: &str, ctype: &str, body: &str) -> Self {
+        self.responses
+            .insert(url.into(), (200, ctype.into(), body.into()));
+        self
+    }
+}
+
+impl FetchClient for Stub {
+    fn fetch(&mut self, req: &FetchRequest) -> Result<FetchResponse, String> {
+        self.seen.push(req.clone());
+        match self.responses.get(&req.url) {
+            Some((status, ctype, body)) => Ok(FetchResponse {
+                status: *status,
+                status_text: "OK".into(),
+                url: req.url.clone(),
+                headers: vec![("content-type".into(), ctype.clone())],
+                body: body.clone(),
+            }),
+            None => Ok(FetchResponse {
+                status: 404,
+                status_text: "Not Found".into(),
+                url: req.url.clone(),
+                headers: Vec::new(),
+                body: String::new(),
+            }),
+        }
+    }
+}
+
+fn run(doc: &Document, scripts: &[&str], client: &mut Stub) -> Document {
+    let owned: Vec<String> = scripts.iter().map(|s| s.to_string()).collect();
+    let (mut engine, realm) = engine_and_realm();
+    run_page_scripts_with_fetch(engine.as_mut(), realm, doc, &owned, &env(), client)
+        .expect("run page scripts")
+}
+
+// --- fixtures ---------------------------------------------------------------
+
+#[test]
+fn dom_mutation_reflects_into_the_rebuilt_tree() {
+    // createElement + appendChild + textContent must round-trip through the
+    // serialize/rebuild bridge into the Rust DOM.
+    let doc = shell_with("result", "init");
+    let mut client = Stub::default();
+    let out = run(
+        &doc,
+        &["var p = document.createElement('p'); p.id = 'made'; \
+           p.textContent = 'hello'; document.body.appendChild(p); \
+           document.getElementById('result').textContent = 'mutated';"],
+        &mut client,
+    );
+    assert_eq!(
+        find_id(out.root(), "result").unwrap().text_content(),
+        "mutated"
+    );
+    let made = find_id(out.root(), "made").expect("script-created <p> is in the tree");
+    assert_eq!(made.text_content(), "hello");
+}
+
+#[test]
+fn navigator_and_screen_report_the_ambient_environment() {
+    // Web-API reads must reflect the real PageEnv (coherent UA + viewport), not
+    // placeholders. This is the offline analogue of what a sensor probes first.
+    let doc = shell_with("result", "init");
+    let mut client = Stub::default();
+    let out = run(
+        &doc,
+        &["var ok = navigator.userAgent.indexOf('Chrome/142') >= 0 \
+             && screen.width === 1280 && navigator.webdriver === false \
+             && typeof navigator.platform === 'string'; \
+           document.getElementById('result').textContent = ok ? 'env-ok' : 'env-bad';"],
+        &mut client,
+    );
+    assert_eq!(
+        find_id(out.root(), "result").unwrap().text_content(),
+        "env-ok",
+        "navigator/screen must report the ambient environment coherently"
+    );
+}
+
+#[test]
+fn microtasks_run_before_the_next_macrotask() {
+    // Ordering oracle: sync → microtask (Promise/queueMicrotask) → macrotask
+    // (setTimeout). The speed-first virtual clock still preserves this order.
+    let doc = shell_with("result", "");
+    let mut client = Stub::default();
+    let out = run(
+        &doc,
+        &["var log = ''; \
+           setTimeout(function(){ log += 'T'; \
+             document.getElementById('result').textContent = log; }, 0); \
+           Promise.resolve().then(function(){ log += 'M'; }); \
+           log += 'S';"],
+        &mut client,
+    );
+    assert_eq!(
+        find_id(out.root(), "result").unwrap().text_content(),
+        "SMT",
+        "sync, then microtask, then timer macrotask"
+    );
+}
+
+#[test]
+fn reese84_shaped_challenge_flow_runs_end_to_end() {
+    // The capstone: a reese84-*shaped* interstitial, exercised entirely offline.
+    //
+    //  1. The page shows BLOCKED and runs an inline "initializeProtection" that
+    //     dynamically injects an external sensor <script src="/sensor.js">.
+    //  2. The host fetches + evals the sensor (the dynamic-external-script path).
+    //  3. The sensor reads Web APIs, computes a token, and POSTs it to /_token.
+    //  4. On the server's OK it reveals the page (sets #content = REVEALED).
+    //
+    // This proves the *machinery* the live Imperva milestone needs — dynamic
+    // script injection, Web-API reads, a POST round-trip, and a JS-driven reveal —
+    // works end to end, with no network and no flagged-IP dependency.
+    let doc = shell_with("content", "BLOCKED");
+
+    let sensor = "(function () {\
+        var fp = [navigator.userAgent, String(screen.width), navigator.platform].join('|');\
+        var token = 'tok_' + fp.length;\
+        fetch('/_token', { method: 'POST', body: token })\
+          .then(function (r) { return r.json(); })\
+          .then(function (d) {\
+            if (d && d.ok) { document.getElementById('content').textContent = 'REVEALED'; }\
+          });\
+    })();";
+
+    let mut client = Stub::default()
+        .route("/sensor.js", "application/javascript", sensor)
+        .route("/_token", "application/json", "{\"ok\":true}");
+
+    let init = "var s = document.createElement('script'); s.src = '/sensor.js'; \
+                document.head.appendChild(s);";
+
+    let out = run(&doc, &[init], &mut client);
+
+    // The full challenge → token → reveal chain executed.
+    assert_eq!(
+        find_id(out.root(), "content").unwrap().text_content(),
+        "REVEALED",
+        "the dynamically-injected sensor revealed the page after the token POST"
+    );
+    // The sensor script was fetched (dynamic external-script load) ...
+    assert!(
+        client.seen.iter().any(|r| r.url == "/sensor.js"),
+        "the dynamically-injected sensor was fetched, got {:?}",
+        client.seen.iter().map(|r| &r.url).collect::<Vec<_>>()
+    );
+    // ... and the token POST round-tripped with the computed body.
+    let post = client
+        .seen
+        .iter()
+        .find(|r| r.url == "/_token")
+        .expect("the sensor POSTed the token");
+    assert_eq!(post.method, "POST");
+    assert!(
+        post.body.starts_with("tok_"),
+        "the token body crossed verbatim, got {:?}",
+        post.body
+    );
+}
