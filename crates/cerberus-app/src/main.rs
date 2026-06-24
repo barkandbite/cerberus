@@ -139,6 +139,14 @@ fn cmd_render(args: &[String]) -> ExitCode {
         outcome.url, outcome.viewport.w, outcome.viewport.h
     );
     println!("  http status     : {}", outcome.status);
+    if let Some(wall) = &outcome.bot_wall {
+        println!("  ⚠ bot wall      : {}", wall.message());
+        println!(
+            "                    content was withheld at the network edge; this is \
+             not a rendering gap.\n                    Cerberus declines to run the \
+             fingerprinting sensor (privacy posture)."
+        );
+    }
     println!(
         "  toolbar + page  : 36px toolbar + {}x{} content",
         outcome.content_size.w, outcome.content_size.h

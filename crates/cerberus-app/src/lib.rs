@@ -151,9 +151,99 @@ pub struct RenderOutcome {
     pub subresources_blocked: usize,
     /// The page's text content, when [`RenderConfig::dump_text`] asked for it.
     pub page_text: Option<String>,
+    /// Set when the origin served a bot-management challenge/denial instead of the
+    /// page (the content was withheld at the network edge, not a rendering gap).
+    pub bot_wall: Option<BotWall>,
     /// Per-stage `(label, milliseconds)` timings, when `--timers` is set (M11).
     pub timings: Vec<(String, f64)>,
     pub framebuffer: Framebuffer,
+}
+
+/// A recognized bot-management interstitial: the origin returned a challenge or
+/// denial page instead of the content. Detected so the browser reports the wall
+/// **honestly** rather than rendering the challenge stub as if it were the page.
+///
+/// This is the privacy posture, not evasion: a bot wall (e.g. Imperva's reese84)
+/// withholds content until the client runs an invasive **browser-fingerprint**
+/// proof-of-work. Cerberus is built to *refuse* that fingerprinting (per-head
+/// farbling; no stable canvas/WebGL/audio surface), so it declines to run the
+/// sensor and surfaces the block instead of pretending success (ADR-0062).
+#[derive(Clone, Debug)]
+pub struct BotWall {
+    /// The bot-management vendor recognized (best-effort).
+    pub vendor: &'static str,
+    /// A short, human-readable explanation of what was served instead of the page.
+    pub detail: String,
+}
+
+impl BotWall {
+    /// A one-line, user-facing summary (`"Vendor — detail"`).
+    pub fn message(&self) -> String {
+        format!("{} — {}", self.vendor, self.detail)
+    }
+}
+
+/// Recognize a bot-management challenge/denial interstitial from a response body.
+///
+/// Uses **high-precision** signatures (vendor-unique resource paths, cookie/sensor
+/// names, incident markers — multi-token where a lone token could occur in real
+/// content) and only scans a bounded prefix, so a normal page is never misreported
+/// and a large page costs nothing. Returns `None` for ordinary content.
+pub fn detect_bot_wall(body: &str) -> Option<BotWall> {
+    // Challenge interstitials are tiny and front-load their markers; bound the scan
+    // to a head slice (kept on a UTF-8 boundary) so a 500 KB real page pays ~nothing.
+    let mut end = body.len().min(16 * 1024);
+    while end > 0 && !body.is_char_boundary(end) {
+        end -= 1;
+    }
+    let low = body[..end].to_ascii_lowercase();
+
+    // Imperva / Incapsula (reese84). The incident iframe + `_Incapsula_Resource`
+    // path are unique to the challenge; `visid_incap` is its session-cookie name.
+    if low.contains("_incapsula_resource")
+        || low.contains("incapsula incident id")
+        || low.contains("visid_incap")
+    {
+        return Some(BotWall {
+            vendor: "Imperva/Incapsula",
+            detail: "served a bot-detection challenge (reese84) instead of the page; \
+                     content is withheld pending an invasive browser-fingerprint \
+                     proof-of-work that a privacy browser declines to provide"
+                .to_string(),
+        });
+    }
+    // Cloudflare managed challenge / "Just a moment…".
+    if low.contains("/cdn-cgi/challenge-platform/")
+        || low.contains("cf-browser-verification")
+        || low.contains("cf_chl_opt")
+    {
+        return Some(BotWall {
+            vendor: "Cloudflare",
+            detail: "served a managed browser challenge instead of the page".to_string(),
+        });
+    }
+    // Akamai Bot Manager.
+    if low.contains("ak_bmsc") || (low.contains("akamai") && low.contains("reference&#32;#")) {
+        return Some(BotWall {
+            vendor: "Akamai Bot Manager",
+            detail: "served a bot-detection interstitial instead of the page".to_string(),
+        });
+    }
+    // PerimeterX / HUMAN.
+    if low.contains("px-captcha") || low.contains("access to this page has been denied") {
+        return Some(BotWall {
+            vendor: "PerimeterX/HUMAN",
+            detail: "denied access (bot detection) instead of serving the page".to_string(),
+        });
+    }
+    // DataDome.
+    if low.contains("geo.captcha-delivery.com") {
+        return Some(BotWall {
+            vendor: "DataDome",
+            detail: "served a CAPTCHA challenge instead of the page".to_string(),
+        });
+    }
+    None
 }
 
 /// Errors surfaced by the composition root.
@@ -901,6 +991,11 @@ pub fn render(config: &RenderConfig) -> Result<RenderOutcome, AppError> {
     };
     timings.record(format!("GET {}", url.host), fetch_t.elapsed());
     let body = String::from_utf8_lossy(&response.body);
+    // Honest bot-wall detection: if the origin returned a challenge/denial
+    // interstitial instead of the page (Imperva, Cloudflare, …), recognize it so we
+    // report the wall rather than rendering the stub — and so we *skip* running the
+    // vendor's fingerprinting sensor below (a privacy browser declines it; ADR-0062).
+    let bot_wall = detect_bot_wall(&body);
     let mut document = parse_html(&body);
 
     // --- JS engine seam: instantiate the active head's engine (this also injects
@@ -943,7 +1038,11 @@ pub fn render(config: &RenderConfig) -> Result<RenderOutcome, AppError> {
                     .chars()
                     .filter(|c| !c.is_whitespace())
                     .count();
-                let needs_js = ssr_chars < 800;
+                // A bot-wall body is a tiny shell too, but running its external
+                // script means executing the vendor's fingerprinting sensor (reese84
+                // is ~838 KB of obfuscated proof-of-work). Decline it: don't fetch
+                // or run external scripts on a recognized challenge page.
+                let needs_js = bot_wall.is_none() && ssr_chars < 800;
                 let bodies = cerberus_js_dom::resolve_scripts(document.scripts(), |src| {
                     if !needs_js {
                         return None;
@@ -1097,6 +1196,7 @@ pub fn render(config: &RenderConfig) -> Result<RenderOutcome, AppError> {
         third_party_decision,
         subresources_blocked,
         page_text: config.dump_text.then(|| visible_text(document.root())),
+        bot_wall,
         timings: if config.timers {
             timings.as_pairs()
         } else {
@@ -5182,6 +5282,42 @@ mod tests {
         assert_eq!(outcome.third_party_decision, Decision::Deny);
         // A frame was produced at the requested size.
         assert_eq!(outcome.framebuffer.size, RenderConfig::default().viewport);
+        // The builtin page is content, not a bot wall.
+        assert!(outcome.bot_wall.is_none());
+    }
+
+    #[test]
+    fn detects_incapsula_bot_wall_and_spares_real_pages() {
+        // The exact interstitial Imperva serves for a flagged client (captured from
+        // pokemoncenter.com): a 1 KB shell with the reese84 sensor + incident iframe,
+        // never the product page.
+        let stub = "<html style=\"height:100%\"><head><META NAME=\"ROBOTS\" \
+            CONTENT=\"NOINDEX, NOFOLLOW\"><script src=\"/vice-come-Soldenyson-it\" \
+            async></script></head><body><iframe id=\"main-iframe\" \
+            src=\"/_Incapsula_Resource?SWUDNSAI=31&incident_id=1840000820661871753\" \
+            >Request unsuccessful. Incapsula incident ID: 1840000820661871753</iframe>\
+            </body></html>";
+        let wall = detect_bot_wall(stub).expect("recognizes the Incapsula challenge");
+        assert_eq!(wall.vendor, "Imperva/Incapsula");
+        assert!(wall.message().contains("reese84"));
+
+        // A real content page (even one that says "captcha" in prose) is not a wall:
+        // the high-precision signatures don't fire on ordinary text.
+        let page = "<html><head><title>Cats</title></head><body><h1>Cat</h1>\
+            <p>This article explains how a captcha protects access to a page.</p>\
+            </body></html>";
+        assert!(detect_bot_wall(page).is_none());
+    }
+
+    #[test]
+    fn detect_bot_wall_is_utf8_boundary_safe_on_a_truncated_multibyte_head() {
+        // A long body whose 16 KiB scan boundary lands mid-codepoint must not panic.
+        let mut s = String::from("<html><body>");
+        while s.len() < 16 * 1024 + 8 {
+            s.push('é'); // 2-byte char: guarantees the 16 KiB index is mid-codepoint
+        }
+        s.push_str("</body></html>");
+        assert!(detect_bot_wall(&s).is_none());
     }
 
     #[test]
