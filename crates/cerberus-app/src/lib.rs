@@ -933,10 +933,21 @@ pub fn render(config: &RenderConfig) -> Result<RenderOutcome, AppError> {
         };
         document = match &client {
             Some(c) => {
-                // Fetch external `<script src>` bundles (consent-gated) and run
-                // them in document order with the inline scripts (ADR-0059) — what
-                // lets client-rendered pages execute their app code at all.
+                // Run external `<script src>` only when the page needs JS to build
+                // its content: a near-empty shell (client-rendered app). A page
+                // that already arrives content-complete (server-rendered) renders
+                // from its HTML, so fetching + running its bundles only adds
+                // latency without changing the result — skip them for speed
+                // (ADR-0061). Inline scripts always run.
+                let ssr_chars = visible_text(document.root())
+                    .chars()
+                    .filter(|c| !c.is_whitespace())
+                    .count();
+                let needs_js = ssr_chars < 800;
                 let bodies = cerberus_js_dom::resolve_scripts(document.scripts(), |src| {
+                    if !needs_js {
+                        return None;
+                    }
                     let abs = resolve_subresource(Some(&url), src);
                     if !(abs.starts_with("http://") || abs.starts_with("https://")) {
                         return None;
