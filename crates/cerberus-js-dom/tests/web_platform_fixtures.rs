@@ -205,6 +205,33 @@ fn performance_now_and_crypto_get_random_values_exist() {
 }
 
 #[test]
+fn crypto_subtle_digest_sha256_matches_the_canonical_vector() {
+    // SHA-256("abc") = ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad
+    // (NIST FIPS 180-4). Proves the digest is a real, correct hash — not a stub —
+    // by checking against the canonical test vector. digest() returns a Promise,
+    // so the .then runs on the microtask pump.
+    let doc = shell_with("result", "init");
+    let mut client = Stub::default();
+    let out = run(
+        &doc,
+        &[
+            "crypto.subtle.digest('SHA-256', new Uint8Array([97,98,99])).then(function (buf) { \
+             var v = new Uint8Array(buf), hex = ''; \
+             for (var i = 0; i < v.length; i++) { var b = v[i].toString(16); \
+               if (b.length < 2) b = '0' + b; hex += b; } \
+             document.getElementById('result').textContent = hex; \
+           });",
+        ],
+        &mut client,
+    );
+    assert_eq!(
+        find_id(out.root(), "result").unwrap().text_content(),
+        "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad",
+        "crypto.subtle.digest('SHA-256', 'abc') must equal the FIPS 180-4 vector"
+    );
+}
+
+#[test]
 fn reese84_shaped_challenge_flow_runs_end_to_end() {
     // The capstone: a reese84-*shaped* interstitial, exercised entirely offline.
     //
