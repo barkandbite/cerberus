@@ -484,15 +484,11 @@ fn parse_media_feature(text: &str) -> Option<MediaFeature> {
         Some((n, v)) => (n.trim().to_ascii_lowercase(), v.trim().to_ascii_lowercase()),
         None => (text.trim().to_ascii_lowercase(), String::new()),
     };
-    let px = || -> Option<u32> {
-        let digits: String = value.chars().take_while(|c| c.is_ascii_digit()).collect();
-        digits.parse().ok()
-    };
     match name.as_str() {
-        "min-width" => Some(MediaFeature::MinWidth(px()?)),
-        "max-width" => Some(MediaFeature::MaxWidth(px()?)),
-        "min-height" => Some(MediaFeature::MinHeight(px()?)),
-        "max-height" => Some(MediaFeature::MaxHeight(px()?)),
+        "min-width" => Some(MediaFeature::MinWidth(eval_media_px(&value)?)),
+        "max-width" => Some(MediaFeature::MaxWidth(eval_media_px(&value)?)),
+        "min-height" => Some(MediaFeature::MinHeight(eval_media_px(&value)?)),
+        "max-height" => Some(MediaFeature::MaxHeight(eval_media_px(&value)?)),
         "orientation" => match value.as_str() {
             "portrait" => Some(MediaFeature::Portrait),
             "landscape" => Some(MediaFeature::Landscape),
@@ -500,6 +496,38 @@ fn parse_media_feature(text: &str) -> Option<MediaFeature> {
         },
         _ => None,
     }
+}
+
+/// A media-query `<length>` → px: `Npx`, `Nem`/`Nrem` (×16), a bare number, or a
+/// `calc(A ± B)` of those (CSS requires spaces around the `+`/`-`). Sites pin
+/// breakpoints with `max-width: calc(640px - 1px)`; without `calc`, the feature
+/// failed to parse and the whole query vacuously matched (ADR-0054).
+fn eval_media_px(value: &str) -> Option<u32> {
+    let v = value.trim();
+    if let Some(inner) = v.strip_prefix("calc(").and_then(|s| s.strip_suffix(')')) {
+        let inner = inner.trim();
+        for (op, subtract) in [(" - ", true), (" + ", false)] {
+            if let Some(i) = inner.find(op) {
+                let a = media_len_px(&inner[..i])?;
+                let b = media_len_px(&inner[i + op.len()..])?;
+                let r = if subtract { a - b } else { a + b };
+                return Some(r.max(0.0).round() as u32);
+            }
+        }
+        return media_len_px(inner).map(|r| r.max(0.0).round() as u32);
+    }
+    media_len_px(v).map(|r| r.max(0.0).round() as u32)
+}
+
+fn media_len_px(t: &str) -> Option<f64> {
+    let t = t.trim();
+    // `rem` before `em` (the latter is a suffix of the former).
+    for (suffix, mul) in [("px", 1.0), ("rem", 16.0), ("em", 16.0)] {
+        if let Some(n) = t.strip_suffix(suffix) {
+            return n.trim().parse::<f64>().ok().map(|v| v * mul);
+        }
+    }
+    t.parse::<f64>().ok()
 }
 
 fn parse_selectors(text: &str) -> Vec<Selector> {

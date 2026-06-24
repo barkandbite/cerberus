@@ -1981,6 +1981,23 @@ mod tests {
     }
 
     #[test]
+    fn media_query_calc_breakpoint_does_not_vacuously_match() {
+        // `max-width: calc(640px - 1px)` (=639) must parse, not fail-and-match —
+        // otherwise a mobile rule leaks into desktop (ADR-0054).
+        let html = "<style>@media screen and (max-width: calc(640px - 1px)) \
+                    { p { color: #ff0000 } }</style><p>x</p>";
+        // 1920 > 639: the mobile rule must NOT apply.
+        let wide = CssEngine::with_media(1920, 1080).style(&parse_html(html));
+        assert_eq!(first(&wide.root, "p").unwrap().style.color, Color::BLACK);
+        // 480 <= 639: it does.
+        let narrow = CssEngine::with_media(480, 800).style(&parse_html(html));
+        assert_eq!(
+            first(&narrow.root, "p").unwrap().style.color,
+            Color::rgb(0xff, 0, 0)
+        );
+    }
+
+    #[test]
     fn media_type_and_feature_combined_track_the_real_viewport() {
         // `screen and (min-width: 1680px)` — media type + feature, the form the
         // Vector skin uses for its desktop grid header. Must resolve against the
