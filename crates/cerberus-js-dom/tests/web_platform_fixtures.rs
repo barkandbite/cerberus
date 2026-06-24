@@ -178,6 +178,33 @@ fn microtasks_run_before_the_next_macrotask() {
 }
 
 #[test]
+fn performance_now_and_crypto_get_random_values_exist() {
+    // The real sensor calls performance.now() and crypto.getRandomValues() early;
+    // when they were missing it threw before doing anything. Assert the contract:
+    // performance.now() is a monotonic number with a numeric timeOrigin, and
+    // getRandomValues fills and returns the same TypedArray.
+    let doc = shell_with("result", "init");
+    let mut client = Stub::default();
+    let out = run(
+        &doc,
+        &["var t0 = performance.now(); \
+           var a = new Uint8Array(16); var r = crypto.getRandomValues(a); \
+           var t1 = performance.now(); \
+           var ok = typeof t0 === 'number' && typeof t1 === 'number' && t1 >= t0 \
+              && typeof performance.timeOrigin === 'number' \
+              && r === a && a.length === 16 \
+              && typeof crypto.randomUUID() === 'string' && crypto.randomUUID().length === 36; \
+           document.getElementById('result').textContent = ok ? 'crypto-perf-ok' : 'bad';"],
+        &mut client,
+    );
+    assert_eq!(
+        find_id(out.root(), "result").unwrap().text_content(),
+        "crypto-perf-ok",
+        "performance.now() and crypto.getRandomValues()/randomUUID() must be present and correct"
+    );
+}
+
+#[test]
 fn reese84_shaped_challenge_flow_runs_end_to_end() {
     // The capstone: a reese84-*shaped* interstitial, exercised entirely offline.
     //
@@ -193,8 +220,11 @@ fn reese84_shaped_challenge_flow_runs_end_to_end() {
     let doc = shell_with("content", "BLOCKED");
 
     let sensor = "(function () {\
-        var fp = [navigator.userAgent, String(screen.width), navigator.platform].join('|');\
-        var token = 'tok_' + fp.length;\
+        var nonce = new Uint8Array(8); crypto.getRandomValues(nonce);\
+        var t = performance.now();\
+        var fp = [navigator.userAgent, String(screen.width), navigator.platform,\
+                  String(typeof t === 'number')].join('|');\
+        var token = 'tok_' + fp.length + '_' + nonce.length;\
         fetch('/_token', { method: 'POST', body: token })\
           .then(function (r) { return r.json(); })\
           .then(function (d) {\

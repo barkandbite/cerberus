@@ -2193,6 +2193,49 @@ pub const DOM_MODEL_PRELUDE: &str = r##"
     window.pageXOffset = 0; window.pageYOffset = 0;
     window.scrollTo = function () {}; window.scrollBy = function () {}; window.scroll = function () {};
 
+    // ---- performance ---------------------------------------------------
+    // Real elapsed time from the native Date clock (QuickJS Date is wall-clock),
+    // so performance.now() is monotonic, sub-call-distinct, and reflects actual
+    // work — what timing-sensitive page code (and bot sensors) read.
+    var __perfOrigin = Date.now();
+    g.performance = {
+      timeOrigin: __perfOrigin,
+      now: function () { return Date.now() - __perfOrigin; },
+      timing: { navigationStart: __perfOrigin },
+      mark: function () {}, measure: function () {},
+      getEntries: function () { return []; },
+      getEntriesByType: function () { return []; },
+      getEntriesByName: function () { return []; },
+      clearMarks: function () {}, clearMeasures: function () {},
+    };
+
+    // ---- crypto (getRandomValues / randomUUID) -------------------------
+    // getRandomValues fills an integer TypedArray with random values (its whole
+    // purpose IS randomness — distinct from the fingerprint surfaces that are
+    // farbled/consistent). subtle (digest/HMAC) is a separate follow-up.
+    g.crypto = g.crypto || {};
+    g.crypto.getRandomValues = function (arr) {
+      if (!arr || typeof arr.length !== "number" || typeof arr.BYTES_PER_ELEMENT !== "number") {
+        throw new TypeError("getRandomValues expects an integer TypedArray");
+      }
+      var bpe = arr.BYTES_PER_ELEMENT;
+      var bound = bpe >= 4 ? 4294967296 : (1 << (8 * bpe));
+      for (var i = 0; i < arr.length; i++) {
+        arr[i] = Math.floor(Math.random() * bound);
+      }
+      return arr;
+    };
+    g.crypto.randomUUID = function () {
+      var h = "0123456789abcdef", s = "";
+      for (var i = 0; i < 36; i++) {
+        if (i === 8 || i === 13 || i === 18 || i === 23) { s += "-"; }
+        else if (i === 14) { s += "4"; }
+        else if (i === 19) { s += h[8 + Math.floor(Math.random() * 4)]; }
+        else { s += h[Math.floor(Math.random() * 16)]; }
+      }
+      return s;
+    };
+
     // ---- storage (in-memory, RUN-SCOPED) -------------------------------
     // getItem/setItem/removeItem/clear/key/length plus index access via the
     // methods. These live for THIS RUN ONLY — there is no persistence across
