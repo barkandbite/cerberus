@@ -1653,15 +1653,16 @@ pub const DOM_MODEL_PRELUDE: &str = r##"
     function parseCompound(text) {
       // text is one compound run with no whitespace/combinators, e.g.
       // `div.foo#bar[data-x="1"]`. Returns null if it is empty/garbage.
-      var compound = { tag: null, id: null, classes: [], attrs: [] };
+      var compound = { tag: null, id: null, classes: [], attrs: [], pseudos: [] };
+      var STOP = ".#[:";
       var i = 0, n = text.length, sawAny = false;
       while (i < n) {
         var ch = text.charAt(i);
         if (ch === "#") {
-          i++; var s = i; while (i < n && !".#[".includes(text.charAt(i))) i++;
+          i++; var s = i; while (i < n && !STOP.includes(text.charAt(i))) i++;
           compound.id = text.slice(s, i); sawAny = true;
         } else if (ch === ".") {
-          i++; var s2 = i; while (i < n && !".#[".includes(text.charAt(i))) i++;
+          i++; var s2 = i; while (i < n && !STOP.includes(text.charAt(i))) i++;
           if (i > s2) { compound.classes.push(text.slice(s2, i)); sawAny = true; }
         } else if (ch === "[") {
           var end = text.indexOf("]", i);
@@ -1670,22 +1671,69 @@ pub const DOM_MODEL_PRELUDE: &str = r##"
           i = end + 1;
           var eq = body.indexOf("=");
           if (eq === -1) {
-            if (body) { compound.attrs.push({ name: body, value: null }); sawAny = true; }
+            if (body) { compound.attrs.push({ name: body, op: null, value: null }); sawAny = true; }
           } else {
-            var an = body.slice(0, eq).trim();
+            var op = "=", nameEnd = eq, opc = body.charAt(eq - 1);
+            if ("~^$*|".indexOf(opc) !== -1) { op = opc + "="; nameEnd = eq - 1; }
+            var an = body.slice(0, nameEnd).trim();
             var av = body.slice(eq + 1).trim();
             if (av.length >= 2 && (av.charAt(0) === '"' || av.charAt(0) === "'")) av = av.slice(1, -1);
-            if (an) { compound.attrs.push({ name: an, value: av }); sawAny = true; }
+            if (an) { compound.attrs.push({ name: an, op: op, value: av }); sawAny = true; }
           }
+        } else if (ch === ":") {
+          i++; if (text.charAt(i) === ":") i++;   // pseudo-element ::x → treat as a (non-matching) pseudo
+          var ps = i; while (i < n && /[a-zA-Z\-]/.test(text.charAt(i))) i++;
+          var pname = text.slice(ps, i).toLowerCase(), parg = null;
+          if (text.charAt(i) === "(") {
+            var depth = 1; i++; var as = i;
+            while (i < n && depth > 0) { var pc = text.charAt(i); if (pc === "(") depth++; else if (pc === ")") depth--; if (depth > 0) i++; }
+            parg = text.slice(as, i); i++;
+          }
+          compound.pseudos.push({ name: pname, arg: parg }); sawAny = true;
         } else {
           // A type (tag) selector or universal `*`; runs until the next part.
-          var s3 = i; while (i < n && !".#[".includes(text.charAt(i))) i++;
+          var s3 = i; while (i < n && !STOP.includes(text.charAt(i))) i++;
           var tag = text.slice(s3, i);
           if (tag && tag !== "*") compound.tag = tag.toLowerCase();
           sawAny = true;
         }
       }
       return sawAny ? compound : null;
+    }
+    function __prevElemSib(el) {
+      var p = el.__parent; if (!p) return null;
+      var idx = p.__kids.indexOf(el);
+      for (var i = idx - 1; i >= 0; i--) if (p.__kids[i].__type === ELEMENT_NODE) return p.__kids[i];
+      return null;
+    }
+    function __nextElemSib(el) {
+      var p = el.__parent; if (!p) return null;
+      var idx = p.__kids.indexOf(el);
+      for (var i = idx + 1; i < p.__kids.length; i++) if (p.__kids[i].__type === ELEMENT_NODE) return p.__kids[i];
+      return null;
+    }
+    function __elemIndex(el) {
+      var p = el.__parent; if (!p) return 1;
+      var idx = 1;
+      for (var i = 0; i < p.__kids.length; i++) {
+        if (p.__kids[i].__type === ELEMENT_NODE) { if (p.__kids[i] === el) return idx; idx++; }
+      }
+      return idx;
+    }
+    function __matchNth(el, arg) {
+      arg = String(arg).replace(/\s+/g, "").toLowerCase();
+      var idx = __elemIndex(el);
+      if (arg === "odd") return idx % 2 === 1;
+      if (arg === "even") return idx % 2 === 0;
+      var m = /^([+-]?\d*)n([+-]\d+)?$/.exec(arg);
+      if (m) {
+        var a = (m[1] === "" || m[1] === "+") ? 1 : (m[1] === "-" ? -1 : parseInt(m[1], 10));
+        var b = m[2] ? parseInt(m[2], 10) : 0;
+        if (a === 0) return idx === b;
+        return (idx - b) % a === 0 && (idx - b) / a >= 0;
+      }
+      var num = parseInt(arg, 10);
+      return !isNaN(num) && idx === num;
     }
     function parseComplex(text) {
       // Split one complex selector into steps, honoring the `>` child combinator
@@ -1698,17 +1746,21 @@ pub const DOM_MODEL_PRELUDE: &str = r##"
         var sawSpace = false;
         while (i < n && /\s/.test(text.charAt(i))) { i++; sawSpace = true; }
         if (i >= n) break;
-        if (text.charAt(i) === ">") {
-          pendingCombinator = ">"; i++;
-          // Skip whitespace after `>`.
+        var cc = text.charAt(i);
+        if (cc === ">" || cc === "+" || cc === "~") {
+          pendingCombinator = cc; i++;
+          // Skip whitespace after the combinator.
           while (i < n && /\s/.test(text.charAt(i))) i++;
         } else if (sawSpace && steps.length > 0) {
           pendingCombinator = " ";
         }
-        // Read the compound run up to the next combinator/whitespace.
+        // Read the compound run up to the next combinator/whitespace, skipping
+        // bracketed [..] and parenthesized (..) (e.g. :not(...), :nth-child(2n+1)).
         var s = i;
-        while (i < n && !/\s/.test(text.charAt(i)) && text.charAt(i) !== ">") {
-          if (text.charAt(i) === "[") { var e = text.indexOf("]", i); i = (e === -1) ? n : e + 1; }
+        while (i < n && !/\s/.test(text.charAt(i)) && ">+~".indexOf(text.charAt(i)) === -1) {
+          var rc = text.charAt(i);
+          if (rc === "[") { var e = text.indexOf("]", i); i = (e === -1) ? n : e + 1; }
+          else if (rc === "(") { var d = 1; i++; while (i < n && d > 0) { var qc = text.charAt(i); if (qc === "(") d++; else if (qc === ")") d--; i++; } }
           else i++;
         }
         var compound = parseCompound(text.slice(s, i));
@@ -1739,7 +1791,32 @@ pub const DOM_MODEL_PRELUDE: &str = r##"
         var a = compound.attrs[j];
         var v = getAttr(el, a.name);
         if (v === null) return false;
-        if (a.value !== null && v !== a.value) return false;
+        if (a.op === null) continue;                       // presence only
+        if (a.op === "=") { if (v !== a.value) return false; }
+        else if (a.op === "^=") { if (a.value === "" || v.indexOf(a.value) !== 0) return false; }
+        else if (a.op === "$=") { if (a.value === "" || v.slice(v.length - a.value.length) !== a.value) return false; }
+        else if (a.op === "*=") { if (a.value === "" || v.indexOf(a.value) === -1) return false; }
+        else if (a.op === "~=") { if (v.split(/\s+/).indexOf(a.value) === -1) return false; }
+        else if (a.op === "|=") { if (v !== a.value && v.indexOf(a.value + "-") !== 0) return false; }
+      }
+      for (var p = 0; p < compound.pseudos.length; p++) {
+        var ps = compound.pseudos[p], nm = ps.name;
+        if (nm === "not") { if (ps.arg && matchesSelector(el, ps.arg)) return false; }
+        else if (nm === "is" || nm === "where" || nm === "matches") { if (ps.arg && !matchesSelector(el, ps.arg)) return false; }
+        else if (nm === "first-child") { if (__prevElemSib(el)) return false; }
+        else if (nm === "last-child") { if (__nextElemSib(el)) return false; }
+        else if (nm === "only-child") { if (__prevElemSib(el) || __nextElemSib(el)) return false; }
+        else if (nm === "nth-child") { if (!__matchNth(el, ps.arg)) return false; }
+        else if (nm === "empty") {
+          for (var e = 0; e < el.__kids.length; e++) {
+            var kd = el.__kids[e];
+            if (kd.__type === ELEMENT_NODE || (kd.__type === TEXT_NODE && kd.__text.length)) return false;
+          }
+        } else if (nm === "root") { if (el.__tag.toLowerCase() !== "html") return false; }
+        else if (nm === "checked") { if (getAttr(el, "checked") === null && !el.__checked) return false; }
+        else if (nm === "disabled") { if (getAttr(el, "disabled") === null) return false; }
+        else if (nm === "enabled") { if (getAttr(el, "disabled") !== null) return false; }
+        else { return false; }                              // unknown pseudo never matches (e.g. :hover)
       }
       return true;
     }
@@ -1755,6 +1832,13 @@ pub const DOM_MODEL_PRELUDE: &str = r##"
         if (rel === ">") {
           node = node.__parent;
           if (!matchesCompound(node, want)) return false;
+        } else if (rel === "+") {
+          node = __prevElemSib(node);
+          if (!node || !matchesCompound(node, want)) return false;
+        } else if (rel === "~") {
+          var sib = __prevElemSib(node), sok = false;
+          while (sib) { if (matchesCompound(sib, want)) { sok = true; node = sib; break; } sib = __prevElemSib(sib); }
+          if (!sok) return false;
         } else {
           // Descendant: find SOME ancestor matching `want`.
           var anc = node.__parent, ok = false;

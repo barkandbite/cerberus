@@ -297,6 +297,39 @@ fn history_pushstate_updates_location_and_fires_popstate() {
 }
 
 #[test]
+fn query_selector_attribute_ops_pseudos_and_sibling_combinators() {
+    // Extend the JS selector engine beyond compound+descendant/child: attribute
+    // operators (^= $= *=), :nth-child/:not/:first-child, and sibling combinators
+    // (+ ~) — all pervasive in querySelector.
+    let doc = shell_with("result", "init");
+    let mut client = Stub::default();
+    let out = run(
+        &doc,
+        &["var ul = document.createElement('ul'); \
+           function li(cls, dx, txt) { var e = document.createElement('li'); \
+             if (cls) e.className = cls; if (dx) e.setAttribute('data-x', dx); \
+             e.textContent = txt; ul.appendChild(e); } \
+           li('a', 'foobar', '1'); li('b', 'bazfoo', '2'); li('', 'qux', '3'); \
+           document.body.appendChild(ul); var r = []; \
+           r.push(ul.querySelectorAll('li[data-x^=\"foo\"]').length); \
+           r.push(ul.querySelectorAll('li[data-x$=\"foo\"]').length); \
+           r.push(ul.querySelectorAll('li[data-x*=\"z\"]').length); \
+           r.push(ul.querySelectorAll('li:nth-child(2)')[0].textContent); \
+           r.push(ul.querySelectorAll('li:not(.a)').length); \
+           r.push(ul.querySelectorAll('li:first-child')[0].textContent); \
+           r.push(ul.querySelectorAll('.a + li')[0].textContent); \
+           r.push(ul.querySelectorAll('.a ~ li').length); \
+           document.getElementById('result').textContent = r.join('|');"],
+        &mut client,
+    );
+    assert_eq!(
+        find_id(out.root(), "result").unwrap().text_content(),
+        "1|1|1|2|2|1|2|2",
+        "attr ^=/$=/*=; :nth-child(2); :not(.a); :first-child; + and ~ siblings"
+    );
+}
+
+#[test]
 fn performance_now_and_crypto_get_random_values_exist() {
     // The real sensor calls performance.now() and crypto.getRandomValues() early;
     // when they were missing it threw before doing anything. Assert the contract:
