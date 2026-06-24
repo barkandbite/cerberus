@@ -2060,17 +2060,35 @@ impl<'a> Ctx<'a> {
             })
             .collect();
 
-        // While measuring (huge probe width), don't expand the template (auto-fill
-        // would create thousands of columns); use one content-wide column so the
-        // grid's measured width is the widest item's content (ADR-0038).
+        // Max-content width while measuring (huge probe). With an explicit
+        // column template, sum the tracks (fixed tracks contribute their size,
+        // flexible/auto tracks their content) — a multi-column grid's intrinsic
+        // width is the sum of its columns, not the widest single item, so a grid
+        // used as a shrink-to-fit flex item (page-shell headers) sizes correctly
+        // (ADR-0053). `repeat(auto-fill)` keeps the one-column heuristic (an
+        // unbounded probe would otherwise fabricate thousands of columns).
         let widths = if self.measuring {
-            let w = items
+            let max_item = items
                 .iter()
                 .map(|it| self.measure_intrinsic_width(it))
                 .max()
                 .unwrap_or(1)
                 .max(1);
-            vec![w]
+            let cols = &node.style.grid_template_columns;
+            if !cols.is_empty() && node.style.grid_auto_fill.is_none() {
+                cols.iter()
+                    .map(|track| match track {
+                        cerberus_style::Track::Px(p) => *p as i32,
+                        cerberus_style::Track::MinMax(min, cerberus_style::TrackMax::Px(p)) => {
+                            (*min as i32).max(*p as i32)
+                        }
+                        cerberus_style::Track::MinMax(min, _) => (*min as i32).max(max_item),
+                        _ => max_item,
+                    })
+                    .collect()
+            } else {
+                vec![max_item]
+            }
         } else {
             resolve_grid_columns(&node.style, avail, gap)
         };
@@ -3632,6 +3650,28 @@ mod tests {
             r[1].w as i32 > 400,
             "cleared block spans the full width: {}",
             r[1].w
+        );
+    }
+
+    #[test]
+    fn grid_intrinsic_width_sums_its_columns() {
+        // A shrink-to-fit grid (here a left float) is sized to the sum of its
+        // column tracks (100px + 80px), not the widest single item (ADR-0053).
+        let laid = lay(
+            "<div style=\"float:left;display:grid;grid-template-columns:100px 80px;\
+               grid-template-areas:'a b'\">\
+               <div style='grid-area:a;background:#ff0000'>x</div>\
+               <div style='grid-area:b;background:#00ff00'>y</div>\
+             </div>",
+            600,
+        );
+        let r = fill_rects(&laid);
+        assert_eq!(r.len(), 2);
+        let span = r.iter().map(|b| b.x + b.w as i32).max().unwrap()
+            - r.iter().map(|b| b.x).min().unwrap();
+        assert!(
+            span >= 160,
+            "grid spans both columns (100+80), not one: span={span}"
         );
     }
 
