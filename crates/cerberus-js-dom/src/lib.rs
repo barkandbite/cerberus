@@ -541,11 +541,20 @@ pub fn run_page_scripts(
     env: &PageEnv,
 ) -> Result<Document, BridgeError> {
     install_page(engine, realm, document, env)?;
-    run_scripts(engine, realm, scripts)?;
-    fire_load(engine, realm)?;
-    run_event_loop(engine, realm, EventLoopBudget::default())?;
+    // JS is best-effort within a wall-clock budget: a throw or a deadline
+    // interrupt stops it but still renders the DOM built so far (ADR-0060).
+    engine.set_deadline(JS_BUDGET_MS);
+    let _ = run_scripts(engine, realm, scripts);
+    let _ = fire_load(engine, realm);
+    let _ = run_event_loop(engine, realm, EventLoopBudget::default());
+    engine.clear_deadline();
     Ok(serialize_dom(engine, realm)?.document)
 }
+
+/// Wall-clock budget (ms) for a page's JavaScript: enough for real progressive
+/// enhancement / hydration, but small enough that a heavy or looping page can
+/// never hang the render — the DOM built so far is shown instead (ADR-0060).
+pub const JS_BUDGET_MS: u64 = 1500;
 
 /// Install the JS document model for `document` into `realm`: the ambient `env`
 /// globals, the [`DOM_MODEL_PRELUDE`], and a snapshot of `document`.
@@ -1015,6 +1024,34 @@ pub fn take_fetches(
     Ok(out)
 }
 
+/// Drain `<script src>` elements inserted into the DOM by script (webpack/Next
+/// chunk loading, analytics, lazy widgets) as `(id, url)` pairs to fetch + run on
+/// the host, then fire each script's `load` event (ADR-0060).
+pub fn take_script_loads(
+    engine: &mut dyn JsEngine,
+    realm: RealmId,
+) -> Result<Vec<(u64, String)>, BridgeError> {
+    let json = match engine.eval(realm, "__cerberusTakeScriptLoads()")? {
+        JsValue::Str(s) => s,
+        _ => return Ok(Vec::new()),
+    };
+    let value = json::parse(&json).map_err(BridgeError::Json)?;
+    let Some(items) = value.as_array() else {
+        return Ok(Vec::new());
+    };
+    let mut out = Vec::with_capacity(items.len());
+    for item in items {
+        let (Some(id), Some(url)) = (
+            item.get("id").and_then(Json::as_u64),
+            item.get("url").and_then(Json::as_str),
+        ) else {
+            continue;
+        };
+        out.push((id, url.to_string()));
+    }
+    Ok(out)
+}
+
 /// Decode a wire `headers` value (`[[name, value], …]`) into a `(name, value)`
 /// list. Missing/garbage entries are skipped; a `None` field yields an empty list.
 fn decode_header_pairs(headers: Option<&Json>) -> Vec<(String, String)> {
@@ -1130,8 +1167,16 @@ pub fn drive_fetches(
     let mut rounds = 0u32;
     let mut requests = 0u32;
     let mut hit_cap = false;
+    // The JS interrupt bounds eval time, but the per-request *network* time isn't
+    // JS — a page pulling many chunks could still take many seconds. A wall-clock
+    // deadline on the whole drain keeps the render fast (ADR-0060).
+    let deadline = std::time::Instant::now() + std::time::Duration::from_millis(JS_BUDGET_MS);
 
     'pump: loop {
+        if std::time::Instant::now() >= deadline {
+            hit_cap = true;
+            break;
+        }
         // Drain timers + microtasks so any pending/just-scheduled fetch enqueues.
         run_event_loop(engine, realm, loop_budget)?;
 
@@ -1140,15 +1185,20 @@ pub fn drive_fetches(
             break;
         }
         let reqs = take_fetches(engine, realm)?;
-        if reqs.is_empty() {
+        // Scripts injected into the DOM (webpack/Next chunk loading) are fetched
+        // + run here, in the same drain loop, then their `load` events fire so the
+        // loader continues — what lets client-rendered pages boot (ADR-0060).
+        let script_loads = take_script_loads(engine, realm)?;
+        if reqs.is_empty() && script_loads.is_empty() {
             break;
         }
         rounds += 1;
 
         for req in reqs {
-            if requests >= fetch_budget.max_requests {
-                // Out of request budget: reject this and every remaining queued
-                // request so no Promise is left dangling, then stop the pump.
+            if requests >= fetch_budget.max_requests || std::time::Instant::now() >= deadline {
+                // Out of request budget (or wall-clock): reject this and every
+                // remaining queued request so no Promise is left dangling, then
+                // stop the pump.
                 hit_cap = true;
                 reject_fetch(engine, realm, req.id, "fetch budget exceeded")?;
                 for rest in take_fetches(engine, realm)? {
@@ -1160,6 +1210,32 @@ pub fn drive_fetches(
             match client.fetch(&req) {
                 Ok(resp) => resolve_fetch(engine, realm, req.id, &resp)?,
                 Err(message) => reject_fetch(engine, realm, req.id, &message)?,
+            }
+        }
+
+        for (id, url) in script_loads {
+            if requests >= fetch_budget.max_requests || std::time::Instant::now() >= deadline {
+                hit_cap = true;
+                let _ = engine.eval(realm, &format!("__cerberusScriptLoaded({id},0)"));
+                continue;
+            }
+            requests += 1;
+            let req = FetchRequest {
+                id,
+                url,
+                method: "GET".to_string(),
+                headers: Vec::new(),
+                body: String::new(),
+            };
+            match client.fetch(&req) {
+                Ok(resp) => {
+                    // Run the fetched module in the realm, then fire its load.
+                    let _ = engine.eval(realm, &resp.body);
+                    let _ = engine.eval(realm, &format!("__cerberusScriptLoaded({id},1)"));
+                }
+                Err(_) => {
+                    let _ = engine.eval(realm, &format!("__cerberusScriptLoaded({id},0)"));
+                }
             }
         }
     }
@@ -1191,15 +1267,20 @@ pub fn run_page_scripts_with_fetch(
     client: &mut dyn FetchClient,
 ) -> Result<Document, BridgeError> {
     install_page(engine, realm, document, env)?;
-    run_scripts(engine, realm, scripts)?;
-    fire_load(engine, realm)?;
-    drive_fetches(
+    // Best-effort JS within a wall-clock budget so a heavy/looping page (or one
+    // pulling many chunks) can never hang the render — the DOM so far is shown
+    // (ADR-0060). Cleared before serialization so reading the DOM back isn't cut.
+    engine.set_deadline(JS_BUDGET_MS);
+    let _ = run_scripts(engine, realm, scripts);
+    let _ = fire_load(engine, realm);
+    let _ = drive_fetches(
         engine,
         realm,
         client,
         EventLoopBudget::default(),
         FetchBudget::default(),
-    )?;
+    );
+    engine.clear_deadline();
     Ok(serialize_dom(engine, realm)?.document)
 }
 
@@ -1392,11 +1473,27 @@ pub const DOM_MODEL_PRELUDE: &str = r##"
       // a node holds EITHER a raw fragment OR live children, never both.
       if (typeof node.__rawHTML === "string") node.__rawHTML = undefined;
     }
+    // A <script src> inserted into the tree by script (webpack/Next chunk
+    // loading, analytics, lazy widgets) is queued for the host to fetch + run on
+    // the next fetch drain, then its `load` fires (ADR-0060). `src` may be a
+    // property (`script.src = url`) or an attribute.
+    function maybeLoadScript(node) {
+      if (!node || node.__type !== ELEMENT_NODE || node.__tag !== "script" || node.__cbLoaded) {
+        return;
+      }
+      var src = node.src || getAttr(node, "src");
+      if (!src) return;
+      node.__cbLoaded = true;
+      var id = g.__cerberusScriptId++;
+      g.__cerberusScriptPending[id] = node;
+      g.__cerberusScriptQueue.push({ id: id, url: String(src) });
+    }
     function appendChild(parent, node) {
       detach(node);
       clearRaw(parent);
       parent.__kids.push(node);
       node.__parent = parent;
+      maybeLoadScript(node);
       return node;
     }
     function insertBefore(parent, node, ref) {
@@ -1407,6 +1504,7 @@ pub const DOM_MODEL_PRELUDE: &str = r##"
       if (i === -1) { parent.__kids.push(node); }
       else { parent.__kids.splice(i, 0, node); }
       node.__parent = parent;
+      maybeLoadScript(node);
       return node;
     }
     function removeChild(parent, node) {
@@ -2384,6 +2482,10 @@ pub const DOM_MODEL_PRELUDE: &str = r##"
     if (!Array.isArray(g.__cerberusFetchQueue)) g.__cerberusFetchQueue = [];
     if (!g.__cerberusFetchPending) g.__cerberusFetchPending = Object.create(null);
     if (typeof g.__cerberusFetchId !== "number") g.__cerberusFetchId = 1;
+    // Injected-<script> load queue (ADR-0060), mirroring the fetch queue.
+    if (!Array.isArray(g.__cerberusScriptQueue)) g.__cerberusScriptQueue = [];
+    if (!g.__cerberusScriptPending) g.__cerberusScriptPending = Object.create(null);
+    if (typeof g.__cerberusScriptId !== "number") g.__cerberusScriptId = 1;
 
     // ---- Headers (case-insensitive, minimal) ---------------------------
     // Backed by an ordered array of [originalName, value]; lookups fold case.
@@ -2526,6 +2628,34 @@ pub const DOM_MODEL_PRELUDE: &str = r##"
       } catch (e) {
         return "[]";
       }
+    };
+
+    // Drain the injected-<script> load queue; entries are {id,url} (ADR-0060).
+    g.__cerberusTakeScriptLoads = function () {
+      try {
+        var q = g.__cerberusScriptQueue;
+        if (!Array.isArray(q) || q.length === 0) return "[]";
+        g.__cerberusScriptQueue = [];
+        return JSON.stringify(q);
+      } catch (e) {
+        return "[]";
+      }
+    };
+
+    // The host ran (ok=1) or failed (ok=0) the script for `id`; fire its event so
+    // the loader's callback chain (webpack `__webpack_require__.l`, etc.) continues.
+    g.__cerberusScriptLoaded = function (id, ok) {
+      try {
+        var node = g.__cerberusScriptPending[id];
+        if (!node) return;
+        delete g.__cerberusScriptPending[id];
+        var ev = { type: ok ? "load" : "error", target: node, currentTarget: node };
+        var handler = ok ? node.onload : node.onerror;
+        if (typeof handler === "function") { try { handler.call(node, ev); } catch (e) {} }
+        if (typeof node.dispatchEvent === "function") {
+          try { node.dispatchEvent(ev); } catch (e) {}
+        }
+      } catch (e) {}
     };
 
     // Resolve the Promise for `id` with a Response built from `resp` =

@@ -72,6 +72,16 @@ pub trait JsEngine {
 
     /// Number of live realms (for diagnostics and the memory gate).
     fn realm_count(&self) -> usize;
+
+    /// Bound subsequent evaluation to a wall-clock budget: once `budget_ms`
+    /// elapses, any running (or new) script is interrupted so a heavy/looping page
+    /// can never hang the render (ADR-0060). Engines without an interrupt seam may
+    /// no-op. Call [`clear_deadline`](Self::clear_deadline) before reading results
+    /// back (e.g. serializing the DOM) so that work isn't itself interrupted.
+    fn set_deadline(&mut self, _budget_ms: u64) {}
+
+    /// Remove any wall-clock evaluation bound set by [`set_deadline`](Self::set_deadline).
+    fn clear_deadline(&mut self) {}
 }
 
 /// Creates fresh engine instances. The identity manager holds one factory and

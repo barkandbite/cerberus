@@ -225,6 +225,21 @@ impl JsEngine for QuickJsEngine {
         "quickjs"
     }
 
+    fn set_deadline(&mut self, budget_ms: u64) {
+        // QuickJS calls the interrupt handler periodically during execution;
+        // returning true aborts the current evaluation. A wall-clock deadline
+        // bounds any script (initial run or chunk loading) so it can't hang the
+        // render (ADR-0060).
+        let deadline = std::time::Instant::now() + std::time::Duration::from_millis(budget_ms);
+        self.runtime.set_interrupt_handler(Some(Box::new(move || {
+            std::time::Instant::now() >= deadline
+        })));
+    }
+
+    fn clear_deadline(&mut self) {
+        self.runtime.set_interrupt_handler(None);
+    }
+
     fn create_realm(&mut self, id: RealmId) -> Result<(), JsError> {
         let context =
             Context::full(&self.runtime).map_err(|e| JsError::Instantiate(e.to_string()))?;
