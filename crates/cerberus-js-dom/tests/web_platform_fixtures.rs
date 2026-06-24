@@ -271,6 +271,32 @@ fn abort_controller_formdata_and_blob() {
 }
 
 #[test]
+fn history_pushstate_updates_location_and_fires_popstate() {
+    // SPA routing: pushState updates location + history.state/length; back()
+    // restores the prior entry and fires popstate (was a no-op stub).
+    let doc = shell_with("result", "init");
+    let mut client = Stub::default();
+    let out = run(
+        &doc,
+        &["var log = []; \
+           window.addEventListener('popstate', function (e) { \
+             log.push('pop:' + location.pathname + ':' + (e.state && e.state.n)); }); \
+           history.pushState({ n: 1 }, '', '/a'); \
+           var afterPush = location.pathname + ':' + history.state.n + ':' + history.length; \
+           history.pushState({ n: 2 }, '', '/b?x=1'); \
+           history.back(); \
+           var afterBack = location.pathname + ':' + (history.state && history.state.n); \
+           document.getElementById('result').textContent = afterPush + '|' + afterBack + '|' + log.join(',');"],
+        &mut client,
+    );
+    assert_eq!(
+        find_id(out.root(), "result").unwrap().text_content(),
+        "/a:1:2|/a:1|pop:/a:1",
+        "pushState updates location + state + length; back() restores + fires popstate"
+    );
+}
+
+#[test]
 fn performance_now_and_crypto_get_random_values_exist() {
     // The real sensor calls performance.now() and crypto.getRandomValues() early;
     // when they were missing it threw before doing anything. Assert the contract:

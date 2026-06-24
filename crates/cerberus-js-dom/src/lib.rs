@@ -2919,11 +2919,53 @@ pub const DOM_MODEL_PRELUDE: &str = r##"
       };
     };
 
-    // ---- history (inert) -----------------------------------------------
+    // ---- history (real pushState/replaceState + popstate) --------------
+    // SPAs route via history.pushState; the old no-op broke client-side URL
+    // state. Maintains a stack, updates `location` (via URL resolution), and
+    // fires popstate on back/forward/go.
+    var __histStack = [{ state: null, url: locationObj.href }];
+    var __histIndex = 0;
+    function __applyLocation(href) {
+      try {
+        var u = new g.URL(String(href), locationObj.href);
+        locationObj.href = u.href; locationObj.protocol = u.protocol;
+        locationObj.host = u.host; locationObj.hostname = u.hostname; locationObj.port = u.port;
+        locationObj.origin = u.origin; locationObj.pathname = u.pathname;
+        locationObj.search = u.search; locationObj.hash = u.hash;
+      } catch (e) {}
+    }
+    function __firePopstate(state) {
+      var ev = { type: "popstate", state: state, target: g, currentTarget: g };
+      if (typeof g.onpopstate === "function") { try { g.onpopstate.call(g, ev); } catch (e) {} }
+      var ls = (window.__listeners && window.__listeners["popstate"]) || [];
+      var c = ls.slice();
+      for (var i = 0; i < c.length; i++) { try { c[i].call(g, ev); } catch (e) {} }
+    }
     g.history = {
-      length: 1, state: null, scrollRestoration: "auto",
-      pushState: function () {}, replaceState: function () {},
-      back: function () {}, forward: function () {}, go: function () {},
+      scrollRestoration: "auto",
+      get length() { return __histStack.length; },
+      get state() { return __histStack[__histIndex].state; },
+      pushState: function (state, title, url) {
+        if (url != null) __applyLocation(url);
+        __histStack = __histStack.slice(0, __histIndex + 1);
+        __histStack.push({ state: state, url: locationObj.href });
+        __histIndex = __histStack.length - 1;
+      },
+      replaceState: function (state, title, url) {
+        if (url != null) __applyLocation(url);
+        __histStack[__histIndex] = { state: state, url: locationObj.href };
+      },
+      back: function () { this.go(-1); },
+      forward: function () { this.go(1); },
+      go: function (delta) {
+        delta = delta || 0;
+        var ni = __histIndex + delta;
+        if (delta === 0 || ni < 0 || ni >= __histStack.length) return;
+        __histIndex = ni;
+        var entry = __histStack[ni];
+        __applyLocation(entry.url);
+        __firePopstate(entry.state);
+      },
     };
 
     // ---- install: snapshot -> JS tree ----------------------------------
