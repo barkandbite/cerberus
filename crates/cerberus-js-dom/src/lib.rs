@@ -2558,23 +2558,41 @@ pub const DOM_MODEL_PRELUDE: &str = r##"
     // methods. These live for THIS RUN ONLY — there is no persistence across
     // run_page_scripts calls (the realm/prelude is reinstalled each time).
     function makeStorage() {
+      // Real Storage semantics via a Proxy: stored keys are own ENUMERABLE
+      // properties (so Object.keys/for-in see the DATA, not the methods), bracket
+      // access (localStorage.foo / localStorage.foo = x) reads/writes the store,
+      // and the methods stay non-enumerable. (The old plain-object version leaked
+      // its method names through Object.keys and dropped bracket writes.)
       var data = Object.create(null);
-      var keys = [];
-      return {
+      var api = {
         getItem: function (k) { k = String(k); return (k in data) ? data[k] : null; },
-        setItem: function (k, v) {
-          k = String(k);
-          if (!(k in data)) keys.push(k);
-          data[k] = String(v);
-        },
-        removeItem: function (k) {
-          k = String(k);
-          if (k in data) { delete data[k]; var i = keys.indexOf(k); if (i !== -1) keys.splice(i, 1); }
-        },
-        clear: function () { data = Object.create(null); keys = []; },
-        key: function (i) { i = i >>> 0; return (i < keys.length) ? keys[i] : null; },
-        get length() { return keys.length; },
+        setItem: function (k, v) { data[String(k)] = String(v); },
+        removeItem: function (k) { delete data[String(k)]; },
+        clear: function () { for (var k in data) delete data[k]; },
+        key: function (i) { var ks = Object.keys(data); i = i >>> 0; return (i < ks.length) ? ks[i] : null; },
       };
+      return new Proxy(api, {
+        get: function (t, k) {
+          if (k === "length") return Object.keys(data).length;
+          if (typeof k !== "string") return api[k];
+          if (k in api) return api[k];
+          return (k in data) ? data[k] : undefined;
+        },
+        set: function (t, k, v) {
+          if (typeof k === "string" && !(k in api)) data[k] = String(v);
+          return true;
+        },
+        has: function (t, k) {
+          return k === "length" || (typeof k === "string" && (k in data || k in api));
+        },
+        deleteProperty: function (t, k) { delete data[String(k)]; return true; },
+        ownKeys: function () { return Object.keys(data); },
+        getOwnPropertyDescriptor: function (t, k) {
+          var kk = String(k);
+          if (kk in data) return { value: data[kk], writable: true, enumerable: true, configurable: true };
+          return undefined;
+        },
+      });
     }
     g.localStorage = makeStorage();
     g.sessionStorage = makeStorage();

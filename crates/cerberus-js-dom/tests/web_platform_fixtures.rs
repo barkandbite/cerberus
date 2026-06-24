@@ -412,6 +412,30 @@ fn event_constructors_and_sendbeacon_work() {
 }
 
 #[test]
+fn local_storage_has_real_storage_semantics() {
+    // setItem + bracket-write both store; Object.keys returns the DATA keys (not
+    // method names — the prior bug); bracket-read and getItem agree; removeItem
+    // and length work.
+    let doc = shell_with("result", "init");
+    let mut client = Stub::default();
+    let out = run(
+        &doc,
+        &["localStorage.setItem('a', '1'); localStorage.b = '2'; \
+           var keys = Object.keys(localStorage).sort().join(','); \
+           var via = localStorage.getItem('b') + '/' + localStorage.a; \
+           localStorage.removeItem('a'); \
+           document.getElementById('result').textContent = keys + '|' + via + '|' \
+             + localStorage.length + '|' + (localStorage.getItem('a') === null);"],
+        &mut client,
+    );
+    assert_eq!(
+        find_id(out.root(), "result").unwrap().text_content(),
+        "a,b|2/1|1|true",
+        "Object.keys returns data keys; bracket + getItem agree; removeItem/length work"
+    );
+}
+
+#[test]
 fn text_encoding_and_base64_round_trip_against_known_vectors() {
     // QuickJS ships none of these (not ECMAScript). Assert spec-correct UTF-8 +
     // base64 against known vectors, incl. a non-ASCII codepoint (U+20AC '€' ->
