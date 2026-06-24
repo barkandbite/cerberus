@@ -1440,11 +1440,13 @@ pub const DOM_MODEL_PRELUDE: &str = r##"
     function setAttr(el, name, value) {
       var v = String(value);
       var i = attrIndex(el, name);
+      var old = (i === -1) ? null : el.__attrs[i][1];
       if (i === -1) el.__attrs.push([name, v]); else el.__attrs[i][1] = v;
+      __moEmitAttr(el, name, old);
     }
     function removeAttr(el, name) {
       var i = attrIndex(el, name);
-      if (i !== -1) el.__attrs.splice(i, 1);
+      if (i !== -1) { var old = el.__attrs[i][1]; el.__attrs.splice(i, 1); __moEmitAttr(el, name, old); }
     }
 
     // ---- classList -----------------------------------------------------
@@ -1527,6 +1529,7 @@ pub const DOM_MODEL_PRELUDE: &str = r##"
       parent.__kids.push(node);
       node.__parent = parent;
       maybeLoadScript(node);
+      __moEmitChildList(parent, [node], null);
       return node;
     }
     function insertBefore(parent, node, ref) {
@@ -1538,13 +1541,82 @@ pub const DOM_MODEL_PRELUDE: &str = r##"
       else { parent.__kids.splice(i, 0, node); }
       node.__parent = parent;
       maybeLoadScript(node);
+      __moEmitChildList(parent, [node], null);
       return node;
     }
     function removeChild(parent, node) {
       var k = parent.__kids.indexOf(node);
-      if (k !== -1) { parent.__kids.splice(k, 1); node.__parent = null; }
+      if (k !== -1) { parent.__kids.splice(k, 1); node.__parent = null; __moEmitChildList(parent, null, [node]); }
       return node;
     }
+
+    // ---- MutationObserver (real) ---------------------------------------
+    // Real childList/attributes records, delivered as a microtask, so sensors and
+    // frameworks that observe(...) actually see DOM changes (the prior stub was a
+    // no-op). Hooked into the shared mutation helpers above; characterData and
+    // node-move (detach) records are minimal. Overrides the speed-first no-op.
+    var __moObservers = [];
+    var __moScheduled = false;
+    function __moSchedule() {
+      if (__moScheduled) return;
+      __moScheduled = true;
+      var run = function () {
+        __moScheduled = false;
+        var obs = __moObservers.slice();
+        for (var i = 0; i < obs.length; i++) {
+          var o = obs[i];
+          if (o.queue.length) {
+            var recs = o.queue; o.queue = [];
+            try { o.cb.call(o.instance, recs, o.instance); } catch (e) {}
+          }
+        }
+      };
+      if (typeof g.queueMicrotask === "function") { g.queueMicrotask(run); }
+      else { Promise.resolve().then(run); }
+    }
+    function __moObserved(o, target) {
+      if (o.target === target) return true;
+      if (!o.opts.subtree) return false;
+      var n = target.__parent;
+      while (n) { if (n === o.target) return true; n = n.__parent; }
+      return false;
+    }
+    function __moEmitChildList(parent, added, removed) {
+      for (var i = 0; i < __moObservers.length; i++) {
+        var o = __moObservers[i];
+        if (o.opts.childList && __moObserved(o, parent)) {
+          o.queue.push({ type: "childList", target: parent, attributeName: null,
+            oldValue: null, addedNodes: added || [], removedNodes: removed || [] });
+          __moSchedule();
+        }
+      }
+    }
+    function __moEmitAttr(el, name, oldValue) {
+      for (var i = 0; i < __moObservers.length; i++) {
+        var o = __moObservers[i];
+        if (!o.opts.attributes || !__moObserved(o, el)) continue;
+        if (o.opts.attributeFilter && o.opts.attributeFilter.indexOf(name) === -1) continue;
+        o.queue.push({ type: "attributes", target: el, attributeName: name,
+          oldValue: o.opts.attributeOldValue ? oldValue : null, addedNodes: [], removedNodes: [] });
+        __moSchedule();
+      }
+    }
+    g.MutationObserver = function MutationObserver(cb) { this.__cb = cb; this.__rec = null; };
+    g.MutationObserver.prototype.observe = function (target, opts) {
+      opts = opts || {};
+      if (this.__rec) { this.__rec.target = target; this.__rec.opts = opts; return; }
+      this.__rec = { target: target, opts: opts, cb: this.__cb, instance: this, queue: [] };
+      __moObservers.push(this.__rec);
+    };
+    g.MutationObserver.prototype.disconnect = function () {
+      var idx = __moObservers.indexOf(this.__rec);
+      if (idx !== -1) __moObservers.splice(idx, 1);
+      if (this.__rec) this.__rec.queue = [];
+    };
+    g.MutationObserver.prototype.takeRecords = function () {
+      if (!this.__rec) return [];
+      var q = this.__rec.queue; this.__rec.queue = []; return q;
+    };
 
     function elementChildren(node) {
       return node.__kids.filter(function (c) { return c.__type === ELEMENT_NODE; });

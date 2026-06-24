@@ -300,6 +300,37 @@ fn document_cookie_writes_are_captured_for_the_host_to_apply() {
 }
 
 #[test]
+fn mutation_observer_delivers_childlist_and_attribute_records() {
+    // Real MutationObserver (was a no-op stub): observing body with
+    // childList+attributes+subtree must deliver, as a microtask, a childList
+    // record for an appended node and attribute records for both the target and a
+    // subtree descendant — in mutation order.
+    let doc = shell_with("result", "init");
+    let mut client = Stub::default();
+    let out = run(
+        &doc,
+        &["var log = []; \
+           var mo = new MutationObserver(function (recs) { \
+             for (var i = 0; i < recs.length; i++) { \
+               log.push(recs[i].type + ':' + (recs[i].attributeName || \
+                 (recs[i].addedNodes.length ? 'add' : 'rm'))); } \
+           }); \
+           mo.observe(document.body, { childList: true, attributes: true, subtree: true }); \
+           var p = document.createElement('p'); document.body.appendChild(p); \
+           document.body.setAttribute('data-x', '1'); \
+           p.setAttribute('data-y', '2'); \
+           Promise.resolve().then(function () { \
+             document.getElementById('result').textContent = log.join(','); });"],
+        &mut client,
+    );
+    assert_eq!(
+        find_id(out.root(), "result").unwrap().text_content(),
+        "childList:add,attributes:data-x,attributes:data-y",
+        "childList (appended <p>) then attribute records for target + subtree node, in order"
+    );
+}
+
+#[test]
 fn text_encoding_and_base64_round_trip_against_known_vectors() {
     // QuickJS ships none of these (not ECMAScript). Assert spec-correct UTF-8 +
     // base64 against known vectors, incl. a non-ASCII codepoint (U+20AC '€' ->
