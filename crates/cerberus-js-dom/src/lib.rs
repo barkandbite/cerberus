@@ -2290,6 +2290,46 @@ pub const DOM_MODEL_PRELUDE: &str = r##"
       cookieEnabled: true,
       webdriver: false,
     };
+    // sendBeacon: fire-and-forget POST on the shared fetch queue (sensors/analytics
+    // ship telemetry through it). Returns true if queued.
+    g.navigator.sendBeacon = function (url, data) {
+      try {
+        if (!Array.isArray(g.__cerberusFetchQueue)) return false;
+        var id = g.__cerberusFetchId++;
+        g.__cerberusFetchQueue.push({
+          id: id, url: String(url), method: "POST", headers: [],
+          body: (data != null ? String(data) : "")
+        });
+        g.__cerberusFetchPending[id] = { xhr: true, settle: function () {}, fail: function () {} };
+        return true;
+      } catch (e) { return false; }
+    };
+
+    // ---- Event / CustomEvent constructors ------------------------------
+    // `new Event('x')` / `new CustomEvent('x', {detail})` were absent, so
+    // dispatchEvent(new Event(...)) threw. Minimal spec-shaped events.
+    g.Event = function Event(type, init) {
+      init = init || {};
+      this.type = String(type);
+      this.bubbles = !!init.bubbles;
+      this.cancelable = !!init.cancelable;
+      this.composed = !!init.composed;
+      this.defaultPrevented = false;
+      this.target = null; this.currentTarget = null; this.eventPhase = 0;
+      this.timeStamp = (g.performance && g.performance.now) ? g.performance.now() : 0;
+      this.__stop = false; this.__stopImmediate = false;
+    };
+    g.Event.NONE = 0; g.Event.CAPTURING_PHASE = 1; g.Event.AT_TARGET = 2; g.Event.BUBBLING_PHASE = 3;
+    g.Event.prototype.preventDefault = function () { if (this.cancelable) this.defaultPrevented = true; };
+    g.Event.prototype.stopPropagation = function () { this.__stop = true; };
+    g.Event.prototype.stopImmediatePropagation = function () { this.__stop = true; this.__stopImmediate = true; };
+    g.CustomEvent = function CustomEvent(type, init) {
+      init = init || {};
+      g.Event.call(this, type, init);
+      this.detail = (init.detail !== undefined) ? init.detail : null;
+    };
+    g.CustomEvent.prototype = Object.create(g.Event.prototype);
+    g.CustomEvent.prototype.constructor = g.CustomEvent;
 
     // ---- screen + window metrics ---------------------------------------
     g.screen = {

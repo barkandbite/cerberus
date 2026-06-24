@@ -376,6 +376,42 @@ fn xmlhttprequest_get_and_post_ride_the_fetch_queue() {
 }
 
 #[test]
+fn event_constructors_and_sendbeacon_work() {
+    // new Event / new CustomEvent were absent (dispatchEvent(new Event(...)) threw);
+    // navigator.sendBeacon was absent. A CustomEvent carries detail to a target
+    // listener; sendBeacon enqueues a fire-and-forget POST on the fetch queue.
+    let doc = shell_with("result", "init");
+    let mut client = Stub::default().route("/beacon", "text/plain", "");
+    let out = run(
+        &doc,
+        &["var got = ''; var d = document.getElementById('result'); \
+           d.addEventListener('ping', function (e) { got = e.type + ':' + e.detail; }); \
+           d.dispatchEvent(new Event('noop')); \
+           d.dispatchEvent(new CustomEvent('ping', { detail: 42 })); \
+           var beac = navigator.sendBeacon('/beacon', 'hello'); \
+           d.textContent = got + '|' + (beac === true) + '|' + (new Event('e').eventPhase === 0);"],
+        &mut client,
+    );
+    assert_eq!(
+        find_id(out.root(), "result").unwrap().text_content(),
+        "ping:42|true|true",
+        "CustomEvent detail reaches the listener; sendBeacon returns true; Event shape ok"
+    );
+    assert!(
+        client
+            .seen
+            .iter()
+            .any(|r| r.url == "/beacon" && r.method == "POST" && r.body == "hello"),
+        "sendBeacon enqueued a POST with the body, got {:?}",
+        client
+            .seen
+            .iter()
+            .map(|r| (&r.url, &r.method))
+            .collect::<Vec<_>>()
+    );
+}
+
+#[test]
 fn text_encoding_and_base64_round_trip_against_known_vectors() {
     // QuickJS ships none of these (not ECMAScript). Assert spec-correct UTF-8 +
     // base64 against known vectors, incl. a non-ASCII codepoint (U+20AC '€' ->
