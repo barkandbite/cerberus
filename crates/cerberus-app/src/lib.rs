@@ -933,23 +933,34 @@ pub fn render(config: &RenderConfig) -> Result<RenderOutcome, AppError> {
         };
         document = match &client {
             Some(c) => {
+                // Fetch external `<script src>` bundles (consent-gated) and run
+                // them in document order with the inline scripts (ADR-0059) — what
+                // lets client-rendered pages execute their app code at all.
+                let bodies = cerberus_js_dom::resolve_scripts(document.scripts(), |src| {
+                    let abs = resolve_subresource(Some(&url), src);
+                    if !(abs.starts_with("http://") || abs.starts_with("https://")) {
+                        return None;
+                    }
+                    if !subresource_allowed(&abs, &consent, fetch_ctx.instance, &first_party) {
+                        return None;
+                    }
+                    fetch_bytes(c, &abs, &fetch_ctx)
+                        .ok()
+                        .map(|b| String::from_utf8_lossy(&b).into_owned())
+                });
                 let mut fc = SyncFetchClient {
                     client: c,
                     base: Some(url.clone()),
                     ctx: fetch_ctx,
                 };
-                run_page_scripts_with_fetch(
-                    engine,
-                    base_realm,
-                    &document,
-                    document.scripts(),
-                    &env,
-                    &mut fc,
-                )
-                .map_err(|e| AppError::Js(format!("{e:?}")))?
+                run_page_scripts_with_fetch(engine, base_realm, &document, &bodies, &env, &mut fc)
+                    .map_err(|e| AppError::Js(format!("{e:?}")))?
             }
-            None => run_page_scripts(engine, base_realm, &document, document.scripts(), &env)
-                .map_err(|e| AppError::Js(format!("{e:?}")))?,
+            None => {
+                let bodies = cerberus_js_dom::resolve_scripts(document.scripts(), |_| None);
+                run_page_scripts(engine, base_realm, &document, &bodies, &env)
+                    .map_err(|e| AppError::Js(format!("{e:?}")))?
+            }
         };
     }
     let engine_name = engine.name().to_string();
@@ -2317,7 +2328,10 @@ impl BrowserApp {
         if install_page(engine, realm, &doc, &env).is_err() {
             return doc;
         }
-        if cerberus_js_dom::run_scripts(engine, realm, doc.scripts()).is_err() {
+        // Interactive path runs inline scripts for now; external `<script src>`
+        // fetching here is async (worker) — a follow-up (ADR-0059).
+        let bodies = cerberus_js_dom::resolve_scripts(doc.scripts(), |_| None);
+        if cerberus_js_dom::run_scripts(engine, realm, &bodies).is_err() {
             return doc;
         }
         let _ = fire_load(engine, realm);
@@ -5018,8 +5032,9 @@ pub fn bench_pipeline(iters: usize) -> Vec<BenchStage> {
                 viewport: (1280, 1024),
                 user_agent: DEFAULT_USER_AGENT.into(),
             };
+            let bodies = cerberus_js_dom::resolve_scripts(document.scripts(), |_| None);
             std::hint::black_box(
-                run_page_scripts(engine, realm, &document, document.scripts(), &env).expect("js"),
+                run_page_scripts(engine, realm, &document, &bodies, &env).expect("js"),
             );
         }));
     }

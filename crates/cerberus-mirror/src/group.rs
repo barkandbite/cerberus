@@ -14,8 +14,8 @@
 
 use cerberus_js::JsEngine;
 use cerberus_js_dom::{
-    dispatch_event, fire_load, install_page, run_event_loop, run_scripts, serialize_dom,
-    set_node_value, EventLoopBudget, PageEnv, RebuiltDom,
+    dispatch_event, fire_load, install_page, resolve_scripts, run_event_loop, run_scripts,
+    serialize_dom, set_node_value, EventLoopBudget, PageEnv, RebuiltDom,
 };
 use cerberus_types::{InstanceId, RealmId};
 
@@ -325,7 +325,7 @@ impl MirrorGroup {
 
         let engine = &mut *self.engine;
         install_page(engine, realm, &doc, &env)?;
-        run_scripts(engine, realm, doc.scripts())?;
+        run_scripts(engine, realm, &resolve_scripts(doc.scripts(), |_| None))?;
         let _ = fire_load(engine, realm);
         let _ = run_event_loop(engine, realm, EventLoopBudget::default());
         let RebuiltDom { document, id_map } = serialize_dom(engine, realm)?;

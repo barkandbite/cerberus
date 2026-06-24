@@ -517,6 +517,22 @@ fn js_string(s: &str) -> String {
 /// abort the run (browsers continue to the next `<script>`); any other engine
 /// error (e.g. [`JsError::NoSuchRealm`]) is infrastructure-level and propagates
 /// as [`BridgeError::Js`].
+/// Resolve a document's scripts to runnable source in document order: inline
+/// bodies as-is, external `src`s fetched via `fetch` (skipped when it returns
+/// `None` — a blocked or failed fetch) — ADR-0059.
+pub fn resolve_scripts(
+    scripts: &[cerberus_dom::ScriptRef],
+    mut fetch: impl FnMut(&str) -> Option<String>,
+) -> Vec<String> {
+    scripts
+        .iter()
+        .filter_map(|s| match s {
+            cerberus_dom::ScriptRef::Inline(body) => Some(body.clone()),
+            cerberus_dom::ScriptRef::External(src) => fetch(src),
+        })
+        .collect()
+}
+
 pub fn run_page_scripts(
     engine: &mut dyn JsEngine,
     realm: RealmId,

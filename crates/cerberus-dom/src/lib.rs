@@ -39,13 +39,21 @@ enum NodeData {
 /// them while their text never appears as visible page content.
 ///
 /// [`scripts`]: Document::scripts
+/// A `<script>` collected for the JS engine, in document order: an inline body or
+/// an external `src` URL to fetch then run (ADR-0059).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ScriptRef {
+    Inline(String),
+    External(String),
+}
+
 #[derive(Clone, Debug)]
 pub struct Document {
     nodes: Vec<NodeData>,
     root: NodeId,
-    /// Inline `<script>` bodies (no `src`), in document order. Kept separate
-    /// from `nodes` so script source is never rendered.
-    scripts: Vec<String>,
+    /// `<script>`s in document order (inline bodies + external `src`s). Kept
+    /// separate from `nodes` so script source is never rendered.
+    scripts: Vec<ScriptRef>,
 }
 
 impl Document {
@@ -64,10 +72,10 @@ impl Document {
         ((id as usize) < self.nodes.len()).then_some(NodeRef { doc: self, id })
     }
 
-    /// Inline `<script>` sources (elements without a `src` attribute), in
-    /// document order. The text is the raw script body, undecoded — it is *not*
-    /// part of the render tree and never appears in [`NodeRef::text_content`].
-    pub fn scripts(&self) -> &[String] {
+    /// `<script>`s in document order — inline bodies and external `src`s. Script
+    /// source is *not* part of the render tree and never appears in
+    /// [`NodeRef::text_content`].
+    pub fn scripts(&self) -> &[ScriptRef] {
         &self.scripts
     }
 
@@ -307,7 +315,7 @@ impl OpenElement {
 /// pushed into its parent's child list. `scripts` holds the inline `<script>`
 /// sources already gathered (in document order) by the tokenizer; they are
 /// stored on the [`Document`] but never enter the render tree.
-fn build_tree(tokens: Vec<Token>, scripts: Vec<String>) -> Document {
+fn build_tree(tokens: Vec<Token>, scripts: Vec<ScriptRef>) -> Document {
     let mut nodes: Vec<NodeData> = Vec::new();
     let mut stack: Vec<OpenElement> = vec![OpenElement::new("#root")];
 
@@ -487,10 +495,10 @@ enum Token {
 /// Returns the token stream plus the inline `<script>` sources (no `src`
 /// attribute) in document order. Script bodies are captured here so they never
 /// become render-tree text.
-fn tokenize(input: &str) -> (Vec<Token>, Vec<String>) {
+fn tokenize(input: &str) -> (Vec<Token>, Vec<ScriptRef>) {
     let b = input.as_bytes();
     let mut tokens = Vec::new();
-    let mut scripts: Vec<String> = Vec::new();
+    let mut scripts: Vec<ScriptRef> = Vec::new();
     let mut i = 0;
 
     while i < b.len() {
@@ -532,13 +540,26 @@ fn tokenize(input: &str) -> (Vec<Token>, Vec<String>) {
                     // Inline scripts (no `src`) are collected out-of-band for
                     // the JS engine — capture before `attrs` is moved into the
                     // Open token.
-                    let is_inline_script =
-                        name == "script" && !attrs.iter().any(|(k, _)| k == "src");
+                    // Scripts are collected out-of-band for the JS engine: an
+                    // inline body, or an external `src` to fetch + run (ADR-0059).
+                    // Capture `src` before `attrs` moves into the Open token.
+                    let script_src = if name == "script" {
+                        attrs
+                            .iter()
+                            .find(|(k, _)| k == "src")
+                            .map(|(_, v)| v.clone())
+                    } else {
+                        None
+                    };
+                    let is_script = name == "script";
                     tokens.push(Token::Open(name.clone(), attrs));
                     let (content, after) = read_rawtext(input, i, &name);
                     i = after;
-                    if is_inline_script {
-                        scripts.push(content.to_string());
+                    if is_script {
+                        scripts.push(match script_src {
+                            Some(src) => ScriptRef::External(src),
+                            None => ScriptRef::Inline(content.to_string()),
+                        });
                     }
                     if keep {
                         tokens.push(Token::Text(content.to_string()));
@@ -922,7 +943,10 @@ mod tests {
         assert!(!text.contains("hidden"), "comment dropped");
         assert!(text.contains("done"));
         // The inline script body is captured separately, rawtext (undecoded).
-        assert_eq!(doc.scripts(), &["if (x<1){ y }".to_string()]);
+        assert_eq!(
+            doc.scripts(),
+            &[ScriptRef::Inline("if (x<1){ y }".to_string())]
+        );
     }
 
     #[test]
@@ -948,29 +972,29 @@ mod tests {
         let doc = parse_html(
             "<head><script>A=1</script></head><body><p>hi</p><script>B=2</script></body>",
         );
-        assert_eq!(doc.scripts(), &["A=1".to_string(), "B=2".to_string()]);
+        assert_eq!(
+            doc.scripts(),
+            &[
+                ScriptRef::Inline("A=1".to_string()),
+                ScriptRef::Inline("B=2".to_string())
+            ]
+        );
     }
 
     #[test]
-    fn external_script_contributes_no_inline_source() {
+    fn external_script_is_captured_as_external() {
+        // An external script is captured by its `src` to fetch + run (ADR-0059),
+        // never as inline source.
         let doc = parse_html("<script src=\"x.js\"></script>");
-        assert!(
-            doc.scripts().is_empty(),
-            "external scripts contribute no inline source; got {:?}",
-            doc.scripts()
-        );
+        assert_eq!(doc.scripts(), &[ScriptRef::External("x.js".to_string())]);
     }
 
     #[test]
-    fn script_with_src_and_body_ignores_body() {
-        // A script with both `src` and a body is treated as external: its body
-        // is ignored (matches browser behavior).
+    fn script_with_src_and_body_uses_src_not_body() {
+        // A script with both `src` and a body is external: its body is ignored
+        // (matches browser behavior) — only the `src` is recorded.
         let doc = parse_html("<script src=\"x.js\">SHOULD_BE_IGNORED</script>");
-        assert!(
-            doc.scripts().is_empty(),
-            "body of a src'd script is ignored; got {:?}",
-            doc.scripts()
-        );
+        assert_eq!(doc.scripts(), &[ScriptRef::External("x.js".to_string())]);
     }
 
     #[test]
@@ -987,7 +1011,24 @@ mod tests {
             "script source must never render; got {text:?}"
         );
         // It is, however, available to the JS engine.
-        assert_eq!(doc.scripts(), &["document.x='SECRET'".to_string()]);
+        assert_eq!(
+            doc.scripts(),
+            &[ScriptRef::Inline("document.x='SECRET'".to_string())]
+        );
+    }
+
+    #[test]
+    fn external_script_src_is_captured_in_order() {
+        // Inline and external `<script>`s are collected in document order; the
+        // external one keeps its `src` to fetch + run (ADR-0059).
+        let doc = parse_html("<script>boot()</script><script src='/app.js'></script>");
+        assert_eq!(
+            doc.scripts(),
+            &[
+                ScriptRef::Inline("boot()".to_string()),
+                ScriptRef::External("/app.js".to_string()),
+            ]
+        );
     }
 
     #[test]
