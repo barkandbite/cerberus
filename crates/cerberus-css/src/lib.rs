@@ -40,6 +40,8 @@ html, body, div, p, h1, h2, h3, h4, h5, h6, ul, ol, li, section, article,
 header, footer, nav, main, aside, blockquote, pre, figure, figcaption, form,
 table, tr, hr, dl, dt, dd, fieldset, address { display: block; }
 head, title, meta, link, style, script, base, template { display: none; }
+/* The HTML `hidden` attribute removes the element from rendering (ADR-0058). */
+[hidden] { display: none; }
 /* We don't paint SVG graphics; hiding it avoids flowing its <text>/markup as
    stray page text (e.g. decorative symbol grids). Icons render as nothing,
    which is what unpainted SVG already was. */
@@ -2046,6 +2048,21 @@ mod tests {
         assert_eq!(
             first(&re.root, "p").unwrap().style.color,
             Color::rgb(0, 0xff, 0)
+        );
+    }
+
+    #[test]
+    fn hidden_attribute_is_display_none() {
+        // The HTML `hidden` attribute removes the element (ADR-0058) — common for
+        // screen-reader / aria-live regions that otherwise pollute the render.
+        let dom = CssEngine::new().style(&parse_html("<p hidden>x</p>"));
+        let p = first(&dom.root, "p").unwrap();
+        assert_eq!(p.style.display, Display::None);
+        // A normal <p> is unaffected.
+        let shown = CssEngine::new().style(&parse_html("<p>x</p>"));
+        assert_ne!(
+            first(&shown.root, "p").unwrap().style.display,
+            Display::None
         );
     }
 
