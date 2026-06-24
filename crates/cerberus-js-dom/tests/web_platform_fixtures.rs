@@ -218,6 +218,59 @@ fn dataset_view_and_structured_clone() {
 }
 
 #[test]
+fn abort_controller_formdata_and_blob() {
+    // All three were absent. Cover: AbortController fires its abort listener and
+    // sets signal.aborted; FormData append/getAll/set/get; Blob size/type.
+    let doc = shell_with("result", "init");
+    let mut client = Stub::default();
+    let out = run(
+        &doc,
+        &["var ac = new AbortController(); var fired = ''; \
+           ac.signal.addEventListener('abort', function () { fired = 'abort:' + ac.signal.aborted; }); \
+           ac.abort(); \
+           var fd = new FormData(); fd.append('a', '1'); fd.append('a', '2'); fd.set('b', '3'); \
+           var fdstr = fd.getAll('a').join(',') + ';' + fd.get('b'); \
+           var blob = new Blob(['hello', ' ', 'world'], { type: 'text/plain' }); \
+           document.getElementById('result').textContent = \
+             fired + '|' + fdstr + '|' + blob.size + ':' + blob.type;"],
+        &mut client,
+    );
+    assert_eq!(
+        find_id(out.root(), "result").unwrap().text_content(),
+        "abort:true|1,2;3|11:text/plain"
+    );
+
+    // fetch integration: a FormData body serializes URL-encoded; an already-aborted
+    // signal rejects before hitting the network.
+    let mut c2 = Stub::default().route("/p", "text/plain", "ok");
+    let out2 = run(
+        &doc,
+        &[
+            "var fd = new FormData(); fd.append('x', '1'); fd.append('y', 'two'); \
+           fetch('/p', { method: 'POST', body: fd }); \
+           var ac = new AbortController(); ac.abort(); \
+           fetch('/blocked', { signal: ac.signal }).catch(function () { \
+             document.getElementById('result').textContent = 'rejected'; });",
+        ],
+        &mut c2,
+    );
+    assert_eq!(
+        find_id(out2.root(), "result").unwrap().text_content(),
+        "rejected"
+    );
+    let post = c2
+        .seen
+        .iter()
+        .find(|r| r.url == "/p")
+        .expect("FormData POST serviced");
+    assert_eq!(post.body, "x=1&y=two", "FormData serialized URL-encoded");
+    assert!(
+        !c2.seen.iter().any(|r| r.url == "/blocked"),
+        "an aborted-signal fetch never reaches the network"
+    );
+}
+
+#[test]
 fn performance_now_and_crypto_get_random_values_exist() {
     // The real sensor calls performance.now() and crypto.getRandomValues() early;
     // when they were missing it threw before doing anything. Assert the contract:

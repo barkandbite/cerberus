@@ -2525,6 +2525,74 @@ pub const DOM_MODEL_PRELUDE: &str = r##"
       })(input, new Map());
     };
 
+    // ---- AbortController / AbortSignal ---------------------------------
+    // Modern fetch/event code passes a signal and calls .abort(); absence broke it.
+    g.AbortSignal = function AbortSignal() { this.aborted = false; this.reason = undefined; this.onabort = null; this.__l = []; };
+    g.AbortSignal.prototype.addEventListener = function (t, fn) { if (t === "abort" && typeof fn === "function") this.__l.push(fn); };
+    g.AbortSignal.prototype.removeEventListener = function (t, fn) { if (t === "abort") { var i = this.__l.indexOf(fn); if (i !== -1) this.__l.splice(i, 1); } };
+    g.AbortSignal.prototype.dispatchEvent = function () { return true; };
+    g.AbortSignal.prototype.throwIfAborted = function () { if (this.aborted) throw this.reason; };
+    g.AbortSignal.abort = function (reason) { var s = new g.AbortSignal(); s.aborted = true; s.reason = reason !== undefined ? reason : new Error("AbortError"); return s; };
+    g.AbortSignal.timeout = function () { return new g.AbortSignal(); };
+    g.AbortController = function AbortController() { this.signal = new g.AbortSignal(); };
+    g.AbortController.prototype.abort = function (reason) {
+      var s = this.signal;
+      if (s.aborted) return;
+      s.aborted = true;
+      s.reason = reason !== undefined ? reason : new Error("AbortError");
+      var ev = { type: "abort", target: s, currentTarget: s };
+      if (typeof s.onabort === "function") { try { s.onabort.call(s, ev); } catch (e) {} }
+      var ls = s.__l.slice();
+      for (var i = 0; i < ls.length; i++) { try { ls[i].call(s, ev); } catch (e) {} }
+    };
+
+    // ---- Blob ----------------------------------------------------------
+    g.Blob = function Blob(parts, options) {
+      parts = parts || [];
+      var strs = [];
+      for (var i = 0; i < parts.length; i++) {
+        var p = parts[i];
+        strs.push(typeof p === "string" ? p : (p && p.__blobText != null ? p.__blobText : String(p)));
+      }
+      this.__blobText = strs.join("");
+      this.size = this.__blobText.length;
+      this.type = (options && options.type) ? String(options.type) : "";
+    };
+    g.Blob.prototype.text = function () { return Promise.resolve(this.__blobText); };
+    g.Blob.prototype.slice = function (s, e, type) { return new g.Blob([this.__blobText.slice(s, e)], { type: type || this.type }); };
+    g.Blob.prototype.arrayBuffer = function () {
+      var s = this.__blobText, buf = new ArrayBuffer(s.length), v = new Uint8Array(buf);
+      for (var i = 0; i < s.length; i++) v[i] = s.charCodeAt(i) & 0xff;
+      return Promise.resolve(buf);
+    };
+
+    // ---- FormData ------------------------------------------------------
+    g.FormData = function FormData() { this.__e = []; };
+    g.FormData.prototype.append = function (k, v) { this.__e.push([String(k), v]); };
+    g.FormData.prototype.set = function (k, v) { k = String(k); this.__e = this.__e.filter(function (e) { return e[0] !== k; }); this.__e.push([k, v]); };
+    g.FormData.prototype.get = function (k) { k = String(k); for (var i = 0; i < this.__e.length; i++) if (this.__e[i][0] === k) return this.__e[i][1]; return null; };
+    g.FormData.prototype.getAll = function (k) { k = String(k); return this.__e.filter(function (e) { return e[0] === k; }).map(function (e) { return e[1]; }); };
+    g.FormData.prototype.has = function (k) { return this.get(String(k)) !== null; };
+    g.FormData.prototype.delete = function (k) { k = String(k); this.__e = this.__e.filter(function (e) { return e[0] !== k; }); };
+    g.FormData.prototype.forEach = function (cb, t) { for (var i = 0; i < this.__e.length; i++) cb.call(t, this.__e[i][1], this.__e[i][0], this); };
+    g.FormData.prototype.keys = function () { return this.__e.map(function (e) { return e[0]; }); };
+    g.FormData.prototype.values = function () { return this.__e.map(function (e) { return e[1]; }); };
+    g.FormData.prototype.entries = function () { return this.__e.map(function (e) { return [e[0], e[1]]; }); };
+    // Serialize a FormData/Blob body to a string the host can send (URL-encoded
+    // for FormData; the raw text for a Blob). Used by fetch/XHR below.
+    g.__cerberusBodyToString = function (body) {
+      if (body == null) return "";
+      if (typeof body === "string") return body;
+      if (body instanceof g.FormData) {
+        return body.__e.map(function (e) {
+          return encodeURIComponent(e[0]) + "=" + encodeURIComponent(typeof e[1] === "string" ? e[1] : (e[1] && e[1].__blobText != null ? e[1].__blobText : String(e[1])));
+        }).join("&");
+      }
+      if (body instanceof g.Blob) return body.__blobText;
+      if (body instanceof g.URLSearchParams) return body.toString();
+      return String(body);
+    };
+
     // ---- screen + window metrics ---------------------------------------
     g.screen = {
       width: vpW, height: vpH, availWidth: vpW, availHeight: vpH,
@@ -3175,9 +3243,12 @@ pub const DOM_MODEL_PRELUDE: &str = r##"
         var url;
         if (input && typeof input === "object" && input.url != null) url = String(input.url);
         else url = String(input);
+        if (init && init.signal && init.signal.aborted) {
+          return Promise.reject(init.signal.reason || new Error("AbortError"));
+        }
         var method = (init && init.method) ? String(init.method).toUpperCase() : "GET";
         var headers = normalizeHeaders(init);
-        var body = (init && init.body != null) ? String(init.body) : "";
+        var body = (init && init.body != null) ? g.__cerberusBodyToString(init.body) : "";
         var id = g.__cerberusFetchId++;
         g.__cerberusFetchQueue.push({ id: id, url: url, method: method, headers: headers, body: body });
         return new Promise(function (resolve, reject) {
@@ -3333,7 +3404,7 @@ pub const DOM_MODEL_PRELUDE: &str = r##"
       var id = g.__cerberusFetchId++;
       g.__cerberusFetchQueue.push({
         id: id, url: this.__url, method: this.__method,
-        headers: this.__reqHeaders.slice(), body: (body != null ? String(body) : "")
+        headers: this.__reqHeaders.slice(), body: g.__cerberusBodyToString(body)
       });
       g.__cerberusFetchPending[id] = {
         xhr: true,
