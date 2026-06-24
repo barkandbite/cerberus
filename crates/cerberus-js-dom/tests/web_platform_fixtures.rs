@@ -193,6 +193,31 @@ fn microtasks_run_before_the_next_macrotask() {
 }
 
 #[test]
+fn dataset_view_and_structured_clone() {
+    // el.dataset (data-* as camelCase, was absent) and structuredClone (deep,
+    // cycle-safe clone, was absent) — both used constantly by app frameworks.
+    let doc = shell_with("result", "init");
+    let mut client = Stub::default();
+    let out = run(
+        &doc,
+        &["var d = document.getElementById('result'); \
+           d.setAttribute('data-foo-bar', 'x'); var read = d.dataset.fooBar; \
+           d.dataset.bazQux = 'y'; var attr = d.getAttribute('data-baz-qux'); \
+           var keys = Object.keys(d.dataset).sort().join(','); \
+           var orig = { a: 1, b: [1, 2, { c: 3 }], d: new Date(0) }; \
+           var cl = structuredClone(orig); cl.b[2].c = 99; \
+           var clone_ok = orig.b[2].c === 3 && cl.b[2].c === 99 && cl.d.getTime() === 0; \
+           d.textContent = read + '|' + attr + '|' + keys + '|' + clone_ok;"],
+        &mut client,
+    );
+    assert_eq!(
+        find_id(out.root(), "result").unwrap().text_content(),
+        "x|y|bazQux,fooBar|true",
+        "dataset camelCase<->data-* both ways + Object.keys; structuredClone deep + independent"
+    );
+}
+
+#[test]
 fn performance_now_and_crypto_get_random_values_exist() {
     // The real sensor calls performance.now() and crypto.getRandomValues() early;
     // when they were missing it threw before doing anything. Assert the contract:

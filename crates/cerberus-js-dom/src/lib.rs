@@ -2009,6 +2009,45 @@ pub const DOM_MODEL_PRELUDE: &str = r##"
     ELEMENT_PROTO.hasAttribute = function (n) { return attrIndex(this, String(n)) !== -1; };
     ELEMENT_PROTO.getAttributeNames = function () { return this.__attrs.map(function (p) { return p[0]; }); };
 
+    // el.dataset: a live view of the element's data-* attributes as camelCase
+    // properties (frameworks use it constantly). data-foo-bar <-> el.dataset.fooBar.
+    function __camelToKebab(s) { return String(s).replace(/[A-Z]/g, function (m) { return "-" + m.toLowerCase(); }); }
+    function __kebabToCamel(s) { return s.replace(/-([a-z])/g, function (_m, c) { return c.toUpperCase(); }); }
+    Object.defineProperty(ELEMENT_PROTO, "dataset", {
+      get: function () {
+        var el = this;
+        return new Proxy({}, {
+          get: function (t, k) {
+            if (typeof k !== "string") return undefined;
+            var v = getAttr(el, "data-" + __camelToKebab(k));
+            return v == null ? undefined : v;
+          },
+          set: function (t, k, v) {
+            if (typeof k === "string") setAttr(el, "data-" + __camelToKebab(k), String(v));
+            return true;
+          },
+          has: function (t, k) {
+            return typeof k === "string" && attrIndex(el, "data-" + __camelToKebab(k)) !== -1;
+          },
+          deleteProperty: function (t, k) {
+            if (typeof k === "string") removeAttr(el, "data-" + __camelToKebab(k));
+            return true;
+          },
+          ownKeys: function () {
+            return el.__attrs
+              .filter(function (p) { return p[0].slice(0, 5) === "data-"; })
+              .map(function (p) { return __kebabToCamel(p[0].slice(5)); });
+          },
+          getOwnPropertyDescriptor: function (t, k) {
+            var v = (typeof k === "string") ? getAttr(el, "data-" + __camelToKebab(k)) : null;
+            if (v == null) return undefined;
+            return { value: v, writable: true, enumerable: true, configurable: true };
+          },
+        });
+      },
+      enumerable: true, configurable: true,
+    });
+
     ELEMENT_PROTO.getElementsByTagName = function (t) { return queryAll(this, String(t)); };
     ELEMENT_PROTO.getElementsByClassName = function (c) { return queryAll(this, "." + String(c)); };
     ELEMENT_PROTO.querySelector = function (s) { return queryOne(this, s); };
@@ -2458,6 +2497,33 @@ pub const DOM_MODEL_PRELUDE: &str = r##"
     };
     g.URL.prototype.toString = function () { return this.href; };
     g.URL.prototype.toJSON = function () { return this.href; };
+
+    // structuredClone: deep clone of plain data (objects/arrays/Date/Map/Set/
+    // typed arrays), cycle-safe. Common in modern app code.
+    g.structuredClone = function (input) {
+      return (function clone(v, seen) {
+        if (v === null || typeof v !== "object") return v;
+        if (seen.has(v)) return seen.get(v);
+        var out;
+        if (Array.isArray(v)) { out = []; seen.set(v, out); for (var i = 0; i < v.length; i++) out[i] = clone(v[i], seen); return out; }
+        if (v instanceof Date) return new Date(v.getTime());
+        if (typeof ArrayBuffer === "function" && v instanceof ArrayBuffer) return v.slice(0);
+        if (typeof ArrayBuffer === "function" && ArrayBuffer.isView(v)) return new v.constructor(v);
+        if (typeof Map === "function" && v instanceof Map) {
+          out = new Map(); seen.set(v, out);
+          v.forEach(function (vv, kk) { out.set(clone(kk, seen), clone(vv, seen)); });
+          return out;
+        }
+        if (typeof Set === "function" && v instanceof Set) {
+          out = new Set(); seen.set(v, out);
+          v.forEach(function (vv) { out.add(clone(vv, seen)); });
+          return out;
+        }
+        out = {}; seen.set(v, out);
+        for (var key in v) if (Object.prototype.hasOwnProperty.call(v, key)) out[key] = clone(v[key], seen);
+        return out;
+      })(input, new Map());
+    };
 
     // ---- screen + window metrics ---------------------------------------
     g.screen = {
