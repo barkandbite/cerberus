@@ -1542,13 +1542,22 @@ fn parse_grid_span(v: &str) -> u32 {
 fn apply_font_shorthand(style: &mut ComputedStyle, v: &str, parent_font_size: u32) {
     for token in v.split_whitespace() {
         let t = token.to_ascii_lowercase();
-        if t == "bold" {
+        if t == "bold" || t == "bolder" {
             style.font.bold = true;
         } else if t == "italic" || t == "oblique" {
             style.font.italic = true;
-        } else if t.chars().any(|c| c.is_ascii_digit()) {
-            if let Some(px) = parse_size(&t, parent_font_size) {
-                style.font_size = px;
+        } else if t.starts_with(|c: char| c.is_ascii_digit()) {
+            // In the `font` shorthand the size carries a unit (or is
+            // `size/line-height`); a *bare* number is the font **weight**
+            // (100–900), never the size — e.g. `font: 600 16px/1.4 Arial` must not
+            // set font-size to 600 (ADR-0057).
+            if t.contains('/') || t.bytes().any(|b| b.is_ascii_alphabetic() || b == b'%') {
+                let size_tok = t.split('/').next().unwrap_or(&t);
+                if let Some(px) = parse_size(size_tok, parent_font_size) {
+                    style.font_size = px;
+                }
+            } else if let Ok(weight) = t.parse::<u32>() {
+                style.font.bold = weight >= 600;
             }
         }
     }
@@ -2038,6 +2047,26 @@ mod tests {
             first(&re.root, "p").unwrap().style.color,
             Color::rgb(0, 0xff, 0)
         );
+    }
+
+    #[test]
+    fn font_shorthand_weight_is_not_size() {
+        // `font: 600 16px/1.4 Arial` → size 16 (from the unit token); the bare 600
+        // is the weight (semibold), not a 600px font-size (ADR-0057).
+        let dom = CssEngine::new().style(&parse_html("<p style='font: 600 16px/1.4 Arial'>x</p>"));
+        let p = first(&dom.root, "p").unwrap();
+        assert_eq!(
+            p.style.font_size, 16,
+            "size comes from 16px, not the weight 600"
+        );
+        assert!(p.style.font.bold, "600 is a semibold weight");
+        // A bare `font: italic 700 1.2em serif` still finds the em size.
+        let dom2 = CssEngine::new().style(&parse_html(
+            "<div style='font-size:20px'><p style='font: italic 700 1.5em serif'>y</p></div>",
+        ));
+        let p2 = first(&dom2.root, "p").unwrap();
+        assert_eq!(p2.style.font_size, 30, "1.5em of the 20px parent");
+        assert!(p2.style.font.italic && p2.style.font.bold);
     }
 
     // ---- CSS custom properties + var()/calc() (ADR-0035) ----
