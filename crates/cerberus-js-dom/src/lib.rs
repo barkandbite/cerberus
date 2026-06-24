@@ -2311,6 +2311,96 @@ pub const DOM_MODEL_PRELUDE: &str = r##"
       return Promise.resolve(buf);
     };
 
+    // ---- encoding (TextEncoder/Decoder, btoa/atob) ---------------------
+    // Not ECMAScript — QuickJS doesn't ship them, but sensors encode/hash their
+    // payload through them. Spec-correct UTF-8 + base64, guarded so a native
+    // implementation (if ever present) wins.
+    function __utf8Encode(str) {
+      str = String(str); var out = [];
+      for (var i = 0; i < str.length; i++) {
+        var c = str.charCodeAt(i);
+        if (c < 0x80) { out.push(c); }
+        else if (c < 0x800) { out.push(0xc0 | (c >> 6), 0x80 | (c & 0x3f)); }
+        else if (c >= 0xd800 && c <= 0xdbff && i + 1 < str.length) {
+          var c2 = str.charCodeAt(i + 1);
+          if (c2 >= 0xdc00 && c2 <= 0xdfff) {
+            var cp = 0x10000 + ((c - 0xd800) << 10) + (c2 - 0xdc00); i++;
+            out.push(0xf0 | (cp >> 18), 0x80 | ((cp >> 12) & 0x3f),
+                     0x80 | ((cp >> 6) & 0x3f), 0x80 | (cp & 0x3f));
+          } else { out.push(0xe0 | (c >> 12), 0x80 | ((c >> 6) & 0x3f), 0x80 | (c & 0x3f)); }
+        } else { out.push(0xe0 | (c >> 12), 0x80 | ((c >> 6) & 0x3f), 0x80 | (c & 0x3f)); }
+      }
+      return out;
+    }
+    function __utf8Decode(bytes) {
+      var s = "", i = 0, n = bytes.length;
+      while (i < n) {
+        var b = bytes[i++];
+        if (b < 0x80) { s += String.fromCharCode(b); }
+        else if (b < 0xe0) { s += String.fromCharCode(((b & 0x1f) << 6) | (bytes[i++] & 0x3f)); }
+        else if (b < 0xf0) {
+          s += String.fromCharCode(((b & 0x0f) << 12) | ((bytes[i++] & 0x3f) << 6) | (bytes[i++] & 0x3f));
+        } else {
+          var cp = (((b & 0x07) << 18) | ((bytes[i++] & 0x3f) << 12)
+                    | ((bytes[i++] & 0x3f) << 6) | (bytes[i++] & 0x3f)) - 0x10000;
+          s += String.fromCharCode(0xd800 + (cp >> 10), 0xdc00 + (cp & 0x3ff));
+        }
+      }
+      return s;
+    }
+    function __asBytes(data) {
+      if (data instanceof ArrayBuffer) { return new Uint8Array(data); }
+      if (data && data.buffer instanceof ArrayBuffer) {
+        return new Uint8Array(data.buffer, data.byteOffset || 0, data.byteLength);
+      }
+      return data || [];
+    }
+    if (typeof g.TextEncoder !== "function") {
+      g.TextEncoder = function TextEncoder() { this.encoding = "utf-8"; };
+      g.TextEncoder.prototype.encode = function (str) {
+        var a = __utf8Encode(str), u = new Uint8Array(a.length);
+        for (var i = 0; i < a.length; i++) { u[i] = a[i]; }
+        return u;
+      };
+    }
+    if (typeof g.TextDecoder !== "function") {
+      g.TextDecoder = function TextDecoder(enc) { this.encoding = enc || "utf-8"; };
+      g.TextDecoder.prototype.decode = function (data) {
+        return data == null ? "" : __utf8Decode(__asBytes(data));
+      };
+    }
+    var __b64 = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    if (typeof g.btoa !== "function") {
+      g.btoa = function (input) {
+        input = String(input); var out = "", i = 0;
+        while (i < input.length) {
+          var c1 = input.charCodeAt(i++) & 0xff;
+          var has2 = i < input.length, c2 = has2 ? input.charCodeAt(i++) & 0xff : 0;
+          var has3 = i < input.length, c3 = has3 ? input.charCodeAt(i++) & 0xff : 0;
+          var e3 = has2 ? (((c2 & 15) << 2) | (c3 >> 6)) : 64;
+          var e4 = has3 ? (c3 & 63) : 64;
+          out += __b64.charAt(c1 >> 2) + __b64.charAt(((c1 & 3) << 4) | (c2 >> 4))
+               + (e3 === 64 ? "=" : __b64.charAt(e3)) + (e4 === 64 ? "=" : __b64.charAt(e4));
+        }
+        return out;
+      };
+    }
+    if (typeof g.atob !== "function") {
+      g.atob = function (input) {
+        input = String(input).replace(/[^A-Za-z0-9+/=]/g, "");
+        function val(ch) { if (ch === "=") { return 64; } var v = __b64.indexOf(ch); return v < 0 ? 0 : v; }
+        var out = "", i = 0;
+        while (i < input.length) {
+          var e1 = val(input.charAt(i++)), e2 = val(input.charAt(i++));
+          var e3 = val(input.charAt(i++)), e4 = val(input.charAt(i++));
+          out += String.fromCharCode((e1 << 2) | (e2 >> 4));
+          if (e3 !== 64) { out += String.fromCharCode(((e2 & 15) << 4) | (e3 >> 2)); }
+          if (e4 !== 64) { out += String.fromCharCode(((e3 & 3) << 6) | e4); }
+        }
+        return out;
+      };
+    }
+
     // ---- storage (in-memory, RUN-SCOPED) -------------------------------
     // getItem/setItem/removeItem/clear/key/length plus index access via the
     // methods. These live for THIS RUN ONLY — there is no persistence across

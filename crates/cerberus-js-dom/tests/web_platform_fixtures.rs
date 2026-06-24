@@ -232,6 +232,33 @@ fn crypto_subtle_digest_sha256_matches_the_canonical_vector() {
 }
 
 #[test]
+fn text_encoding_and_base64_round_trip_against_known_vectors() {
+    // QuickJS ships none of these (not ECMAScript). Assert spec-correct UTF-8 +
+    // base64 against known vectors, incl. a non-ASCII codepoint (U+20AC '€' ->
+    // E2 82 AC) and a base64 round-trip.
+    let doc = shell_with("result", "init");
+    let mut client = Stub::default();
+    let out = run(
+        &doc,
+        &["var abc = new TextEncoder().encode('abc'); \
+           var euro = new TextEncoder().encode('\\u20AC'); \
+           var rt = new TextDecoder().decode(new TextEncoder().encode('héllo €')); \
+           var ok = abc.length === 3 && abc[0] === 97 && abc[2] === 99 \
+              && euro.length === 3 && euro[0] === 226 && euro[1] === 130 && euro[2] === 172 \
+              && btoa('abc') === 'YWJj' && atob('YWJj') === 'abc' \
+              && btoa('Man') === 'TWFu' && btoa('a') === 'YQ==' && btoa('ab') === 'YWI=' \
+              && rt === 'héllo €'; \
+           document.getElementById('result').textContent = ok ? 'enc-ok' : 'enc-bad';"],
+        &mut client,
+    );
+    assert_eq!(
+        find_id(out.root(), "result").unwrap().text_content(),
+        "enc-ok",
+        "TextEncoder/TextDecoder/btoa/atob must match known vectors"
+    );
+}
+
+#[test]
 fn reese84_shaped_challenge_flow_runs_end_to_end() {
     // The capstone: a reese84-*shaped* interstitial, exercised entirely offline.
     //
@@ -246,14 +273,19 @@ fn reese84_shaped_challenge_flow_runs_end_to_end() {
     // works end to end, with no network and no flagged-IP dependency.
     let doc = shell_with("content", "BLOCKED");
 
+    // The realistic sensor pipeline: collect a fingerprint, UTF-8 encode it,
+    // SHA-256 it, base64 the digest into a token, POST it, reveal on OK. Exercises
+    // getRandomValues + performance.now + navigator/screen + TextEncoder +
+    // subtle.digest + btoa + fetch + the Promise chain + the DOM reveal at once.
     let sensor = "(function () {\
         var nonce = new Uint8Array(8); crypto.getRandomValues(nonce);\
-        var t = performance.now();\
         var fp = [navigator.userAgent, String(screen.width), navigator.platform,\
-                  String(typeof t === 'number')].join('|');\
-        var token = 'tok_' + fp.length + '_' + nonce.length;\
-        fetch('/_token', { method: 'POST', body: token })\
-          .then(function (r) { return r.json(); })\
+                  String(performance.now() >= 0), String(nonce.length)].join('|');\
+        crypto.subtle.digest('SHA-256', new TextEncoder().encode(fp)).then(function (h) {\
+          var b = new Uint8Array(h), bin = '';\
+          for (var i = 0; i < b.length; i++) { bin += String.fromCharCode(b[i]); }\
+          return fetch('/_token', { method: 'POST', body: btoa(bin) });\
+        }).then(function (r) { return r.json(); })\
           .then(function (d) {\
             if (d && d.ok) { document.getElementById('content').textContent = 'REVEALED'; }\
           });\
@@ -287,9 +319,16 @@ fn reese84_shaped_challenge_flow_runs_end_to_end() {
         .find(|r| r.url == "/_token")
         .expect("the sensor POSTed the token");
     assert_eq!(post.method, "POST");
+    // The token is base64 of the 32-byte SHA-256 digest: 44 chars, one '=' pad.
+    assert_eq!(
+        post.body.len(),
+        44,
+        "base64 of a 32-byte digest, got {:?}",
+        post.body
+    );
     assert!(
-        post.body.starts_with("tok_"),
-        "the token body crossed verbatim, got {:?}",
+        post.body.ends_with('='),
+        "base64 padding, got {:?}",
         post.body
     );
 }
