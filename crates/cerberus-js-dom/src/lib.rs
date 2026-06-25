@@ -2328,11 +2328,83 @@ pub const DOM_MODEL_PRELUDE: &str = r##"
       indexNode(el);
       // Fingerprintable surfaces come from the farbling prologue (per-head
       // seeded shims, installed before this model): every canvas — parsed or
-      // script-created — gets its farbled getContext/toDataURL here.
-      if (el.__tag === "canvas" && globalThis.__cerberusFarble) {
-        globalThis.__cerberusFarble.attachCanvas(el);
+      // script-created — gets its farbled getContext/toDataURL here. When the
+      // host opts a context into REAL values (g.__cerberusCanvasReal, OFF by
+      // default so farbling stays the privacy default), getContext('2d') returns
+      // a real software 2D context backed by an actual pixel buffer instead.
+      if (el.__tag === "canvas") {
+        if (globalThis.__cerberusFarble) globalThis.__cerberusFarble.attachCanvas(el);
+        var __farbleGC = el.getContext;
+        el.getContext = function (type) {
+          if (g.__cerberusCanvasReal && String(type) === "2d") {
+            if (!el.__real2d) el.__real2d = __realCanvas2D(el);
+            return el.__real2d;
+          }
+          return __farbleGC ? __farbleGC.call(el, type) : null;
+        };
       }
       return el;
+    }
+    // A real software Canvas 2D context: geometric fills + pixel read/write over
+    // an actual RGBA buffer (so getImageData reflects what was drawn — not noise).
+    // Paths/text/drawImage/toDataURL are minimal for now (follow-ups).
+    function __realCanvas2D(canvas) {
+      function dim(a, def) { var v = parseInt(getAttr(canvas, a), 10); return v > 0 ? v : def; }
+      var w = dim("width", 300), h = dim("height", 150);
+      var data = new Uint8ClampedArray(w * h * 4);
+      var st = { fillStyle: "#000000", strokeStyle: "#000000", globalAlpha: 1, lineWidth: 1, font: "10px sans-serif" };
+      function col(s) {
+        s = String(s).trim(); var m;
+        if (m = /^#([0-9a-fA-F]{3})$/.exec(s)) return [parseInt(m[1][0] + m[1][0], 16), parseInt(m[1][1] + m[1][1], 16), parseInt(m[1][2] + m[1][2], 16), 255];
+        if (m = /^#([0-9a-fA-F]{6})$/.exec(s)) return [parseInt(m[1].slice(0, 2), 16), parseInt(m[1].slice(2, 4), 16), parseInt(m[1].slice(4, 6), 16), 255];
+        if (m = /^rgba?\(([^)]+)\)$/.exec(s)) { var p = m[1].split(",").map(parseFloat); return [p[0] | 0, p[1] | 0, p[2] | 0, p.length > 3 ? Math.round(p[3] * 255) : 255]; }
+        var named = { black: [0, 0, 0, 255], white: [255, 255, 255, 255], red: [255, 0, 0, 255], lime: [0, 255, 0, 255], green: [0, 128, 0, 255], blue: [0, 0, 255, 255], transparent: [0, 0, 0, 0] };
+        return named[s.toLowerCase()] || [0, 0, 0, 255];
+      }
+      function fillRaw(x, y, rw, rh, c) {
+        x = Math.round(x); y = Math.round(y); rw = Math.round(rw); rh = Math.round(rh);
+        for (var yy = Math.max(0, y); yy < Math.min(h, y + rh); yy++)
+          for (var xx = Math.max(0, x); xx < Math.min(w, x + rw); xx++) {
+            var o = (yy * w + xx) * 4;
+            data[o] = c[0]; data[o + 1] = c[1]; data[o + 2] = c[2]; data[o + 3] = c[3];
+          }
+      }
+      var ctx = {
+        canvas: canvas,
+        fillRect: function (x, y, rw, rh) { fillRaw(x, y, rw, rh, col(st.fillStyle)); },
+        clearRect: function (x, y, rw, rh) { fillRaw(x, y, rw, rh, [0, 0, 0, 0]); },
+        strokeRect: function (x, y, rw, rh) { var c = col(st.strokeStyle); fillRaw(x, y, rw, 1, c); fillRaw(x, y + rh - 1, rw, 1, c); fillRaw(x, y, 1, rh, c); fillRaw(x + rw - 1, y, 1, rh, c); },
+        getImageData: function (x, y, gw, gh) {
+          x = Math.round(x); y = Math.round(y); gw = Math.round(gw); gh = Math.round(gh);
+          var out = new Uint8ClampedArray(gw * gh * 4);
+          for (var yy = 0; yy < gh; yy++) for (var xx = 0; xx < gw; xx++) {
+            var sx = x + xx, sy = y + yy, di = (yy * gw + xx) * 4;
+            if (sx >= 0 && sx < w && sy >= 0 && sy < h) { var so = (sy * w + sx) * 4; out[di] = data[so]; out[di + 1] = data[so + 1]; out[di + 2] = data[so + 2]; out[di + 3] = data[so + 3]; }
+          }
+          return { data: out, width: gw, height: gh };
+        },
+        putImageData: function (img, dx, dy) {
+          dx = Math.round(dx); dy = Math.round(dy); var iw = img.width, ih = img.height, src = img.data;
+          for (var yy = 0; yy < ih; yy++) for (var xx = 0; xx < iw; xx++) {
+            var tx = dx + xx, ty = dy + yy;
+            if (tx >= 0 && tx < w && ty >= 0 && ty < h) { var to = (ty * w + tx) * 4, fo = (yy * iw + xx) * 4; data[to] = src[fo]; data[to + 1] = src[fo + 1]; data[to + 2] = src[fo + 2]; data[to + 3] = src[fo + 3]; }
+          }
+        },
+        createImageData: function (iw, ih) { return { data: new Uint8ClampedArray(iw * ih * 4), width: iw, height: ih }; },
+        beginPath: function () {}, closePath: function () {}, moveTo: function () {}, lineTo: function () {},
+        arc: function () {}, rect: function () {}, fill: function () {}, stroke: function () {}, clip: function () {},
+        save: function () {}, restore: function () {}, translate: function () {}, scale: function () {}, rotate: function () {}, setTransform: function () {}, transform: function () {},
+        drawImage: function () {}, fillText: function () {}, strokeText: function () {},
+        measureText: function (t) { return { width: String(t).length * 6 }; },
+        createLinearGradient: function () { return { addColorStop: function () {} }; },
+        createPattern: function () { return null; },
+      };
+      Object.defineProperty(ctx, "fillStyle", { get: function () { return st.fillStyle; }, set: function (v) { st.fillStyle = String(v); } });
+      Object.defineProperty(ctx, "strokeStyle", { get: function () { return st.strokeStyle; }, set: function (v) { st.strokeStyle = String(v); } });
+      Object.defineProperty(ctx, "globalAlpha", { get: function () { return st.globalAlpha; }, set: function (v) { st.globalAlpha = +v; } });
+      Object.defineProperty(ctx, "lineWidth", { get: function () { return st.lineWidth; }, set: function (v) { st.lineWidth = +v; } });
+      Object.defineProperty(ctx, "font", { get: function () { return st.font; }, set: function (v) { st.font = String(v); } });
+      return ctx;
     }
     function makeText(text, id) {
       var t = Object.create(TEXT_PROTO);

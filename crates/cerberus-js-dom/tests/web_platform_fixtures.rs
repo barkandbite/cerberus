@@ -413,6 +413,35 @@ fn dom_completeness_helpers() {
 }
 
 #[test]
+fn real_canvas_2d_fills_and_reads_back_actual_pixels() {
+    // With the real-canvas mode opted in (farble stays the default), getContext
+    // ('2d') backs a true pixel buffer: fillRect writes real colors, getImageData
+    // reads them back (not noise), clearRect zeroes alpha.
+    let doc = shell_with("result", "init");
+    let mut client = Stub::default();
+    let out = run(
+        &doc,
+        &["globalThis.__cerberusCanvasReal = true; \
+           var cv = document.createElement('canvas'); cv.setAttribute('width', '20'); cv.setAttribute('height', '20'); \
+           var ctx = cv.getContext('2d'); \
+           ctx.fillStyle = '#ff0000'; ctx.fillRect(2, 2, 5, 5); \
+           ctx.fillStyle = 'rgba(0,255,0,1)'; ctx.fillRect(10, 10, 3, 3); \
+           var red = ctx.getImageData(3, 3, 1, 1).data; \
+           var green = ctx.getImageData(11, 11, 1, 1).data; \
+           var blank = ctx.getImageData(0, 0, 1, 1).data; \
+           ctx.clearRect(2, 2, 5, 5); var cleared = ctx.getImageData(3, 3, 1, 1).data; \
+           document.getElementById('result').textContent = \
+             [red[0], red[1], red[2], red[3], green[1], blank[3], cleared[3]].join(',');"],
+        &mut client,
+    );
+    assert_eq!(
+        find_id(out.root(), "result").unwrap().text_content(),
+        "255,0,0,255,255,0,0",
+        "fillRect writes real RGBA; getImageData reads it; clearRect zeroes alpha"
+    );
+}
+
+#[test]
 fn performance_now_and_crypto_get_random_values_exist() {
     // The real sensor calls performance.now() and crypto.getRandomValues() early;
     // when they were missing it threw before doing anything. Assert the contract:
