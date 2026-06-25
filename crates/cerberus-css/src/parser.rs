@@ -823,10 +823,9 @@ fn apply_pseudo(c: &mut Compound, name: &str, arg: &str) {
             }
         }
         "not" => {
-            // Simple `:not(compound)` — one inner compound (no combinators).
-            if let Some(inner) = parse_compound(arg.trim()) {
-                c.not.push(inner);
-            }
+            // `:not(a, b, …)` — none of the listed compounds may match (the match
+            // checks `any`, so a list reads as "not (a or b …)").
+            c.not.extend(parse_compound_list(arg));
         }
         // `:is(a, b, …)` / its legacy alias `:matches` — matches if the element
         // matches any argument; `:where(…)` is the same but with zero specificity.

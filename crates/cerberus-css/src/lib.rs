@@ -2620,6 +2620,32 @@ mod tests {
     }
 
     #[test]
+    fn not_accepts_a_selector_list() {
+        let html = "<style>\
+                    span:not(.a, .b) { color: #ff0000 } \
+                    i:not(.a, .b) { color: #00ff00 } \
+                    b:not(.a, .b) { color: #0000ff }\
+                    </style>\
+                    <span class='a'>x</span><i>y</i><b class='b'>z</b>";
+        let dom = CssEngine::new().style(&parse_html(html));
+        assert_ne!(
+            first(&dom.root, "span").unwrap().style.color,
+            Color::rgb(0xff, 0, 0),
+            ":not(.a, .b) excludes .a"
+        );
+        assert_eq!(
+            first(&dom.root, "i").unwrap().style.color,
+            Color::rgb(0, 0xff, 0),
+            ":not(.a, .b) matches an element with neither class"
+        );
+        assert_ne!(
+            first(&dom.root, "b").unwrap().style.color,
+            Color::rgb(0, 0, 0xff),
+            ":not(.a, .b) excludes .b"
+        );
+    }
+
+    #[test]
     fn is_and_where_selectors() {
         let html = "<style>\
                     :is(h1, h2) { color: #ff0000 } \
