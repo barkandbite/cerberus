@@ -19,8 +19,8 @@ use cerberus_style::{
 };
 use cerberus_types::{Color, ImageFit, ImagePos};
 use parser::{
-    parse_declaration_block, parse_stylesheet, ElemRef, MediaContext, RuleIndex, SiblingRef,
-    Specificity, Stylesheet,
+    parse_declaration_block, parse_stylesheet, ElemRef, MediaContext, PseudoEl, RuleIndex,
+    SiblingRef, Specificity, Stylesheet,
 };
 use std::collections::HashMap;
 use std::rc::Rc;
@@ -110,6 +110,7 @@ impl CssEngine {
         path: &mut Vec<ElemRef>,
         author: &Stylesheet,
         author_index: &RuleIndex,
+        collect_pseudo: bool,
     ) -> StyledNode {
         let is_root = node.tag() == "#root";
         let mut style = if is_root {
@@ -179,7 +180,7 @@ impl CssEngine {
             .collect::<Vec<_>>()
             .into();
         let mut elem_index = 0usize;
-        let children = node
+        let mut children: Vec<StyledChild> = node
             .children()
             .map(|child| match child.text() {
                 Some(t) => StyledChild::Text(t.to_string()),
@@ -193,12 +194,40 @@ impl CssEngine {
                         path,
                         author,
                         author_index,
+                        collect_pseudo,
                     );
                     elem_index += 1;
                     StyledChild::Element(Box::new(styled))
                 }
             })
             .collect();
+
+        // Generated `::before`/`::after` content — a separate cascade pass that
+        // never touches the host element's own style (so no leak). We render it as
+        // the element's leading / trailing text, inheriting the host's text style:
+        // enough for the common case (icons, separators, required-field marks).
+        // Replaced/void elements generate no pseudo boxes, and a `display:none`
+        // host generates nothing.
+        if collect_pseudo && !is_root && style.display != Display::None && !is_replaced(node.tag())
+        {
+            let em = style.font_size as f32;
+            if let Some(t) = self.pseudo_content(
+                author,
+                author_index,
+                path,
+                &vars,
+                em,
+                node,
+                PseudoEl::Before,
+            ) {
+                children.insert(0, StyledChild::Text(t));
+            }
+            if let Some(t) =
+                self.pseudo_content(author, author_index, path, &vars, em, node, PseudoEl::After)
+            {
+                children.push(StyledChild::Text(t));
+            }
+        }
 
         path.pop();
         StyledNode {
@@ -208,6 +237,60 @@ impl CssEngine {
             children,
             node_id: node.id(),
         }
+    }
+
+    /// The generated text for the `kind` (`::before`/`::after`) pseudo-element of
+    /// the element at `path`'s tail, or `None` if no `::before`/`::after` rule
+    /// matches (or its winning `content` is `none`/`normal`/empty). Runs the same
+    /// subject-indexed cascade as element styling, restricted to pseudo selectors,
+    /// then resolves the winning `content` value (strings, `attr()`, `var()`).
+    #[allow(clippy::too_many_arguments)]
+    fn pseudo_content(
+        &self,
+        author: &Stylesheet,
+        author_index: &RuleIndex,
+        path: &[ElemRef],
+        vars: &Vars,
+        em: f32,
+        node: NodeRef<'_>,
+        kind: PseudoEl,
+    ) -> Option<String> {
+        let el = {
+            let e = path.last()?;
+            &e.siblings[e.index]
+        };
+        let mut matched: Vec<MatchedRule<'_>> = Vec::new();
+        for order in self.ua_index.candidates(el) {
+            let rule = &self.ua.rules[order];
+            if rule.applies(self.media) {
+                if let Some(spec) = rule.matches_pseudo(path, kind) {
+                    matched.push((0, spec, order, &rule.declarations));
+                }
+            }
+        }
+        for order in author_index.candidates(el) {
+            let rule = &author.rules[order];
+            if rule.applies(self.media) {
+                if let Some(spec) = rule.matches_pseudo(path, kind) {
+                    matched.push((1, spec, order, &rule.declarations));
+                }
+            }
+        }
+        if matched.is_empty() {
+            return None;
+        }
+        matched.sort_by(|a, b| (a.0, a.1, a.2).cmp(&(b.0, b.1, b.2)));
+        // The winning `content` declaration in cascade order (last wins).
+        let mut raw: Option<&str> = None;
+        for (_, _, _, decls) in &matched {
+            for (prop, val) in *decls {
+                if prop == "content" {
+                    raw = Some(val);
+                }
+            }
+        }
+        let resolved = resolve_value(raw?, vars, em);
+        parse_content_value(resolved.trim(), node)
     }
 }
 
@@ -227,6 +310,10 @@ impl StyleEngine for CssEngine {
         collect_author_css(doc.root(), sheets, &mut css);
         let author = parse_stylesheet(&css);
         let author_index = RuleIndex::build(&author);
+        // Only run the per-element `::before`/`::after` pass if some author rule
+        // actually targets one (the UA sheet declares none) — near-zero cost for
+        // the overwhelming majority of pages that use no generated content.
+        let collect_pseudo = author.rules.iter().any(|r| r.has_pseudo());
         let mut path = Vec::new();
         let root = doc.root();
         let root_siblings: Rc<[SiblingRef]> = vec![sibling_ref(root)].into();
@@ -240,6 +327,7 @@ impl StyleEngine for CssEngine {
             &mut path,
             &author,
             &author_index,
+            collect_pseudo,
         );
         StyledDom { root: styled }
     }
@@ -255,6 +343,127 @@ fn sibling_ref(node: NodeRef<'_>) -> SiblingRef {
             .unwrap_or_default(),
         attrs: node.attrs().to_vec(),
     }
+}
+
+/// Replaced / void elements that render their own content (or nothing) and so do
+/// not get generated `::before`/`::after` text from us.
+fn is_replaced(tag: &str) -> bool {
+    matches!(
+        tag,
+        "img"
+            | "input"
+            | "textarea"
+            | "select"
+            | "br"
+            | "hr"
+            | "canvas"
+            | "video"
+            | "audio"
+            | "iframe"
+            | "embed"
+            | "object"
+            | "source"
+            | "track"
+            | "col"
+            | "wbr"
+            | "meta"
+            | "link"
+            | "base"
+            | "param"
+    )
+}
+
+/// Resolve a CSS `content` value (already `var()`/`calc()`-substituted) to the
+/// text it generates. Handles quoted strings (with `\26`-style hex and `\<char>`
+/// escapes) and `attr(name)` against `node`; `none`/`normal`/empty yield `None`,
+/// and functions we don't render (`counter()`, `url()`, `open-quote`, …) are
+/// skipped, so a mixed value like `"[" attr(label) "]"` still resolves.
+fn parse_content_value(value: &str, node: NodeRef<'_>) -> Option<String> {
+    let v = value.trim();
+    if v.is_empty() || v.eq_ignore_ascii_case("none") || v.eq_ignore_ascii_case("normal") {
+        return None;
+    }
+    let chars: Vec<char> = v.chars().collect();
+    let mut i = 0;
+    let mut out = String::new();
+    while i < chars.len() {
+        let c = chars[i];
+        if c.is_whitespace() {
+            i += 1;
+            continue;
+        }
+        if c == '"' || c == '\'' {
+            i += 1; // opening quote
+            while i < chars.len() && chars[i] != c {
+                if chars[i] == '\\' {
+                    i += 1;
+                    if i >= chars.len() {
+                        break;
+                    }
+                    if chars[i].is_ascii_hexdigit() {
+                        // A Unicode escape: 1–6 hex digits, an optional single
+                        // trailing whitespace ends it.
+                        let start = i;
+                        while i < chars.len() && i - start < 6 && chars[i].is_ascii_hexdigit() {
+                            i += 1;
+                        }
+                        let hex: String = chars[start..i].iter().collect();
+                        if let Some(ch) =
+                            u32::from_str_radix(&hex, 16).ok().and_then(char::from_u32)
+                        {
+                            out.push(ch);
+                        }
+                        if i < chars.len() && chars[i].is_whitespace() {
+                            i += 1;
+                        }
+                    } else {
+                        out.push(chars[i]); // an escaped literal (e.g. `\"`)
+                        i += 1;
+                    }
+                } else {
+                    out.push(chars[i]);
+                    i += 1;
+                }
+            }
+            i += usize::from(i < chars.len()); // consume the closing quote
+        } else {
+            // An identifier or function token.
+            let start = i;
+            while i < chars.len()
+                && !matches!(chars[i], ' ' | '\t' | '\n' | '\r' | '(' | '"' | '\'')
+            {
+                i += 1;
+            }
+            let name: String = chars[start..i].iter().collect();
+            if i < chars.len() && chars[i] == '(' {
+                // Capture the balanced argument group.
+                i += 1;
+                let astart = i;
+                let mut depth = 1;
+                while i < chars.len() && depth > 0 {
+                    match chars[i] {
+                        '(' => depth += 1,
+                        ')' => depth -= 1,
+                        _ => {}
+                    }
+                    if depth > 0 {
+                        i += 1;
+                    }
+                }
+                let arg: String = chars[astart..i].iter().collect();
+                i += usize::from(i < chars.len()); // consume ')'
+                if name.eq_ignore_ascii_case("attr") {
+                    let attr = arg.trim().trim_matches(|q| q == '"' || q == '\'');
+                    if let Some(val) = node.attr(attr) {
+                        out.push_str(val);
+                    }
+                }
+                // counter()/counters()/url()/… are not rendered as text.
+            }
+            // A bare keyword (`open-quote`, `close-quote`, …) generates no text.
+        }
+    }
+    (!out.is_empty()).then_some(out)
 }
 
 /// Append author CSS in document order: each `<style>` element's text, and each
@@ -1922,6 +2131,50 @@ mod tests {
             StyledChild::Element(e) => first(e, tag),
             StyledChild::Text(_) => None,
         })
+    }
+
+    #[test]
+    fn pseudo_before_after_content_renders_as_host_text() {
+        let html = "<style>.x::before{content:'A'} .x::after{content:'B'}</style>\
+                    <p class='x'>mid</p>";
+        let dom = CssEngine::new().style(&parse_html(html));
+        let p = first(&dom.root, "p").unwrap();
+        // ::before is the leading text, ::after the trailing text.
+        assert_eq!(p.text(), "AmidB");
+    }
+
+    #[test]
+    fn pseudo_content_resolves_attr_and_hex_escape() {
+        // attr() pulls the host's attribute; `\2192` is the U+2192 arrow (the one
+        // trailing space terminates the hex escape and is consumed, per CSS).
+        let html = "<style>a::after{content:attr(data-x)} a::before{content:'\\2192 '}</style>\
+                    <a data-x='Z'>q</a>";
+        let dom = CssEngine::new().style(&parse_html(html));
+        let a = first(&dom.root, "a").unwrap();
+        assert_eq!(a.text(), "\u{2192}qZ");
+    }
+
+    #[test]
+    fn pseudo_none_and_missing_content_generate_nothing() {
+        let html = "<style>p::before{content:none} p::after{color:red}</style><p>y</p>";
+        let dom = CssEngine::new().style(&parse_html(html));
+        let p = first(&dom.root, "p").unwrap();
+        assert_eq!(p.text(), "y");
+    }
+
+    #[test]
+    fn pseudo_rule_does_not_leak_onto_the_host_box() {
+        // The non-`content` declarations on a ::before rule must not style the
+        // real <p> element (the historical leak this guards).
+        let html = "<style>p::before{content:'x'; color:#ff0000}</style><p>y</p>";
+        let dom = CssEngine::new().style(&parse_html(html));
+        let p = first(&dom.root, "p").unwrap();
+        assert_ne!(
+            p.style.color,
+            Color::rgb(0xff, 0, 0),
+            "::before color leaked"
+        );
+        assert_eq!(p.text(), "xy", "but its content still renders");
     }
 
     #[test]

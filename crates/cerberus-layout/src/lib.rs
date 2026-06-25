@@ -4135,6 +4135,23 @@ mod tests {
     }
 
     #[test]
+    fn pseudo_element_content_is_shaped_into_the_display_list() {
+        // `::before`/`::after` generated content flows as the host's leading /
+        // trailing inline text and reaches paint as real glyphs.
+        let base = lay("<p>x</p>", 400);
+        assert_eq!(total_glyphs(&base), 1);
+        let with_pseudo = lay(
+            "<style>p::before{content:'>>'} p::after{content:'!'}</style><p>x</p>",
+            400,
+        );
+        // 2 (before) + 1 (host "x") + 1 (after) = 4 shaped glyphs.
+        assert_eq!(total_glyphs(&with_pseudo), 4);
+        // The leading marker sits at or before the host text's x.
+        let xs = glyph_xs(&with_pseudo);
+        assert_eq!(xs[0], *xs.iter().min().unwrap(), "::before leads the line");
+    }
+
+    #[test]
     fn inline_flows_blocks_stack() {
         let laid = lay("<p>Hello <b>brave</b> world</p><p>next</p>", 400);
         let ys = glyph_ys(&laid);

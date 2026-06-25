@@ -78,6 +78,19 @@ enum Pseudo {
     Never, // :hover/:focus/:active/:visited/:link — no static match
 }
 
+/// Which renderable pseudo-element a selector targets, if any. We generate boxes
+/// only for `::before`/`::after` (their `content` is collected in a separate
+/// cascade pass); every other pseudo-element stays unmatchable (a `Pseudo::Never`
+/// on its compound). A selector tagged with a pseudo-element is excluded from the
+/// normal element cascade so its declarations never leak onto the host element.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum PseudoEl {
+    #[default]
+    None,
+    Before,
+    After,
+}
+
 #[derive(Clone, Debug, Default)]
 struct Compound {
     combinator: Combinator,
@@ -88,6 +101,10 @@ struct Compound {
     attrs: Vec<AttrSel>,
     pseudos: Vec<Pseudo>,
     not: Vec<Compound>,
+    /// A `::before`/`::after` marker on this compound. Lifted onto the owning
+    /// `Selector` (it is only meaningful on the subject compound); a marker on a
+    /// non-subject compound is an invalid selector forced to never match.
+    pseudo_el: PseudoEl,
 }
 
 impl Compound {
@@ -175,14 +192,24 @@ fn nth_matches(a: i32, b: i32, pos: i32) -> bool {
 #[derive(Clone, Debug)]
 pub struct Selector {
     compounds: Vec<Compound>,
+    /// The renderable pseudo-element this selector targets (`::before`/`::after`),
+    /// if any. When set, the selector's `compounds` match the *host* element, but
+    /// the selector is excluded from the normal element cascade and only feeds the
+    /// pseudo-content pass ([`Rule::matches_pseudo`]).
+    pseudo: PseudoEl,
 }
 
 impl Selector {
     fn specificity(&self) -> Specificity {
-        self.compounds.iter().fold((0, 0, 0), |a, c| {
+        let mut s = self.compounds.iter().fold((0, 0, 0), |a, c| {
             let s = c.specificity();
             (a.0 + s.0, a.1 + s.1, a.2 + s.2)
-        })
+        });
+        // A pseudo-element contributes one to the type/element component.
+        if self.pseudo != PseudoEl::None {
+            s.2 += 1;
+        }
+        s
     }
 
     /// Match against an ancestor path (root … element); the element is last.
@@ -278,13 +305,33 @@ pub struct Rule {
 }
 
 impl Rule {
-    /// The highest specificity among selectors matching `path`, if any.
+    /// The highest specificity among the rule's *element* selectors matching
+    /// `path`, if any. Pseudo-element selectors (`::before`/`::after`) are excluded
+    /// so their declarations never apply to the real host element — they are
+    /// collected separately by [`matches_pseudo`](Self::matches_pseudo).
     pub fn matches(&self, path: &[ElemRef]) -> Option<Specificity> {
         self.selectors
             .iter()
-            .filter(|s| s.matches(path))
+            .filter(|s| s.pseudo == PseudoEl::None && s.matches(path))
             .map(Selector::specificity)
             .max()
+    }
+
+    /// The highest specificity among this rule's `kind` (`::before`/`::after`)
+    /// selectors whose host matches `path`, if any — the pseudo-content pass.
+    pub fn matches_pseudo(&self, path: &[ElemRef], kind: PseudoEl) -> Option<Specificity> {
+        self.selectors
+            .iter()
+            .filter(|s| s.pseudo == kind && s.matches(path))
+            .map(Selector::specificity)
+            .max()
+    }
+
+    /// Whether any selector targets a renderable pseudo-element, so the cascade
+    /// can skip the (otherwise per-element) pseudo-content pass for sheets that
+    /// declare no `::before`/`::after`.
+    pub fn has_pseudo(&self) -> bool {
+        self.selectors.iter().any(|s| s.pseudo != PseudoEl::None)
     }
 
     /// Whether this rule applies under `ctx` (no `@media`, or it matches).
@@ -562,7 +609,18 @@ fn parse_selector(text: &str) -> Selector {
             }
         }
     }
-    Selector { compounds }
+    // A pseudo-element is only meaningful on the subject (rightmost) compound;
+    // lift it onto the selector. A marker on any earlier compound (`a::before b`)
+    // is invalid — force that compound to never match so it can't leak.
+    let pseudo = compounds.last().map(|c| c.pseudo_el).unwrap_or_default();
+    let n = compounds.len();
+    for (i, c) in compounds.iter_mut().enumerate() {
+        if i + 1 < n && c.pseudo_el != PseudoEl::None {
+            c.pseudos.push(Pseudo::Never);
+            c.pseudo_el = PseudoEl::None;
+        }
+    }
+    Selector { compounds, pseudo }
 }
 
 fn parse_compound(token: &str) -> Option<Compound> {
@@ -626,12 +684,22 @@ fn parse_compound(token: &str) -> Option<Compound> {
                     arg = chars[s..i].iter().collect();
                     i += usize::from(i < chars.len()); // consume ')'
                 }
-                // We don't generate pseudo-element boxes, so a selector targeting
-                // one must never match a real element — otherwise its declarations
-                // leak onto that element (e.g. `p::before{width:120pt}` was sizing
-                // every `<p>`). `::x` and the legacy `:before/:after/:first-line/
-                // :first-letter` are pseudo-elements; other `:x` are pseudo-classes.
-                if double_colon || is_pseudo_element(&name) {
+                // `::before`/`::after` are the pseudo-elements we render: keep the
+                // host compound matchable and tag the side, so a separate pass can
+                // attach their generated `content` (the selector is still excluded
+                // from the normal element cascade — see `Selector::pseudo`).
+                // Every *other* pseudo-element targets a generated box we don't
+                // create, so it must never match a real element — otherwise its
+                // declarations leak onto that element (e.g. `p::first-line{...}`).
+                // `::x` and the legacy `:before/:after/:first-line/:first-letter`
+                // are pseudo-elements; other `:x` are pseudo-classes.
+                if name == "before" || name == "after" {
+                    c.pseudo_el = if name == "before" {
+                        PseudoEl::Before
+                    } else {
+                        PseudoEl::After
+                    };
+                } else if double_colon || is_pseudo_element(&name) {
                     c.pseudos.push(Pseudo::Never);
                 } else {
                     apply_pseudo(&mut c, &name, &arg);
