@@ -88,6 +88,54 @@ fn geometry_styles_and_media_are_observable_from_js() {
 }
 
 #[test]
+fn computed_style_width_height_resolve_from_geometry() {
+    let mut engine = QuickJsEngineFactory.instantiate().expect("engine");
+    let realm = RealmId::from_u64_pair(0, 1);
+    engine.create_realm(realm).expect("realm");
+    let doc = parse_html("<div id=\"x\" style=\"width:auto\">hi</div>");
+    let env = PageEnv {
+        url: "https://t.test/".into(),
+        viewport: (800, 600),
+        user_agent: "ua".into(),
+        cookies: String::new(),
+        local_storage: String::new(),
+    };
+    install_page(engine.as_mut(), realm, &doc, &env).expect("install");
+    let id = node_id(&doc, "x");
+
+    // Before layout: width reflects the authored (inline) value.
+    assert_eq!(
+        engine
+            .eval(
+                realm,
+                "getComputedStyle(document.getElementById('x')).width"
+            )
+            .unwrap(),
+        JsValue::Str("auto".into())
+    );
+    // After geometry is bridged, width/height are the used pixels (like a browser).
+    set_geometry(engine.as_mut(), realm, &[(id, Rect::new(0, 0, 240, 100))]).unwrap();
+    assert_eq!(
+        engine
+            .eval(
+                realm,
+                "getComputedStyle(document.getElementById('x')).width"
+            )
+            .unwrap(),
+        JsValue::Str("240px".into())
+    );
+    assert_eq!(
+        engine
+            .eval(
+                realm,
+                "getComputedStyle(document.getElementById('x')).getPropertyValue('height')"
+            )
+            .unwrap(),
+        JsValue::Str("100px".into())
+    );
+}
+
+#[test]
 fn offset_and_client_metrics_reflect_bridged_geometry() {
     let mut engine = QuickJsEngineFactory.instantiate().expect("engine");
     let realm = RealmId::from_u64_pair(0, 1);

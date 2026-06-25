@@ -3689,6 +3689,16 @@ pub const DOM_MODEL_PRELUDE: &str = r##"
             if (p) decls[p] = v;
           });
         }
+        // getComputedStyle returns the *used* (resolved) box size, so width/height
+        // come from the laid-out geometry when it has been bridged (post-layout),
+        // overriding the authored value — matching browsers, where reading
+        // `.width` yields e.g. "240px" even for `width:auto`. Before layout (the
+        // one-shot render's script phase) no geometry is pushed, so the cascade/
+        // inline value stands.
+        if (el.__geometry) {
+          decls.width = Math.round(el.__geometry.w) + "px";
+          decls.height = Math.round(el.__geometry.h) + "px";
+        }
       }
       return new Proxy(decls, {
         get: function (t, k) {
