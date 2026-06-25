@@ -1306,6 +1306,18 @@ fn apply_declarations(
                     .any(|t| t == "none")
             }
             "text-indent" => set_margin(&mut style.text_indent, v, style.font_size as f32),
+            "overflow-wrap" | "word-wrap" => {
+                style.break_word = matches!(
+                    v.trim().to_ascii_lowercase().as_str(),
+                    "break-word" | "anywhere"
+                )
+            }
+            "word-break" => {
+                style.break_word = matches!(
+                    v.trim().to_ascii_lowercase().as_str(),
+                    "break-all" | "break-word"
+                )
+            }
             "visibility" => {
                 style.visibility = match v.to_ascii_lowercase().as_str() {
                     "hidden" | "collapse" => Visibility::Hidden,

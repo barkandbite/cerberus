@@ -322,6 +322,10 @@ pub struct ComputedStyle {
     /// `text-indent` — the first-line indent (px) of a block's inline content.
     /// Inherited.
     pub text_indent: i32,
+    /// `overflow-wrap`/`word-wrap: break-word` or `word-break: break-all` — break
+    /// a too-long word that would overflow the line, instead of overflowing.
+    /// Inherited.
+    pub break_word: bool,
     /// `visibility: hidden` — laid out but not painted. Inherited.
     pub visibility: Visibility,
     /// `opacity` in `[0.0, 1.0]`, composited in paint. Not inherited.
@@ -440,6 +444,7 @@ impl ComputedStyle {
             nowrap: false,
             list_style_none: false,
             text_indent: 0,
+            break_word: false,
             visibility: Visibility::Visible,
             opacity: 1.0,
             flex_direction: FlexDirection::Row,
@@ -491,6 +496,7 @@ impl ComputedStyle {
             nowrap: self.nowrap,
             list_style_none: self.list_style_none,
             text_indent: self.text_indent,
+            break_word: self.break_word,
             visibility: self.visibility,
             // Reset per element:
             display: Display::Inline,

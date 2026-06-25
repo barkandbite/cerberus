@@ -964,7 +964,39 @@ impl<'a> Ctx<'a> {
         } else {
             self.x += gap;
         }
+        // `overflow-wrap: break-word` — if the word is wider than a whole line, it
+        // can't fit even on a fresh line, so break it across lines instead of
+        // overflowing. (Gated on `break_word`, so normal text is unaffected.)
+        if style.break_word && !style.nowrap && w as i32 > self.right - self.left {
+            self.add_broken_word(word, style, href);
+            return;
+        }
         self.push_piece(px, w, glyphs, style, href);
+    }
+
+    /// Break a too-long word character-by-character across lines (`overflow-wrap:
+    /// break-word`). Greedy: accumulate chars until the next would overflow the
+    /// current line, place the chunk, wrap, repeat.
+    fn add_broken_word(&mut self, word: &str, style: &ComputedStyle, href: Option<&str>) {
+        let px = style.font_size.max(1);
+        let mut chunk = String::new();
+        let mut chunk_w = 0i32;
+        for ch in word.chars() {
+            let (_, cw) = self.shape_run(&ch.to_string(), px, style);
+            if !chunk.is_empty() && self.x + chunk_w + cw as i32 > self.right {
+                let (g, w) = self.shape_run(&chunk, px, style);
+                self.push_piece(px, w, g, style, href);
+                self.newline();
+                chunk.clear();
+                chunk_w = 0;
+            }
+            chunk.push(ch);
+            chunk_w += cw as i32;
+        }
+        if !chunk.is_empty() {
+            let (g, w) = self.shape_run(&chunk, px, style);
+            self.push_piece(px, w, g, style, href);
+        }
     }
 
     fn add_run(&mut self, text: &str, style: &ComputedStyle, href: Option<&str>) {
@@ -4155,6 +4187,27 @@ mod tests {
         // The leading marker sits at or before the host text's x.
         let xs = glyph_xs(&with_pseudo);
         assert_eq!(xs[0], *xs.iter().min().unwrap(), "::before leads the line");
+    }
+
+    #[test]
+    fn overflow_wrap_break_word_breaks_a_long_word() {
+        let word = "supercalifragilisticexpialidocious";
+        let normal = lay(&format!("<div style='width:50px'>{word}</div>"), 400);
+        let broken = lay(
+            &format!("<div style='width:50px; overflow-wrap:break-word'>{word}</div>"),
+            400,
+        );
+        // Without break-word, the long word stays on one (overflowing) line.
+        assert_eq!(
+            distinct(&glyph_ys(&normal)),
+            1,
+            "no break-word: long word overflows on one line"
+        );
+        // With break-word, it wraps across multiple lines.
+        assert!(
+            distinct(&glyph_ys(&broken)) > 1,
+            "break-word wraps the long word"
+        );
     }
 
     #[test]
