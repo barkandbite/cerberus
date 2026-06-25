@@ -1,7 +1,8 @@
 //! CSS parsing + selector matching + specificity. Bootstrapped; no dependencies.
 //!
 //! Supported selectors: universal `*`, type, `.class`, `#id`, attribute
-//! selectors (`[a]`, `[a=v]`, `~= |= ^= $= *=`), structural pseudo-classes
+//! selectors (`[a]`, `[a=v]`, `~= |= ^= $= *=`, with a trailing `i`/`s`
+//! case-sensitivity flag), structural pseudo-classes
 //! (`:first-child`, `:last-child`, `:only-child`, `:nth-child(an+b)`, the
 //! `*-of-type` family (`:first/last/only-of-type`, `:nth-of-type(an+b)`),
 //! `:not(list)`, `:is(list)`/`:matches(list)`, `:where(list)`, `:root`), grouping
@@ -60,6 +61,9 @@ struct AttrSel {
     name: String,
     op: AttrOp,
     value: String,
+    /// ASCII case-insensitive value matching, set by a trailing `i` flag
+    /// (`[type="search" i]`). The `s` flag and no flag both stay case-sensitive.
+    ci: bool,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -192,17 +196,29 @@ impl Compound {
 }
 
 fn attr_matches(a: &AttrSel, el: &SiblingRef) -> bool {
-    let Some((_, v)) = el.attrs.iter().find(|(k, _)| k == &a.name) else {
+    let Some((_, raw)) = el.attrs.iter().find(|(k, _)| k == &a.name) else {
         return false;
     };
+    // The `i` flag lowercases both sides (allocating short-lived copies); the
+    // default and `s` flag borrow and compare as-is, so the hot path is alloc-free.
+    use std::borrow::Cow;
+    let (v, needle): (Cow<'_, str>, Cow<'_, str>) = if a.ci {
+        (
+            Cow::Owned(raw.to_ascii_lowercase()),
+            Cow::Owned(a.value.to_ascii_lowercase()),
+        )
+    } else {
+        (Cow::Borrowed(raw.as_str()), Cow::Borrowed(a.value.as_str()))
+    };
+    let (v, needle) = (v.as_ref(), needle.as_ref());
     match a.op {
         AttrOp::Exists => true,
-        AttrOp::Eq => v == &a.value,
-        AttrOp::Include => v.split_whitespace().any(|w| w == a.value),
-        AttrOp::Dash => v == &a.value || v.starts_with(&format!("{}-", a.value)),
-        AttrOp::Prefix => !a.value.is_empty() && v.starts_with(&a.value),
-        AttrOp::Suffix => !a.value.is_empty() && v.ends_with(&a.value),
-        AttrOp::Substr => !a.value.is_empty() && v.contains(&a.value),
+        AttrOp::Eq => v == needle,
+        AttrOp::Include => v.split_whitespace().any(|w| w == needle),
+        AttrOp::Dash => v == needle || v.starts_with(&format!("{needle}-")),
+        AttrOp::Prefix => !needle.is_empty() && v.starts_with(needle),
+        AttrOp::Suffix => !needle.is_empty() && v.ends_with(needle),
+        AttrOp::Substr => !needle.is_empty() && v.contains(needle),
     }
 }
 
@@ -996,10 +1012,12 @@ fn parse_attr_sel(body: &str) -> Option<AttrSel> {
         ("=", AttrOp::Eq),
     ] {
         if let Some((name, value)) = body.split_once(sym) {
+            let (value, ci) = split_attr_flag(value);
             return Some(AttrSel {
                 name: name.trim().to_ascii_lowercase(),
                 op,
-                value: unquote(value.trim()),
+                value: unquote(value),
+                ci,
             });
         }
     }
@@ -1010,7 +1028,24 @@ fn parse_attr_sel(body: &str) -> Option<AttrSel> {
         name: body.to_ascii_lowercase(),
         op: AttrOp::Exists,
         value: String::new(),
+        ci: false,
     })
+}
+
+/// Peel a trailing case-sensitivity flag (`i`/`s`, Selectors-4) off an attribute
+/// selector's value text, returning the value (still possibly quoted) and whether
+/// matching is case-insensitive. The flag is a lone `i`/`s` token separated from
+/// the value by whitespace, so the preceding-whitespace guard prevents stripping
+/// the last letter of an unquoted value (e.g. `[rel=tags]` keeps its `s`).
+fn split_attr_flag(value: &str) -> (&str, bool) {
+    let v = value.trim();
+    if let Some(rest) = v.strip_suffix(['i', 'I', 's', 'S']) {
+        if rest.ends_with(char::is_whitespace) {
+            let ci = v.as_bytes()[v.len() - 1].eq_ignore_ascii_case(&b'i');
+            return (rest.trim_end(), ci);
+        }
+    }
+    (v, false)
 }
 
 fn unquote(s: &str) -> String {
@@ -1183,6 +1218,29 @@ mod tests {
         assert!(matches("input[type=text] { x: y }", &path));
         assert!(matches("[href^=\"https\"] { x: y }", &path));
         assert!(!matches("[type=checkbox] { x: y }", &path));
+    }
+
+    #[test]
+    fn attribute_case_insensitive_flag() {
+        let path = chain(vec![sref(
+            "input",
+            None,
+            &[],
+            &[("type", "SEARCH"), ("rel", "tags")],
+        )]);
+        // `i` flag → ASCII case-insensitive value match (quoted or bare value).
+        assert!(matches("input[type=\"search\" i] { x: y }", &path));
+        assert!(matches("input[type=SEARCH i] { x: y }", &path));
+        // No flag and the `s` flag both stay case-sensitive (value is "SEARCH").
+        assert!(!matches("input[type=\"search\"] { x: y }", &path));
+        assert!(!matches("input[type=\"search\" s] { x: y }", &path));
+        // The flag is a lone whitespace-separated i/s, so an unquoted value that
+        // happens to end in `s` (`tags`) is not mis-read as the `s` flag.
+        assert!(matches("input[rel=tags] { x: y }", &path));
+        // Substring / prefix / suffix operators honor the flag too.
+        assert!(matches("input[type*=\"ear\" i] { x: y }", &path));
+        assert!(matches("input[type^=\"sea\" i] { x: y }", &path));
+        assert!(matches("input[type$=\"rch\" i] { x: y }", &path));
     }
 
     #[test]

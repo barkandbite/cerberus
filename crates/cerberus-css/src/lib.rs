@@ -2540,6 +2540,46 @@ mod tests {
     }
 
     #[test]
+    fn attribute_case_insensitive_flag_cascades() {
+        let dom = CssEngine::new().style(&parse_html(
+            "<style>\
+             input[type=\"search\" i] { color: #ff0000 } \
+             input[name=\"Foo\"] { color: #0000ff } \
+             a[rel=tags] { color: #00ff00 }\
+             </style>\
+             <input type=\"SEARCH\">\
+             <input type=\"search\">\
+             <input type=\"text\" name=\"foo\">\
+             <a rel=\"tags\">x</a>",
+        ));
+        let mut inputs = Vec::new();
+        collect(&dom.root, "input", &mut inputs);
+        let red = Color::rgb(0xff, 0, 0);
+        assert_eq!(
+            inputs[0].style.color, red,
+            "[i] matches an upper-case value"
+        );
+        assert_eq!(
+            inputs[1].style.color, red,
+            "[i] matches the canonical-case value"
+        );
+        assert_ne!(
+            inputs[2].style.color, red,
+            "[i] must not match an unrelated value"
+        );
+        assert_ne!(
+            inputs[2].style.color,
+            Color::rgb(0, 0, 0xff),
+            "case-sensitive [name=\"Foo\"] must NOT match name=\"foo\""
+        );
+        assert_eq!(
+            first(&dom.root, "a").unwrap().style.color,
+            Color::rgb(0, 0xff, 0),
+            "an unquoted value ending in 's' is not mis-read as the 's' flag"
+        );
+    }
+
+    #[test]
     fn nth_last_selectors() {
         let dom = CssEngine::new().style(&parse_html(
             "<style>li:nth-last-child(1){color:#ff0000} li:nth-last-child(2){color:#00ff00}</style>\
