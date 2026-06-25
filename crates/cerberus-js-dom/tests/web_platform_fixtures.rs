@@ -514,6 +514,31 @@ fn real_canvas_serializes_drawn_pixels_as_a_src_data_url() {
 }
 
 #[test]
+fn real_canvas_draw_image_composites_a_source_canvas() {
+    // drawImage from another canvas (offscreen/double-buffer pattern) was a no-op;
+    // now it composites the source buffer at the destination position.
+    let doc = shell_with("result", "init");
+    let mut client = Stub::default();
+    let out = run(
+        &doc,
+        &["globalThis.__cerberusCanvasReal = true; \
+           var src = document.createElement('canvas'); src.setAttribute('width','4'); src.setAttribute('height','4'); \
+           var sctx = src.getContext('2d'); sctx.fillStyle = '#ff0000'; sctx.fillRect(0,0,4,4); \
+           var dst = document.createElement('canvas'); dst.setAttribute('width','10'); dst.setAttribute('height','10'); \
+           var dctx = dst.getContext('2d'); dctx.fillStyle = '#0000ff'; dctx.fillRect(0,0,10,10); \
+           dctx.drawImage(src, 2, 2); \
+           var inside = dctx.getImageData(3,3,1,1).data; var outside = dctx.getImageData(8,8,1,1).data; \
+           document.getElementById('result').textContent = [inside[0], inside[2], outside[2]].join(',');"],
+        &mut client,
+    );
+    assert_eq!(
+        find_id(out.root(), "result").unwrap().text_content(),
+        "255,0,255",
+        "src (red) composited at (2,2): inside=red, outside stays dst-blue"
+    );
+}
+
+#[test]
 fn performance_now_and_crypto_get_random_values_exist() {
     // The real sensor calls performance.now() and crypto.getRandomValues() early;
     // when they were missing it threw before doing anything. Assert the contract:

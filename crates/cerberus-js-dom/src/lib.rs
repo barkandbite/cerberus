@@ -2475,7 +2475,28 @@ pub const DOM_MODEL_PRELUDE: &str = r##"
         stroke: function () { var c = col(st.strokeStyle); for (var s = 0; s < path.length; s++) { var p = path[s]; for (var i = 0; i + 1 < p.length; i++) line(p[i], p[i + 1], c); } },
         clip: function () {},
         save: function () {}, restore: function () {}, translate: function () {}, scale: function () {}, rotate: function () {}, setTransform: function () {}, transform: function () {},
-        drawImage: function () {}, fillText: function () {}, strokeText: function () {},
+        drawImage: function () {
+          // Source may be another real canvas or an ImageData; an <img> has no
+          // JS-accessible pixels here, so it's a no-op (graceful).
+          var src = arguments[0], sd = null, sw = 0, sh = 0;
+          if (src && src.__real2d && typeof src.__real2d.getImageData === "function") {
+            var iw = parseInt(getAttr(src, "width"), 10) || 300, ih = parseInt(getAttr(src, "height"), 10) || 150;
+            var g0 = src.__real2d.getImageData(0, 0, iw, ih); sd = g0.data; sw = iw; sh = ih;
+          } else if (src && src.data && typeof src.width === "number") { sd = src.data; sw = src.width; sh = src.height; }
+          if (!sd) return;
+          var sx = 0, sy = 0, ssw = sw, ssh = sh, dx, dy, dw, dh, A = arguments;
+          if (A.length <= 5) { dx = A[1] || 0; dy = A[2] || 0; dw = (A.length >= 5) ? A[3] : sw; dh = (A.length >= 5) ? A[4] : sh; }
+          else { sx = A[1]; sy = A[2]; ssw = A[3]; ssh = A[4]; dx = A[5]; dy = A[6]; dw = A[7]; dh = A[8]; }
+          for (var yy = 0; yy < dh; yy++) for (var xx = 0; xx < dw; xx++) {
+            var sxp = Math.floor(sx + xx / dw * ssw), syp = Math.floor(sy + yy / dh * ssh);
+            if (sxp < 0 || sxp >= sw || syp < 0 || syp >= sh) continue;
+            var tx = Math.round(dx + xx), ty = Math.round(dy + yy);
+            if (tx < 0 || tx >= w || ty < 0 || ty >= h) continue;
+            var so = (syp * sw + sxp) * 4; if (sd[so + 3] === 0) continue;
+            var to = (ty * w + tx) * 4; data[to] = sd[so]; data[to + 1] = sd[so + 1]; data[to + 2] = sd[so + 2]; data[to + 3] = sd[so + 3];
+          }
+        },
+        fillText: function () {}, strokeText: function () {},
         measureText: function (t) { return { width: String(t).length * 6 }; },
         createLinearGradient: function () { return { addColorStop: function () {} }; },
         createPattern: function () { return null; },
