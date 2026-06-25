@@ -1334,6 +1334,22 @@ fn apply_declarations(
                 }
             }
             "inset" => apply_inset_shorthand(style, v, style.font_size as f32),
+            // Logical inset (positioned-element offsets) → physical, default
+            // horizontal-tb / ltr writing mode.
+            "inset-block-start" => set_inset_len(&mut style.inset_top, v, style.font_size as f32),
+            "inset-block-end" => set_inset_len(&mut style.inset_bottom, v, style.font_size as f32),
+            "inset-inline-start" => set_inset_len(&mut style.inset_left, v, style.font_size as f32),
+            "inset-inline-end" => set_inset_len(&mut style.inset_right, v, style.font_size as f32),
+            "inset-block" => {
+                let (a, b) = two_values(v);
+                set_inset_len(&mut style.inset_top, a, style.font_size as f32);
+                set_inset_len(&mut style.inset_bottom, b, style.font_size as f32);
+            }
+            "inset-inline" => {
+                let (a, b) = two_values(v);
+                set_inset_len(&mut style.inset_left, a, style.font_size as f32);
+                set_inset_len(&mut style.inset_right, b, style.font_size as f32);
+            }
             "z-index" => {
                 let t = v.trim().to_ascii_lowercase();
                 if t == "auto" {
@@ -2253,6 +2269,14 @@ fn set_margin(field: &mut i32, v: &str, em: f32) {
     }
 }
 
+/// Set an inset (`top`/`left`/…) `Len` field from a value (no-op if it doesn't
+/// parse) — supports `auto`/`%`/`vw`/`vh` like the physical inset arms.
+fn set_inset_len(field: &mut Len, v: &str, em: f32) {
+    if let Some(l) = parse_inset(v, em) {
+        *field = l;
+    }
+}
+
 /// Split a value into its first two whitespace-separated tokens, the second
 /// defaulting to the first (the 1-or-2-value box shorthand pattern).
 fn two_values(v: &str) -> (&str, &str) {
@@ -2462,6 +2486,17 @@ mod tests {
             Color::rgb(0xff, 0, 0),
             "!important beats #id and inline-normal"
         );
+    }
+
+    #[test]
+    fn logical_inset_maps_to_physical() {
+        let d = CssEngine::new().style(&parse_html(
+            "<div style='position:absolute; inset-block: 5px 15px; inset-inline-start: 20px'>x</div>",
+        ));
+        let s = &first(&d.root, "div").unwrap().style;
+        assert_eq!(s.inset_top, Len::Px(5));
+        assert_eq!(s.inset_bottom, Len::Px(15));
+        assert_eq!(s.inset_left, Len::Px(20));
     }
 
     #[test]
