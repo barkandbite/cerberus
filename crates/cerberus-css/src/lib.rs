@@ -353,6 +353,11 @@ fn sibling_ref(node: NodeRef<'_>) -> SiblingRef {
             .map(|c| c.split_whitespace().map(str::to_string).collect())
             .unwrap_or_default(),
         attrs: node.attrs().to_vec(),
+        // `:empty` per Selectors-4: no children, or only whitespace text. The
+        // DOM has no comment nodes, so whitespace-only text is the sole carve-out.
+        empty: node
+            .children()
+            .all(|c| c.text().map(|t| t.trim().is_empty()).unwrap_or(false)),
     }
 }
 
@@ -2501,6 +2506,36 @@ mod tests {
             first(&dom.root, "textarea").unwrap().style.color,
             Color::rgb(0, 0, 0xff),
             ":enabled must NOT match a disabled element"
+        );
+    }
+
+    #[test]
+    fn empty_pseudo_matches_only_childless_or_whitespace() {
+        let dom = CssEngine::new().style(&parse_html(
+            "<style>div:empty { color: #ff0000 }</style>\
+             <div></div>\
+             <div>   </div>\
+             <div><span>x</span></div>\
+             <div>text</div>",
+        ));
+        let mut divs = Vec::new();
+        collect(&dom.root, "div", &mut divs);
+        let red = Color::rgb(0xff, 0, 0);
+        assert_eq!(
+            divs[0].style.color, red,
+            ":empty matches a childless element"
+        );
+        assert_eq!(
+            divs[1].style.color, red,
+            ":empty matches an element with only whitespace text"
+        );
+        assert_ne!(
+            divs[2].style.color, red,
+            ":empty must NOT match an element with a child element"
+        );
+        assert_ne!(
+            divs[3].style.color, red,
+            ":empty must NOT match an element with non-whitespace text"
         );
     }
 

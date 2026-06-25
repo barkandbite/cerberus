@@ -31,6 +31,9 @@ pub struct SiblingRef {
     pub id: Option<String>,
     pub classes: Vec<String>,
     pub attrs: Vec<(String, String)>,
+    /// Whether the element has no children other than whitespace text (for
+    /// `:empty`, per the Selectors-4 definition where whitespace-only counts).
+    pub empty: bool,
 }
 
 /// An element on the match path: its parent's element children (shared via `Rc`
@@ -88,6 +91,9 @@ enum Pseudo {
     Checked,
     Disabled,
     Enabled,
+    /// `:empty` — no children other than whitespace text (precomputed on the
+    /// `SiblingRef`, since the match path has no DOM child pointers).
+    Empty,
     Never, // :hover/:focus/:active/:visited/:link — no static match
 }
 
@@ -243,6 +249,7 @@ fn pseudo_matches(
         Pseudo::Enabled => {
             is_form_element(&el.tag) && !el.attrs.iter().any(|(k, _)| k == "disabled")
         }
+        Pseudo::Empty => el.empty,
         Pseudo::Never => false,
     }
 }
@@ -921,6 +928,8 @@ fn apply_pseudo(c: &mut Compound, name: &str, arg: &str) {
         "checked" => c.pseudos.push(Pseudo::Checked),
         "disabled" => c.pseudos.push(Pseudo::Disabled),
         "enabled" => c.pseudos.push(Pseudo::Enabled),
+        // `:empty` — only whitespace-text (or no) children; precomputed.
+        "empty" => c.pseudos.push(Pseudo::Empty),
         // The remaining state pseudo-classes have no static answer; force a
         // non-match so we never wrongly apply (e.g.) :hover styles at rest.
         "hover" | "focus" | "active" | "visited" | "link" | "focus-within" | "focus-visible" => {
@@ -1075,6 +1084,7 @@ mod tests {
                 .iter()
                 .map(|(k, v)| (k.to_string(), v.to_string()))
                 .collect(),
+            empty: false,
         }
     }
 
