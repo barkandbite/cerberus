@@ -218,6 +218,51 @@ fn programmatic_click_dispatches_and_is_connected_tracks_tree() {
 }
 
 #[test]
+fn normalize_clipboard_and_permissions() {
+    let (mut engine, realm) = engine_and_realm();
+    let doc = doc_with_div_x();
+    let scripts = vec![
+        "globalThis.__n = []; \
+         var d = document.createElement('div'); \
+         d.appendChild(document.createTextNode('a')); \
+         d.appendChild(document.createTextNode('')); \
+         d.appendChild(document.createTextNode('b')); \
+         var before = d.childNodes.length; \
+         d.normalize(); \
+         globalThis.__n.push('norm:' + before + '->' + d.childNodes.length + ':' + d.textContent); \
+         globalThis.__n.push('clip:' + (typeof navigator.clipboard.writeText('hi').then === 'function')); \
+         navigator.permissions.query({ name: 'geolocation' }) \
+            .then(function (r) { globalThis.__permState = r.state; });"
+            .to_string(),
+    ];
+    run_page_scripts(engine.as_mut(), realm, &doc, &scripts, &env()).expect("run");
+
+    let n = engine
+        .eval(realm, "globalThis.__n.join('|')")
+        .expect("read __n");
+    match n {
+        JsValue::Str(s) => {
+            assert!(
+                s.contains("norm:3->1:ab"),
+                "normalize merges text nodes; got {s:?}"
+            );
+            assert!(
+                s.contains("clip:true"),
+                "clipboard.writeText is thenable; got {s:?}"
+            );
+        }
+        other => panic!("expected string, got {other:?}"),
+    }
+    // The permissions promise resolved during the microtask drain.
+    assert_eq!(
+        engine
+            .eval(realm, "globalThis.__permState || 'pending'")
+            .expect("read __permState"),
+        JsValue::Str("prompt".into())
+    );
+}
+
+#[test]
 fn attributes_namednodemap_scroll_and_getselection() {
     let (mut engine, realm) = engine_and_realm();
     let doc = doc_with_div_x();

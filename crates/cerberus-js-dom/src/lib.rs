@@ -2299,6 +2299,23 @@ pub const DOM_MODEL_PRELUDE: &str = r##"
       while (t.__parent) t = t.__parent;
       return t;
     };
+    // normalize: drop empty text nodes and merge adjacent text nodes (recursively),
+    // as called after DOM text manipulation.
+    NODE_PROTO.normalize = function () {
+      var kids = this.__kids;
+      for (var i = 0; i < kids.length; i++) {
+        var n = kids[i];
+        if (n.__type === TEXT_NODE) {
+          if (n.__text === "") { kids.splice(i, 1); i--; continue; }
+          while (i + 1 < kids.length && kids[i + 1].__type === TEXT_NODE) {
+            n.__text += kids[i + 1].__text;
+            kids.splice(i + 1, 1);
+          }
+        } else if (n.__type === ELEMENT_NODE) {
+          n.normalize();
+        }
+      }
+    };
 
     // -- elements (ELEMENT_PROTO) --
     defAccessor(ELEMENT_PROTO, "tagName", function () { return this.__tag.toUpperCase(); });
@@ -2973,6 +2990,26 @@ pub const DOM_MODEL_PRELUDE: &str = r##"
       onLine: true,
       cookieEnabled: true,
       webdriver: false,
+    };
+    // clipboard: copy buttons call navigator.clipboard.writeText(text). No system
+    // clipboard, but resolve so the page's success path (its own UI feedback) runs
+    // instead of an unhandled rejection; readText resolves empty.
+    g.navigator.clipboard = {
+      writeText: function () { return Promise.resolve(); },
+      readText: function () { return Promise.resolve(""); },
+      write: function () { return Promise.resolve(); },
+      read: function () { return Promise.resolve([]); },
+    };
+    // permissions.query → a neutral 'prompt' PermissionStatus, so feature-detecting
+    // code (geolocation/notifications/…) runs without throwing and doesn't see a
+    // capability auto-granted.
+    g.navigator.permissions = {
+      query: function (desc) {
+        return Promise.resolve({
+          state: "prompt", name: (desc && desc.name) || "", onchange: null,
+          addEventListener: function () {}, removeEventListener: function () {},
+        });
+      },
     };
     // sendBeacon: fire-and-forget POST on the shared fetch queue (sensors/analytics
     // ship telemetry through it). Returns true if queued.
