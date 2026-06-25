@@ -2050,6 +2050,41 @@ pub const DOM_MODEL_PRELUDE: &str = r##"
       while (this.__kids.length) removeChild(this, this.__kids[0]);
       for (var i = 0; i < arguments.length; i++) appendChild(this, __toNode(arguments[i]));
     };
+    ELEMENT_PROTO.toggleAttribute = function (name, force) {
+      name = String(name);
+      var has = attrIndex(this, name) !== -1;
+      if (force === undefined) force = !has;
+      if (force) { if (!has) setAttr(this, name, ""); return true; }
+      if (has) removeAttr(this, name);
+      return false;
+    };
+    function __insertAdjacent(el, pos, node) {
+      pos = String(pos).toLowerCase();
+      if (pos === "beforebegin") { if (el.__parent) insertBefore(el.__parent, node, el); }
+      else if (pos === "afterbegin") { insertBefore(el, node, el.__kids[0] || null); }
+      else if (pos === "beforeend") { appendChild(el, node); }
+      else if (pos === "afterend") {
+        var p = el.__parent;
+        if (p) insertBefore(p, node, p.__kids[p.__kids.indexOf(el) + 1] || null);
+      }
+      return node;
+    }
+    ELEMENT_PROTO.insertAdjacentElement = function (pos, node) { return __insertAdjacent(this, pos, node); };
+    ELEMENT_PROTO.insertAdjacentText = function (pos, text) { return __insertAdjacent(this, pos, makeText(text)); };
+    Object.defineProperty(ELEMENT_PROTO, "hidden", {
+      get: function () { return attrIndex(this, "hidden") !== -1; },
+      set: function (v) { if (v) setAttr(this, "hidden", ""); else removeAttr(this, "hidden"); },
+      enumerable: true, configurable: true,
+    });
+    ELEMENT_PROTO.scrollIntoView = function () {};
+    ELEMENT_PROTO.focus = function () {};
+    ELEMENT_PROTO.blur = function () {};
+    ELEMENT_PROTO.getClientRects = function () {
+      var r = (typeof this.getBoundingClientRect === "function")
+        ? this.getBoundingClientRect()
+        : { x: 0, y: 0, width: 0, height: 0, top: 0, left: 0, right: 0, bottom: 0 };
+      return [r];
+    };
     NODE_PROTO.contains = function (other) {
       for (var n = other; n; n = n.__parent) if (n === this) return true;
       return false;
@@ -2378,7 +2413,15 @@ pub const DOM_MODEL_PRELUDE: &str = r##"
     document.querySelector = function (s) { return this.documentElement ? queryOne(this.documentElement, s) : null; };
     document.querySelectorAll = function (s) { return this.documentElement ? queryAll(this.documentElement, s) : []; };
     document.createElement = function (tag) { return makeElement(tag); };
+    document.createElementNS = function (ns, tag) { return makeElement(tag); };
     document.createTextNode = function (text) { return makeText(text); };
+    document.getElementsByName = function (name) {
+      name = String(name); var out = [];
+      if (document.documentElement) walkElements(document.documentElement, function (el) {
+        if (getAttr(el, "name") === name) out.push(el);
+      });
+      return out;
+    };
     document.createDocumentFragment = function () {
       // A lightweight fragment: appendChild moves its children, like the spec,
       // but we model it as a bare element whose kids get re-parented on insert.

@@ -382,6 +382,37 @@ fn clone_replacechild_and_modern_manipulation() {
 }
 
 #[test]
+fn dom_completeness_helpers() {
+    // toggleAttribute, el.hidden, insertAdjacentElement, getElementsByName,
+    // createElementNS, scrollIntoView/getClientRects — all were missing.
+    let doc = shell_with("result", "init");
+    let mut client = Stub::default();
+    let out = run(
+        &doc,
+        &["var d = document.getElementById('result'); \
+           d.toggleAttribute('data-on'); var t1 = d.hasAttribute('data-on'); \
+           d.toggleAttribute('data-on'); var t2 = d.hasAttribute('data-on'); \
+           d.toggleAttribute('aria-x', true); var t3 = d.getAttribute('aria-x') === ''; \
+           d.hidden = true; var h1 = d.getAttribute('hidden') === ''; \
+           d.hidden = false; var h2 = !d.hasAttribute('hidden'); \
+           var span = document.createElement('span'); span.id = 'adj'; \
+           d.insertAdjacentElement('afterbegin', span); var adj = d.children[0].id === 'adj'; \
+           var inp = document.createElement('input'); inp.setAttribute('name', 'q'); document.body.appendChild(inp); \
+           var byName = document.getElementsByName('q').length; \
+           var svg = document.createElementNS('http://www.w3.org/2000/svg', 'svg'); \
+           var svgOk = svg.tagName.toLowerCase() === 'svg'; \
+           d.scrollIntoView(); var rects = d.getClientRects().length; \
+           document.getElementById('result').textContent = \
+             [t1, t2, t3, h1, h2, adj, byName, svgOk, rects].join(',');"],
+        &mut client,
+    );
+    assert_eq!(
+        find_id(out.root(), "result").unwrap().text_content(),
+        "true,false,true,true,true,true,1,true,1"
+    );
+}
+
+#[test]
 fn performance_now_and_crypto_get_random_values_exist() {
     // The real sensor calls performance.now() and crypto.getRandomValues() early;
     // when they were missing it threw before doing anything. Assert the contract:
