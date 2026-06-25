@@ -157,19 +157,57 @@ fn console_log_is_captured() {
     let doc = doc_with_div_x();
     let scripts = vec!["console.log('hello', 42)".to_string()];
 
-    // run_page_scripts leaves the realm intact, so we can read the capture buffer
-    // out of the same realm with a follow-up eval.
+    // run_page_scripts leaves the realm intact, so we can drain the capture buffer
+    // out of the same realm via the structured `take_console` bridge.
     run_page_scripts(engine.as_mut(), realm, &doc, &scripts, &env()).expect("run");
-    let joined = engine
-        .eval(realm, "globalThis.__cerberusConsole.join('|')")
-        .expect("read console");
-    match joined {
-        cerberus_js::JsValue::Str(s) => assert!(
-            s.contains("hello 42"),
-            "console capture should contain 'hello 42', got {s:?}"
-        ),
-        other => panic!("expected string, got {other:?}"),
-    }
+    let msgs = cerberus_js_dom::take_console(engine.as_mut(), realm);
+    assert!(
+        msgs.iter()
+            .any(|m| m.level == "log" && m.text.contains("hello 42")),
+        "console capture should contain a log 'hello 42', got {msgs:?}"
+    );
+    // The drain clears the buffer.
+    assert!(
+        cerberus_js_dom::take_console(engine.as_mut(), realm).is_empty(),
+        "take_console should clear the buffer"
+    );
+}
+
+#[test]
+fn console_levels_and_thrown_script_error_surface() {
+    let (mut engine, realm) = engine_and_realm();
+    let doc = doc_with_div_x();
+    let scripts = vec![
+        "console.warn('beware'); console.error('boom')".to_string(),
+        "throw new Error('kaboom')".to_string(),
+        "console.log('after-throw still runs')".to_string(),
+    ];
+    run_page_scripts(engine.as_mut(), realm, &doc, &scripts, &env()).expect("run");
+    let msgs = cerberus_js_dom::take_console(engine.as_mut(), realm);
+
+    assert!(
+        msgs.iter()
+            .any(|m| m.level == "warn" && m.text.contains("beware")),
+        "warn level captured, got {msgs:?}"
+    );
+    assert!(
+        msgs.iter()
+            .any(|m| m.level == "error" && m.text.contains("boom")),
+        "error level captured"
+    );
+    // A thrown <script> is recorded as an error-level entry (carrying its
+    // message/stack) instead of vanishing — the observability fix.
+    assert!(
+        msgs.iter()
+            .any(|m| m.level == "error" && m.text.contains("kaboom")),
+        "thrown script error should surface, got {msgs:?}"
+    );
+    // …and the run continues to the next script (browser-faithful).
+    assert!(
+        msgs.iter()
+            .any(|m| m.text.contains("after-throw still runs")),
+        "run should continue after a thrown script"
+    );
 }
 
 #[test]

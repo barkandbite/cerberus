@@ -616,11 +616,39 @@ pub fn run_scripts(
 ) -> Result<(), BridgeError> {
     for script in scripts {
         match engine.eval(realm, script) {
-            Ok(_) | Err(JsError::Eval(_)) => {}
+            Ok(_) => {}
+            Err(JsError::Eval(msg)) => {
+                // Browser-faithful: a thrown `<script>` doesn't abort the run. But
+                // rather than vanish, record it (with the JS stack the engine puts
+                // in the message) as an error-level console entry, so it surfaces
+                // through `take_console` instead of leaving the host blind.
+                let expr = format!(
+                    "(typeof __cerberusRecordError==='function')&&__cerberusRecordError(\"{}\")",
+                    js_escape(&msg)
+                );
+                let _ = engine.eval(realm, &expr);
+            }
             Err(other) => return Err(BridgeError::Js(other)),
         }
     }
     Ok(())
+}
+
+/// Escape a string for embedding inside a double-quoted JS string literal.
+fn js_escape(s: &str) -> String {
+    let mut out = String::with_capacity(s.len() + 8);
+    for c in s.chars() {
+        match c {
+            '\\' => out.push_str("\\\\"),
+            '"' => out.push_str("\\\""),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            c if (c as u32) < 0x20 => out.push_str(&format!("\\u{:04x}", c as u32)),
+            c => out.push(c),
+        }
+    }
+    out
 }
 
 /// Fire `DOMContentLoaded` then `load` into an installed realm via
@@ -1000,6 +1028,46 @@ pub fn take_cookie_writes(
         .iter()
         .filter_map(|v| v.as_str().map(str::to_string))
         .collect())
+}
+
+/// A captured `console.*` message: the level (`log`/`warn`/`error`/`info`/`debug`/
+/// `trace`) and the joined text. Script errors swallowed by [`run_scripts`] arrive
+/// here as `error`-level entries carrying their JS stack.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ConsoleMessage {
+    pub level: String,
+    pub text: String,
+}
+
+/// Drain (and clear) the realm's buffered `console.*` output via
+/// `__cerberusTakeConsole()`, parsing the `[{level,text}…]` array. Non-fatal: a
+/// realm without the DOM model, or any drain hiccup, yields an empty `Vec` rather
+/// than erroring — observability must never break a render.
+pub fn take_console(engine: &mut dyn JsEngine, realm: RealmId) -> Vec<ConsoleMessage> {
+    let json = match engine.eval(
+        realm,
+        "(typeof __cerberusTakeConsole==='function')?__cerberusTakeConsole():'[]'",
+    ) {
+        Ok(JsValue::Str(s)) => s,
+        _ => return Vec::new(),
+    };
+    let Ok(value) = json::parse(&json) else {
+        return Vec::new();
+    };
+    let Some(items) = value.as_array() else {
+        return Vec::new();
+    };
+    items
+        .iter()
+        .filter_map(|item| {
+            let text = item.get("text").and_then(Json::as_str)?;
+            let level = item.get("level").and_then(Json::as_str).unwrap_or("log");
+            Some(ConsoleMessage {
+                level: level.to_string(),
+                text: text.to_string(),
+            })
+        })
+        .collect()
 }
 
 /// Evals `__cerberusTakeFetches()` (which `JSON.stringify`s the queue then empties
@@ -1392,16 +1460,31 @@ pub const DOM_MODEL_PRELUDE: &str = r##"
 
     // ---- console (capture, never throw) --------------------------------
     if (!Array.isArray(g.__cerberusConsole)) g.__cerberusConsole = [];
-    function consoleSink() {
-      var parts = [];
-      for (var i = 0; i < arguments.length; i++) {
-        try { parts.push(String(arguments[i])); } catch (e) { parts.push(""); }
-      }
-      try { g.__cerberusConsole.push(parts.join(" ")); } catch (e) {}
+    function consoleSink(level) {
+      return function () {
+        var parts = [];
+        for (var i = 0; i < arguments.length; i++) {
+          try { parts.push(String(arguments[i])); } catch (e) { parts.push(""); }
+        }
+        try { g.__cerberusConsole.push({ level: level, text: parts.join(" ") }); } catch (e) {}
+      };
     }
     g.console = {
-      log: consoleSink, warn: consoleSink, error: consoleSink,
-      info: consoleSink, debug: consoleSink,
+      log: consoleSink("log"), warn: consoleSink("warn"),
+      error: consoleSink("error"), info: consoleSink("info"),
+      debug: consoleSink("debug"), trace: consoleSink("trace"),
+    };
+    // Drain (and clear) the captured console buffer as JSON of {level,text} — the
+    // Rust host's `take_console` reads this so page diagnostics reach Rust logging.
+    g.__cerberusTakeConsole = function () {
+      var out = g.__cerberusConsole || [];
+      g.__cerberusConsole = [];
+      try { return JSON.stringify(out); } catch (e) { return "[]"; }
+    };
+    // Record a host-detected script error as an error-level console entry, so a
+    // thrown `<script>` surfaces through the same drain (carrying its JS stack).
+    g.__cerberusRecordError = function (text) {
+      try { g.__cerberusConsole.push({ level: "error", text: String(text) }); } catch (e) {}
     };
 
     // ---- node model ----------------------------------------------------

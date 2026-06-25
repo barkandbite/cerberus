@@ -1110,6 +1110,11 @@ pub fn render(config: &RenderConfig) -> Result<RenderOutcome, AppError> {
                 jar.set_cookie(active_instance, &url, &first_party, &raw);
             }
         }
+        // Surface page console output + swallowed script errors (with their JS
+        // stacks) to the Rust logging layer (stderr) — the observability bridge.
+        for m in cerberus_js_dom::take_console(engine, base_realm) {
+            eprintln!("[js:{}] {}", m.level, m.text);
+        }
     }
     let engine_name = engine.name().to_string();
     let realms_live = engine.realm_count();
@@ -2632,6 +2637,11 @@ impl BrowserApp {
         // Drain timers/microtasks the page scheduled, under the default caps
         // (ADR-0013), so first-paint reflects deferred work and no page can hang.
         let _ = run_event_loop(engine, realm, EventLoopBudget::default());
+        // Surface page console output + swallowed script errors (with their JS
+        // stacks) to stderr — the observability bridge (same as the render path).
+        for m in cerberus_js_dom::take_console(engine, realm) {
+            eprintln!("[js:{}] {}", m.level, m.text);
+        }
         match serialize_dom(engine, realm) {
             Ok(rebuilt) => {
                 let RebuiltDom { document, id_map } = rebuilt;
