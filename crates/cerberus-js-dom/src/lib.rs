@@ -2220,6 +2220,24 @@ pub const DOM_MODEL_PRELUDE: &str = r##"
       var Ctor = (typeof g.MouseEvent === "function") ? g.MouseEvent : g.Event;
       this.dispatchEvent(new Ctor("click", { bubbles: true, cancelable: true }));
     };
+    // Web Animations: we have no compositor/timeline and render the final state,
+    // so an element.animate(...) is immediately "finished". Return a minimal
+    // Animation so common chaining — el.animate(...).finished.then(...),
+    // .cancel(), .onfinish — works instead of throwing.
+    ELEMENT_PROTO.animate = function () {
+      var anim = {
+        playState: "finished", currentTime: 0, startTime: 0, playbackRate: 1,
+        finished: Promise.resolve(), ready: Promise.resolve(),
+        onfinish: null, oncancel: null,
+        play: function () {}, pause: function () {}, cancel: function () {},
+        finish: function () {}, reverse: function () {}, persist: function () {},
+        updatePlaybackRate: function () {},
+        addEventListener: function () {}, removeEventListener: function () {},
+      };
+      anim.finished.then(function () { if (typeof anim.onfinish === "function") anim.onfinish(); });
+      return anim;
+    };
+    ELEMENT_PROTO.getAnimations = function () { return []; };
     ELEMENT_PROTO.getClientRects = function () {
       var r = (typeof this.getBoundingClientRect === "function")
         ? this.getBoundingClientRect()
@@ -2241,6 +2259,18 @@ pub const DOM_MODEL_PRELUDE: &str = r##"
       },
       configurable: true,
     });
+    // getRootNode: the document when this node is connected, else the topmost
+    // node of its detached subtree (no shadow roots, so `composed` is moot).
+    NODE_PROTO.getRootNode = function () {
+      var root = g.document && g.document.documentElement;
+      var droot = g.document && g.document.__root;
+      for (var n = this; n; n = n.__parent) {
+        if (n === g.document || n === root || n === droot) return g.document;
+      }
+      var t = this;
+      while (t.__parent) t = t.__parent;
+      return t;
+    };
 
     // -- elements (ELEMENT_PROTO) --
     defAccessor(ELEMENT_PROTO, "tagName", function () { return this.__tag.toUpperCase(); });
@@ -2709,6 +2739,11 @@ pub const DOM_MODEL_PRELUDE: &str = r##"
     var document = {
       __listeners: Object.create(null),
       readyState: "loading",
+      // Page Visibility: a rendered page is always visible (no backgrounding in
+      // the one-shot/headless model), so visibility-gated logic runs its visible
+      // branch rather than stalling.
+      visibilityState: "visible",
+      hidden: false,
       __cookie: "",
       __root: null,        // the synthetic #root element (snapshot root)
       documentElement: null,
@@ -2716,6 +2751,13 @@ pub const DOM_MODEL_PRELUDE: &str = r##"
       body: null,
       nodeType: 9,
     };
+    document.hasFocus = function () { return true; };
+    document.getAnimations = function () { return []; };
+    Object.defineProperty(document, "activeElement", {
+      // No focus model; default to <body> as browsers do when nothing is focused.
+      get: function () { return this.body || this.documentElement || null; },
+      configurable: true,
+    });
 
     Object.defineProperty(document, "title", {
       get: function () {

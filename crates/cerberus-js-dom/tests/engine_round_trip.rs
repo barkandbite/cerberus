@@ -218,6 +218,50 @@ fn programmatic_click_dispatches_and_is_connected_tracks_tree() {
 }
 
 #[test]
+fn page_visibility_focus_rootnode_and_animate_stub() {
+    let (mut engine, realm) = engine_and_realm();
+    let doc = doc_with_div_x();
+    let scripts = vec![
+        "globalThis.__v = []; \
+         globalThis.__v.push('vis:' + document.visibilityState + ':' + document.hidden \
+            + ':' + document.hasFocus()); \
+         globalThis.__v.push('active:' + (document.activeElement === document.body)); \
+         var x = document.getElementById('x'); \
+         globalThis.__v.push('root:' + (x.getRootNode() === document)); \
+         var a = x.animate([{ opacity: 0 }, { opacity: 1 }], 200); \
+         globalThis.__v.push('anim:' + a.playState + ':' + (typeof a.finished.then === 'function')); \
+         a.cancel();"
+            .to_string(),
+    ];
+    run_page_scripts(engine.as_mut(), realm, &doc, &scripts, &env()).expect("run");
+
+    let v = engine
+        .eval(realm, "globalThis.__v.join('|')")
+        .expect("read __v");
+    match v {
+        JsValue::Str(s) => {
+            assert!(
+                s.contains("vis:visible:false:true"),
+                "visibility/focus; got {s:?}"
+            );
+            assert!(
+                s.contains("active:true"),
+                "activeElement is body; got {s:?}"
+            );
+            assert!(
+                s.contains("root:true"),
+                "getRootNode is document; got {s:?}"
+            );
+            assert!(
+                s.contains("anim:finished:true"),
+                "animate stub thenable; got {s:?}"
+            );
+        }
+        other => panic!("expected string, got {other:?}"),
+    }
+}
+
+#[test]
 fn classlist_replace_iterate_and_css_helpers() {
     let (mut engine, realm) = engine_and_realm();
     let doc = doc_with_div_x();
