@@ -550,8 +550,11 @@ fn collect_vars(
 /// values contain neither, so the fast path returns them untouched.
 fn resolve_value(value: &str, vars: &Vars, em: f32) -> String {
     let has_var = value.contains("var(");
-    let has_calc = value.contains("calc(");
-    if !has_var && !has_calc {
+    let has_math = value.contains("calc(")
+        || value.contains("min(")
+        || value.contains("max(")
+        || value.contains("clamp(");
+    if !has_var && !has_math {
         return value.to_string();
     }
     let substituted = if has_var {
@@ -559,10 +562,114 @@ fn resolve_value(value: &str, vars: &Vars, em: f32) -> String {
     } else {
         value.to_string()
     };
-    if substituted.contains("calc(") {
+    // `calc()` first (it may sit inside a min/max/clamp argument), then the
+    // comparison functions.
+    let resolved = if substituted.contains("calc(") {
         eval_calcs(&substituted, em)
     } else {
         substituted
+    };
+    if resolved.contains("min(") || resolved.contains("max(") || resolved.contains("clamp(") {
+        eval_minmaxclamp(&resolved, em)
+    } else {
+        resolved
+    }
+}
+
+/// Find `name` (e.g. `"max("`) at an identifier boundary, so `max(` inside
+/// `minmax(` is not mistaken for the `max()` function.
+fn find_func(s: &str, name: &str) -> Option<usize> {
+    let mut from = 0;
+    while let Some(rel) = s[from..].find(name) {
+        let pos = from + rel;
+        let boundary = pos == 0
+            || s[..pos]
+                .chars()
+                .next_back()
+                .is_none_or(|p| !(p.is_alphanumeric() || p == '-' || p == '_'));
+        if boundary {
+            return Some(pos);
+        }
+        from = pos + 1;
+    }
+    None
+}
+
+/// Split `s` at top-level commas (ignoring commas inside nested parens),
+/// borrowing the slices (the math-function argument splitter).
+fn split_fn_args(s: &str) -> Vec<&str> {
+    let mut parts = Vec::new();
+    let mut depth = 0i32;
+    let mut start = 0;
+    for (i, c) in s.char_indices() {
+        match c {
+            '(' => depth += 1,
+            ')' => depth -= 1,
+            ',' if depth == 0 => {
+                parts.push(&s[start..i]);
+                start = i + 1;
+            }
+            _ => {}
+        }
+    }
+    parts.push(&s[start..]);
+    parts
+}
+
+/// Evaluate `min()` / `max()` / `clamp()` of **absolute-length** arguments to a
+/// `px` value. Functions with a `%` (the calc evaluator's `%` is em-based, wrong
+/// for these), a viewport unit, or any otherwise-unresolvable argument are left
+/// verbatim so the downstream length parser can still try (no wrong guesses).
+fn eval_minmaxclamp(input: &str, em: f32) -> String {
+    let mut out = String::new();
+    let mut rest = input;
+    loop {
+        let next = [("clamp(", 6usize), ("min(", 4), ("max(", 4)]
+            .iter()
+            .filter_map(|(f, len)| find_func(rest, f).map(|i| (i, *f, *len)))
+            .min_by_key(|(i, _, _)| *i);
+        let Some((pos, func, flen)) = next else {
+            out.push_str(rest);
+            return out;
+        };
+        out.push_str(&rest[..pos]);
+        let Some((inner, tail)) = take_group(&rest[pos + flen..]) else {
+            out.push_str(&rest[pos..]);
+            return out;
+        };
+        // Resolve any nested min/max/clamp in the arguments first.
+        let inner = eval_minmaxclamp(inner, em);
+        let args = split_fn_args(&inner);
+        let nums: Option<Vec<f32>> = if inner.contains('%') {
+            None // em-based % would be wrong here; leave verbatim
+        } else {
+            args.iter().map(|a| eval_calc_expr(a.trim(), em)).collect()
+        };
+        let result = match (func, &nums) {
+            ("min(", Some(v)) if !v.is_empty() => {
+                Some(v.iter().copied().fold(f32::INFINITY, f32::min))
+            }
+            ("max(", Some(v)) if !v.is_empty() => {
+                Some(v.iter().copied().fold(f32::NEG_INFINITY, f32::max))
+            }
+            ("clamp(", Some(v)) if v.len() == 3 => Some(v[1].max(v[0]).min(v[2])),
+            _ => None,
+        };
+        match result {
+            Some(px) => {
+                if (px.round() - px).abs() < 1e-4 {
+                    out.push_str(&format!("{}px", px.round() as i64));
+                } else {
+                    out.push_str(&format!("{px}px"));
+                }
+            }
+            None => {
+                out.push_str(func);
+                out.push_str(&inner);
+                out.push(')');
+            }
+        }
+        rest = tail;
     }
 }
 
@@ -2276,6 +2383,33 @@ mod tests {
             Color::rgb(0xff, 0, 0),
             "!important beats #id and inline-normal"
         );
+    }
+
+    #[test]
+    fn min_max_clamp_resolve_absolute_lengths() {
+        let fs = |css: &str| {
+            let dom =
+                CssEngine::new().style(&parse_html(&format!("<p style='font-size:{css}'>x</p>")));
+            first(&dom.root, "p").unwrap().style.font_size
+        };
+        assert_eq!(fs("max(10px, 20px)"), 20);
+        assert_eq!(fs("min(40px, 24px)"), 24);
+        // clamp(min, value, max): 30 clamped into [12, 18] → 18.
+        assert_eq!(fs("clamp(12px, 30px, 18px)"), 18);
+        // Mixed absolute units resolve too (2rem = 32px > 20px).
+        assert_eq!(fs("max(20px, 2rem)"), 32);
+    }
+
+    #[test]
+    fn minmax_is_not_mistaken_for_max_function() {
+        // `minmax(100px, 1fr)` must survive intact (the `max(` inside it is not
+        // the max() function), so the grid track parses.
+        let html = "<div style='display:grid; grid-template-columns: minmax(100px, 1fr) 1fr'>\
+                    <span>a</span></div>";
+        let dom = CssEngine::new().style(&parse_html(html));
+        let div = first(&dom.root, "div").unwrap();
+        // Two tracks parsed (the minmax wasn't corrupted into a single px value).
+        assert_eq!(div.style.grid_template_columns.len(), 2);
     }
 
     #[test]
