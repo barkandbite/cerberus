@@ -2471,6 +2471,40 @@ mod tests {
     }
 
     #[test]
+    fn state_pseudos_resolve_from_attributes() {
+        let dom = CssEngine::new().style(&parse_html(
+            "<style>\
+             input:checked { color: #ff0000 } \
+             button:disabled { color: #00ff00 } \
+             select:enabled { color: #0000ff } \
+             textarea:enabled { color: #0000ff }\
+             </style>\
+             <input checked><button disabled>b</button>\
+             <select></select><textarea disabled></textarea>",
+        ));
+        assert_eq!(
+            first(&dom.root, "input").unwrap().style.color,
+            Color::rgb(0xff, 0, 0),
+            ":checked matches input[checked]"
+        );
+        assert_eq!(
+            first(&dom.root, "button").unwrap().style.color,
+            Color::rgb(0, 0xff, 0),
+            ":disabled matches button[disabled]"
+        );
+        assert_eq!(
+            first(&dom.root, "select").unwrap().style.color,
+            Color::rgb(0, 0, 0xff),
+            ":enabled matches a non-disabled form element"
+        );
+        assert_ne!(
+            first(&dom.root, "textarea").unwrap().style.color,
+            Color::rgb(0, 0, 0xff),
+            ":enabled must NOT match a disabled element"
+        );
+    }
+
+    #[test]
     fn nth_last_selectors() {
         let dom = CssEngine::new().style(&parse_html(
             "<style>li:nth-last-child(1){color:#ff0000} li:nth-last-child(2){color:#00ff00}</style>\

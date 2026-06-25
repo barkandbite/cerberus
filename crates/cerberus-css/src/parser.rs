@@ -83,6 +83,11 @@ enum Pseudo {
     NthOfType(i32, i32),     // an+b among same-tag siblings (1-based)
     NthLastOfType(i32, i32), // an+b among same-tag siblings, from the end
     Root,
+    /// `:checked`/`:disabled`/`:enabled` resolved from the static attributes (a
+    /// server-rendered `<input checked>`/`<button disabled>` IS in that state).
+    Checked,
+    Disabled,
+    Enabled,
     Never, // :hover/:focus/:active/:visited/:link — no static match
 }
 
@@ -233,8 +238,22 @@ fn pseudo_matches(
             nth_matches(*a, *b, from_end)
         }
         Pseudo::Root => el.tag == "html",
+        Pseudo::Checked => el.attrs.iter().any(|(k, _)| k == "checked"),
+        Pseudo::Disabled => el.attrs.iter().any(|(k, _)| k == "disabled"),
+        Pseudo::Enabled => {
+            is_form_element(&el.tag) && !el.attrs.iter().any(|(k, _)| k == "disabled")
+        }
         Pseudo::Never => false,
     }
+}
+
+/// Tags for which `:enabled`/`:disabled` are meaningful (so `:enabled` doesn't
+/// match every element that merely lacks a `disabled` attribute).
+fn is_form_element(tag: &str) -> bool {
+    matches!(
+        tag,
+        "input" | "button" | "select" | "textarea" | "option" | "optgroup" | "fieldset"
+    )
 }
 
 /// Whether `pos` (1-based) satisfies `an + b` for some integer n ≥ 0.
@@ -897,10 +916,16 @@ fn apply_pseudo(c: &mut Compound, name: &str, arg: &str) {
                 c.where_any.push(group);
             }
         }
-        // State pseudo-classes have no static answer; force a non-match so we
-        // never wrongly apply (e.g.) :hover styles at rest.
-        "hover" | "focus" | "active" | "visited" | "link" | "focus-within" | "focus-visible"
-        | "checked" | "disabled" | "enabled" => c.pseudos.push(Pseudo::Never),
+        // `:checked`/`:disabled`/`:enabled` resolve from static attributes (a
+        // server-rendered checked/disabled control is in that state).
+        "checked" => c.pseudos.push(Pseudo::Checked),
+        "disabled" => c.pseudos.push(Pseudo::Disabled),
+        "enabled" => c.pseudos.push(Pseudo::Enabled),
+        // The remaining state pseudo-classes have no static answer; force a
+        // non-match so we never wrongly apply (e.g.) :hover styles at rest.
+        "hover" | "focus" | "active" | "visited" | "link" | "focus-within" | "focus-visible" => {
+            c.pseudos.push(Pseudo::Never)
+        }
         _ => {} // unknown pseudo — ignore (matches nothing extra)
     }
 }
