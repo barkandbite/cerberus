@@ -645,9 +645,18 @@ impl<'a> Ctx<'a> {
         // the full width once flow passes a float's bottom; a `clear` (or the
         // container's end) drops below them — ADR-0039/0049.
         let mut floats = Floats::new(self.left, self.right);
+        // Adjacent-sibling vertical margin collapsing: the bottom margin of the
+        // last in-flow block child, so the next block child's top margin collapses
+        // with it (gap = the larger of the two, never below zero — content can't
+        // overlap). Reset to `None` by any non-block child, so collapsing only
+        // happens between directly consecutive block siblings (ADR-0072).
+        let mut prev_block_mb: Option<i32> = None;
         for child in &node.children {
             match child {
                 StyledChild::Text(t) => {
+                    if !t.trim().is_empty() {
+                        prev_block_mb = None;
+                    }
                     self.flow_among_floats(&floats);
                     if visible {
                         self.add_text(t, style, href);
@@ -657,12 +666,14 @@ impl<'a> Ctx<'a> {
                     if e.style.float != cerberus_style::Float::None
                         && e.style.display != Display::None =>
                 {
-                    // Floats size against the container's full content box.
+                    // Floats are out of flow; they neither collapse nor reset the
+                    // in-flow block margin chain.
                     self.left = floats.cont_left;
                     self.right = floats.cont_right;
                     self.place_float(e, href, &mut floats);
                 }
                 StyledChild::Element(e) => {
+                    let inflow_block = is_inflow_block(e);
                     if e.style.clear != cerberus_style::Clear::None {
                         self.flush_floats(&mut floats);
                         self.left = floats.cont_left;
@@ -670,8 +681,21 @@ impl<'a> Ctx<'a> {
                         self.x = self.left;
                     } else {
                         self.flow_among_floats(&floats);
+                        // Collapse this block's top margin with the previous block
+                        // sibling's bottom margin: remove the smaller (both ≥ 0),
+                        // leaving the larger as the gap — so it can never overlap.
+                        if inflow_block {
+                            if let Some(pmb) = prev_block_mb {
+                                self.y -= pmb.min(e.style.margin_top.max(0));
+                            }
+                        }
                     }
                     self.walk(e, href);
+                    prev_block_mb = if inflow_block {
+                        Some(e.style.margin_bottom.max(0))
+                    } else {
+                        None
+                    };
                 }
             }
         }
@@ -2584,6 +2608,17 @@ fn capitalize_words(s: &str) -> String {
     out
 }
 
+/// A child that participates in adjacent-sibling vertical margin collapsing: an
+/// in-flow (non-floated, non-absolutely-positioned) block-level box.
+fn is_inflow_block(e: &StyledNode) -> bool {
+    matches!(e.style.display, Display::Block | Display::ListItem)
+        && e.style.float == cerberus_style::Float::None
+        && !matches!(
+            e.style.position,
+            cerberus_style::Position::Absolute | cerberus_style::Position::Fixed
+        )
+}
+
 fn line_height(px: u32) -> i32 {
     px as i32 + px as i32 / 2
 }
@@ -4188,6 +4223,35 @@ mod tests {
         // The leading marker sits at or before the host text's x.
         let xs = glyph_xs(&with_pseudo);
         assert_eq!(xs[0], *xs.iter().min().unwrap(), "::before leads the line");
+    }
+
+    #[test]
+    fn adjacent_block_margins_collapse_to_the_max() {
+        // bottom margin 30 then top margin 10: collapsed gap = max(30,10) = 30, so
+        // the second block sits where it would with the 10 absent (10 absorbed).
+        let collapsed = lay(
+            "<div style='margin-bottom:30px'>aaa</div><div style='margin-top:10px'>bbb</div>",
+            400,
+        );
+        let reference = lay(
+            "<div style='margin-bottom:30px'>aaa</div><div>bbb</div>",
+            400,
+        );
+        let bbb_collapsed = *glyph_ys(&collapsed).iter().max().unwrap();
+        let bbb_reference = *glyph_ys(&reference).iter().max().unwrap();
+        assert_eq!(
+            bbb_collapsed, bbb_reference,
+            "adjacent margins collapse to the max (10 absorbed into 30)"
+        );
+        // And meaningful content between the blocks prevents the collapse.
+        let separated = lay(
+            "<div style='margin-bottom:30px'>aaa</div>x<div style='margin-top:10px'>bbb</div>",
+            400,
+        );
+        assert!(
+            *glyph_ys(&separated).iter().max().unwrap() > bbb_collapsed,
+            "inline content between blocks prevents collapsing (margins sum)"
+        );
     }
 
     #[test]
