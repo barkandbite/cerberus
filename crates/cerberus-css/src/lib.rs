@@ -2471,6 +2471,45 @@ mod tests {
     }
 
     #[test]
+    fn nth_last_selectors() {
+        let dom = CssEngine::new().style(&parse_html(
+            "<style>li:nth-last-child(1){color:#ff0000} li:nth-last-child(2){color:#00ff00}</style>\
+             <ul><li>a</li><li>b</li><li>c</li></ul>",
+        ));
+        let mut lis = Vec::new();
+        collect(&dom.root, "li", &mut lis);
+        assert_eq!(
+            lis[2].style.color,
+            Color::rgb(0xff, 0, 0),
+            "nth-last-child(1) = last"
+        );
+        assert_eq!(
+            lis[1].style.color,
+            Color::rgb(0, 0xff, 0),
+            "nth-last-child(2) = 2nd from end"
+        );
+        assert_ne!(
+            lis[0].style.color,
+            Color::rgb(0xff, 0, 0),
+            "first li unaffected"
+        );
+
+        // nth-last-of-type counts same-tag from the end (ignores the <span>).
+        let dom2 = CssEngine::new().style(&parse_html(
+            "<style>p:nth-last-of-type(1){color:#0000ff}</style>\
+             <div><p>p1</p><span>s</span><p>p2</p></div>",
+        ));
+        let mut ps = Vec::new();
+        collect(&dom2.root, "p", &mut ps);
+        assert_eq!(
+            ps[1].style.color,
+            Color::rgb(0, 0, 0xff),
+            "nth-last-of-type(1) = last p"
+        );
+        assert_ne!(ps[0].style.color, Color::rgb(0, 0, 0xff));
+    }
+
+    #[test]
     fn of_type_selectors() {
         let html = "<style>\
                     p:first-of-type { color: #ff0000 } \

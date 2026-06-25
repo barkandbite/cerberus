@@ -75,11 +75,13 @@ enum Pseudo {
     FirstChild,
     LastChild,
     OnlyChild,
-    NthChild(i32, i32), // a, b  for an+b (1-based position)
+    NthChild(i32, i32),     // a, b  for an+b (1-based position)
+    NthLastChild(i32, i32), // an+b counted from the end
     FirstOfType,
     LastOfType,
     OnlyOfType,
-    NthOfType(i32, i32), // an+b among same-tag siblings (1-based)
+    NthOfType(i32, i32),     // an+b among same-tag siblings (1-based)
+    NthLastOfType(i32, i32), // an+b among same-tag siblings, from the end
     Root,
     Never, // :hover/:focus/:active/:visited/:link — no static match
 }
@@ -207,6 +209,7 @@ fn pseudo_matches(
         Pseudo::LastChild => index + 1 == total,
         Pseudo::OnlyChild => total == 1,
         Pseudo::NthChild(a, b) => nth_matches(*a, *b, pos),
+        Pseudo::NthLastChild(a, b) => nth_matches(*a, *b, total as i32 - index as i32),
         // `*-of-type` count only siblings sharing this element's tag.
         Pseudo::FirstOfType => !sibs.get(..index).unwrap_or(&[]).iter().any(same_type),
         Pseudo::LastOfType => !sibs.get(index + 1..).unwrap_or(&[]).iter().any(same_type),
@@ -219,6 +222,15 @@ fn pseudo_matches(
                 .filter(|s| same_type(s))
                 .count() as i32;
             nth_matches(*a, *b, type_pos)
+        }
+        Pseudo::NthLastOfType(a, b) => {
+            let from_end = sibs
+                .get(index..)
+                .unwrap_or(sibs)
+                .iter()
+                .filter(|s| same_type(s))
+                .count() as i32;
+            nth_matches(*a, *b, from_end)
         }
         Pseudo::Root => el.tag == "html",
         Pseudo::Never => false,
@@ -851,9 +863,19 @@ fn apply_pseudo(c: &mut Compound, name: &str, arg: &str) {
                 c.pseudos.push(Pseudo::NthChild(a, b));
             }
         }
+        "nth-last-child" => {
+            if let Some((a, b)) = parse_an_plus_b(arg) {
+                c.pseudos.push(Pseudo::NthLastChild(a, b));
+            }
+        }
         "nth-of-type" => {
             if let Some((a, b)) = parse_an_plus_b(arg) {
                 c.pseudos.push(Pseudo::NthOfType(a, b));
+            }
+        }
+        "nth-last-of-type" => {
+            if let Some((a, b)) = parse_an_plus_b(arg) {
+                c.pseudos.push(Pseudo::NthLastOfType(a, b));
             }
         }
         "not" => {
