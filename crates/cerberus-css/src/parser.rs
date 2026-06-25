@@ -491,12 +491,10 @@ pub fn parse_declaration_block(text: &str) -> Vec<(String, String)> {
         }
         if let Some((prop, value)) = chunk.split_once(':') {
             let prop = prop.trim().to_ascii_lowercase();
-            let mut value = value.trim().to_string();
-            let low = value.to_ascii_lowercase();
-            if let Some(pos) = low.rfind("!important") {
-                value.truncate(pos);
-                value = value.trim().to_string();
-            }
+            // Keep any `!important` in the value; the cascade reads it to apply
+            // important declarations in a second pass (so they win over normal
+            // ones regardless of specificity) and strips it before parsing.
+            let value = value.trim().to_string();
             if !prop.is_empty() {
                 decls.push((prop, value));
             }

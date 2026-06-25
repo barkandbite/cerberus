@@ -163,11 +163,22 @@ impl CssEngine {
             // resolves against the winning value regardless of declaration order.
             vars = collect_vars(parent_vars, &matched, inline.as_deref());
 
+            // Normal declarations in cascade order (matched rules, then inline),
+            // then a second pass for `!important` ones — so an important
+            // declaration wins over any normal one regardless of specificity
+            // (our UA sheet has no `!important`, so author/inline importance is
+            // the only tier and source order within it suffices).
             for (_, _, _, decls) in &matched {
-                apply_declarations(&mut style, decls, parent.font_size, &vars);
+                apply_declarations(&mut style, decls, parent.font_size, &vars, false);
             }
             if let Some(decls) = &inline {
-                apply_declarations(&mut style, decls, parent.font_size, &vars);
+                apply_declarations(&mut style, decls, parent.font_size, &vars, false);
+            }
+            for (_, _, _, decls) in &matched {
+                apply_declarations(&mut style, decls, parent.font_size, &vars, true);
+            }
+            if let Some(decls) = &inline {
+                apply_declarations(&mut style, decls, parent.font_size, &vars, true);
             }
         }
 
@@ -289,7 +300,7 @@ impl CssEngine {
                 }
             }
         }
-        let resolved = resolve_value(raw?, vars, em);
+        let resolved = resolve_value(split_important(raw?).0, vars, em);
         parse_content_value(resolved.trim(), node)
     }
 }
@@ -519,8 +530,9 @@ fn collect_vars(
         for (p, v) in decls {
             if p.starts_with("--") {
                 // Keys are already lowercased by the parser; store the raw value
-                // (its own `var()`s resolve lazily, at use, in `substitute_vars`).
-                map.insert(p.clone(), v.trim().to_string());
+                // (its own `var()`s resolve lazily, at use, in `substitute_vars`),
+                // minus any `!important` so it doesn't leak into substitutions.
+                map.insert(p.clone(), split_important(v).0.trim().to_string());
             }
         }
     };
@@ -813,11 +825,28 @@ impl CalcParser<'_> {
     }
 }
 
+/// Split a trailing `!important` (optional whitespace after `!`, case-insensitive)
+/// off a value, returning `(clean_value, is_important)`. Fast-paths the common
+/// case of no `!` at all.
+fn split_important(value: &str) -> (&str, bool) {
+    if !value.contains('!') {
+        return (value, false);
+    }
+    let low = value.to_ascii_lowercase();
+    if let Some(bang) = low.rfind('!') {
+        if low[bang + 1..].trim_start() == "important" {
+            return (value[..bang].trim_end(), true);
+        }
+    }
+    (value, false)
+}
+
 fn apply_declarations(
     style: &mut ComputedStyle,
     decls: &[(String, String)],
     parent_font_size: u32,
     vars: &Vars,
+    important_only: bool,
 ) {
     for (prop, value) in decls {
         // Custom properties are collected separately (`collect_vars`); they do
@@ -825,9 +854,16 @@ fn apply_declarations(
         if prop.starts_with("--") {
             continue;
         }
+        // Two-pass cascade: this call applies only normal *or* only important
+        // declarations, so the important pass (run after the normal one) wins
+        // regardless of specificity. Strip `!important` before parsing.
+        let (clean, important) = split_important(value);
+        if important != important_only {
+            continue;
+        }
         // Resolve `var()` references and `calc()` math before parsing the value.
         // `em` for `calc()` uses the element's current font size.
-        let resolved = resolve_value(value, vars, style.font_size as f32);
+        let resolved = resolve_value(clean, vars, style.font_size as f32);
         let v = resolved.trim();
         match prop.as_str() {
             "color" => {
@@ -2196,6 +2232,34 @@ mod tests {
         let p = first(&dom.root, "p").unwrap();
         // inline beats #id beats type.
         assert_eq!(p.style.color, Color::rgb(0, 0, 255));
+    }
+
+    #[test]
+    fn important_wins_over_higher_specificity_and_inline_normal() {
+        // `#x` is more specific than `.c`, and inline normally beats both — but a
+        // `!important` declaration wins over every normal one regardless.
+        let html = "<style>#x { color: #00ff00 } .c { color: #ff0000 !important }</style>\
+                    <p id='x' class='c' style='color: #0000ff'>hi</p>";
+        let dom = CssEngine::new().style(&parse_html(html));
+        let p = first(&dom.root, "p").unwrap();
+        assert_eq!(
+            p.style.color,
+            Color::rgb(0xff, 0, 0),
+            "!important beats #id and inline-normal"
+        );
+    }
+
+    #[test]
+    fn inline_important_beats_author_important() {
+        let html = "<style>p { color: #00ff00 !important }</style>\
+                    <p style='color: #0000ff !important'>hi</p>";
+        let dom = CssEngine::new().style(&parse_html(html));
+        let p = first(&dom.root, "p").unwrap();
+        assert_eq!(
+            p.style.color,
+            Color::rgb(0, 0, 0xff),
+            "inline !important wins over author !important (source order)"
+        );
     }
 
     #[test]
