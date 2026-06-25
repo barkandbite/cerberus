@@ -175,6 +175,49 @@ fn console_log_is_captured() {
 }
 
 #[test]
+fn programmatic_click_dispatches_and_is_connected_tracks_tree() {
+    let (mut engine, realm) = engine_and_realm();
+    let doc = doc_with_div_x();
+    let scripts = vec!["globalThis.__log = []; \
+         var x = document.getElementById('x'); \
+         document.body.addEventListener('click', function (e) { \
+            globalThis.__log.push('bubbled:' + e.target.id + ':' + (e instanceof MouseEvent)); }); \
+         x.click(); \
+         var d = document.createElement('div'); \
+         globalThis.__log.push('detached:' + d.isConnected); \
+         document.body.appendChild(d); \
+         globalThis.__log.push('attached:' + d.isConnected); \
+         globalThis.__log.push('xconn:' + x.isConnected);"
+        .to_string()];
+    run_page_scripts(engine.as_mut(), realm, &doc, &scripts, &env()).expect("run");
+
+    let log = engine
+        .eval(realm, "globalThis.__log.join('|')")
+        .expect("read __log");
+    match log {
+        JsValue::Str(s) => {
+            assert!(
+                s.contains("bubbled:x:true"),
+                "click() should dispatch a bubbling MouseEvent to a delegated listener; got {s:?}"
+            );
+            assert!(
+                s.contains("detached:false"),
+                "createElement'd node not connected; got {s:?}"
+            );
+            assert!(
+                s.contains("attached:true"),
+                "connected after appendChild; got {s:?}"
+            );
+            assert!(
+                s.contains("xconn:true"),
+                "in-document element is connected; got {s:?}"
+            );
+        }
+        other => panic!("expected string, got {other:?}"),
+    }
+}
+
+#[test]
 fn local_storage_seeds_from_env_and_snapshots_back() {
     let (mut engine, realm) = engine_and_realm();
     let doc = doc_with_div_x();

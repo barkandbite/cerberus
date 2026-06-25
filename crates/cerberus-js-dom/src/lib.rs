@@ -2196,6 +2196,14 @@ pub const DOM_MODEL_PRELUDE: &str = r##"
     ELEMENT_PROTO.scrollIntoView = function () {};
     ELEMENT_PROTO.focus = function () {};
     ELEMENT_PROTO.blur = function () {};
+    // Programmatic click: dispatch a real bubbling, cancelable click event so the
+    // element's own (and delegated) click handlers run — `el.click()` is how SPAs
+    // trigger file inputs, submit forms, and simulate user clicks. (MouseEvent is
+    // defined later in the prelude but resolves at call time.)
+    ELEMENT_PROTO.click = function () {
+      var Ctor = (typeof g.MouseEvent === "function") ? g.MouseEvent : g.Event;
+      this.dispatchEvent(new Ctor("click", { bubbles: true, cancelable: true }));
+    };
     ELEMENT_PROTO.getClientRects = function () {
       var r = (typeof this.getBoundingClientRect === "function")
         ? this.getBoundingClientRect()
@@ -2207,6 +2215,16 @@ pub const DOM_MODEL_PRELUDE: &str = r##"
       return false;
     };
     NODE_PROTO.hasChildNodes = function () { return this.__kids.length > 0; };
+    // isConnected: whether the node is in the live document tree (commonly checked
+    // before measuring/animating a node, or to detect detached subtrees).
+    Object.defineProperty(NODE_PROTO, "isConnected", {
+      get: function () {
+        var root = g.document && g.document.documentElement;
+        for (var n = this; n; n = n.__parent) if (n === root || n === g.document) return true;
+        return false;
+      },
+      configurable: true,
+    });
 
     // -- elements (ELEMENT_PROTO) --
     defAccessor(ELEMENT_PROTO, "tagName", function () { return this.__tag.toUpperCase(); });
