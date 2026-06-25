@@ -715,7 +715,13 @@ impl<'a> Ctx<'a> {
                     + style.border_top
                     + style.border_bottom;
                 let natural = (self.y - bx.top).max(0);
-                let sized = resolve_block_height(style, natural, v_extra, self.vw, self.vh);
+                let h_extra = style.padding_left
+                    + style.padding_right
+                    + style.border_left
+                    + style.border_right;
+                let content_w = (bx.right - bx.left - h_extra).max(0);
+                let sized =
+                    resolve_block_height(style, natural, v_extra, content_w, self.vw, self.vh);
                 self.y = bx.top + sized;
                 let h = (self.y - bx.top).max(0) as u32;
                 if h > 0 {
@@ -1890,7 +1896,10 @@ impl<'a> Ctx<'a> {
         // justify-content as the vertical proxy.
         let v_extra = s.padding_top + s.padding_bottom + s.border_top + s.border_bottom;
         let natural = (self.y - box_top).max(0);
-        let sized = resolve_block_height(s, natural, v_extra, self.vw, self.vh);
+        // aspect-ratio on a flex *container* itself is uncommon and its content
+        // width isn't readily available here (items get aspect-ratio via their own
+        // block close), so pass 0 to skip it.
+        let sized = resolve_block_height(s, natural, v_extra, 0, self.vw, self.vh);
         if sized > natural {
             let extra = sized - natural;
             let vrt = matches!(s.flex_direction, FlexDirection::Row);
@@ -2366,7 +2375,9 @@ impl<'a> Ctx<'a> {
         // Apply height/min-height/max-height to the grid container (ADR-0042).
         let v_extra = s.padding_top + s.padding_bottom + s.border_top + s.border_bottom;
         let natural = (self.y - box_top).max(0);
-        self.y = box_top + resolve_block_height(s, natural, v_extra, self.vw, self.vh);
+        // (Grid container aspect-ratio: as with flex, pass 0 — items size via their
+        // own block close.)
+        self.y = box_top + resolve_block_height(s, natural, v_extra, 0, self.vw, self.vh);
 
         let h = (self.y - box_top).max(0) as u32;
         if h > 0 {
@@ -2801,6 +2812,7 @@ fn resolve_block_height(
     style: &ComputedStyle,
     natural: i32,
     v_extra: i32,
+    content_width: i32,
     vw: i32,
     vh: i32,
 ) -> i32 {
@@ -2816,6 +2828,18 @@ fn resolve_block_height(
         cerberus_style::BoxSizing::ContentBox => v + v_extra,
     };
     let mut h = res(style.height).map(adjust).unwrap_or(natural);
+    // `aspect-ratio`: when the height isn't an explicit length, size the box from
+    // its content width (`width / ratio`, as a border-box height), but never below
+    // the natural content height — so taller content is never clipped. Gated on
+    // `aspect_ratio` being set, so non-aspect boxes are unaffected.
+    if res(style.height).is_none() {
+        if let (Some(ratio), true) = (style.aspect_ratio, content_width > 0) {
+            if ratio > 0.0 {
+                let aspect_h = ((content_width as f32 / ratio).round() as i32 + v_extra).max(0);
+                h = h.max(aspect_h);
+            }
+        }
+    }
     if let Some(min) = res(style.min_height) {
         h = h.max(adjust(min));
     }
@@ -4223,6 +4247,26 @@ mod tests {
         // The leading marker sits at or before the host text's x.
         let xs = glyph_xs(&with_pseudo);
         assert_eq!(xs[0], *xs.iter().min().unwrap(), "::before leads the line");
+    }
+
+    #[test]
+    fn aspect_ratio_sizes_height_from_width() {
+        // width 200 + aspect-ratio 2/1 → height 100; the following block starts at
+        // y=100. Without aspect-ratio the empty box has no height (gated).
+        let with_ar = lay(
+            "<div style='width:200px; aspect-ratio:2/1'></div><div>after</div>",
+            400,
+        );
+        let without = lay("<div style='width:200px'></div><div>after</div>", 400);
+        let y_with = *glyph_ys(&with_ar).iter().min().unwrap();
+        let y_without = *glyph_ys(&without).iter().min().unwrap();
+        // The empty box contributes 0 height without aspect-ratio and exactly 100
+        // (200/2) with it — so the following block drops by 100.
+        assert_eq!(
+            y_with - y_without,
+            100,
+            "aspect-ratio:2/1 on width:200 adds 100px of height (gated)"
+        );
     }
 
     #[test]

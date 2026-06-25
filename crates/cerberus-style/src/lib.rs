@@ -395,6 +395,10 @@ pub struct ComputedStyle {
     /// element's own size. `None` when no (supported) transform. Scale/rotate/
     /// matrix and animated transforms are not modeled (v1).
     pub transform_translate: Option<(Len, Len)>,
+    /// `aspect-ratio` as width÷height; when set and the height is `auto`, the box
+    /// is sized to at least `width / ratio` (never clipping taller content). Not
+    /// inherited.
+    pub aspect_ratio: Option<f32>,
 }
 
 impl ComputedStyle {
@@ -481,6 +485,7 @@ impl ComputedStyle {
             inset_left: Len::Auto,
             z_index: None,
             transform_translate: None,
+            aspect_ratio: None,
         }
     }
 
@@ -572,6 +577,7 @@ impl ComputedStyle {
             inset_left: Len::Auto,
             z_index: None,
             transform_translate: None,
+            aspect_ratio: None,
         }
     }
 }

@@ -948,6 +948,22 @@ fn split_important(value: &str) -> (&str, bool) {
     (value, false)
 }
 
+/// Parse `aspect-ratio` (`16 / 9`, `1.5`, `auto 4/3`, …) to width÷height. The
+/// `auto` keyword is ignored (we don't have a replaced-element intrinsic ratio to
+/// combine it with); a bare/zero/invalid ratio yields `None`.
+fn parse_aspect_ratio(v: &str) -> Option<f32> {
+    let cleaned = v.to_ascii_lowercase().replace("auto", " ");
+    let cleaned = cleaned.trim();
+    if cleaned.is_empty() {
+        return None;
+    }
+    let (w, h) = match cleaned.split_once('/') {
+        Some((w, h)) => (w.trim().parse::<f32>().ok()?, h.trim().parse::<f32>().ok()?),
+        None => (cleaned.parse::<f32>().ok()?, 1.0),
+    };
+    (w > 0.0 && h > 0.0).then_some(w / h)
+}
+
 fn parse_align_items(v: &str) -> AlignItems {
     match v.to_ascii_lowercase().as_str() {
         "center" => AlignItems::Center,
@@ -1178,6 +1194,7 @@ fn apply_declarations(
             "min-height" => {
                 style.min_height = parse_inset(v, style.font_size as f32).unwrap_or(Len::Auto)
             }
+            "aspect-ratio" => style.aspect_ratio = parse_aspect_ratio(v),
             "float" => {
                 style.float = match v.trim().to_ascii_lowercase().as_str() {
                     "left" => Float::Left,
@@ -2600,6 +2617,16 @@ mod tests {
         let div = first(&dom.root, "div").unwrap();
         // Two tracks parsed (the minmax wasn't corrupted into a single px value).
         assert_eq!(div.style.grid_template_columns.len(), 2);
+    }
+
+    #[test]
+    fn aspect_ratio_parses_ratios() {
+        assert_eq!(parse_aspect_ratio("16 / 9"), Some(16.0 / 9.0));
+        assert_eq!(parse_aspect_ratio("1.5"), Some(1.5));
+        assert_eq!(parse_aspect_ratio("auto 4/3"), Some(4.0 / 3.0));
+        assert_eq!(parse_aspect_ratio("auto"), None);
+        assert_eq!(parse_aspect_ratio("0 / 1"), None);
+        assert_eq!(parse_aspect_ratio("nonsense"), None);
     }
 
     #[test]
