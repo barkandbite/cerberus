@@ -483,6 +483,20 @@ impl<'a> Ctx<'a> {
         } else {
             None
         };
+        // Capture the same output range for a `transform: translate(...)` element,
+        // so the tail can offset its painted box + subtree (block/inline path).
+        let xform_base = if node.style.transform_translate.is_some() {
+            Some(PosBase {
+                disp: self.display.items.len(),
+                links: self.links.len(),
+                fields: self.fields.len(),
+                elements: self.elements.len(),
+                y: self.y,
+                x: self.left0,
+            })
+        } else {
+            None
+        };
 
         // An out-of-flow box (`absolute`/`fixed`) uses its **shrink-to-fit**
         // content width (or, when both left & right are set, the stretched width),
@@ -708,6 +722,31 @@ impl<'a> Ctx<'a> {
         }
         if let Some(base) = pos_base {
             self.apply_positioning(&node.style, base);
+        }
+        // transform: translate(...) — offset the element's painted output in place
+        // (% relative to its own size). Composes with relative; out-of-flow boxes
+        // are positioned by their insets instead (v1).
+        if let (Some(xb), Some((tx, ty)), false) =
+            (xform_base, node.style.transform_translate, out_of_flow)
+        {
+            let ew = (self.right - self.left0).max(0);
+            let eh = (self.y - xb.y).max(0);
+            let dx = tx.resolve_vp(ew, self.vw, self.vh).unwrap_or(0);
+            let dy = ty.resolve_vp(eh, self.vw, self.vh).unwrap_or(0);
+            if dx != 0 || dy != 0 {
+                for it in &mut self.display.items[xb.disp..] {
+                    translate_item(it, dx, dy);
+                }
+                for l in &mut self.links[xb.links..] {
+                    l.rect = offset_rect(l.rect, dx, dy);
+                }
+                for f in &mut self.fields[xb.fields..] {
+                    f.rect = offset_rect(f.rect, dx, dy);
+                }
+                for e in &mut self.elements[xb.elements..] {
+                    e.rect = offset_rect(e.rect, dx, dy);
+                }
+            }
         }
         if let Some(r) = saved_right {
             self.right = r;
@@ -4680,6 +4719,23 @@ mod tests {
         // B shifted by the insets.
         assert_eq!(gr[1].0, gp[1].0 + 25, "B shifted right by left:25");
         assert_eq!(gr[1].1, gp[1].1 + 10, "B shifted down by top:10");
+    }
+
+    #[test]
+    fn transform_translate_offsets_the_painted_box_without_affecting_flow() {
+        // transform: translate shifts B's painted glyphs but (unlike margins)
+        // doesn't change the following element's flow position.
+        let plain = lay("<p>A</p><p>B</p><p>C</p>", 400);
+        let xf = lay(
+            "<p>A</p><p style=\"transform:translate(25px,10px)\">B</p><p>C</p>",
+            400,
+        );
+        let (gp, gx) = (glyph_xy(&plain), glyph_xy(&xf));
+        assert_eq!(gp.len(), 3);
+        assert_eq!(gx.len(), 3);
+        assert_eq!(gx[2].1, gp[2].1, "transform doesn't change following flow");
+        assert_eq!(gx[1].0, gp[1].0 + 25, "B translated right by 25");
+        assert_eq!(gx[1].1, gp[1].1 + 10, "B translated down by 10");
     }
 
     #[test]

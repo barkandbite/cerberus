@@ -373,6 +373,11 @@ pub struct ComputedStyle {
     pub inset_bottom: Len,
     pub inset_left: Len,
     pub z_index: Option<i32>,
+    /// `transform: translate(x, y)` (and `translateX`/`translateY`). A static
+    /// paint-time offset of the element's box + subtree; `%` is relative to the
+    /// element's own size. `None` when no (supported) transform. Scale/rotate/
+    /// matrix and animated transforms are not modeled (v1).
+    pub transform_translate: Option<(Len, Len)>,
 }
 
 impl ComputedStyle {
@@ -453,6 +458,7 @@ impl ComputedStyle {
             inset_bottom: Len::Auto,
             inset_left: Len::Auto,
             z_index: None,
+            transform_translate: None,
         }
     }
 
@@ -538,6 +544,7 @@ impl ComputedStyle {
             inset_bottom: Len::Auto,
             inset_left: Len::Auto,
             z_index: None,
+            transform_translate: None,
         }
     }
 }

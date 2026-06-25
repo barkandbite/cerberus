@@ -892,6 +892,11 @@ fn apply_declarations(
                     style.z_index = Some(n);
                 }
             }
+            "transform" => {
+                // Static translate only (translate/translateX/translateY/translate3d).
+                // Scale/rotate/matrix and animated transforms are not modeled (v1).
+                style.transform_translate = parse_transform_translate(v, style.font_size as f32);
+            }
             "flex-direction" => {
                 let low = v.to_ascii_lowercase();
                 style.flex_direction = match low.as_str() {
@@ -1635,6 +1640,39 @@ fn parse_css_px(v: &str, em_base: f32) -> Option<f32> {
 }
 
 /// Parse a `top`/`right`/`bottom`/`left` inset: `auto`, a px length, or a `%`
+/// Extract the argument string of `name(...)` from a (lowercased) value.
+fn func_args<'a>(s: &'a str, name: &str) -> Option<&'a str> {
+    let open = s.find(&format!("{name}("))? + name.len() + 1;
+    let rest = &s[open..];
+    let close = rest.find(')')?;
+    Some(&rest[..close])
+}
+
+/// Parse the `translate` component of a `transform` value into `(x, y)` lengths
+/// (px or %). Other transform functions (scale/rotate/matrix) are ignored.
+fn parse_transform_translate(v: &str, em_base: f32) -> Option<(Len, Len)> {
+    let low = v.trim().to_ascii_lowercase();
+    let comp = |s: &str| -> Option<Len> {
+        let s = s.trim();
+        if s == "0" {
+            Some(Len::Px(0))
+        } else {
+            parse_inset(s, em_base)
+        }
+    };
+    if let Some(args) = func_args(&low, "translatex") {
+        return Some((comp(args)?, Len::Px(0)));
+    }
+    if let Some(args) = func_args(&low, "translatey") {
+        return Some((Len::Px(0), comp(args)?));
+    }
+    let args = func_args(&low, "translate3d").or_else(|| func_args(&low, "translate"))?;
+    let mut parts = args.split(',');
+    let x = comp(parts.next()?)?;
+    let y = parts.next().and_then(comp).unwrap_or(Len::Px(0));
+    Some((x, y))
+}
+
 /// (kept as a percentage for resolution against the containing block at layout).
 fn parse_inset(v: &str, em_base: f32) -> Option<Len> {
     let v = v.trim().to_ascii_lowercase();
