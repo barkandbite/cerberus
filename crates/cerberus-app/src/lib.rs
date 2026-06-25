@@ -1660,6 +1660,87 @@ const IMAGE_DECODE_BUDGET_BYTES: usize = 16 * 1024 * 1024;
 /// pool — browser-like — overlaps the network waits without unbounded sockets.
 const IMAGE_FETCH_CONCURRENCY: usize = 8;
 
+/// Decode standard base64 (ignoring whitespace; `=` padding ends input).
+fn base64_decode(input: &str) -> Option<Vec<u8>> {
+    fn val(c: u8) -> Option<u8> {
+        match c {
+            b'A'..=b'Z' => Some(c - b'A'),
+            b'a'..=b'z' => Some(c - b'a' + 26),
+            b'0'..=b'9' => Some(c - b'0' + 52),
+            b'+' => Some(62),
+            b'/' => Some(63),
+            _ => None,
+        }
+    }
+    let mut out = Vec::with_capacity(input.len() / 4 * 3);
+    let mut chunk = [0u8; 4];
+    let mut n = 0;
+    for b in input.bytes() {
+        if b == b'=' {
+            break;
+        }
+        if b.is_ascii_whitespace() {
+            continue;
+        }
+        chunk[n] = val(b)?;
+        n += 1;
+        if n == 4 {
+            out.push((chunk[0] << 2) | (chunk[1] >> 4));
+            out.push((chunk[1] << 4) | (chunk[2] >> 2));
+            out.push((chunk[2] << 6) | chunk[3]);
+            n = 0;
+        }
+    }
+    if n >= 2 {
+        out.push((chunk[0] << 2) | (chunk[1] >> 4));
+        if n == 3 {
+            out.push((chunk[1] << 4) | (chunk[2] >> 2));
+        }
+    }
+    Some(out)
+}
+
+/// Percent-decode a `data:` URL's non-base64 payload (e.g. inline SVG).
+fn percent_decode(s: &str) -> Vec<u8> {
+    fn hex(c: u8) -> Option<u8> {
+        match c {
+            b'0'..=b'9' => Some(c - b'0'),
+            b'a'..=b'f' => Some(c - b'a' + 10),
+            b'A'..=b'F' => Some(c - b'A' + 10),
+            _ => None,
+        }
+    }
+    let b = s.as_bytes();
+    let mut out = Vec::with_capacity(b.len());
+    let mut i = 0;
+    while i < b.len() {
+        if b[i] == b'%' && i + 2 < b.len() {
+            if let (Some(h), Some(l)) = (hex(b[i + 1]), hex(b[i + 2])) {
+                out.push((h << 4) | l);
+                i += 3;
+                continue;
+            }
+        }
+        out.push(b[i]);
+        i += 1;
+    }
+    out
+}
+
+/// Decode a `data:[<mediatype>][;base64],<payload>` image into pixels. No network.
+fn decode_data_url_image(url: &str, codec: &ImageCodec) -> Option<DecodedImage> {
+    let rest = url.strip_prefix("data:")?;
+    let comma = rest.find(',')?;
+    let meta = &rest[..comma];
+    let payload = &rest[comma + 1..];
+    let bytes = if meta.contains(";base64") {
+        base64_decode(payload)?
+    } else {
+        percent_decode(payload)
+    };
+    codec.decode(&bytes).ok()
+}
+
 #[allow(clippy::too_many_arguments)]
 fn fetch_images_sync(
     document: &Document,
@@ -1676,20 +1757,40 @@ fn fetch_images_sync(
     collect_bg_image_urls(&styled.root, &mut srcs);
 
     let mut urls: Vec<String> = Vec::new();
+    let mut data_urls: Vec<String> = Vec::new();
     for src in srcs {
         let abs = resolve_subresource(Some(base), &src);
-        if (abs.starts_with("http://") || abs.starts_with("https://")) && !urls.contains(&abs) {
+        if abs.starts_with("data:") {
+            if !data_urls.contains(&abs) {
+                data_urls.push(abs);
+            }
+        } else if (abs.starts_with("http://") || abs.starts_with("https://"))
+            && !urls.contains(&abs)
+        {
             urls.push(abs);
         }
     }
+
+    let mut out: HashMap<String, ImageState> = HashMap::with_capacity(urls.len() + data_urls.len());
+    // `data:` URL images decode inline — no network, no consent gate (same-document
+    // content, like inline CSS). Many sites use them for icons/logos; they were
+    // dropped entirely before.
+    if !data_urls.is_empty() {
+        let codec = ImageCodec::new();
+        for du in data_urls {
+            let state = decode_data_url_image(&du, &codec)
+                .map(|img| ImageState::Ready(Arc::new(img)))
+                .unwrap_or(ImageState::Failed);
+            out.insert(du, state);
+        }
+    }
     if urls.is_empty() {
-        return HashMap::new();
+        return out;
     }
 
     // Consent gate up front (one lock pass, in document order): unruled
     // third-party subresources never hit the network and are recorded Blocked;
     // the rest become the fetch work-list.
-    let mut out: HashMap<String, ImageState> = HashMap::with_capacity(urls.len());
     let mut allowed: Vec<String> = Vec::with_capacity(urls.len());
     {
         let mut pol = policy.locked();
@@ -5342,6 +5443,24 @@ mod tests {
                 kb as f64 / 1024.0
             );
         }
+    }
+
+    #[test]
+    fn base64_percent_and_data_url_image_decode() {
+        // base64 against known vectors.
+        assert_eq!(base64_decode("TWFu").unwrap(), b"Man");
+        assert_eq!(base64_decode("YQ==").unwrap(), b"a");
+        assert_eq!(base64_decode("YWI=").unwrap(), b"ab");
+        assert_eq!(base64_decode("YWJj").unwrap(), b"abc");
+        assert!(base64_decode("@@@@").is_none());
+        // percent-decode (data: SVG payloads).
+        assert_eq!(percent_decode("%3Csvg%3E"), b"<svg>");
+        // A real 1x1 PNG data URL decodes to an image; a non-data URL does not.
+        let url = "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg==";
+        let payload = &url["data:image/png;base64,".len()..];
+        assert_eq!(&base64_decode(payload).unwrap()[..4], &[137, 80, 78, 71]); // PNG signature
+        assert!(decode_data_url_image(url, &ImageCodec::new()).is_some());
+        assert!(decode_data_url_image("https://x/y.png", &ImageCodec::new()).is_none());
     }
 
     #[test]
