@@ -631,7 +631,7 @@ impl<'a> Ctx<'a> {
             self.right = (box_left + box_w - br - pr).max(self.left + 1);
             self.y += style.border_top + style.padding_top;
             self.x = self.left;
-            if visible && style.display == Display::ListItem {
+            if visible && style.display == Display::ListItem && !style.list_style_none {
                 self.add_run("\u{2022}", style, None);
                 self.x += space_width(self.shaper, style.font_size.max(1)) as i32;
             }
@@ -4150,6 +4150,19 @@ mod tests {
         // The leading marker sits at or before the host text's x.
         let xs = glyph_xs(&with_pseudo);
         assert_eq!(xs[0], *xs.iter().min().unwrap(), "::before leads the line");
+    }
+
+    #[test]
+    fn list_style_none_suppresses_the_bullet() {
+        let with_bullet = lay("<ul><li>a</li></ul>", 400);
+        let no_bullet = lay("<ul style='list-style:none'><li>a</li></ul>", 400);
+        // The only glyph difference is the marker (inherited from the <ul>).
+        assert_eq!(
+            total_glyphs(&with_bullet),
+            total_glyphs(&no_bullet) + 1,
+            "list-style:none removes exactly the bullet"
+        );
+        assert!(total_glyphs(&no_bullet) >= 1, "the item text still renders");
     }
 
     #[test]

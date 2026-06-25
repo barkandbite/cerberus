@@ -315,6 +315,10 @@ pub struct ComputedStyle {
     /// `white-space: nowrap` — collapse whitespace but never break lines.
     /// Inherited (whitespace inherits).
     pub nowrap: bool,
+    /// `list-style[-type]: none` — suppress the list-item marker (bullet).
+    /// Inherited (list-style-type inherits), so `ul { list-style: none }`
+    /// silences its descendant `<li>` markers.
+    pub list_style_none: bool,
     /// `visibility: hidden` — laid out but not painted. Inherited.
     pub visibility: Visibility,
     /// `opacity` in `[0.0, 1.0]`, composited in paint. Not inherited.
@@ -431,6 +435,7 @@ impl ComputedStyle {
             background_position: ImagePos::TOP_LEFT,
             preformatted: false,
             nowrap: false,
+            list_style_none: false,
             visibility: Visibility::Visible,
             opacity: 1.0,
             flex_direction: FlexDirection::Row,
@@ -480,6 +485,7 @@ impl ComputedStyle {
             letter_spacing: self.letter_spacing,
             preformatted: self.preformatted,
             nowrap: self.nowrap,
+            list_style_none: self.list_style_none,
             visibility: self.visibility,
             // Reset per element:
             display: Display::Inline,

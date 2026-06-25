@@ -1295,6 +1295,16 @@ fn apply_declarations(
                 style.preformatted = low.starts_with("pre");
                 style.nowrap = low == "nowrap";
             }
+            // We render only the disc marker; the meaningful distinction is
+            // none vs. a marker. `list-style` is the shorthand (type/position/
+            // image) — `none` anywhere in it suppresses the marker.
+            "list-style-type" => style.list_style_none = v.trim().eq_ignore_ascii_case("none"),
+            "list-style" => {
+                style.list_style_none = v
+                    .to_ascii_lowercase()
+                    .split_whitespace()
+                    .any(|t| t == "none")
+            }
             "visibility" => {
                 style.visibility = match v.to_ascii_lowercase().as_str() {
                     "hidden" | "collapse" => Visibility::Hidden,
