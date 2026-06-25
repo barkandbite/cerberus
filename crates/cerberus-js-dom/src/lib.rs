@@ -1503,10 +1503,22 @@ pub const DOM_MODEL_PRELUDE: &str = r##"
       g.__cerberusConsole = [];
       try { return JSON.stringify(out); } catch (e) { return "[]"; }
     };
-    // Record a host-detected script error as an error-level console entry, so a
-    // thrown `<script>` surfaces through the same drain (carrying its JS stack).
+    // Record a host-detected script error as an error-level console entry (so a
+    // thrown `<script>` surfaces through the console drain carrying its JS stack)
+    // AND run the page's uncaught-error hooks: window.onerror, then an `error`
+    // event on window. (window/Event are defined later in the prelude but resolve
+    // at call time — this runs only when a script actually throws.) Every step is
+    // guarded so reporting an error can never itself throw.
     g.__cerberusRecordError = function (text) {
-      try { g.__cerberusConsole.push({ level: "error", text: String(text) }); } catch (e) {}
+      var msg = String(text);
+      try { g.__cerberusConsole.push({ level: "error", text: msg }); } catch (e) {}
+      try {
+        var w = g.window || g;
+        if (typeof w.onerror === "function") { try { w.onerror(msg); } catch (e) {} }
+        if (typeof w.dispatchEvent === "function" && typeof g.Event === "function") {
+          try { w.dispatchEvent(new g.Event("error")); } catch (e) {}
+        }
+      } catch (e) {}
     };
 
     // ---- node model ----------------------------------------------------

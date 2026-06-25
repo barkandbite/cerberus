@@ -240,6 +240,37 @@ fn console_levels_and_thrown_script_error_surface() {
 }
 
 #[test]
+fn uncaught_script_error_fires_window_onerror_and_error_event() {
+    let (mut engine, realm) = engine_and_realm();
+    let doc = doc_with_div_x();
+    let scripts = vec![
+        "globalThis.__errs = []; \
+         window.onerror = function (m) { globalThis.__errs.push('onerror:' + m); }; \
+         window.addEventListener('error', function () { globalThis.__errs.push('listener'); });"
+            .to_string(),
+        "throw new Error('kaboom-onerror')".to_string(),
+    ];
+    run_page_scripts(engine.as_mut(), realm, &doc, &scripts, &env()).expect("run");
+
+    let joined = engine
+        .eval(realm, "(globalThis.__errs || []).join('|')")
+        .expect("read __errs");
+    match joined {
+        JsValue::Str(s) => {
+            assert!(
+                s.contains("onerror:") && s.contains("kaboom-onerror"),
+                "window.onerror should fire with the thrown message; got {s:?}"
+            );
+            assert!(
+                s.contains("listener"),
+                "an 'error' event listener on window should fire; got {s:?}"
+            );
+        }
+        other => panic!("expected string, got {other:?}"),
+    }
+}
+
+#[test]
 fn speed_first_still_applies() {
     let (mut engine, realm) = engine_and_realm();
     let doc = doc_with_div_x();
