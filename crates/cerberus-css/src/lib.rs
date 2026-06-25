@@ -1290,7 +1290,11 @@ fn apply_declarations(
             "border-right-width" => set_len(&mut style.border_right, v, style.font_size as f32),
             "border-bottom-width" => set_len(&mut style.border_bottom, v, style.font_size as f32),
             "border-left-width" => set_len(&mut style.border_left, v, style.font_size as f32),
-            "white-space" => style.preformatted = v.to_ascii_lowercase().starts_with("pre"),
+            "white-space" => {
+                let low = v.trim().to_ascii_lowercase();
+                style.preformatted = low.starts_with("pre");
+                style.nowrap = low == "nowrap";
+            }
             "visibility" => {
                 style.visibility = match v.to_ascii_lowercase().as_str() {
                     "hidden" | "collapse" => Visibility::Hidden,

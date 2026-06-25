@@ -953,7 +953,8 @@ impl<'a> Ctx<'a> {
         } else {
             space_width(self.shaper, px) as i32
         };
-        if self.x != self.left && self.x + gap + w as i32 > self.right {
+        // `white-space: nowrap` never breaks the line (it overflows instead).
+        if !style.nowrap && self.x != self.left && self.x + gap + w as i32 > self.right {
             self.newline();
         } else {
             self.x += gap;
@@ -4149,6 +4150,23 @@ mod tests {
         // The leading marker sits at or before the host text's x.
         let xs = glyph_xs(&with_pseudo);
         assert_eq!(xs[0], *xs.iter().min().unwrap(), "::before leads the line");
+    }
+
+    #[test]
+    fn nowrap_keeps_text_on_one_line() {
+        // In a narrow container, normal text wraps to multiple lines; nowrap stays
+        // on one line (overflowing instead of breaking).
+        let wrapped = lay("<div style='width:40px'>one two three four five</div>", 400);
+        let nowrap = lay(
+            "<div style='width:40px; white-space:nowrap'>one two three four five</div>",
+            400,
+        );
+        assert!(distinct(&glyph_ys(&wrapped)) > 1, "normal text should wrap");
+        assert_eq!(
+            distinct(&glyph_ys(&nowrap)),
+            1,
+            "white-space:nowrap stays on one line"
+        );
     }
 
     #[test]
