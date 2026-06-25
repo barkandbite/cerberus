@@ -1218,6 +1218,45 @@ fn apply_declarations(
             "padding-right" => set_len(&mut style.padding_right, v, style.font_size as f32),
             "padding-bottom" => set_len(&mut style.padding_bottom, v, style.font_size as f32),
             "padding-left" => set_len(&mut style.padding_left, v, style.font_size as f32),
+            // Logical margin/padding → physical, for the default horizontal-tb / ltr
+            // writing mode (block axis = vertical, inline axis = horizontal). These
+            // are increasingly common in modern CSS. (margin-right has no value
+            // field in normal block flow — only the `auto` centering flag — so
+            // `margin-inline-end` mirrors the physical `margin-right` arm.)
+            "margin-block-start" => set_margin(&mut style.margin_top, v, style.font_size as f32),
+            "margin-block-end" => set_margin(&mut style.margin_bottom, v, style.font_size as f32),
+            "margin-inline-start" => {
+                style.margin_left_auto = v.trim().eq_ignore_ascii_case("auto");
+                set_margin(&mut style.margin_left, v, style.font_size as f32);
+            }
+            "margin-inline-end" => {
+                style.margin_right_auto = v.trim().eq_ignore_ascii_case("auto");
+            }
+            "margin-block" => {
+                let (a, b) = two_values(v);
+                set_margin(&mut style.margin_top, a, style.font_size as f32);
+                set_margin(&mut style.margin_bottom, b, style.font_size as f32);
+            }
+            "margin-inline" => {
+                let (a, b) = two_values(v);
+                style.margin_left_auto = a.trim().eq_ignore_ascii_case("auto");
+                style.margin_right_auto = b.trim().eq_ignore_ascii_case("auto");
+                set_margin(&mut style.margin_left, a, style.font_size as f32);
+            }
+            "padding-block-start" => set_len(&mut style.padding_top, v, style.font_size as f32),
+            "padding-block-end" => set_len(&mut style.padding_bottom, v, style.font_size as f32),
+            "padding-inline-start" => set_len(&mut style.padding_left, v, style.font_size as f32),
+            "padding-inline-end" => set_len(&mut style.padding_right, v, style.font_size as f32),
+            "padding-block" => {
+                let (a, b) = two_values(v);
+                set_len(&mut style.padding_top, a, style.font_size as f32);
+                set_len(&mut style.padding_bottom, b, style.font_size as f32);
+            }
+            "padding-inline" => {
+                let (a, b) = two_values(v);
+                set_len(&mut style.padding_left, a, style.font_size as f32);
+                set_len(&mut style.padding_right, b, style.font_size as f32);
+            }
             "border" => apply_border(style, v, [true, true, true, true]),
             "border-top" => apply_border(style, v, [true, false, false, false]),
             "border-right" => apply_border(style, v, [false, true, false, false]),
@@ -2206,6 +2245,23 @@ fn set_len(field: &mut i32, v: &str, em: f32) {
     }
 }
 
+/// Set a margin px field from a length value (no-op if it doesn't parse). Unlike
+/// [`set_len`], margins may be negative.
+fn set_margin(field: &mut i32, v: &str, em: f32) {
+    if let Some(n) = parse_len(v, em) {
+        *field = n;
+    }
+}
+
+/// Split a value into its first two whitespace-separated tokens, the second
+/// defaulting to the first (the 1-or-2-value box shorthand pattern).
+fn two_values(v: &str) -> (&str, &str) {
+    let mut it = v.split_whitespace();
+    let a = it.next().unwrap_or("");
+    let b = it.next().unwrap_or(a);
+    (a, b)
+}
+
 /// Apply a 1–4 value box shorthand (top/right/bottom/left, CSS order) to four px
 /// fields — used for `padding` and `border-width` (ADR-0040).
 fn apply_box_shorthand(v: &str, em: f32, sides: &mut [&mut i32; 4]) {
@@ -2405,6 +2461,23 @@ mod tests {
             p.style.color,
             Color::rgb(0xff, 0, 0),
             "!important beats #id and inline-normal"
+        );
+    }
+
+    #[test]
+    fn logical_margin_and_padding_map_to_physical() {
+        let d = CssEngine::new().style(&parse_html(
+            "<div style='padding-block: 8px 12px; padding-inline: 10px; \
+                         margin-block-start: 20px; margin-inline: auto'>x</div>",
+        ));
+        let s = &first(&d.root, "div").unwrap().style;
+        assert_eq!(s.padding_top, 8);
+        assert_eq!(s.padding_bottom, 12);
+        assert_eq!((s.padding_left, s.padding_right), (10, 10));
+        assert_eq!(s.margin_top, 20);
+        assert!(
+            s.margin_left_auto && s.margin_right_auto,
+            "margin-inline:auto centers"
         );
     }
 
