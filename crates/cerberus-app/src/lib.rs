@@ -1929,6 +1929,12 @@ fn collect_image_urls(node: NodeRef<'_>, out: &mut Vec<String>, viewport_w: u32)
         if let Some(src) = pick_img_url(|n| node.attr(n), viewport_w) {
             out.push(src);
         }
+    } else if node.tag() == "canvas" {
+        // A real-mode canvas serializes its drawn pixels as a `src` data URL
+        // (see __cerberusSerializeDOM); collect it so layout paints the canvas.
+        if let Some(src) = node.attr("src") {
+            out.push(src.to_string());
+        }
     }
     for child in node.children() {
         if child.is_element() {

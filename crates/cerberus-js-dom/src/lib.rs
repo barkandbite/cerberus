@@ -3853,6 +3853,12 @@ pub const DOM_MODEL_PRELUDE: &str = r##"
           }
           var attrs = [];
           for (var a = 0; a < node.__attrs.length; a++) attrs.push([node.__attrs[a][0], node.__attrs[a][1]]);
+          // A real-mode <canvas> that was drawn to carries its pixels out as a
+          // `src` data URL, so the host's image pipeline paints the canvas
+          // (canvas -> toDataURL -> image). Skipped when farbling (no __real2d).
+          if (node.__tag === "canvas" && node.__real2d && typeof node.__real2d.toDataURL === "function") {
+            try { attrs.push(["src", node.__real2d.toDataURL()]); } catch (e) {}
+          }
           // A node whose innerHTML was set carries a raw fragment instead of JS
           // children. Emit it with an "innerHTML" field (no children); Rust
           // reparses it with the real HTML parser at rebuild time.

@@ -491,6 +491,29 @@ fn real_canvas_path_fill() {
 }
 
 #[test]
+fn real_canvas_serializes_drawn_pixels_as_a_src_data_url() {
+    // The bridge to visual rendering: a drawn real-mode canvas serializes its
+    // pixels as a `src` PNG data URL, which the host image pipeline then paints.
+    let doc = shell_with("result", "init");
+    let mut client = Stub::default();
+    let out = run(
+        &doc,
+        &["globalThis.__cerberusCanvasReal = true; \
+           var cv = document.createElement('canvas'); cv.id = 'cv'; \
+           cv.setAttribute('width', '4'); cv.setAttribute('height', '4'); \
+           var ctx = cv.getContext('2d'); ctx.fillStyle = '#ff0000'; ctx.fillRect(0, 0, 4, 4); \
+           document.body.appendChild(cv);"],
+        &mut client,
+    );
+    let cv = find_id(out.root(), "cv").expect("canvas present in rebuilt tree");
+    let src = cv.attr("src").expect("drawn canvas serialized a src");
+    assert!(
+        src.starts_with("data:image/png;base64,") && src.len() > 60,
+        "canvas src is a non-trivial PNG data URL"
+    );
+}
+
+#[test]
 fn performance_now_and_crypto_get_random_values_exist() {
     // The real sensor calls performance.now() and crypto.getRandomValues() early;
     // when they were missing it threw before doing anything. Assert the contract:

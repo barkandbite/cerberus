@@ -401,6 +401,15 @@ impl<'a> Ctx<'a> {
                 }
                 return;
             }
+            // A real-mode <canvas> serializes its drawn pixels as a `src` data URL
+            // and is painted like an image; an undrawn canvas falls through to a
+            // normal (empty) box.
+            "canvas" if node.attr("src").is_some() => {
+                if visible {
+                    self.image(node, in_link);
+                }
+                return;
+            }
             "input" => {
                 if visible {
                     self.form_input(node);
