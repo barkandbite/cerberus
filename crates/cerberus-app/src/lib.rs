@@ -99,6 +99,10 @@ pub struct RenderConfig {
     /// "Allow all sites": permit third-party subresources/cookies without
     /// prompting (the "stop bugging me" mode). Off by default (privacy-first).
     pub allow_all: bool,
+    /// Opt canvas/WebGL into REAL pixel values instead of the per-head farbled
+    /// shims (`--canvas-real`). Off by default so fingerprint-resistance stays the
+    /// default; on, sites that read/export canvas get the actual drawn pixels.
+    pub canvas_real: bool,
 }
 
 impl Default for RenderConfig {
@@ -114,6 +118,7 @@ impl Default for RenderConfig {
             proxy: None,
             timers: false,
             allow_all: false,
+            canvas_real: false,
         }
     }
 }
@@ -1009,6 +1014,12 @@ pub fn render(config: &RenderConfig) -> Result<RenderOutcome, AppError> {
     let scripts_ran = document.scripts().len();
     let scripts_t = Instant::now();
     let engine = heads.engine().map_err(|e| AppError::Js(format!("{e:?}")))?;
+    // Opt this realm into REAL canvas values (vs the farbled default) before any
+    // page script runs, so a script's getContext('2d')/toDataURL sees actual
+    // drawn pixels. Set on the realm global; the DOM model's getContext reads it.
+    if config.canvas_real {
+        let _ = engine.eval(base_realm, "globalThis.__cerberusCanvasReal = true;");
+    }
     if scripts_ran == 0 {
         engine
             .eval(base_realm, "void 0")

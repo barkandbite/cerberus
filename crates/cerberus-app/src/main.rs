@@ -109,6 +109,7 @@ fn cmd_render(args: &[String]) -> ExitCode {
     config.headed = has_flag(args, "--headed");
     config.system_roots = has_flag(args, "--system-roots");
     config.allow_all = has_flag(args, "--allow-all");
+    config.canvas_real = has_flag(args, "--canvas-real");
     config.data_dir = flag(args, "--data-dir");
     config.dump_text = has_flag(args, "--dump-text");
     config.proxy = flag(args, "--proxy");
@@ -517,6 +518,7 @@ fn print_usage() {
          \x20 --system-roots      trust the OS cert store (TLS-inspecting proxies)\n\
          \x20 --data-dir <DIR>    persistent profile (cookies survive runs)\n\
          \x20 --dump-text         print the page's text content (automation)\n\
+         \x20 --canvas-real       real canvas pixels instead of farbled (off=privacy default)\n\
          \x20 --timers            collect + print per-stage performance timings\n\
          \x20 --proxy <HOST:PORT> single egress proxy (CONNECT tunnel, no DNS leak)\n\
          \x20 (--out extension selects the format: .ppm, .png, or .pdf)\n\n\
