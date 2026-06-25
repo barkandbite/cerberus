@@ -2459,6 +2459,46 @@ mod tests {
         })
     }
 
+    fn collect<'a>(node: &'a StyledNode, tag: &str, out: &mut Vec<&'a StyledNode>) {
+        if node.tag == tag {
+            out.push(node);
+        }
+        for c in &node.children {
+            if let StyledChild::Element(e) = c {
+                collect(e, tag, out);
+            }
+        }
+    }
+
+    #[test]
+    fn of_type_selectors() {
+        let html = "<style>\
+                    p:first-of-type { color: #ff0000 } \
+                    p:nth-of-type(2) { color: #00ff00 } \
+                    p:last-of-type { color: #0000ff }\
+                    </style>\
+                    <div><span>s</span><p>p1</p><h2>h</h2><p>p2</p><p>p3</p></div>";
+        let dom = CssEngine::new().style(&parse_html(html));
+        let mut ps = Vec::new();
+        collect(&dom.root, "p", &mut ps);
+        assert_eq!(ps.len(), 3);
+        assert_eq!(
+            ps[0].style.color,
+            Color::rgb(0xff, 0, 0),
+            ":first-of-type → p1"
+        );
+        assert_eq!(
+            ps[1].style.color,
+            Color::rgb(0, 0xff, 0),
+            ":nth-of-type(2) → p2"
+        );
+        assert_eq!(
+            ps[2].style.color,
+            Color::rgb(0, 0, 0xff),
+            ":last-of-type → p3"
+        );
+    }
+
     #[test]
     fn pseudo_before_after_content_renders_as_host_text() {
         let html = "<style>.x::before{content:'A'} .x::after{content:'B'}</style>\

@@ -2,9 +2,11 @@
 //!
 //! Supported selectors: universal `*`, type, `.class`, `#id`, attribute
 //! selectors (`[a]`, `[a=v]`, `~= |= ^= $= *=`), structural pseudo-classes
-//! (`:first-child`, `:last-child`, `:only-child`, `:nth-child(an+b)`, `:not(…)`,
-//! `:root`), grouping `,`, and the descendant / child (`>`) / adjacent-sibling
-//! (`+`) / general-sibling (`~`) combinators. State pseudo-classes (`:hover`,
+//! (`:first-child`, `:last-child`, `:only-child`, `:nth-child(an+b)`, the
+//! `*-of-type` family (`:first/last/only-of-type`, `:nth-of-type(an+b)`),
+//! `:not(list)`, `:is(list)`/`:matches(list)`, `:where(list)`, `:root`), grouping
+//! `,`, and the descendant / child (`>`) / adjacent-sibling (`+`) /
+//! general-sibling (`~`) combinators. State pseudo-classes (`:hover`,
 //! `:focus`, `:active`, `:visited`, `:link`) parse but never match in the static
 //! cascade. `@media` blocks are parsed and gated on the viewport; other `@`-rules
 //! are skipped.
@@ -74,6 +76,10 @@ enum Pseudo {
     LastChild,
     OnlyChild,
     NthChild(i32, i32), // a, b  for an+b (1-based position)
+    FirstOfType,
+    LastOfType,
+    OnlyOfType,
+    NthOfType(i32, i32), // an+b among same-tag siblings (1-based)
     Root,
     Never, // :hover/:focus/:active/:visited/:link — no static match
 }
@@ -136,7 +142,7 @@ impl Compound {
     }
 
     /// Match this compound against `el` at sibling position `index` of `total`.
-    fn matches(&self, el: &SiblingRef, index: usize, total: usize) -> bool {
+    fn matches(&self, el: &SiblingRef, sibs: &[SiblingRef], index: usize, total: usize) -> bool {
         if let Some(t) = &self.tag {
             if t != &el.tag {
                 return false;
@@ -154,17 +160,17 @@ impl Compound {
             return false;
         }
         for p in &self.pseudos {
-            if !pseudo_matches(p, el, index, total) {
+            if !pseudo_matches(p, el, sibs, index, total) {
                 return false;
             }
         }
         // :not(...) — none of the inner simple compounds may match.
-        if self.not.iter().any(|n| n.matches(el, index, total)) {
+        if self.not.iter().any(|n| n.matches(el, sibs, index, total)) {
             return false;
         }
         // :is(...)/:where(...) — each group must have at least one match.
         for group in self.is_any.iter().chain(self.where_any.iter()) {
-            if !group.iter().any(|c| c.matches(el, index, total)) {
+            if !group.iter().any(|c| c.matches(el, sibs, index, total)) {
                 return false;
             }
         }
@@ -187,13 +193,33 @@ fn attr_matches(a: &AttrSel, el: &SiblingRef) -> bool {
     }
 }
 
-fn pseudo_matches(p: &Pseudo, el: &SiblingRef, index: usize, total: usize) -> bool {
+fn pseudo_matches(
+    p: &Pseudo,
+    el: &SiblingRef,
+    sibs: &[SiblingRef],
+    index: usize,
+    total: usize,
+) -> bool {
     let pos = index as i32 + 1; // 1-based
+    let same_type = |s: &SiblingRef| s.tag == el.tag;
     match p {
         Pseudo::FirstChild => index == 0,
         Pseudo::LastChild => index + 1 == total,
         Pseudo::OnlyChild => total == 1,
         Pseudo::NthChild(a, b) => nth_matches(*a, *b, pos),
+        // `*-of-type` count only siblings sharing this element's tag.
+        Pseudo::FirstOfType => !sibs.get(..index).unwrap_or(&[]).iter().any(same_type),
+        Pseudo::LastOfType => !sibs.get(index + 1..).unwrap_or(&[]).iter().any(same_type),
+        Pseudo::OnlyOfType => sibs.iter().filter(|s| same_type(s)).count() == 1,
+        Pseudo::NthOfType(a, b) => {
+            let type_pos = sibs
+                .get(..=index)
+                .unwrap_or(sibs)
+                .iter()
+                .filter(|s| same_type(s))
+                .count() as i32;
+            nth_matches(*a, *b, type_pos)
+        }
         Pseudo::Root => el.tag == "html",
         Pseudo::Never => false,
     }
@@ -259,7 +285,7 @@ impl Selector {
     fn match_at(&self, ci: usize, path: &[ElemRef], pi: usize, sib: usize) -> bool {
         let level = &path[pi];
         let total = level.siblings.len();
-        if !self.compounds[ci].matches(&level.siblings[sib], sib, total) {
+        if !self.compounds[ci].matches(&level.siblings[sib], &level.siblings, sib, total) {
             return false;
         }
         if ci == 0 {
@@ -816,10 +842,18 @@ fn apply_pseudo(c: &mut Compound, name: &str, arg: &str) {
         "first-child" => c.pseudos.push(Pseudo::FirstChild),
         "last-child" => c.pseudos.push(Pseudo::LastChild),
         "only-child" => c.pseudos.push(Pseudo::OnlyChild),
+        "first-of-type" => c.pseudos.push(Pseudo::FirstOfType),
+        "last-of-type" => c.pseudos.push(Pseudo::LastOfType),
+        "only-of-type" => c.pseudos.push(Pseudo::OnlyOfType),
         "root" => c.pseudos.push(Pseudo::Root),
         "nth-child" => {
             if let Some((a, b)) = parse_an_plus_b(arg) {
                 c.pseudos.push(Pseudo::NthChild(a, b));
+            }
+        }
+        "nth-of-type" => {
+            if let Some((a, b)) = parse_an_plus_b(arg) {
+                c.pseudos.push(Pseudo::NthOfType(a, b));
             }
         }
         "not" => {
