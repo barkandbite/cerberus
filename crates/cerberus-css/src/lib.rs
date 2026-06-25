@@ -2620,6 +2620,37 @@ mod tests {
     }
 
     #[test]
+    fn is_and_where_selectors() {
+        let html = "<style>\
+                    :is(h1, h2) { color: #ff0000 } \
+                    div:is(.x) { color: #00ff00 } \
+                    span:is(.y) { color: #0000ff }\
+                    </style>\
+                    <h1>a</h1><h2>b</h2><div>c</div><span class='y'>d</span>";
+        let dom = CssEngine::new().style(&parse_html(html));
+        assert_eq!(
+            first(&dom.root, "h1").unwrap().style.color,
+            Color::rgb(0xff, 0, 0),
+            ":is(h1, h2) matches h1"
+        );
+        assert_eq!(
+            first(&dom.root, "h2").unwrap().style.color,
+            Color::rgb(0xff, 0, 0),
+            ":is(h1, h2) matches h2"
+        );
+        assert_ne!(
+            first(&dom.root, "div").unwrap().style.color,
+            Color::rgb(0, 0xff, 0),
+            "div:is(.x) must NOT match a div without .x (over-match fix)"
+        );
+        assert_eq!(
+            first(&dom.root, "span").unwrap().style.color,
+            Color::rgb(0, 0, 0xff),
+            "span:is(.y) matches a span with .y"
+        );
+    }
+
+    #[test]
     fn aspect_ratio_parses_ratios() {
         assert_eq!(parse_aspect_ratio("16 / 9"), Some(16.0 / 9.0));
         assert_eq!(parse_aspect_ratio("1.5"), Some(1.5));

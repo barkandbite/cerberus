@@ -101,6 +101,13 @@ struct Compound {
     attrs: Vec<AttrSel>,
     pseudos: Vec<Pseudo>,
     not: Vec<Compound>,
+    /// `:is(...)`/`:matches(...)` groups — each is an OR-list of compounds; ALL
+    /// groups must have a match. Contributes its most-specific argument's
+    /// specificity.
+    is_any: Vec<Vec<Compound>>,
+    /// `:where(...)` groups — like `:is` for matching, but contribute ZERO
+    /// specificity.
+    where_any: Vec<Vec<Compound>>,
     /// A `::before`/`::after` marker on this compound. Lifted onto the owning
     /// `Selector` (it is only meaningful on the subject compound); a marker on a
     /// non-subject compound is an invalid selector forced to never match.
@@ -117,6 +124,13 @@ impl Compound {
         for n in &self.not {
             let inner = n.specificity();
             s = (s.0 + inner.0, s.1 + inner.1, s.2 + inner.2);
+        }
+        // `:is(...)` takes the specificity of its most specific argument; a
+        // `:where(...)` contributes nothing.
+        for group in &self.is_any {
+            if let Some(inner) = group.iter().map(|c| c.specificity()).max() {
+                s = (s.0 + inner.0, s.1 + inner.1, s.2 + inner.2);
+            }
         }
         s
     }
@@ -147,6 +161,12 @@ impl Compound {
         // :not(...) — none of the inner simple compounds may match.
         if self.not.iter().any(|n| n.matches(el, index, total)) {
             return false;
+        }
+        // :is(...)/:where(...) — each group must have at least one match.
+        for group in self.is_any.iter().chain(self.where_any.iter()) {
+            if !group.iter().any(|c| c.matches(el, index, total)) {
+                return false;
+            }
         }
         true
     }
@@ -576,7 +596,10 @@ fn media_len_px(t: &str) -> Option<f64> {
 }
 
 fn parse_selectors(text: &str) -> Vec<Selector> {
-    text.split(',')
+    // Split on TOP-LEVEL commas only — commas inside `:is(a, b)` / `:not(...)` /
+    // `[attr="x,y"]` belong to the functional pseudo / attribute, not the list.
+    split_top_level(text, ',')
+        .into_iter()
         .filter_map(|s| {
             let sel = parse_selector(s.trim());
             (!sel.compounds.is_empty()).then_some(sel)
@@ -584,10 +607,59 @@ fn parse_selectors(text: &str) -> Vec<Selector> {
         .collect()
 }
 
+/// Split `text` on `sep` only where not nested inside `(...)` or `[...]`.
+fn split_top_level(text: &str, sep: char) -> Vec<&str> {
+    let mut parts = Vec::new();
+    let mut depth = 0i32;
+    let mut start = 0;
+    for (i, ch) in text.char_indices() {
+        match ch {
+            '(' | '[' => depth += 1,
+            ')' | ']' => depth -= 1,
+            c if c == sep && depth == 0 => {
+                parts.push(&text[start..i]);
+                start = i + c.len_utf8();
+            }
+            _ => {}
+        }
+    }
+    parts.push(&text[start..]);
+    parts
+}
+
+/// Tokenize a complex selector on whitespace, but keep whitespace inside
+/// `(...)`/`[...]` (so `:is(a, b)` and `[a = "x y"]` stay one token).
+fn split_selector_tokens(text: &str) -> Vec<&str> {
+    let mut tokens = Vec::new();
+    let mut depth = 0i32;
+    let mut start: Option<usize> = None;
+    for (i, ch) in text.char_indices() {
+        match ch {
+            '(' | '[' => {
+                depth += 1;
+                start.get_or_insert(i);
+            }
+            ')' | ']' => depth -= 1,
+            c if c.is_whitespace() && depth == 0 => {
+                if let Some(s) = start.take() {
+                    tokens.push(&text[s..i]);
+                }
+            }
+            _ => {
+                start.get_or_insert(i);
+            }
+        }
+    }
+    if let Some(s) = start {
+        tokens.push(&text[s..]);
+    }
+    tokens
+}
+
 fn parse_selector(text: &str) -> Selector {
     let mut compounds = Vec::new();
     let mut pending = Combinator::Descendant;
-    for token in text.split_whitespace() {
+    for token in split_selector_tokens(text) {
         match token {
             ">" => pending = Combinator::Child,
             "+" => pending = Combinator::Adjacent,
@@ -725,8 +797,18 @@ fn parse_compound(token: &str) -> Option<Compound> {
         || !c.classes.is_empty()
         || !c.attrs.is_empty()
         || !c.pseudos.is_empty()
-        || !c.not.is_empty();
+        || !c.not.is_empty()
+        || !c.is_any.is_empty()
+        || !c.where_any.is_empty();
     any.then_some(c)
+}
+
+/// Parse a comma-separated list of simple compounds (the argument of
+/// `:is()`/`:where()`/`:not()`), dropping any that don't parse.
+fn parse_compound_list(arg: &str) -> Vec<Compound> {
+    arg.split(',')
+        .filter_map(|s| parse_compound(s.trim()))
+        .collect()
 }
 
 fn apply_pseudo(c: &mut Compound, name: &str, arg: &str) {
@@ -744,6 +826,20 @@ fn apply_pseudo(c: &mut Compound, name: &str, arg: &str) {
             // Simple `:not(compound)` — one inner compound (no combinators).
             if let Some(inner) = parse_compound(arg.trim()) {
                 c.not.push(inner);
+            }
+        }
+        // `:is(a, b, …)` / its legacy alias `:matches` — matches if the element
+        // matches any argument; `:where(…)` is the same but with zero specificity.
+        "is" | "matches" => {
+            let group = parse_compound_list(arg);
+            if !group.is_empty() {
+                c.is_any.push(group);
+            }
+        }
+        "where" => {
+            let group = parse_compound_list(arg);
+            if !group.is_empty() {
+                c.where_any.push(group);
             }
         }
         // State pseudo-classes have no static answer; force a non-match so we
