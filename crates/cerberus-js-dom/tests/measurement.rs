@@ -86,3 +86,65 @@ fn geometry_styles_and_media_are_observable_from_js() {
         JsValue::Number(0.0)
     );
 }
+
+#[test]
+fn offset_and_client_metrics_reflect_bridged_geometry() {
+    let mut engine = QuickJsEngineFactory.instantiate().expect("engine");
+    let realm = RealmId::from_u64_pair(0, 1);
+    engine.create_realm(realm).expect("realm");
+    let doc = parse_html("<div id=\"x\">hi</div>");
+    let env = PageEnv {
+        url: "https://t.test/".into(),
+        viewport: (800, 600),
+        user_agent: "ua".into(),
+        cookies: String::new(),
+        local_storage: String::new(),
+    };
+    install_page(engine.as_mut(), realm, &doc, &env).expect("install");
+    let id = node_id(&doc, "x");
+    set_geometry(engine.as_mut(), realm, &[(id, Rect::new(10, 20, 30, 40))]).unwrap();
+
+    // offset*/client*/scroll* sizes come from the same bridged geometry (w=30,
+    // h=40) as getBoundingClientRect, as rounded integers.
+    for (expr, want) in [
+        ("offsetWidth", 30.0),
+        ("offsetHeight", 40.0),
+        ("clientWidth", 30.0),
+        ("clientHeight", 40.0),
+        ("scrollWidth", 30.0),
+        ("scrollHeight", 40.0),
+        ("offsetLeft", 10.0),
+        ("offsetTop", 20.0),
+        ("scrollTop", 0.0),
+        ("scrollLeft", 0.0),
+    ] {
+        assert_eq!(
+            engine
+                .eval(realm, &format!("document.getElementById('x').{expr}"))
+                .unwrap(),
+            JsValue::Number(want),
+            "{expr}"
+        );
+    }
+    // scrollTop is settable (code that sets it must not throw) but stays 0 (no
+    // scroll model).
+    engine
+        .eval(realm, "document.getElementById('x').scrollTop = 50")
+        .unwrap();
+    assert_eq!(
+        engine
+            .eval(realm, "document.getElementById('x').scrollTop")
+            .unwrap(),
+        JsValue::Number(0.0)
+    );
+    // offsetParent of an in-flow element is the body.
+    assert_eq!(
+        engine
+            .eval(
+                realm,
+                "document.getElementById('x').offsetParent === document.body ? 1 : 0"
+            )
+            .unwrap(),
+        JsValue::Number(1.0)
+    );
+}

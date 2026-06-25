@@ -2350,6 +2350,41 @@ pub const DOM_MODEL_PRELUDE: &str = r##"
       };
     };
 
+    // Integer layout-metric accessors derived from the SAME bridged geometry as
+    // getBoundingClientRect (__geometry = {x,y,w,h}, pushed post-layout). They are
+    // integers in browsers, so we round. v1 simplifications: client*/scroll* size
+    // == border-box size (no separate content box / scrollable overflow);
+    // scrollTop/Left == 0 (no scroll model, but settable so code doesn't throw);
+    // offsetTop/Left are viewport-relative (no offsetParent walk). Enough for the
+    // common case — SPAs reading non-zero element dimensions to drive layout math.
+    function __geom(node) { return node.__geometry || { x: 0, y: 0, w: 0, h: 0 }; }
+    function __defMetric(name, fn) {
+      Object.defineProperty(ELEMENT_PROTO, name, {
+        get: function () { return fn(__geom(this)); }, configurable: true,
+      });
+    }
+    __defMetric("offsetWidth", function (m) { return Math.round(m.w); });
+    __defMetric("offsetHeight", function (m) { return Math.round(m.h); });
+    __defMetric("clientWidth", function (m) { return Math.round(m.w); });
+    __defMetric("clientHeight", function (m) { return Math.round(m.h); });
+    __defMetric("scrollWidth", function (m) { return Math.round(m.w); });
+    __defMetric("scrollHeight", function (m) { return Math.round(m.h); });
+    __defMetric("offsetTop", function (m) { return Math.round(m.y); });
+    __defMetric("offsetLeft", function (m) { return Math.round(m.x); });
+    Object.defineProperty(ELEMENT_PROTO, "scrollTop", {
+      get: function () { return 0; }, set: function () {}, configurable: true,
+    });
+    Object.defineProperty(ELEMENT_PROTO, "scrollLeft", {
+      get: function () { return 0; }, set: function () {}, configurable: true,
+    });
+    Object.defineProperty(ELEMENT_PROTO, "offsetParent", {
+      get: function () {
+        if (this.__tag === "body" || this.__tag === "html") return null;
+        return (g.document && g.document.body) || null;
+      },
+      configurable: true,
+    });
+
     // Inert event listener registry on elements (dispatch not yet driven by
     // the bridge beyond DOMContentLoaded/load on document+window). __listeners
     // is created lazily on first addEventListener so listener-free nodes pay
