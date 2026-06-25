@@ -168,6 +168,12 @@ pub struct StorageEnvironment {
     vault: Box<dyn Vault>,
     /// Unsaved cookie changes (the vault tracks its own dirtiness).
     dirty: bool,
+    /// Web Storage (`localStorage`), partitioned by `(instance, origin)` so it is
+    /// sealed per identity AND per web origin — a cross-instance or cross-origin
+    /// read is impossible by construction. Each entry is the origin's store as a
+    /// JSON object string. In-memory for the environment's lifetime, so it
+    /// survives navigations within a session; on-disk persistence is a follow-up.
+    web_storage: HashMap<(InstanceId, String), String>,
 }
 
 impl StorageEnvironment {
@@ -177,7 +183,23 @@ impl StorageEnvironment {
             partitions: HashMap::new(),
             vault,
             dirty: false,
+            web_storage: HashMap::new(),
         }
+    }
+
+    /// The persisted `localStorage` JSON for `(instance, origin)`, if any. Sealed
+    /// per identity and per web origin: no cross-instance, no cross-origin read.
+    pub fn local_storage(&self, instance: InstanceId, origin: &str) -> Option<&str> {
+        self.web_storage
+            .get(&(instance, origin.to_string()))
+            .map(String::as_str)
+    }
+
+    /// Replace the `localStorage` JSON for `(instance, origin)` with the post-run
+    /// snapshot (the full state, so cleared/removed keys are persisted as gone).
+    pub fn set_local_storage(&mut self, instance: InstanceId, origin: &str, json: String) {
+        self.web_storage
+            .insert((instance, origin.to_string()), json);
     }
 
     /// Create an environment with no usable vault (quarantine writes will fail
@@ -257,6 +279,7 @@ impl StorageEnvironment {
             partitions,
             vault,
             dirty: false,
+            web_storage: HashMap::new(),
         })
     }
 
@@ -836,6 +859,27 @@ mod tests {
 
     fn instance_b() -> InstanceId {
         InstanceId::from_u64_pair(0, 0xB)
+    }
+
+    #[test]
+    fn local_storage_is_sealed_per_instance_and_origin() {
+        let mut env = StorageEnvironment::with_no_vault();
+        env.set_local_storage(instance_a(), "https://a.example", r#"{"k":"1"}"#.into());
+        // Same instance, same origin → readable.
+        assert_eq!(
+            env.local_storage(instance_a(), "https://a.example"),
+            Some(r#"{"k":"1"}"#)
+        );
+        // A different origin in the same instance is a separate store.
+        assert_eq!(env.local_storage(instance_a(), "https://b.example"), None);
+        // A different identity (instance) can never read it.
+        assert_eq!(env.local_storage(instance_b(), "https://a.example"), None);
+        // Replacement overwrites the full snapshot (cleared keys vanish).
+        env.set_local_storage(instance_a(), "https://a.example", "{}".into());
+        assert_eq!(
+            env.local_storage(instance_a(), "https://a.example"),
+            Some("{}")
+        );
     }
 
     #[test]

@@ -888,6 +888,15 @@ impl CookieJar for SealedJar {
     }
 }
 
+/// The `localStorage` partition key for an origin: `scheme://host[:port]` — the
+/// web origin, so storage is sealed per origin (not merged across subdomains).
+fn origin_storage_key(o: &Origin) -> String {
+    match o.port {
+        Some(p) => format!("{}://{}:{}", o.scheme, o.host, p),
+        None => format!("{}://{}", o.scheme, o.host),
+    }
+}
+
 /// Run the full render pipeline and return a summary plus the frame.
 pub fn render(config: &RenderConfig) -> Result<RenderOutcome, AppError> {
     install_psl();
@@ -1039,11 +1048,19 @@ pub fn render(config: &RenderConfig) -> Result<RenderOutcome, AppError> {
                 .collect::<Vec<_>>()
                 .join("; ")
         };
+        // Seed localStorage with this origin's persisted store (sealed per
+        // identity + origin) so a value cached on a prior visit round-trips.
+        let doc_local_storage = storage
+            .locked()
+            .local_storage(active_instance, &origin_storage_key(&first_party))
+            .unwrap_or_default()
+            .to_string();
         let env = PageEnv {
             url: config.url.clone(),
             viewport: (config.viewport.w, config.viewport.h),
             user_agent: active_ua,
             cookies: doc_cookies,
+            local_storage: doc_local_storage,
         };
         // JS fetch() rides the page's subresource context (sealed jar + consent),
         // performed synchronously here (the one-shot path already blocks).
@@ -1114,6 +1131,15 @@ pub fn render(config: &RenderConfig) -> Result<RenderOutcome, AppError> {
         // stacks) to the Rust logging layer (stderr) — the observability bridge.
         for m in cerberus_js_dom::take_console(engine, base_realm) {
             eprintln!("[js:{}] {}", m.level, m.text);
+        }
+        // Persist the post-run localStorage snapshot to the sealed per-origin
+        // store, so the next visit to this origin (within the session) sees it.
+        if let Some(snap) = cerberus_js_dom::snapshot_local_storage(engine, base_realm) {
+            storage.locked().set_local_storage(
+                active_instance,
+                &origin_storage_key(&first_party),
+                snap,
+            );
         }
     }
     let engine_name = engine.name().to_string();
@@ -2611,9 +2637,10 @@ impl BrowserApp {
             url: self.toolbar.url_text.clone(),
             viewport: (self.last_size.w, self.last_size.h),
             user_agent: self.active_ua.clone(),
-            // Interactive path doesn't seed the cookie bridge yet (the headless
-            // render path does); follow-up wires it here too.
+            // Interactive path doesn't seed the cookie / localStorage bridges yet
+            // (the headless render path does); follow-up wires them here too.
             cookies: String::new(),
+            local_storage: String::new(),
         };
         let engine = match self.heads.engine() {
             Ok(engine) => engine,
@@ -5336,6 +5363,7 @@ pub fn bench_pipeline(iters: usize) -> Vec<BenchStage> {
                 viewport: (1280, 1024),
                 user_agent: DEFAULT_USER_AGENT.into(),
                 cookies: String::new(),
+                local_storage: String::new(),
             };
             let bodies = cerberus_js_dom::resolve_scripts(document.scripts(), |_| None);
             std::hint::black_box(

@@ -36,6 +36,7 @@ fn env() -> PageEnv {
                      (KHTML, like Gecko) Chrome/142.0.0.0 Safari/537.36"
             .into(),
         cookies: String::new(),
+        local_storage: String::new(),
     }
 }
 
@@ -170,6 +171,34 @@ fn console_log_is_captured() {
     assert!(
         cerberus_js_dom::take_console(engine.as_mut(), realm).is_empty(),
         "take_console should clear the buffer"
+    );
+}
+
+#[test]
+fn local_storage_seeds_from_env_and_snapshots_back() {
+    let (mut engine, realm) = engine_and_realm();
+    let doc = doc_with_div_x();
+    // A value persisted on a prior visit, handed in via the ambient env.
+    let mut e = env();
+    e.local_storage = r#"{"token":"abc"}"#.to_string();
+    let scripts = vec!["if (localStorage.getItem('token') !== 'abc') \
+                          throw new Error('seed lost'); \
+                        localStorage.setItem('count', \
+                          String((+localStorage.getItem('count') || 0) + 1));"
+        .to_string()];
+
+    run_page_scripts(engine.as_mut(), realm, &doc, &scripts, &e).expect("run");
+    let snap =
+        cerberus_js_dom::snapshot_local_storage(engine.as_mut(), realm).expect("snapshot present");
+    // The seeded value survived into the run, and the new write is captured for
+    // the host to persist.
+    assert!(
+        snap.contains("\"token\":\"abc\""),
+        "seed must round-trip: {snap}"
+    );
+    assert!(
+        snap.contains("\"count\":\"1\""),
+        "write must be captured: {snap}"
     );
 }
 
@@ -481,6 +510,7 @@ fn navigator_platform_tracks_the_user_agent() {
             viewport: (800, 600),
             user_agent: ua.into(),
             cookies: String::new(),
+            local_storage: String::new(),
         };
         let scripts = vec!["var x = document.getElementById('x'); \
              x.setAttribute('data-ua', String(navigator.userAgent)); \

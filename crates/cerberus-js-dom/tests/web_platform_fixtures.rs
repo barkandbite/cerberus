@@ -45,6 +45,7 @@ fn env() -> PageEnv {
                      (KHTML, like Gecko) Chrome/142.0.0.0 Safari/537.36"
             .into(),
         cookies: String::new(),
+        local_storage: String::new(),
     }
 }
 
@@ -53,6 +54,7 @@ fn env() -> PageEnv {
 fn env_with_cookies(cookies: &str) -> PageEnv {
     PageEnv {
         cookies: cookies.into(),
+        local_storage: String::new(),
         ..env()
     }
 }

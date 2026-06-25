@@ -492,6 +492,12 @@ pub struct PageEnv {
     /// never read them (they still ride requests through the jar). Empty when
     /// there are none — the default for built-in/cookieless pages.
     pub cookies: String,
+    /// The origin's persisted `localStorage`, as a JSON object string
+    /// (`{"k":"v",…}`), seeded into `localStorage` before scripts run so a value
+    /// stored on a prior visit round-trips. The host partitions it per identity
+    /// and per web origin; empty when none / ephemeral. Read back after the run
+    /// with [`snapshot_local_storage`].
+    pub local_storage: String,
 }
 
 /// Encode `s` as a JS/JSON string literal (quotes included) suitable for
@@ -583,12 +589,13 @@ pub fn install_page(
 ) -> Result<(), BridgeError> {
     // Inject the ambient environment, then install the document model.
     let env_install = format!(
-        "globalThis.__CERBERUS_ENV__ = {{ url: {}, width: {}, height: {}, userAgent: {}, cookies: {} }};",
+        "globalThis.__CERBERUS_ENV__ = {{ url: {}, width: {}, height: {}, userAgent: {}, cookies: {}, localStorage: {} }};",
         js_string(&env.url),
         env.viewport.0,
         env.viewport.1,
         js_string(&env.user_agent),
         js_string(&env.cookies),
+        js_string(&env.local_storage),
     );
     engine.eval(realm, &env_install)?;
     engine.eval(realm, DOM_MODEL_PRELUDE)?;
@@ -1028,6 +1035,21 @@ pub fn take_cookie_writes(
         .iter()
         .filter_map(|v| v.as_str().map(str::to_string))
         .collect())
+}
+
+/// Snapshot the realm's current `localStorage` as a JSON object string
+/// (`{"k":"v",…}`) via `__cerberusSnapshotLocalStorage()`, for the host to persist
+/// to the sealed per-origin store after scripts run. Non-fatal: a realm without
+/// the DOM model (or any hiccup) yields `None`, so the caller leaves the prior
+/// persisted value untouched rather than clobbering it with nothing.
+pub fn snapshot_local_storage(engine: &mut dyn JsEngine, realm: RealmId) -> Option<String> {
+    match engine.eval(
+        realm,
+        "(typeof __cerberusSnapshotLocalStorage==='function')?__cerberusSnapshotLocalStorage():''",
+    ) {
+        Ok(JsValue::Str(s)) if !s.is_empty() => Some(s),
+        _ => None,
+    }
 }
 
 /// A captured `console.*` message: the level (`log`/`warn`/`error`/`info`/`debug`/
@@ -3291,13 +3313,13 @@ pub const DOM_MODEL_PRELUDE: &str = r##"
     // getItem/setItem/removeItem/clear/key/length plus index access via the
     // methods. These live for THIS RUN ONLY — there is no persistence across
     // run_page_scripts calls (the realm/prelude is reinstalled each time).
-    function makeStorage() {
+    function makeStorage(data) {
       // Real Storage semantics via a Proxy: stored keys are own ENUMERABLE
       // properties (so Object.keys/for-in see the DATA, not the methods), bracket
       // access (localStorage.foo / localStorage.foo = x) reads/writes the store,
       // and the methods stay non-enumerable. (The old plain-object version leaked
-      // its method names through Object.keys and dropped bracket writes.)
-      var data = Object.create(null);
+      // its method names through Object.keys and dropped bracket writes.) The
+      // backing `data` is supplied so the host can seed/snapshot localStorage.
       var api = {
         getItem: function (k) { k = String(k); return (k in data) ? data[k] : null; },
         setItem: function (k, v) { data[String(k)] = String(v); },
@@ -3328,8 +3350,32 @@ pub const DOM_MODEL_PRELUDE: &str = r##"
         },
       });
     }
-    g.localStorage = makeStorage();
-    g.sessionStorage = makeStorage();
+    // localStorage's backing is exposed so the Rust host can seed it (from the
+    // sealed per-origin store) and snapshot it back after scripts run; persisted,
+    // origin-partitioned. sessionStorage stays private (per browsing context).
+    g.__cerberusLocalStorageData = Object.create(null);
+    g.localStorage = makeStorage(g.__cerberusLocalStorageData);
+    g.sessionStorage = makeStorage(Object.create(null));
+    (function () {
+      try {
+        var env = (g.__CERBERUS_ENV__ && typeof g.__CERBERUS_ENV__ === "object") ? g.__CERBERUS_ENV__ : {};
+        if (typeof env.localStorage === "string" && env.localStorage) {
+          var seed = JSON.parse(env.localStorage);
+          if (seed && typeof seed === "object") {
+            for (var sk in seed) g.__cerberusLocalStorageData[sk] = String(seed[sk]);
+          }
+        }
+      } catch (e) {}
+    })();
+    // Snapshot the current localStorage as JSON for the host to persist (the full
+    // state, so cleared/removed keys are persisted as gone).
+    g.__cerberusSnapshotLocalStorage = function () {
+      try {
+        var out = {}, d = g.__cerberusLocalStorageData;
+        for (var k in d) out[k] = d[k];
+        return JSON.stringify(out);
+      } catch (e) { return "{}"; }
+    };
 
     // ---- getComputedStyle (inline values only) -------------------------
     // Returns an object whose getPropertyValue(name) yields the element's

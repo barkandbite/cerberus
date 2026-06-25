@@ -441,6 +441,7 @@ impl MirrorGroup {
             // Mirror windows don't seed script-readable cookies yet (the jar
             // bridge lives in the app render path); default to none.
             cookies: String::new(),
+            local_storage: String::new(),
         }
     }
 }

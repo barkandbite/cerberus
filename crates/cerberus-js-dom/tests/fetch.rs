@@ -32,6 +32,7 @@ fn env() -> PageEnv {
         viewport: (1280, 800),
         user_agent: "Cerberus/0.0".into(),
         cookies: String::new(),
+        local_storage: String::new(),
     }
 }
 

@@ -212,6 +212,7 @@ fn page_scripts_reach_the_farbled_canvas_through_the_dom_model() {
         viewport: (800, 600),
         user_agent: "Cerberus/0.0".into(),
         cookies: String::new(),
+        local_storage: String::new(),
     };
     let rebuilt = run_page_scripts(
         engine.as_mut(),
