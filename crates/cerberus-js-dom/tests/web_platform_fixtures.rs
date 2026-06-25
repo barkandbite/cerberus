@@ -442,6 +442,29 @@ fn real_canvas_2d_fills_and_reads_back_actual_pixels() {
 }
 
 #[test]
+fn real_canvas_todataurl_emits_a_valid_png() {
+    // toDataURL on the real canvas produces an actual PNG data URL (correct
+    // prefix + PNG signature bytes after base64-decoding), not a noise stub.
+    let doc = shell_with("result", "init");
+    let mut client = Stub::default();
+    let out = run(
+        &doc,
+        &["globalThis.__cerberusCanvasReal = true; \
+           var cv = document.createElement('canvas'); cv.setAttribute('width', '4'); cv.setAttribute('height', '4'); \
+           var ctx = cv.getContext('2d'); ctx.fillStyle = '#0000ff'; ctx.fillRect(0, 0, 4, 4); \
+           var url = cv.toDataURL(); var bin = atob(url.slice(22)); \
+           var sig = [bin.charCodeAt(0), bin.charCodeAt(1), bin.charCodeAt(2), bin.charCodeAt(3)].join(','); \
+           document.getElementById('result').textContent = url.slice(0, 22) + '|' + sig + '|' + (bin.length > 30);"],
+        &mut client,
+    );
+    assert_eq!(
+        find_id(out.root(), "result").unwrap().text_content(),
+        "data:image/png;base64,|137,80,78,71|true",
+        "toDataURL emits a real PNG (signature 137,80,78,71)"
+    );
+}
+
+#[test]
 fn performance_now_and_crypto_get_random_values_exist() {
     // The real sensor calls performance.now() and crypto.getRandomValues() early;
     // when they were missing it threw before doing anything. Assert the contract:

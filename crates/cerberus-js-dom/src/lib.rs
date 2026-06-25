@@ -2334,7 +2334,7 @@ pub const DOM_MODEL_PRELUDE: &str = r##"
       // a real software 2D context backed by an actual pixel buffer instead.
       if (el.__tag === "canvas") {
         if (globalThis.__cerberusFarble) globalThis.__cerberusFarble.attachCanvas(el);
-        var __farbleGC = el.getContext;
+        var __farbleGC = el.getContext, __farbleTDU = el.toDataURL;
         el.getContext = function (type) {
           if (g.__cerberusCanvasReal && String(type) === "2d") {
             if (!el.__real2d) el.__real2d = __realCanvas2D(el);
@@ -2342,12 +2342,52 @@ pub const DOM_MODEL_PRELUDE: &str = r##"
           }
           return __farbleGC ? __farbleGC.call(el, type) : null;
         };
+        el.toDataURL = function (type) {
+          if (g.__cerberusCanvasReal) {
+            if (!el.__real2d) el.__real2d = __realCanvas2D(el);
+            return el.__real2d.toDataURL(type);
+          }
+          return __farbleTDU ? __farbleTDU.call(el, type) : "";
+        };
       }
       return el;
     }
+    // Encode an RGBA pixel buffer to a real PNG data: URL (signature + IHDR +
+    // IDAT[zlib stored] + IEND, with correct CRC32/Adler32). Used by the real
+    // canvas toDataURL. Stored (uncompressed) zlib keeps it simple + correct.
+    var __crcTab = (function () {
+      var t = [];
+      for (var n = 0; n < 256; n++) { var c = n; for (var k = 0; k < 8; k++) c = (c & 1) ? (0xedb88320 ^ (c >>> 1)) : (c >>> 1); t[n] = c >>> 0; }
+      return t;
+    })();
+    function __canvasToPNG(data, w, h) {
+      function u32(v) { return [(v >>> 24) & 0xff, (v >>> 16) & 0xff, (v >>> 8) & 0xff, v & 0xff]; }
+      function crc(body) { var c = 0xffffffff; for (var i = 0; i < body.length; i++) c = __crcTab[(c ^ body[i]) & 0xff] ^ (c >>> 8); return (c ^ 0xffffffff) >>> 0; }
+      function chunk(type, d) {
+        var body = [type.charCodeAt(0), type.charCodeAt(1), type.charCodeAt(2), type.charCodeAt(3)].concat(d);
+        return u32(d.length).concat(body).concat(u32(crc(body)));
+      }
+      var raw = [];
+      for (var y = 0; y < h; y++) { raw.push(0); for (var x = 0; x < w; x++) { var o = (y * w + x) * 4; raw.push(data[o], data[o + 1], data[o + 2], data[o + 3]); } }
+      var z = [0x78, 0x01], i = 0, a = 1, b = 0, n = raw.length;
+      while (i < n) {
+        var len = Math.min(65535, n - i), fin = (i + len >= n) ? 1 : 0;
+        z.push(fin, len & 0xff, (len >>> 8) & 0xff, (~len) & 0xff, ((~len) >>> 8) & 0xff);
+        for (var j = 0; j < len; j++) { var bv = raw[i + j]; z.push(bv); a = (a + bv) % 65521; b = (b + a) % 65521; }
+        i += len;
+      }
+      var ad = ((b << 16) | a) >>> 0;
+      z.push((ad >>> 24) & 0xff, (ad >>> 16) & 0xff, (ad >>> 8) & 0xff, ad & 0xff);
+      var png = [137, 80, 78, 71, 13, 10, 26, 10]
+        .concat(chunk("IHDR", u32(w).concat(u32(h)).concat([8, 6, 0, 0, 0])))
+        .concat(chunk("IDAT", z)).concat(chunk("IEND", []));
+      var s = "";
+      for (var p = 0; p < png.length; p++) s += String.fromCharCode(png[p]);
+      return "data:image/png;base64," + (typeof g.btoa === "function" ? g.btoa(s) : "");
+    }
     // A real software Canvas 2D context: geometric fills + pixel read/write over
-    // an actual RGBA buffer (so getImageData reflects what was drawn — not noise).
-    // Paths/text/drawImage/toDataURL are minimal for now (follow-ups).
+    // an actual RGBA buffer (so getImageData reflects what was drawn — not noise),
+    // and a real toDataURL. Paths/text/drawImage are minimal for now (follow-ups).
     function __realCanvas2D(canvas) {
       function dim(a, def) { var v = parseInt(getAttr(canvas, a), 10); return v > 0 ? v : def; }
       var w = dim("width", 300), h = dim("height", 150);
@@ -2391,6 +2431,7 @@ pub const DOM_MODEL_PRELUDE: &str = r##"
           }
         },
         createImageData: function (iw, ih) { return { data: new Uint8ClampedArray(iw * ih * 4), width: iw, height: ih }; },
+        toDataURL: function () { return __canvasToPNG(data, w, h); },
         beginPath: function () {}, closePath: function () {}, moveTo: function () {}, lineTo: function () {},
         arc: function () {}, rect: function () {}, fill: function () {}, stroke: function () {}, clip: function () {},
         save: function () {}, restore: function () {}, translate: function () {}, scale: function () {}, rotate: function () {}, setTransform: function () {}, transform: function () {},
