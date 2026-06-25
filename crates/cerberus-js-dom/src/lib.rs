@@ -2002,6 +2002,54 @@ pub const DOM_MODEL_PRELUDE: &str = r##"
     NODE_PROTO.removeChild = function (child) { return removeChild(this, child); };
     NODE_PROTO.insertBefore = function (child, ref) { return insertBefore(this, child, ref); };
     NODE_PROTO.remove = function () { detach(this); };
+    NODE_PROTO.replaceChild = function (newChild, oldChild) {
+      var i = this.__kids.indexOf(oldChild);
+      if (i === -1) return oldChild;
+      detach(newChild);
+      this.__kids[i] = newChild; newChild.__parent = this; oldChild.__parent = null;
+      __moEmitChildList(this, [newChild], [oldChild]);
+      return oldChild;
+    };
+    function __cloneNode(node, deep) {
+      var copy;
+      if (node.__type === TEXT_NODE) { copy = makeText(node.__text); }
+      else {
+        copy = makeElement(node.__tag);
+        for (var i = 0; i < node.__attrs.length; i++) copy.__attrs.push([node.__attrs[i][0], node.__attrs[i][1]]);
+        if (node.__rawHTML != null) copy.__rawHTML = node.__rawHTML;
+        if (deep) for (var j = 0; j < node.__kids.length; j++) {
+          var ch = __cloneNode(node.__kids[j], true); ch.__parent = copy; copy.__kids.push(ch);
+        }
+      }
+      return copy;
+    }
+    NODE_PROTO.cloneNode = function (deep) { return __cloneNode(this, !!deep); };
+    // Modern manipulation (append/prepend/before/after/replaceWith/
+    // replaceChildren); a string argument becomes a text node.
+    function __toNode(a) { return (a && a.__type !== undefined) ? a : makeText(a == null ? "" : String(a)); }
+    ELEMENT_PROTO.append = function () { for (var i = 0; i < arguments.length; i++) appendChild(this, __toNode(arguments[i])); };
+    ELEMENT_PROTO.prepend = function () {
+      var first = this.__kids[0] || null;
+      for (var i = 0; i < arguments.length; i++) insertBefore(this, __toNode(arguments[i]), first);
+    };
+    ELEMENT_PROTO.before = function () {
+      var p = this.__parent; if (!p) return;
+      for (var i = 0; i < arguments.length; i++) insertBefore(p, __toNode(arguments[i]), this);
+    };
+    ELEMENT_PROTO.after = function () {
+      var p = this.__parent; if (!p) return;
+      var ref = p.__kids[p.__kids.indexOf(this) + 1] || null;
+      for (var i = 0; i < arguments.length; i++) insertBefore(p, __toNode(arguments[i]), ref);
+    };
+    ELEMENT_PROTO.replaceWith = function () {
+      var p = this.__parent; if (!p) return;
+      for (var i = 0; i < arguments.length; i++) insertBefore(p, __toNode(arguments[i]), this);
+      removeChild(p, this);
+    };
+    ELEMENT_PROTO.replaceChildren = function () {
+      while (this.__kids.length) removeChild(this, this.__kids[0]);
+      for (var i = 0; i < arguments.length; i++) appendChild(this, __toNode(arguments[i]));
+    };
     NODE_PROTO.contains = function (other) {
       for (var n = other; n; n = n.__parent) if (n === this) return true;
       return false;

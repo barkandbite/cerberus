@@ -356,6 +356,32 @@ fn event_dispatch_runs_capture_target_then_bubble() {
 }
 
 #[test]
+fn clone_replacechild_and_modern_manipulation() {
+    // cloneNode/replaceChild were missing (Phase 1 gap); append/prepend/after are
+    // modern manipulation. Build a list, clone (deep, with attrs), replaceChild,
+    // and after(); assert final text + structure.
+    let doc = shell_with("result", "init");
+    let mut client = Stub::default();
+    let out = run(
+        &doc,
+        &["var box = document.createElement('div'); document.body.appendChild(box); \
+           var a = document.createElement('p'); a.textContent = 'A'; a.setAttribute('data-k', 'v'); \
+           box.append(a, 'tail'); box.prepend('head'); \
+           var clone = a.cloneNode(true); clone.id = 'clone'; box.append(clone); \
+           var b = document.createElement('p'); b.textContent = 'B'; box.replaceChild(b, a); \
+           var c = document.createElement('i'); c.textContent = 'C'; b.after(c); \
+           document.getElementById('result').textContent = box.textContent + '|' \
+             + clone.getAttribute('data-k') + '|' + clone.textContent + '|' + box.children.length;"],
+        &mut client,
+    );
+    assert_eq!(
+        find_id(out.root(), "result").unwrap().text_content(),
+        "headBCtailA|v|A|3",
+        "append/prepend/after order; deep cloneNode copies attrs+text; replaceChild swaps"
+    );
+}
+
+#[test]
 fn performance_now_and_crypto_get_random_values_exist() {
     // The real sensor calls performance.now() and crypto.getRandomValues() early;
     // when they were missing it threw before doing anything. Assert the contract:
