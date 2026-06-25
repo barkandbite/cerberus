@@ -841,6 +841,29 @@ fn split_important(value: &str) -> (&str, bool) {
     (value, false)
 }
 
+/// Replace each (case-insensitive) `currentColor` token in `value` with `color`
+/// as an `rgba(...)` literal the color parsers understand.
+fn replace_current_color(value: &str, color: Color) -> String {
+    let rgba = format!(
+        "rgba({}, {}, {}, {})",
+        color.r,
+        color.g,
+        color.b,
+        color.a as f32 / 255.0
+    );
+    let low = value.to_ascii_lowercase();
+    let mut out = String::with_capacity(value.len());
+    let mut i = 0;
+    while let Some(rel) = low[i..].find("currentcolor") {
+        let start = i + rel;
+        out.push_str(&value[i..start]);
+        out.push_str(&rgba);
+        i = start + "currentcolor".len();
+    }
+    out.push_str(&value[i..]);
+    out
+}
+
 fn apply_declarations(
     style: &mut ComputedStyle,
     decls: &[(String, String)],
@@ -863,7 +886,13 @@ fn apply_declarations(
         }
         // Resolve `var()` references and `calc()` math before parsing the value.
         // `em` for `calc()` uses the element's current font size.
-        let resolved = resolve_value(clean, vars, style.font_size as f32);
+        let mut resolved = resolve_value(clean, vars, style.font_size as f32);
+        // `currentColor` resolves to the element's current `color` (best-effort:
+        // the value as cascaded so far, since `color` usually precedes the
+        // properties that reference it). Substitute it before the color parsers.
+        if resolved.to_ascii_lowercase().contains("currentcolor") {
+            resolved = replace_current_color(&resolved, style.color);
+        }
         let v = resolved.trim();
         match prop.as_str() {
             "color" => {
@@ -2247,6 +2276,16 @@ mod tests {
             Color::rgb(0xff, 0, 0),
             "!important beats #id and inline-normal"
         );
+    }
+
+    #[test]
+    fn current_color_resolves_to_the_elements_color() {
+        // `currentColor` resolves to the element's `color` (set earlier in the
+        // same rule), so the background becomes red.
+        let html = "<style>p { color: #ff0000; background: currentColor }</style><p>x</p>";
+        let dom = CssEngine::new().style(&parse_html(html));
+        let p = first(&dom.root, "p").unwrap();
+        assert_eq!(p.style.background, Some(Color::rgb(255, 0, 0)));
     }
 
     #[test]
