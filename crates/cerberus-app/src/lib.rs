@@ -2633,14 +2633,29 @@ impl BrowserApp {
             return doc;
         }
         let realm = RealmId(self.heads.active().id.0);
+        let instance = self.heads.active().instance;
+        let origin = self.current_url.as_ref().and_then(|u| u.origin());
+        // Seed localStorage with this origin's persisted store so a value cached on
+        // a prior navigation in this session round-trips (sealed per identity +
+        // origin). The interactive `document.cookie` bridge is still a follow-up.
+        let doc_local_storage = origin
+            .as_ref()
+            .map(|o| {
+                self.storage
+                    .locked()
+                    .local_storage(instance, &origin_storage_key(o))
+                    .unwrap_or_default()
+                    .to_string()
+            })
+            .unwrap_or_default();
         let env = PageEnv {
             url: self.toolbar.url_text.clone(),
             viewport: (self.last_size.w, self.last_size.h),
             user_agent: self.active_ua.clone(),
-            // Interactive path doesn't seed the cookie / localStorage bridges yet
-            // (the headless render path does); follow-up wires them here too.
+            // Interactive path doesn't seed the cookie bridge yet (the headless
+            // render path does); follow-up wires it here too.
             cookies: String::new(),
-            local_storage: String::new(),
+            local_storage: doc_local_storage,
         };
         let engine = match self.heads.engine() {
             Ok(engine) => engine,
@@ -2669,14 +2684,24 @@ impl BrowserApp {
         for m in cerberus_js_dom::take_console(engine, realm) {
             eprintln!("[js:{}] {}", m.level, m.text);
         }
-        match serialize_dom(engine, realm) {
+        // Capture the localStorage snapshot while the engine is still borrowed.
+        let snapshot = cerberus_js_dom::snapshot_local_storage(engine, realm);
+        let result = match serialize_dom(engine, realm) {
             Ok(rebuilt) => {
                 let RebuiltDom { document, id_map } = rebuilt;
                 self.node_to_js = invert_id_map(&id_map);
                 document
             }
             Err(_) => doc,
+        };
+        // Persist it to the sealed per-origin store, so the next navigation to this
+        // origin (within the session) sees it — cross-navigation persistence.
+        if let (Some(o), Some(s)) = (origin.as_ref(), snapshot) {
+            self.storage
+                .locked()
+                .set_local_storage(instance, &origin_storage_key(o), s);
         }
+        result
     }
 
     fn commit_response(
@@ -6313,6 +6338,46 @@ mod tests {
         assert!(
             !text.contains("old"),
             "original text should be replaced; got {text:?}"
+        );
+    }
+
+    #[test]
+    fn local_storage_persists_across_same_origin_navigations() {
+        // One page writes a value; a later navigation to the SAME origin must see
+        // it — proving the interactive localStorage bridge seeds from and persists
+        // to the sealed per-origin store across navigations (each navigation
+        // re-installs the model, which would otherwise wipe localStorage).
+        let mut b = fake_app(vec![
+            (
+                "https://ls.test/write",
+                Ok(page(
+                    "https://ls.test/write",
+                    200,
+                    None,
+                    "<div id=\"app\">writing</div>\
+                     <script>localStorage.setItem('tok', 'xyz-123')</script>",
+                )),
+            ),
+            (
+                "https://ls.test/read",
+                Ok(page(
+                    "https://ls.test/read",
+                    200,
+                    None,
+                    "<div id=\"app\">reading</div>\
+                     <script>document.getElementById('app').textContent = \
+                        (localStorage.getItem('tok') || 'MISSING')</script>",
+                )),
+            ),
+        ]);
+        b.navigate("https://ls.test/write");
+        assert!(b.poll());
+        b.navigate("https://ls.test/read");
+        assert!(b.poll());
+        let text = b.document.root().text_content();
+        assert!(
+            text.contains("xyz-123"),
+            "localStorage should persist across same-origin navigations; got {text:?}"
         );
     }
 
