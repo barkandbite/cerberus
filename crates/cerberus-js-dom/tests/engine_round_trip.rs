@@ -240,6 +240,49 @@ fn console_levels_and_thrown_script_error_surface() {
 }
 
 #[test]
+fn typed_event_constructors_carry_init_and_dispatch() {
+    let (mut engine, realm) = engine_and_realm();
+    let doc = doc_with_div_x();
+    let scripts = vec!["globalThis.__seen = []; \
+         var x = document.getElementById('x'); \
+         x.addEventListener('keydown', function (e) { \
+            globalThis.__seen.push('kd:' + e.key + ':' + e.ctrlKey + ':' \
+              + (e instanceof KeyboardEvent) + ':' + (e instanceof Event)); \
+         }); \
+         x.dispatchEvent(new KeyboardEvent('keydown', \
+            { key: 'Enter', ctrlKey: true, bubbles: true })); \
+         var m = new MouseEvent('click', { clientX: 12, clientY: 34, button: 1 }); \
+         globalThis.__seen.push('ms:' + m.clientX + ',' + m.clientY + ':' \
+            + (m instanceof MouseEvent) + ':' + (m instanceof UIEvent)); \
+         var p = new PointerEvent('pointerdown', { pointerType: 'touch', clientX: 5 }); \
+         globalThis.__seen.push('pt:' + p.pointerType + ':' + p.clientX + ':' \
+            + (p instanceof MouseEvent));"
+        .to_string()];
+    run_page_scripts(engine.as_mut(), realm, &doc, &scripts, &env()).expect("run");
+
+    let seen = engine
+        .eval(realm, "globalThis.__seen.join('|')")
+        .expect("read __seen");
+    match seen {
+        JsValue::Str(s) => {
+            assert!(
+                s.contains("kd:Enter:true:true:true"),
+                "KeyboardEvent init + instanceof + dispatch; got {s:?}"
+            );
+            assert!(
+                s.contains("ms:12,34:true:true"),
+                "MouseEvent init + instanceof UIEvent; got {s:?}"
+            );
+            assert!(
+                s.contains("pt:touch:5:true"),
+                "PointerEvent extends MouseEvent; got {s:?}"
+            );
+        }
+        other => panic!("expected string, got {other:?}"),
+    }
+}
+
+#[test]
 fn uncaught_script_error_fires_window_onerror_and_error_event() {
     let (mut engine, realm) = engine_and_realm();
     let doc = doc_with_div_x();

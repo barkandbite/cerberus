@@ -2911,6 +2911,62 @@ pub const DOM_MODEL_PRELUDE: &str = r##"
     g.CustomEvent.prototype = Object.create(g.Event.prototype);
     g.CustomEvent.prototype.constructor = g.CustomEvent;
 
+    // Typed Event subclasses (KeyboardEvent/MouseEvent/PointerEvent/…). SPAs and
+    // widgets construct and dispatch these for synthetic input and custom flows;
+    // only Event/CustomEvent existed, so `new KeyboardEvent(...)` threw. Each
+    // extends its parent and copies its own init fields (with defaults), so the
+    // prototype chain (and `instanceof Event`) and the dispatch machinery work.
+    function __defEventClass(name, parent, fields) {
+      var ctor = function (type, init) {
+        init = init || {};
+        parent.call(this, type, init);
+        for (var i = 0; i < fields.length; i++) {
+          var k = fields[i][0];
+          this[k] = (init[k] !== undefined) ? init[k] : fields[i][1];
+        }
+      };
+      ctor.prototype = Object.create(parent.prototype);
+      ctor.prototype.constructor = ctor;
+      g[name] = ctor;
+      return ctor;
+    }
+    var UIEvent = __defEventClass("UIEvent", g.Event, [["detail", 0], ["view", null]]);
+    var MouseEvent = __defEventClass("MouseEvent", UIEvent, [
+      ["screenX", 0], ["screenY", 0], ["clientX", 0], ["clientY", 0],
+      ["pageX", 0], ["pageY", 0], ["movementX", 0], ["movementY", 0],
+      ["button", 0], ["buttons", 0], ["relatedTarget", null],
+      ["ctrlKey", false], ["shiftKey", false], ["altKey", false], ["metaKey", false],
+    ]);
+    __defEventClass("PointerEvent", MouseEvent, [
+      ["pointerId", 0], ["pointerType", ""], ["isPrimary", false],
+      ["width", 1], ["height", 1], ["pressure", 0], ["tiltX", 0], ["tiltY", 0],
+    ]);
+    __defEventClass("WheelEvent", MouseEvent, [
+      ["deltaX", 0], ["deltaY", 0], ["deltaZ", 0], ["deltaMode", 0],
+    ]);
+    __defEventClass("DragEvent", MouseEvent, [["dataTransfer", null]]);
+    __defEventClass("KeyboardEvent", UIEvent, [
+      ["key", ""], ["code", ""], ["location", 0], ["repeat", false], ["isComposing", false],
+      ["charCode", 0], ["keyCode", 0], ["which", 0],
+      ["ctrlKey", false], ["shiftKey", false], ["altKey", false], ["metaKey", false],
+    ]);
+    __defEventClass("InputEvent", UIEvent, [["data", null], ["inputType", ""], ["isComposing", false]]);
+    __defEventClass("FocusEvent", UIEvent, [["relatedTarget", null]]);
+    __defEventClass("TouchEvent", UIEvent, [
+      ["touches", []], ["targetTouches", []], ["changedTouches", []],
+      ["ctrlKey", false], ["shiftKey", false], ["altKey", false], ["metaKey", false],
+    ]);
+    __defEventClass("SubmitEvent", g.Event, [["submitter", null]]);
+    __defEventClass("PopStateEvent", g.Event, [["state", null]]);
+    __defEventClass("HashChangeEvent", g.Event, [["oldURL", ""], ["newURL", ""]]);
+    __defEventClass("MessageEvent", g.Event, [
+      ["data", null], ["origin", ""], ["lastEventId", ""], ["source", null], ["ports", []],
+    ]);
+    __defEventClass("ErrorEvent", g.Event, [
+      ["message", ""], ["filename", ""], ["lineno", 0], ["colno", 0], ["error", null],
+    ]);
+    __defEventClass("ProgressEvent", g.Event, [["lengthComputable", false], ["loaded", 0], ["total", 0]]);
+
     // ---- URL / URLSearchParams -----------------------------------------
     // `new URL(...)` and `URLSearchParams` are used pervasively (routing, link
     // building, query parsing); their absence silently broke that code. A
