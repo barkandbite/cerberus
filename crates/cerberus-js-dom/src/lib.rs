@@ -2238,6 +2238,34 @@ pub const DOM_MODEL_PRELUDE: &str = r##"
       return anim;
     };
     ELEMENT_PROTO.getAnimations = function () { return []; };
+    // Element-level scroll methods (no scroll model — no-ops, but present and
+    // settable so `el.scrollTo(0,0)` / smooth-scroll calls don't throw).
+    ELEMENT_PROTO.scrollTo = function () {};
+    ELEMENT_PROTO.scrollBy = function () {};
+    ELEMENT_PROTO.scroll = function () {};
+    // attributes: a NamedNodeMap-like over the element's attributes (length,
+    // indexed access, item(i), getNamedItem(name), iteration). Built per read
+    // from the live __attrs list — enough for the common `for (a of el.attributes)`
+    // and `el.attributes.length` uses.
+    Object.defineProperty(ELEMENT_PROTO, "attributes", {
+      get: function () {
+        var attrs = this.__attrs || [];
+        var list = [];
+        for (var i = 0; i < attrs.length; i++) {
+          list.push({
+            name: attrs[i][0], localName: attrs[i][0], value: attrs[i][1],
+            namespaceURI: null, prefix: null, specified: true,
+          });
+        }
+        list.item = function (j) { return this[j] || null; };
+        list.getNamedItem = function (n) {
+          for (var j = 0; j < this.length; j++) if (this[j].name === n) return this[j];
+          return null;
+        };
+        return list;
+      },
+      configurable: true,
+    });
     ELEMENT_PROTO.getClientRects = function () {
       var r = (typeof this.getBoundingClientRect === "function")
         ? this.getBoundingClientRect()
@@ -3308,6 +3336,22 @@ pub const DOM_MODEL_PRELUDE: &str = r##"
     window.scrollX = 0; window.scrollY = 0;
     window.pageXOffset = 0; window.pageYOffset = 0;
     window.scrollTo = function () {}; window.scrollBy = function () {}; window.scroll = function () {};
+    // getSelection: no live selection model — return an empty, collapsed Selection
+    // so copy/contenteditable/selection code runs (e.g. `getSelection().toString()`
+    // returns "") instead of throwing.
+    window.getSelection = function () {
+      return {
+        rangeCount: 0, type: "None", isCollapsed: true,
+        anchorNode: null, anchorOffset: 0, focusNode: null, focusOffset: 0,
+        toString: function () { return ""; },
+        removeAllRanges: function () {}, addRange: function () {},
+        collapse: function () {}, collapseToStart: function () {}, collapseToEnd: function () {},
+        selectAllChildren: function () {}, empty: function () {},
+        containsNode: function () { return false; },
+        getRangeAt: function () { throw new Error("getSelection: no range at index"); },
+      };
+    };
+    document.getSelection = window.getSelection;
 
     // ---- performance ---------------------------------------------------
     // Real elapsed time from the native Date clock (QuickJS Date is wall-clock),

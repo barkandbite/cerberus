@@ -218,6 +218,48 @@ fn programmatic_click_dispatches_and_is_connected_tracks_tree() {
 }
 
 #[test]
+fn attributes_namednodemap_scroll_and_getselection() {
+    let (mut engine, realm) = engine_and_realm();
+    let doc = doc_with_div_x();
+    let scripts = vec![
+        "globalThis.__a = []; \
+         var x = document.getElementById('x'); \
+         x.setAttribute('data-k', 'v'); \
+         var at = x.attributes; \
+         globalThis.__a.push('len:' + (at.length >= 2)); \
+         globalThis.__a.push('named:' + (at.getNamedItem('data-k') ? at.getNamedItem('data-k').value : 'null')); \
+         var names = []; for (var i = 0; i < at.length; i++) names.push(at[i].name); \
+         globalThis.__a.push('hasid:' + (names.indexOf('id') !== -1) \
+            + ':hasdata:' + (names.indexOf('data-k') !== -1)); \
+         x.scrollTo(0, 0); x.scroll({ top: 0 }); \
+         var sel = window.getSelection(); \
+         globalThis.__a.push('sel:' + sel.rangeCount + ':' \
+            + JSON.stringify(sel.toString()) + ':' + sel.isCollapsed);"
+            .to_string(),
+    ];
+    run_page_scripts(engine.as_mut(), realm, &doc, &scripts, &env()).expect("run");
+
+    let a = engine
+        .eval(realm, "globalThis.__a.join('|')")
+        .expect("read __a");
+    match a {
+        JsValue::Str(s) => {
+            assert!(s.contains("len:true"), "attributes.length; got {s:?}");
+            assert!(s.contains("named:v"), "getNamedItem; got {s:?}");
+            assert!(
+                s.contains("hasid:true:hasdata:true"),
+                "attribute iteration; got {s:?}"
+            );
+            assert!(
+                s.contains("sel:0:\"\":true"),
+                "getSelection stub; got {s:?}"
+            );
+        }
+        other => panic!("expected string, got {other:?}"),
+    }
+}
+
+#[test]
 fn page_visibility_focus_rootnode_and_animate_stub() {
     let (mut engine, realm) = engine_and_realm();
     let doc = doc_with_div_x();
