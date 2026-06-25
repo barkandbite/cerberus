@@ -1608,7 +1608,23 @@ pub const DOM_MODEL_PRELUDE: &str = r##"
           return want;
         },
         item: function (i) { return classTokens(el)[i] || null; },
+        replace: function (oldT, newT) {
+          oldT = String(oldT); newT = String(newT);
+          var toks = classTokens(el);
+          var k = toks.indexOf(oldT);
+          if (k === -1) return false;
+          if (toks.indexOf(newT) === -1) toks[k] = newT; else toks.splice(k, 1);
+          writeClass(el, toks);
+          return true;
+        },
+        forEach: function (cb, thisArg) {
+          var toks = classTokens(el);
+          for (var i = 0; i < toks.length; i++) cb.call(thisArg, toks[i], i, this);
+        },
+        get value() { return getAttr(el, "class") || ""; },
+        set value(v) { writeClass(el, String(v).split(/\s+/).filter(function (t) { return t; })); },
         toString: function () { return getAttr(el, "class") || ""; },
+        [Symbol.iterator]: function () { return classTokens(el)[Symbol.iterator](); },
       };
     }
 
@@ -2984,6 +3000,35 @@ pub const DOM_MODEL_PRELUDE: &str = r##"
       ["message", ""], ["filename", ""], ["lineno", 0], ["colno", 0], ["error", null],
     ]);
     __defEventClass("ProgressEvent", g.Event, [["lengthComputable", false], ["loaded", 0], ["total", 0]]);
+
+    // ---- CSS (supports / escape) ---------------------------------------
+    // CSS.supports drives progressive-enhancement feature detection. We report
+    // `true` (the engine supports a broad CSS subset and already applies @supports
+    // blocks unconditionally — ADR-aligned), so sites take their modern path.
+    // CSS.escape implements the spec algorithm for escaping a string for use in a
+    // selector (used to build querySelector args safely).
+    g.CSS = {
+      supports: function () { return true; },
+      escape: function (value) {
+        var s = String(value), out = "", i, c, first = s.charCodeAt(0);
+        for (i = 0; i < s.length; i++) {
+          c = s.charCodeAt(i);
+          if (c === 0) { out += "�"; continue; }
+          if ((c >= 0x1 && c <= 0x1f) || c === 0x7f ||
+              (i === 0 && c >= 0x30 && c <= 0x39) ||
+              (i === 1 && c >= 0x30 && c <= 0x39 && first === 0x2d)) {
+            out += "\\" + c.toString(16) + " "; continue;
+          }
+          if (i === 0 && c === 0x2d && s.length === 1) { out += "\\-"; continue; }
+          if (c >= 0x80 || c === 0x2d || c === 0x5f ||
+              (c >= 0x30 && c <= 0x39) || (c >= 0x41 && c <= 0x5a) || (c >= 0x61 && c <= 0x7a)) {
+            out += s.charAt(i); continue;
+          }
+          out += "\\" + s.charAt(i);
+        }
+        return out;
+      },
+    };
 
     // ---- URL / URLSearchParams -----------------------------------------
     // `new URL(...)` and `URLSearchParams` are used pervasively (routing, link

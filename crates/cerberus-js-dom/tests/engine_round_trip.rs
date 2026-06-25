@@ -218,6 +218,51 @@ fn programmatic_click_dispatches_and_is_connected_tracks_tree() {
 }
 
 #[test]
+fn classlist_replace_iterate_and_css_helpers() {
+    let (mut engine, realm) = engine_and_realm();
+    let doc = doc_with_div_x();
+    let scripts = vec!["globalThis.__r = []; \
+         var x = document.getElementById('x'); \
+         x.className = 'a b c'; \
+         globalThis.__r.push('replace:' + x.classList.replace('b', 'B') + ':' + x.className); \
+         var seen = []; x.classList.forEach(function (t) { seen.push(t); }); \
+         globalThis.__r.push('forEach:' + seen.join(',')); \
+         globalThis.__r.push('value:' + x.classList.value); \
+         var it = []; for (var t of x.classList) it.push(t); \
+         globalThis.__r.push('iter:' + it.join(',')); \
+         globalThis.__r.push('supports:' + CSS.supports('display', 'grid')); \
+         globalThis.__r.push('esc1:' + CSS.escape('a.b#c')); \
+         globalThis.__r.push('esc2:' + CSS.escape('1x'));"
+        .to_string()];
+    run_page_scripts(engine.as_mut(), realm, &doc, &scripts, &env()).expect("run");
+
+    let r = engine
+        .eval(realm, "globalThis.__r.join('~')")
+        .expect("read __r");
+    match r {
+        JsValue::Str(s) => {
+            assert!(
+                s.contains("replace:true:a B c"),
+                "classList.replace; got {s:?}"
+            );
+            assert!(s.contains("forEach:a,B,c"), "classList.forEach; got {s:?}");
+            assert!(s.contains("value:a B c"), "classList.value; got {s:?}");
+            assert!(s.contains("iter:a,B,c"), "classList iteration; got {s:?}");
+            assert!(s.contains("supports:true"), "CSS.supports; got {s:?}");
+            assert!(
+                s.contains("esc1:a\\.b\\#c"),
+                "CSS.escape specials; got {s:?}"
+            );
+            assert!(
+                s.contains("esc2:\\31 x"),
+                "CSS.escape leading digit; got {s:?}"
+            );
+        }
+        other => panic!("expected string, got {other:?}"),
+    }
+}
+
+#[test]
 fn local_storage_seeds_from_env_and_snapshots_back() {
     let (mut engine, realm) = engine_and_realm();
     let doc = doc_with_div_x();
