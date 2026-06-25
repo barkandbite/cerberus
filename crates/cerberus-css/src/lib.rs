@@ -948,6 +948,36 @@ fn split_important(value: &str) -> (&str, bool) {
     (value, false)
 }
 
+fn parse_align_items(v: &str) -> AlignItems {
+    match v.to_ascii_lowercase().as_str() {
+        "center" => AlignItems::Center,
+        "flex-end" | "end" => AlignItems::End,
+        "flex-start" | "start" => AlignItems::Start,
+        _ => AlignItems::Stretch,
+    }
+}
+
+fn parse_justify_content(v: &str) -> JustifyContent {
+    match v.to_ascii_lowercase().as_str() {
+        "center" => JustifyContent::Center,
+        "flex-end" | "end" | "right" => JustifyContent::End,
+        "space-between" => JustifyContent::SpaceBetween,
+        "space-around" => JustifyContent::SpaceAround,
+        "space-evenly" => JustifyContent::SpaceEvenly,
+        _ => JustifyContent::Start,
+    }
+}
+
+fn parse_align_self(v: &str) -> AlignSelf {
+    match v.to_ascii_lowercase().as_str() {
+        "center" => AlignSelf::Center,
+        "flex-end" | "end" => AlignSelf::End,
+        "flex-start" | "start" => AlignSelf::Start,
+        "stretch" => AlignSelf::Stretch,
+        _ => AlignSelf::Auto,
+    }
+}
+
 /// Replace each (case-insensitive) `currentColor` token in `value` with `color`
 /// as an `rgba(...)` literal the color parsers understand.
 fn replace_current_color(value: &str, color: Color) -> String {
@@ -1287,32 +1317,25 @@ fn apply_declarations(
                 style.flex_reverse = low.ends_with("-reverse");
             }
             "flex-wrap" => style.flex_wrap = v.to_ascii_lowercase().starts_with("wrap"),
-            "justify-content" => {
-                style.justify_content = match v.to_ascii_lowercase().as_str() {
-                    "center" => JustifyContent::Center,
-                    "flex-end" | "end" | "right" => JustifyContent::End,
-                    "space-between" => JustifyContent::SpaceBetween,
-                    "space-around" => JustifyContent::SpaceAround,
-                    "space-evenly" => JustifyContent::SpaceEvenly,
-                    _ => JustifyContent::Start,
-                }
+            "justify-content" => style.justify_content = parse_justify_content(v),
+            "align-items" => style.align_items = parse_align_items(v),
+            "align-self" => style.align_self = parse_align_self(v),
+            // The `place-*` shorthands (the ubiquitous grid/flex centering idioms).
+            // We model the cross-axis item alignment (align-items / align-self) and
+            // the main-axis content distribution (justify-content); the unmodeled
+            // halves (justify-items / align-content / justify-self) are skipped.
+            "place-items" => {
+                style.align_items = parse_align_items(v.split_whitespace().next().unwrap_or(""))
             }
-            "align-items" => {
-                style.align_items = match v.to_ascii_lowercase().as_str() {
-                    "center" => AlignItems::Center,
-                    "flex-end" | "end" => AlignItems::End,
-                    "flex-start" | "start" => AlignItems::Start,
-                    _ => AlignItems::Stretch,
-                }
+            "place-self" => {
+                style.align_self = parse_align_self(v.split_whitespace().next().unwrap_or(""))
             }
-            "align-self" => {
-                style.align_self = match v.to_ascii_lowercase().as_str() {
-                    "center" => AlignSelf::Center,
-                    "flex-end" | "end" => AlignSelf::End,
-                    "flex-start" | "start" => AlignSelf::Start,
-                    "stretch" => AlignSelf::Stretch,
-                    _ => AlignSelf::Auto,
-                }
+            "place-content" => {
+                // `place-content: <align-content> [<justify-content>]` — the engine
+                // distributes on justify-content (2nd token, or the single value).
+                let mut it = v.split_whitespace();
+                let a = it.next().unwrap_or("");
+                style.justify_content = parse_justify_content(it.next().unwrap_or(a));
             }
             "flex" => apply_flex_shorthand(style, v, style.font_size as f32),
             "flex-grow" => {
@@ -2382,6 +2405,31 @@ mod tests {
             p.style.color,
             Color::rgb(0xff, 0, 0),
             "!important beats #id and inline-normal"
+        );
+    }
+
+    #[test]
+    fn place_shorthands_map_to_align_and_justify() {
+        let d = CssEngine::new().style(&parse_html(
+            "<div style='display:grid; place-items:center; place-content:center'>x</div>",
+        ));
+        let d = first(&d.root, "div").unwrap();
+        assert_eq!(d.style.align_items, AlignItems::Center);
+        assert_eq!(d.style.justify_content, JustifyContent::Center);
+
+        // Two-value place-content: the 2nd token is the justify-content half.
+        let d2 = CssEngine::new().style(&parse_html(
+            "<div style='display:flex; place-content: start space-between'>x</div>",
+        ));
+        assert_eq!(
+            first(&d2.root, "div").unwrap().style.justify_content,
+            JustifyContent::SpaceBetween
+        );
+
+        let d3 = CssEngine::new().style(&parse_html("<div style='place-self: end'>x</div>"));
+        assert_eq!(
+            first(&d3.root, "div").unwrap().style.align_self,
+            AlignSelf::End
         );
     }
 
