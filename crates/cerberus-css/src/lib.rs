@@ -1124,6 +1124,13 @@ fn apply_declarations(
                     style.letter_spacing = px;
                 }
             }
+            "word-spacing" => {
+                if v.trim().eq_ignore_ascii_case("normal") {
+                    style.word_spacing = 0;
+                } else if let Some(px) = parse_len(v, style.font_size as f32) {
+                    style.word_spacing = px;
+                }
+            }
             "text-decoration" | "text-decoration-line" => {
                 let low = v.to_ascii_lowercase();
                 if low.contains("underline") {

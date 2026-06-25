@@ -956,7 +956,8 @@ impl<'a> Ctx<'a> {
         let gap = if self.line.is_empty() {
             0
         } else {
-            space_width(self.shaper, px) as i32
+            // `word-spacing` adds to (or subtracts from) the inter-word space.
+            (space_width(self.shaper, px) as i32 + style.word_spacing).max(0)
         };
         // `white-space: nowrap` never breaks the line (it overflows instead).
         if !style.nowrap && self.x != self.left && self.x + gap + w as i32 > self.right {
@@ -4187,6 +4188,21 @@ mod tests {
         // The leading marker sits at or before the host text's x.
         let xs = glyph_xs(&with_pseudo);
         assert_eq!(xs[0], *xs.iter().min().unwrap(), "::before leads the line");
+    }
+
+    #[test]
+    fn word_spacing_widens_the_inter_word_gap() {
+        let plain = lay("<p>aa bb</p>", 400);
+        let spaced = lay("<p style='word-spacing:20px'>aa bb</p>", 400);
+        let p = glyph_xs(&plain);
+        let s = glyph_xs(&spaced);
+        assert_eq!((p.len(), s.len()), (2, 2), "two words, one run each");
+        assert_eq!(s[0], p[0], "first word unaffected by word-spacing");
+        assert_eq!(
+            s[1] - p[1],
+            20,
+            "word-spacing shifts the second word by 20px"
+        );
     }
 
     #[test]
