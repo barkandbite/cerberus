@@ -465,6 +465,32 @@ fn real_canvas_todataurl_emits_a_valid_png() {
 }
 
 #[test]
+fn real_canvas_path_fill() {
+    // beginPath/moveTo/lineTo/closePath/fill do a real scanline polygon fill (was
+    // a no-op). Fill the whole canvas green, then a triangle red; check inside vs
+    // outside the triangle.
+    let doc = shell_with("result", "init");
+    let mut client = Stub::default();
+    let out = run(
+        &doc,
+        &["globalThis.__cerberusCanvasReal = true; \
+           var cv = document.createElement('canvas'); cv.setAttribute('width', '10'); cv.setAttribute('height', '10'); \
+           var ctx = cv.getContext('2d'); ctx.fillStyle = '#00ff00'; \
+           ctx.beginPath(); ctx.moveTo(0,0); ctx.lineTo(10,0); ctx.lineTo(10,10); ctx.lineTo(0,10); ctx.closePath(); ctx.fill(); \
+           var center = ctx.getImageData(5,5,1,1).data; \
+           ctx.fillStyle = '#ff0000'; ctx.beginPath(); ctx.moveTo(0,0); ctx.lineTo(8,0); ctx.lineTo(0,8); ctx.closePath(); ctx.fill(); \
+           var inTri = ctx.getImageData(1,1,1,1).data; var outTri = ctx.getImageData(7,7,1,1).data; \
+           document.getElementById('result').textContent = [center[1], inTri[0], outTri[1]].join(',');"],
+        &mut client,
+    );
+    assert_eq!(
+        find_id(out.root(), "result").unwrap().text_content(),
+        "255,255,255",
+        "rect fill (green) then triangle fill (red): inside=red, outside stays green"
+    );
+}
+
+#[test]
 fn performance_now_and_crypto_get_random_values_exist() {
     // The real sensor calls performance.now() and crypto.getRandomValues() early;
     // when they were missing it threw before doing anything. Assert the contract:

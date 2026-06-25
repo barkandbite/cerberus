@@ -2409,6 +2409,35 @@ pub const DOM_MODEL_PRELUDE: &str = r##"
             data[o] = c[0]; data[o + 1] = c[1]; data[o + 2] = c[2]; data[o + 3] = c[3];
           }
       }
+      function px(x, y, c) { if (x >= 0 && x < w && y >= 0 && y < h) { var o = (y * w + x) * 4; data[o] = c[0]; data[o + 1] = c[1]; data[o + 2] = c[2]; data[o + 3] = c[3]; } }
+      // Current path = array of subpaths (each an array of {x,y}); even-odd
+      // scanline fill, Bresenham stroke.
+      var path = [], cur = null;
+      function newSub(x, y) { cur = [{ x: x, y: y }]; path.push(cur); }
+      function fillPath(c) {
+        var minY = Infinity, maxY = -Infinity, s, i;
+        for (s = 0; s < path.length; s++) for (i = 0; i < path[s].length; i++) { var py = path[s][i].y; if (py < minY) minY = py; if (py > maxY) maxY = py; }
+        if (minY === Infinity) return;
+        for (var y = Math.max(0, Math.floor(minY)); y <= Math.min(h - 1, Math.ceil(maxY)); y++) {
+          var sy = y + 0.5, xs = [];
+          for (s = 0; s < path.length; s++) {
+            var pts = path[s], np = pts.length;
+            for (i = 0; i < np; i++) {
+              var a = pts[i], b = pts[(i + 1) % np];
+              if ((a.y <= sy && b.y > sy) || (b.y <= sy && a.y > sy)) xs.push(a.x + (sy - a.y) / (b.y - a.y) * (b.x - a.x));
+            }
+          }
+          xs.sort(function (p, q) { return p - q; });
+          for (var k = 0; k + 1 < xs.length; k += 2) {
+            for (var x = Math.max(0, Math.round(xs[k])); x < Math.min(w, Math.round(xs[k + 1])); x++) px(x, y, c);
+          }
+        }
+      }
+      function line(a, b, c) {
+        var x0 = Math.round(a.x), y0 = Math.round(a.y), x1 = Math.round(b.x), y1 = Math.round(b.y);
+        var dx = Math.abs(x1 - x0), dy = Math.abs(y1 - y0), sx = x0 < x1 ? 1 : -1, sy = y0 < y1 ? 1 : -1, err = dx - dy;
+        for (;;) { px(x0, y0, c); if (x0 === x1 && y0 === y1) break; var e2 = 2 * err; if (e2 > -dy) { err -= dy; x0 += sx; } if (e2 < dx) { err += dx; y0 += sy; } }
+      }
       var ctx = {
         canvas: canvas,
         fillRect: function (x, y, rw, rh) { fillRaw(x, y, rw, rh, col(st.fillStyle)); },
@@ -2432,8 +2461,19 @@ pub const DOM_MODEL_PRELUDE: &str = r##"
         },
         createImageData: function (iw, ih) { return { data: new Uint8ClampedArray(iw * ih * 4), width: iw, height: ih }; },
         toDataURL: function () { return __canvasToPNG(data, w, h); },
-        beginPath: function () {}, closePath: function () {}, moveTo: function () {}, lineTo: function () {},
-        arc: function () {}, rect: function () {}, fill: function () {}, stroke: function () {}, clip: function () {},
+        beginPath: function () { path = []; cur = null; },
+        closePath: function () { cur = null; },
+        moveTo: function (x, y) { newSub(x, y); },
+        lineTo: function (x, y) { if (!cur) newSub(x, y); else cur.push({ x: x, y: y }); },
+        rect: function (x, y, rw, rh) { path.push([{ x: x, y: y }, { x: x + rw, y: y }, { x: x + rw, y: y + rh }, { x: x, y: y + rh }]); cur = null; },
+        arc: function (cx, cy, r, a0, a1) {
+          var seg = Math.max(8, Math.ceil(Math.abs(a1 - a0) / (Math.PI / 8)));
+          if (!cur) newSub(cx + r * Math.cos(a0), cy + r * Math.sin(a0));
+          for (var i = 0; i <= seg; i++) { var a = a0 + (a1 - a0) * i / seg; cur.push({ x: cx + r * Math.cos(a), y: cy + r * Math.sin(a) }); }
+        },
+        fill: function () { fillPath(col(st.fillStyle)); },
+        stroke: function () { var c = col(st.strokeStyle); for (var s = 0; s < path.length; s++) { var p = path[s]; for (var i = 0; i + 1 < p.length; i++) line(p[i], p[i + 1], c); } },
+        clip: function () {},
         save: function () {}, restore: function () {}, translate: function () {}, scale: function () {}, rotate: function () {}, setTransform: function () {}, transform: function () {},
         drawImage: function () {}, fillText: function () {}, strokeText: function () {},
         measureText: function (t) { return { width: String(t).length * 6 }; },
