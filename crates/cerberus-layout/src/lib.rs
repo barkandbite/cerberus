@@ -630,7 +630,8 @@ impl<'a> Ctx<'a> {
             self.left = box_left + bl + pl;
             self.right = (box_left + box_w - br - pr).max(self.left + 1);
             self.y += style.border_top + style.padding_top;
-            self.x = self.left;
+            // `text-indent` offsets the first line only (wrapping resets x to left).
+            self.x = self.left + style.text_indent.max(0);
             if visible && style.display == Display::ListItem && !style.list_style_none {
                 self.add_run("\u{2022}", style, None);
                 self.x += space_width(self.shaper, style.font_size.max(1)) as i32;
@@ -948,7 +949,11 @@ impl<'a> Ctx<'a> {
     fn add_word(&mut self, word: &str, style: &ComputedStyle, href: Option<&str>) {
         let px = style.font_size.max(1);
         let (glyphs, w) = self.shape_run(word, px, style);
-        let gap = if self.x == self.left {
+        // No inter-word space before the first piece on the line (using the line
+        // buffer, not `x == left`, so a `text-indent`-shifted first word doesn't
+        // get a spurious leading space; a list bullet is itself a piece, so the
+        // word after it still gets its space).
+        let gap = if self.line.is_empty() {
             0
         } else {
             space_width(self.shaper, px) as i32
@@ -4150,6 +4155,15 @@ mod tests {
         // The leading marker sits at or before the host text's x.
         let xs = glyph_xs(&with_pseudo);
         assert_eq!(xs[0], *xs.iter().min().unwrap(), "::before leads the line");
+    }
+
+    #[test]
+    fn text_indent_offsets_the_first_line() {
+        let plain = lay("<p>hello</p>", 400);
+        let indented = lay("<p style='text-indent:30px'>hello</p>", 400);
+        let px = glyph_xs(&plain).into_iter().min().unwrap();
+        let ix = glyph_xs(&indented).into_iter().min().unwrap();
+        assert_eq!(ix - px, 30, "first line is indented by text-indent");
     }
 
     #[test]

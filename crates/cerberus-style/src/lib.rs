@@ -319,6 +319,9 @@ pub struct ComputedStyle {
     /// Inherited (list-style-type inherits), so `ul { list-style: none }`
     /// silences its descendant `<li>` markers.
     pub list_style_none: bool,
+    /// `text-indent` — the first-line indent (px) of a block's inline content.
+    /// Inherited.
+    pub text_indent: i32,
     /// `visibility: hidden` — laid out but not painted. Inherited.
     pub visibility: Visibility,
     /// `opacity` in `[0.0, 1.0]`, composited in paint. Not inherited.
@@ -436,6 +439,7 @@ impl ComputedStyle {
             preformatted: false,
             nowrap: false,
             list_style_none: false,
+            text_indent: 0,
             visibility: Visibility::Visible,
             opacity: 1.0,
             flex_direction: FlexDirection::Row,
@@ -486,6 +490,7 @@ impl ComputedStyle {
             preformatted: self.preformatted,
             nowrap: self.nowrap,
             list_style_none: self.list_style_none,
+            text_indent: self.text_indent,
             visibility: self.visibility,
             // Reset per element:
             display: Display::Inline,

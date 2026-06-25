@@ -1305,6 +1305,7 @@ fn apply_declarations(
                     .split_whitespace()
                     .any(|t| t == "none")
             }
+            "text-indent" => set_margin(&mut style.text_indent, v, style.font_size as f32),
             "visibility" => {
                 style.visibility = match v.to_ascii_lowercase().as_str() {
                     "hidden" | "collapse" => Visibility::Hidden,
