@@ -2316,6 +2316,26 @@ pub const DOM_MODEL_PRELUDE: &str = r##"
         }
       }
     };
+    // compareDocumentPosition: the DOCUMENT_POSITION_* bitmask describing `other`'s
+    // position relative to this node. Used by libraries (jQuery/Sizzle) to sort
+    // nodes into document order. Bits: DISCONNECTED 1, PRECEDING 2, FOLLOWING 4,
+    // CONTAINS 8, CONTAINED_BY 16, IMPLEMENTATION_SPECIFIC 32.
+    NODE_PROTO.compareDocumentPosition = function (other) {
+      if (other === this) return 0;
+      function chain(n) { var c = []; for (; n; n = n.__parent) c.push(n); return c; }
+      var a = chain(this), b = chain(other);
+      if (a[a.length - 1] !== b[b.length - 1]) {
+        // Different roots: disconnected, with a consistent (id-based) order.
+        return 1 + 32 + ((other.__id || 0) < (this.__id || 0) ? 2 : 4);
+      }
+      if (a.indexOf(other) !== -1) return 8 + 2;  // other is an ancestor of this
+      if (b.indexOf(this) !== -1) return 16 + 4;  // other is a descendant of this
+      var ar = a.reverse(), br = b.reverse();     // root → node
+      var i = 0;
+      while (i < ar.length && i < br.length && ar[i] === br[i]) i++;
+      var kids = ar[i - 1].__kids;
+      return kids.indexOf(br[i]) > kids.indexOf(ar[i]) ? 4 : 2;
+    };
 
     // -- elements (ELEMENT_PROTO) --
     defAccessor(ELEMENT_PROTO, "tagName", function () { return this.__tag.toUpperCase(); });

@@ -218,6 +218,49 @@ fn programmatic_click_dispatches_and_is_connected_tracks_tree() {
 }
 
 #[test]
+fn compare_document_position_orders_nodes() {
+    let (mut engine, realm) = engine_and_realm();
+    let doc = doc_with_div_x();
+    let scripts = vec!["globalThis.__r = []; \
+         var p = document.createElement('div'); \
+         var a = document.createElement('span'); var b = document.createElement('span'); \
+         p.appendChild(a); p.appendChild(b); \
+         globalThis.__r.push('ab:' + a.compareDocumentPosition(b)); \
+         globalThis.__r.push('ba:' + b.compareDocumentPosition(a)); \
+         globalThis.__r.push('pa:' + p.compareDocumentPosition(a)); \
+         globalThis.__r.push('ap:' + a.compareDocumentPosition(p)); \
+         globalThis.__r.push('self:' + a.compareDocumentPosition(a)); \
+         var other = document.createElement('i'); \
+         globalThis.__r.push('disc:' + ((a.compareDocumentPosition(other) & 1) !== 0));"
+        .to_string()];
+    run_page_scripts(engine.as_mut(), realm, &doc, &scripts, &env()).expect("run");
+
+    let r = engine
+        .eval(realm, "globalThis.__r.join('|')")
+        .expect("read __r");
+    match r {
+        JsValue::Str(s) => {
+            assert!(s.contains("ab:4"), "b follows a (FOLLOWING); got {s:?}");
+            assert!(s.contains("ba:2"), "a precedes b (PRECEDING); got {s:?}");
+            assert!(
+                s.contains("pa:20"),
+                "a contained by p (CONTAINED_BY|FOLLOWING); got {s:?}"
+            );
+            assert!(
+                s.contains("ap:10"),
+                "p contains a (CONTAINS|PRECEDING); got {s:?}"
+            );
+            assert!(s.contains("self:0"), "a vs a is 0; got {s:?}");
+            assert!(
+                s.contains("disc:true"),
+                "disconnected sets bit 1; got {s:?}"
+            );
+        }
+        other => panic!("expected string, got {other:?}"),
+    }
+}
+
+#[test]
 fn normalize_clipboard_and_permissions() {
     let (mut engine, realm) = engine_and_realm();
     let doc = doc_with_div_x();
