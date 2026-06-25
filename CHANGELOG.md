@@ -3,6 +3,80 @@
 All notable changes to Cerberus are recorded here. Versions are small while the
 browser is pre-1.0; this is the first tagged preview.
 
+## [0.0.6] — 2026-06-25
+
+The JavaScript & Web-platform release. Pages that build themselves with scripts
+now execute, read, and mutate a live DOM, and the CSS engine + selector support
+cover the modern surface real sites actually use. The engine decision (ADR-0064)
+was to **keep QuickJS and build the Web-platform layer on top** rather than write
+or embed a new engine.
+
+### Added — JavaScript engine & DOM
+- **Live DOM bindings.** Scripts query and traverse the document and mutate it:
+  create / clone / insert / replace nodes (`append`/`prepend`/`before`/`after`/
+  `replaceWith`/`replaceChildren`/`insertAdjacent*`/`replaceChild`/`cloneNode`),
+  attributes (incl. `dataset`, `toggleAttribute`, `createElementNS`), `classList`,
+  and geometry accessors (`offset*`/`client*`/`scroll*`, `getBoundingClientRect`/
+  `getClientRects`, `scrollIntoView`, and `getComputedStyle` resolved to used px).
+- **Events.** Typed constructors (`Keyboard`/`Mouse`/`Pointer`/`Custom`…), full
+  three-phase propagation with the capture phase, and a real **`MutationObserver`**
+  (previously a no-op stub).
+- **A second, JS-side selector engine** (for `querySelector*`) extended with
+  attribute operators, pseudo-classes, and sibling combinators.
+- **Web APIs returning the real runtime's values, never synthetic ones:** `URL`/
+  `URLSearchParams`, `FormData`/`Blob`, `AbortController`/`AbortSignal`,
+  `XMLHttpRequest` + `fetch` bodies, `TextEncoder`/`TextDecoder`, `btoa`/`atob`,
+  `structuredClone`, `performance.now()`, `crypto.getRandomValues`/`randomUUID` +
+  `crypto.subtle.digest` (real SHA-256), `history.pushState`/`replaceState`/
+  `popstate`, and `navigator.sendBeacon`.
+- **Storage.** Origin-partitioned, persisted `localStorage` with real `Storage`
+  semantics, and a `document.cookie`↔jar bridge (read **and** write-back) that
+  enforces `HttpOnly` on reads.
+- **Scripts.** External `<script src>` (consent-gated) and dynamic `<script>`
+  injection run under a wall-clock JS budget; content-complete SSR pages skip
+  redundant external fetches.
+- **Observability.** A structured JS `console` and an uncaught-error bridge into
+  Rust (`window.onerror` + `error` events).
+- **Conformance harnesses (offline, no network, CI-friendly oracle):** a
+  Test262-style engine subset and a web-platform fixture harness (#41).
+
+### Added — CSS, layout & canvas
+- **Selectors:** `:is()`/`:where()`, `:not(list)`, the `:*-of-type` family,
+  `:nth-last-child`/`-of-type`, `:checked`/`:disabled`/`:enabled`, `:empty`, and
+  the `[attr=val i]` / `[s]` case-sensitivity flag.
+- **Cascade:** `!important` (two-pass — fixes real mis-renders), `currentColor`,
+  `min()`/`max()`/`clamp()`, `hsl()`/`hsla()` + 4/8-digit hex, `calc()` in media
+  values, and `@media` evaluated against the real viewport.
+- **Box & text:** logical `margin`/`padding`/`inset`, `place-items`/`-content`/
+  `-self`, `aspect-ratio`, `white-space: nowrap`, `list-style: none`,
+  `text-indent`, `overflow-wrap`/`word-break`, `word-spacing`, the `hidden`
+  attribute, and `max`/`min`/`fit-content` widths.
+- **Layout:** adjacent-sibling vertical **margin collapsing** (overlap-proof,
+  ADR-0072) and static `transform: translate`.
+- **Grid:** named template areas, `grid-auto-flow: column` + `grid-auto-columns`,
+  and correct intrinsic column widths.
+- **Generated content:** `::before` / `::after`.
+- **Canvas 2D:** an opt-in real software canvas (path fill/stroke, `drawImage`,
+  `toDataURL` PNG) behind `--canvas-real`; per-head farbling stays the default.
+  Plus `data:` / inline images.
+
+### Changed / Fixed — real-site rendering & performance
+- **CSS cascade ~8×** by indexing rules on their selector subject (ADR-0047);
+  since every interaction re-styles, this also cuts click lag.
+- **Pseudo-elements never match real elements** (Wikipedia paragraph-width fix);
+  **per-float wrap** so content reclaims full width past a float; **tables honor
+  their own `width`** (ADR-0049/0050).
+- **Font shorthand weight is not size** (no more 600px headings); an `<img>` with
+  a single dimension attribute preserves aspect ratio; image and script fetches
+  parallelized.
+- **Honest bot-wall handling.** Bot-management interstitials are detected and
+  reported as such instead of running the fingerprint sensor — so a datacenter-IP
+  block reads as IP reputation, not an engine defect.
+
+### Notes
+- Cut from the active feature branch for hands-on testing; not yet merged to
+  `main`. Linux + Windows x86-64 binaries are attached to the release.
+
 ## [0.0.5] — 2026-06-22
 
 Responsive-image fidelity: pictures now keep their aspect ratio, anchor where the
