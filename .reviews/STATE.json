@@ -1,0 +1,68 @@
+{
+  "review_date": "2026-06-29",
+  "repo": "barkandbite/cerberus",
+  "reviewer": "fleet-worker",
+  "focus_band": "P2 Structure & maintainability",
+  "categories_swept": ["P0 Security", "P1 Performance", "P2 Structure & maintainability", "P3 Architecture", "P4 UX"],
+  "corpus": {
+    "open_issues_seen": 48,
+    "closed_issues_seen": 3,
+    "notes": "Dense existing automated-review corpus (#9-#58). Existing P2 coverage: #18 app god-module, #19 DOM prelude string, #20 layout Ctx walker, #55 apply_declarations god-fn, #56 lock pattern, #58 vh/vw collapse, #34-#37 image/css maintainability. Avoided all of these as duplicates."
+  },
+  "findings": [
+    {
+      "issue": 59,
+      "disposition": "NEW",
+      "severity": "medium",
+      "category": "maintainability",
+      "title": "Media-query evaluation reimplemented four times with divergent feature support and unit bugs",
+      "primary_file": "crates/cerberus-css/src/parser.rs",
+      "fingerprint": "cerberus|crates/cerberus-css/src/parser.rs|media-query-evaluator-fork"
+    },
+    {
+      "issue": 60,
+      "disposition": "NEW",
+      "severity": "medium",
+      "category": "maintainability",
+      "title": "cerberus-style has zero tests despite owning viewport/length resolution + computed-style defaults",
+      "primary_file": "crates/cerberus-style/src/lib.rs",
+      "fingerprint": "cerberus|crates/cerberus-style/src/lib.rs|zero-tests-len-resolve"
+    },
+    {
+      "issue": 61,
+      "disposition": "NEW",
+      "severity": "low",
+      "category": "maintainability",
+      "title": "No diagnostics facility in library crates; failures silently swallowed, app-only eprintln!",
+      "primary_file": "crates/cerberus-app/src/lib.rs",
+      "fingerprint": "cerberus|crates/cerberus-app/src/lib.rs|no-library-diagnostics"
+    },
+    {
+      "issue": 62,
+      "disposition": "NEW",
+      "severity": "low",
+      "category": "maintainability",
+      "title": "object-position/background-position two same-axis keywords silently misparses; untested",
+      "primary_file": "crates/cerberus-css/src/lib.rs",
+      "fingerprint": "cerberus|crates/cerberus-css/src/lib.rs|combine_pos-same-axis"
+    }
+  ],
+  "duplicates_skipped": [
+    "vh/vw nested collapse (#58)",
+    "apply_declarations god-fn (#55)",
+    "poison-tolerant lock confinement (#56)",
+    "img single-axis stretch (#34)",
+    "sizes length-parsing fork (#36)",
+    "srcset comma-split (#35)",
+    "background shorthand longhand reset (#37)",
+    "layout Ctx walker god-fn (#20)",
+    "app god-module (#18)"
+  ],
+  "no_findings_areas": [
+    "No todo!()/unimplemented!()/FIXME stubs anywhere in the tree",
+    "cerberus-image well-tested incl. SVG/decode-bomb ceiling",
+    "pick_img_url/select_srcset shared cleanly between fetch and layout (no divergent walk)",
+    "non-test unwraps in rendering crates are minimal and bounded (min/max on non-empty)"
+  ],
+  "overall_health": "Good. High-churn rendering engine with a mature, dense issue backlog already capturing most P0/P1/P2 debt. New findings are convergence/observability/untested-path gaps, not correctness emergencies. No CRITICAL/HIGH from this run."
+}
