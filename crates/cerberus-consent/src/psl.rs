@@ -112,12 +112,15 @@ pub fn is_public_suffix(host: &str) -> bool {
     registrable_domain(&normalized) == normalized && {
         // `registrable_domain` also returns the host unchanged for single-label
         // unknown hosts and IPs; only call it a public suffix when a rule (or
-        // the default TLD rule) actually says so.
+        // the default TLD rule) actually says so — an exact-rule or wildcard-
+        // rule table hit, never merely "one label and not an IP". (A stray
+        // `&&`/`||` precedence bug here used to let the label-count/IP check
+        // alone decide it, which made any bare intranet hostname — e.g.
+        // "localhost" — count as a public suffix with no PSL lookup at all.)
         let labels: Vec<&str> = normalized.split('.').collect();
         let r = rules();
-        labels.len() == 1 && normalized.parse::<IpAddr>().is_err()
-            || r.exact.contains(normalized.as_str())
-            || labels.len() >= 2 && r.wildcard.contains(labels[1..].join(".").as_str())
+        r.exact.contains(normalized.as_str())
+            || (labels.len() >= 2 && r.wildcard.contains(labels[1..].join(".").as_str()))
     }
 }
 
@@ -204,5 +207,16 @@ mod tests {
         assert!(is_public_suffix("github.io"));
         assert!(!is_public_suffix("example.com"));
         assert!(!is_public_suffix("alice.github.io"));
+    }
+
+    #[test]
+    fn is_public_suffix_rejects_bare_intranet_hostnames() {
+        // Regression for the `&&`/`||` precedence bug: a single-label,
+        // non-IP host must only be a public suffix when the PSL data itself
+        // has an exact rule for it (as "com" does) — being a bare hostname
+        // is not sufficient on its own.
+        assert!(!is_public_suffix("localhost"));
+        assert!(!is_public_suffix("router"));
+        assert!(!is_public_suffix("myintranet"));
     }
 }

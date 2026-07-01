@@ -15,6 +15,7 @@ use std::sync::{Arc, Mutex};
 use cerberus_autofill::{fill_plan, Profile};
 use cerberus_css::CssEngine;
 use cerberus_dom::{parse_html, Document, NodeId, NodeRef};
+use cerberus_farbling::FarblingProvider;
 use cerberus_identity::HeadManager;
 use cerberus_js::JsEngineFactory;
 use cerberus_js_quickjs::QuickJsEngineFactory;
@@ -96,7 +97,7 @@ pub fn mirror_group_from_heads(
     let members = heads
         .heads()
         .iter()
-        .map(|h| (h.instance, h.label.clone()))
+        .map(|h| (h.instance, h.label.clone(), h.farbling.js_prologue()))
         .collect();
     let engine = QuickJsEngineFactory
         .instantiate()
@@ -710,8 +711,8 @@ mod tests {
         let follower = InstanceId::from_u64_pair(0, 2);
         let engine = QuickJsEngineFactory.instantiate().unwrap();
         let members = vec![
-            (master, "work".to_string()),
-            (follower, "personal".to_string()),
+            (master, "work".to_string(), String::new()),
+            (follower, "personal".to_string(), String::new()),
         ];
         let group =
             MirrorGroup::new(engine, Box::new(InputPage), members, (800, 600), "ua").unwrap();
@@ -789,8 +790,8 @@ mod tests {
         let follower = InstanceId::from_u64_pair(0, 2);
         let engine = QuickJsEngineFactory.instantiate().unwrap();
         let members = vec![
-            (master, "work".to_string()),
-            (follower, "personal".to_string()),
+            (master, "work".to_string(), String::new()),
+            (follower, "personal".to_string(), String::new()),
         ];
         let group =
             MirrorGroup::new(engine, Box::new(InputPage), members, (800, 600), "ua").unwrap();

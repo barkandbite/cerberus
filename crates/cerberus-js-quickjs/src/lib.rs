@@ -40,6 +40,8 @@ use cerberus_js::{JsEngine, JsEngineFactory, JsError, JsValue};
 use cerberus_types::RealmId;
 use rquickjs::{CatchResultExt, Coerced, Context, Ctx, Runtime, Value};
 use std::collections::HashMap;
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 /// Delay-free host environment installed into every realm at creation, before
 /// any page script (see module docs for the speed-first rationale).
@@ -197,6 +199,55 @@ const SPEED_FIRST_PRELUDE: &str = r#"
 })();
 "#;
 
+/// Per-engine JS heap cap (issue #68): a single page's `<script>` must not be
+/// able to OOM the whole browser process via an unbounded allocation loop
+/// (e.g. `let a = []; while (true) a.push(a.slice());`). This is a *per-engine*
+/// limit, not the whole-process mem-gate budget tracked elsewhere (64 MiB) —
+/// 192 MiB is generous enough that no realistic page or existing test comes
+/// close, while still turning "grow forever" into a prompt, catchable
+/// [`JsError::Eval`] instead of a process OOM kill.
+const MAX_JS_HEAP_BYTES: usize = 192 * 1024 * 1024;
+
+/// Max QuickJS interpreter stack size. This matches rquickjs's own built-in
+/// default (see `Runtime::set_max_stack_size` doc comment); we set it
+/// explicitly rather than relying on the implicit default so the cap is
+/// visible and auditable here rather than only inside the vendored crate.
+const MAX_JS_STACK_BYTES: usize = 256 * 1024;
+
+/// Default wall-clock budget for a single top-level [`QuickJsEngine::eval`]
+/// call (issue #68): stops a page-controlled `while (true) {}` from hanging
+/// the browser process forever. Generous for real pages/tests, short enough
+/// that a hang is a blip rather than an outage.
+const DEFAULT_EVAL_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Shared deadline cell read by the QuickJS interrupt handler and written by
+/// [`QuickJsEngine::eval`] just before each top-level `ctx.eval`. QuickJS
+/// calls the interrupt handler periodically and automatically while running
+/// script; returning `true` makes it raise an uncatchable exception and
+/// return control to the caller — exactly what stops a runaway loop. One
+/// `Runtime` (and thus one handler closure) is reused across every realm and
+/// call over the engine's lifetime, so the deadline must be refreshed per
+/// call rather than fixed at construction; a `Mutex<Option<Instant>>` is the
+/// simplest shared cell that lets `eval` set a fresh deadline and the
+/// interrupt closure read it, without pulling in a generic timer type.
+type DeadlineCell = Arc<Mutex<Option<Instant>>>;
+
+/// Install the interrupt handler that enforces `deadline` on `runtime`.
+///
+/// `None` in the cell means "no deadline armed" (never interrupt) — used
+/// between top-level calls so background bookkeeping (if any) isn't cut off
+/// mid-flight by a stale deadline from a previous `eval`.
+fn install_deadline_watchdog(runtime: &Runtime, deadline: DeadlineCell) {
+    runtime.set_interrupt_handler(Some(Box::new(move || {
+        match deadline.lock() {
+            Ok(guard) => guard.is_some_and(|by| Instant::now() >= by),
+            // A poisoned lock means a prior holder panicked mid-access; fail
+            // safe by interrupting rather than risking an unbounded script.
+            Err(_) => true,
+        }
+    })));
+}
+
 /// A live QuickJS engine: one runtime (one GC heap) hosting many realms.
 ///
 /// Not `Send` (QuickJS is single-threaded): it lives on the UI thread with the
@@ -204,19 +255,62 @@ const SPEED_FIRST_PRELUDE: &str = r#"
 pub struct QuickJsEngine {
     runtime: Runtime,
     realms: HashMap<RealmId, Context>,
+    /// Per-call eval budget (issue #68); see [`QuickJsEngine::with_eval_timeout`].
+    eval_timeout: Duration,
+    /// Shared with the runtime's interrupt handler; `eval` refreshes this
+    /// right before each top-level `ctx.eval`.
+    deadline: DeadlineCell,
 }
 
 impl QuickJsEngine {
-    /// Build an engine over a fresh runtime with no realms yet.
+    /// Build an engine with the production-default eval timeout
+    /// ([`DEFAULT_EVAL_TIMEOUT`]). Delegates to [`Self::with_eval_timeout`].
     ///
     /// Returns [`JsError::Instantiate`] if the runtime cannot be created (only
     /// happens on allocation failure).
     pub fn new() -> Result<Self, JsError> {
+        Self::with_eval_timeout(DEFAULT_EVAL_TIMEOUT)
+    }
+
+    /// Build an engine whose top-level `eval` calls are interrupted after
+    /// `timeout` (issue #68). A separate constructor (rather than a `new()`
+    /// parameter) so production call sites keep the zero-argument default
+    /// while tests can arm a millisecond-scale timeout without a real sleep.
+    ///
+    /// Returns [`JsError::Instantiate`] if the runtime cannot be created (only
+    /// happens on allocation failure).
+    pub fn with_eval_timeout(timeout: Duration) -> Result<Self, JsError> {
         let runtime = Runtime::new().map_err(|e| JsError::Instantiate(e.to_string()))?;
+        runtime.set_memory_limit(MAX_JS_HEAP_BYTES);
+        runtime.set_max_stack_size(MAX_JS_STACK_BYTES);
+        let deadline: DeadlineCell = Arc::new(Mutex::new(None));
+        install_deadline_watchdog(&runtime, Arc::clone(&deadline));
         Ok(Self {
             runtime,
             realms: HashMap::new(),
+            eval_timeout: timeout,
+            deadline,
         })
+    }
+
+    /// Arm the shared deadline for one top-level entry point, run `f`, then
+    /// disarm it. Disarming afterwards means a slow-but-legitimate host
+    /// operation between calls (e.g. the pending-job drain in `eval`, which
+    /// runs script and so must stay covered) is never cut short by a stale
+    /// deadline from a previous call — each entry point gets its own fresh
+    /// budget and nothing outside one is bounded by it.
+    fn with_deadline<T>(&self, f: impl FnOnce() -> T) -> T {
+        let by = Instant::now() + self.eval_timeout;
+        {
+            let mut guard = self.deadline.lock().unwrap_or_else(|e| e.into_inner());
+            *guard = Some(by);
+        }
+        let result = f();
+        {
+            let mut guard = self.deadline.lock().unwrap_or_else(|e| e.into_inner());
+            *guard = None;
+        }
+        result
     }
 }
 
@@ -231,10 +325,15 @@ impl JsEngine for QuickJsEngine {
         // Install the speed-first host environment before any page script. The
         // prelude is self-guarding (its body is wrapped in try/catch), but a
         // genuine engine error (e.g. compile failure) still surfaces here.
-        context.with(|ctx| {
-            ctx.eval::<(), _>(SPEED_FIRST_PRELUDE)
-                .catch(&ctx)
-                .map_err(|e| JsError::Instantiate(e.to_string()))
+        // Armed with the same deadline as page `eval` calls: the prelude is
+        // fixed, trusted source, but arming it uniformly means one code path
+        // (`with_deadline`) governs every script the runtime ever executes.
+        self.with_deadline(|| {
+            context.with(|ctx| {
+                ctx.eval::<(), _>(SPEED_FIRST_PRELUDE)
+                    .catch(&ctx)
+                    .map_err(|e| JsError::Instantiate(e.to_string()))
+            })
         })?;
         // Inserting over an existing id refreshes the realm: the old context is
         // dropped (freeing it) and replaced. Simple and non-panicking.
@@ -244,25 +343,31 @@ impl JsEngine for QuickJsEngine {
 
     fn inject_prologue(&mut self, id: RealmId, script: &str) -> Result<(), JsError> {
         let context = self.realms.get(&id).ok_or(JsError::NoSuchRealm(id))?;
-        context.with(|ctx| {
-            ctx.eval::<(), _>(script)
-                .catch(&ctx)
-                .map_err(|e| JsError::Eval(e.to_string()))
+        self.with_deadline(|| {
+            context.with(|ctx| {
+                ctx.eval::<(), _>(script)
+                    .catch(&ctx)
+                    .map_err(|e| JsError::Eval(e.to_string()))
+            })
         })
     }
 
     fn eval(&mut self, id: RealmId, source: &str) -> Result<JsValue, JsError> {
         let context = self.realms.get(&id).ok_or(JsError::NoSuchRealm(id))?;
-        context.with(|ctx| {
-            let value = ctx
-                .eval::<Value<'_>, _>(source)
-                .catch(&ctx)
-                .map_err(|e| JsError::Eval(e.to_string()))?;
-            // Drain the job queue so Promise reactions and queueMicrotask
-            // callbacks scheduled by `source` actually run before we return.
-            // `execute_pending_job` operates on this context's runtime.
-            while ctx.execute_pending_job() {}
-            Ok(js_value_from(&ctx, value))
+        self.with_deadline(|| {
+            context.with(|ctx| {
+                let value = ctx
+                    .eval::<Value<'_>, _>(source)
+                    .catch(&ctx)
+                    .map_err(|e| JsError::Eval(e.to_string()))?;
+                // Drain the job queue so Promise reactions and queueMicrotask
+                // callbacks scheduled by `source` actually run before we return.
+                // `execute_pending_job` operates on this context's runtime, and
+                // pending jobs are page-derived callbacks too, so they stay
+                // covered by the same deadline armed above.
+                while ctx.execute_pending_job() {}
+                Ok(js_value_from(&ctx, value))
+            })
         })
     }
 
@@ -692,5 +797,110 @@ mod tests {
             e.eval(r, "typeof keep").unwrap(),
             JsValue::Str("undefined".to_string())
         );
+    }
+
+    // ---- issue #68: memory limit / interrupt watchdog / stack cap --------
+
+    /// A tiny timeout so the infinite-loop test below is bounded and fast
+    /// rather than a real multi-second sleep; production uses
+    /// [`DEFAULT_EVAL_TIMEOUT`] via [`QuickJsEngine::new`].
+    const TINY_TIMEOUT: Duration = Duration::from_millis(20);
+
+    #[test]
+    fn infinite_loop_is_interrupted_within_configured_timeout() {
+        let r = realm(1);
+        let mut e = QuickJsEngine::with_eval_timeout(TINY_TIMEOUT).expect("runtime");
+        e.create_realm(r).unwrap();
+        let start = Instant::now();
+        match e.eval(r, "while (true) {}") {
+            Err(JsError::Eval(_)) => {}
+            other => panic!("expected Eval error from interrupted loop, got {other:?}"),
+        }
+        // Bounded: well under a real hang, and not dependent on wall-clock
+        // flakiness on a loaded CI box.
+        assert!(
+            start.elapsed() < Duration::from_secs(5),
+            "interrupt took too long: {:?}",
+            start.elapsed()
+        );
+    }
+
+    #[test]
+    fn allocation_loop_is_interrupted_within_configured_timeout() {
+        // A page that never busy-loops but keeps allocating (the OOM half of
+        // #68) must also be bounded by the same watchdog, since QuickJS's
+        // interrupt handler is polled during allocation-heavy execution too.
+        let r = realm(1);
+        let mut e = QuickJsEngine::with_eval_timeout(TINY_TIMEOUT).expect("runtime");
+        e.create_realm(r).unwrap();
+        match e.eval(r, "var a = []; while (true) { a.push(new Array(1024)); }") {
+            Err(JsError::Eval(_)) => {}
+            other => panic!("expected Eval error from runaway allocation, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn fast_script_still_succeeds_with_interrupt_handler_installed() {
+        // No false positives: a normal, fast script must still complete
+        // successfully even though the watchdog is armed on every eval.
+        let r = realm(1);
+        let mut e = QuickJsEngine::with_eval_timeout(Duration::from_secs(5)).expect("runtime");
+        e.create_realm(r).unwrap();
+        assert_eq!(e.eval(r, "1 + 1").unwrap(), JsValue::Number(2.0));
+    }
+
+    #[test]
+    fn memory_limit_bounds_unbounded_allocation() {
+        // rquickjs's `Runtime` exposes no getter for the configured limit, so
+        // exercise it behaviorally: a runtime with a tiny injected limit must
+        // fail an unbounded allocation loop with an error rather than growing
+        // forever. Use a generous timeout so the interrupt watchdog above
+        // isn't what trips first — this test is isolating the memory limit.
+        let r = realm(1);
+        let mut e = QuickJsEngine::with_eval_timeout(Duration::from_secs(5)).expect("runtime");
+        // Create the realm (and its prelude eval, which needs some heap)
+        // BEFORE injecting a tiny limit, then clamp down for the allocation
+        // loop under test — isolates "does the limit stop growth" from
+        // "is the limit big enough to bootstrap a realm at all".
+        e.create_realm(r).unwrap();
+        e.runtime.set_memory_limit(64 * 1024);
+        match e.eval(
+            r,
+            "var a = []; for (var i = 0; i < 10_000_000; i++) { a.push(new Array(1024)); }",
+        ) {
+            Err(JsError::Eval(_)) => {}
+            other => panic!("expected Eval error from memory-limited allocation, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn deep_but_bounded_recursion_still_works() {
+        // Sanity check on the explicit stack-size cap: legitimate, bounded
+        // recursion (well short of overflowing 256 KiB of interpreter stack)
+        // must still evaluate normally.
+        let r = realm(1);
+        let mut e = engine_with_realm(r);
+        assert_eq!(
+            e.eval(
+                r,
+                "function sum(n) { return n <= 0 ? 0 : n + sum(n - 1); } sum(100)"
+            )
+            .unwrap(),
+            JsValue::Number(5_050.0)
+        );
+    }
+
+    #[test]
+    fn runaway_recursion_errors_instead_of_crashing() {
+        // Unbounded recursion must surface as a catchable JsError::Eval (stack
+        // overflow), not crash the process — this is rquickjs's own default
+        // stack guard, set explicitly here for auditability (see
+        // MAX_JS_STACK_BYTES).
+        let r = realm(1);
+        let mut e = engine_with_realm(r);
+        assert!(matches!(
+            e.eval(r, "function f() { return f(); } f()"),
+            Err(JsError::Eval(_))
+        ));
     }
 }

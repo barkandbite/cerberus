@@ -63,14 +63,18 @@ pub struct MirrorGroup {
 }
 
 impl MirrorGroup {
-    /// Build a group over `members` (`(identity, label)`, first is the master).
+    /// Build a group over `members` (`(identity, label, farbling_prologue)`,
+    /// first is the master). `farbling_prologue` is that identity's pre-rendered
+    /// anti-fingerprinting JS shim (e.g. `Head::farbling.js_prologue()`),
+    /// injected into the realm on every catch-up (issue #69) — an empty string
+    /// is a harmless no-op for callers that do not care (e.g. tests).
     ///
     /// The engine is shared and starts with no realm; the master's realm is
     /// created lazily on the first [`act`](MirrorGroup::act).
     pub fn new(
         engine: Box<dyn JsEngine>,
         source: Box<dyn PageSource>,
-        members: Vec<(InstanceId, String)>,
+        members: Vec<(InstanceId, String, String)>,
         viewport: (u32, u32),
         user_agent: impl Into<String>,
     ) -> Result<Self, MirrorError> {
@@ -79,7 +83,7 @@ impl MirrorGroup {
         }
         let instances = members
             .into_iter()
-            .map(|(id, label)| MirrorInstance::new(id, label))
+            .map(|(id, label, farbling_prologue)| MirrorInstance::new(id, label, farbling_prologue))
             .collect();
         Ok(Self {
             engine,
@@ -288,6 +292,14 @@ impl MirrorGroup {
     fn catch_up(&mut self, idx: usize) -> Result<(), MirrorError> {
         let realm = self.realm_of(idx);
         self.engine.create_realm(realm)?;
+        // Farble this instance's realm before any page script runs, mirroring
+        // the single-window `HeadManager::engine()`'s create-then-inject order —
+        // otherwise every mirrored identity shares one undifferentiated
+        // canvas/audio/WebGL fingerprint (issue #69).
+        if !self.instances[idx].farbling_prologue.is_empty() {
+            self.engine
+                .inject_prologue(realm, &self.instances[idx].farbling_prologue)?;
+        }
         self.instances[idx].live = true;
         self.instances[idx].released = false;
         self.instances[idx].diverged = None;

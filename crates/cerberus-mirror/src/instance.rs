@@ -40,11 +40,18 @@ pub struct MirrorInstance {
     /// one that is already converged can be re-viewed without any rebuild.
     pub(crate) released: bool,
     pub(crate) diverged: Option<Divergence>,
+    /// This instance's per-head anti-fingerprinting JS shim, injected into its
+    /// realm on every catch-up (issue #69) so mirrored identities do not share a
+    /// byte-identical canvas/audio/WebGL fingerprint. Pre-rendered by the caller
+    /// (`Head::farbling.js_prologue()` in the app) so this crate needs no
+    /// dependency on `cerberus-farbling` — same reasoning as `user_agent` being a
+    /// plain `String` here rather than a UA-generating type.
+    pub(crate) farbling_prologue: String,
 }
 
 impl MirrorInstance {
     /// A fresh, dormant instance with an empty document and no realm.
-    pub(crate) fn new(id: InstanceId, label: String) -> Self {
+    pub(crate) fn new(id: InstanceId, label: String, farbling_prologue: String) -> Self {
         Self {
             id,
             label,
@@ -55,6 +62,7 @@ impl MirrorInstance {
             live: false,
             released: false,
             diverged: None,
+            farbling_prologue,
         }
     }
 

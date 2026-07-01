@@ -4958,8 +4958,14 @@ pub struct MirrorBench {
 /// snapshots. Guards the catch-up perf (E1/E2) and the bounded-memory model that
 /// keeps thousands of profiles affordable (PLAN §1).
 pub fn mirror_bench(n: usize) -> Result<MirrorBench, String> {
-    let members: Vec<(InstanceId, String)> = (0..n)
-        .map(|i| (InstanceId::from_u64_pair(0, i as u64 + 1), format!("id{i}")))
+    let members: Vec<(InstanceId, String, String)> = (0..n)
+        .map(|i| {
+            (
+                InstanceId::from_u64_pair(0, i as u64 + 1),
+                format!("id{i}"),
+                String::new(),
+            )
+        })
         .collect();
     let engine = QuickJsEngineFactory
         .instantiate()
