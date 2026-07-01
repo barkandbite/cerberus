@@ -210,6 +210,14 @@ impl StorageEnvironment {
         self.vault.unlock(passphrase)
     }
 
+    /// Lock the vault, dropping (and zeroizing) the derived key. Callers that
+    /// keep their own decrypted copies of vault-sealed data (e.g. an autofill
+    /// fill provider) must clear those separately — locking the vault only
+    /// guarantees the vault's own key is wiped (issue #17).
+    pub fn lock_vault(&mut self) {
+        self.vault.lock();
+    }
+
     /// Seal an arbitrary per-instance blob in the vault (e.g. an autofill
     /// profile), keyed by `(instance, key)`. Errors if the vault is locked.
     pub fn store_blob(

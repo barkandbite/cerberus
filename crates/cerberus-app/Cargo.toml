@@ -46,6 +46,7 @@ cerberus-headless = { path = "../cerberus-headless" }
 cerberus-sysmem = { path = "../cerberus-sysmem" }
 cerberus-mirror = { path = "../cerberus-mirror" }
 cerberus-autofill = { path = "../cerberus-autofill" }
+zeroize = "1"
 
 [dev-dependencies]
 # Dev-only: generates PNG fixtures for the image-pipeline tests. Production

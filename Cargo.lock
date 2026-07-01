@@ -274,6 +274,7 @@ dependencies = [
  "cerberus-ui",
  "cerberus-url",
  "image",
+ "zeroize",
 ]
 
 [[package]]

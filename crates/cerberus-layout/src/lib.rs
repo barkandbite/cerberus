@@ -2798,6 +2798,64 @@ pub fn pick_img_url<'a>(attr: impl Fn(&str) -> Option<&'a str>, viewport_w: u32)
     attr("src").map(str::to_string)
 }
 
+/// Tokenize a `srcset` attribute value into `(url, descriptor)` candidates per the
+/// WHATWG "parse a srcset attribute" algorithm. A bare `,` only separates candidates
+/// when it terminates the URL or descriptor, not when it appears inside a URL (a
+/// query string or a `data:` URI may legitimately contain commas).
+fn srcset_candidates(input: &str) -> Vec<(&str, Option<&str>)> {
+    let mut out = Vec::new();
+    let bytes = input.as_bytes();
+    let mut i = 0;
+    let is_ws = |c: u8| c.is_ascii_whitespace();
+    while i < bytes.len() {
+        while i < bytes.len() && (is_ws(bytes[i]) || bytes[i] == b',') {
+            i += 1;
+        }
+        if i >= bytes.len() {
+            break;
+        }
+        let url_start = i;
+        while i < bytes.len() && !is_ws(bytes[i]) {
+            i += 1;
+        }
+        let mut url = &input[url_start..i];
+        // A URL ending in one or more commas has them stripped, and the comma(s)
+        // end the candidate with no descriptor.
+        let trimmed = url.trim_end_matches(',');
+        if trimmed.len() != url.len() {
+            url = trimmed;
+            if !url.is_empty() {
+                out.push((url, None));
+            }
+            continue;
+        }
+        while i < bytes.len() && is_ws(bytes[i]) {
+            i += 1;
+        }
+        // Collect the descriptor up to the next top-level comma (depth 0), so a
+        // parenthesized descriptor component isn't split early.
+        let desc_start = i;
+        let mut depth = 0i32;
+        while i < bytes.len() {
+            match bytes[i] {
+                b'(' => depth += 1,
+                b')' => depth = (depth - 1).max(0),
+                b',' if depth == 0 => break,
+                _ => {}
+            }
+            i += 1;
+        }
+        // Only the first descriptor token is meaningful to the selection logic
+        // below (a width/density pair on one candidate is not something we act on).
+        let descriptor = input[desc_start..i].split_whitespace().next();
+        out.push((url, descriptor));
+        if i < bytes.len() && bytes[i] == b',' {
+            i += 1;
+        }
+    }
+    out
+}
+
 /// Pick one URL from an `srcset` candidate list (ADR-0046). Width (`w`) candidates
 /// pick the smallest whose width covers the `sizes`-resolved target (bandwidth-
 /// first, at device-pixel-ratio 1); density (`x`/bare) candidates pick `1x` (we
@@ -2805,10 +2863,8 @@ pub fn pick_img_url<'a>(attr: impl Fn(&str) -> Option<&'a str>, viewport_w: u32)
 pub fn select_srcset(srcset: &str, sizes: Option<&str>, viewport_w: u32) -> Option<String> {
     let mut width: Vec<(u32, &str)> = Vec::new();
     let mut density: Vec<(f32, &str)> = Vec::new();
-    for cand in srcset.split(',') {
-        let mut toks = cand.split_whitespace();
-        let Some(url) = toks.next() else { continue };
-        match toks.next() {
+    for (url, descriptor) in srcset_candidates(srcset) {
+        match descriptor {
             Some(d) if d.ends_with('w') => {
                 if let Ok(w) = d[..d.len() - 1].parse::<u32>() {
                     width.push((w, url));
@@ -3940,6 +3996,21 @@ mod tests {
             Some("s.png")
         );
         assert_eq!(select_srcset("", None, 800), None);
+    }
+
+    #[test]
+    fn srcset_commas_inside_urls_do_not_shear_candidates() {
+        // A query-string comma must not be mistaken for a candidate separator.
+        assert_eq!(
+            select_srcset("a.jpg?x=1,2 480w, b.jpg 800w", None, 1000).as_deref(),
+            Some("b.jpg"),
+            "the 800w candidate wins, not a sheared a.jpg?x=1"
+        );
+        // A `data:` URI's embedded commas stay part of one candidate.
+        assert_eq!(
+            select_srcset("data:image/png;base64,AAA,BBB 1x, b.png 2x", None, 1000).as_deref(),
+            Some("data:image/png;base64,AAA,BBB")
+        );
     }
 
     #[test]
