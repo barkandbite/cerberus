@@ -191,6 +191,41 @@ fn rejected_fetch_runs_catch() {
 }
 
 #[test]
+fn fetch_with_crlf_injected_header_rejects_cleanly() {
+    // A page tries to smuggle an extra header via a CRLF in a header *value*
+    // (issue #57: e.g. `"X": "a\r\nCookie: stolen=1"` could otherwise sneak a
+    // `Cookie:` line past the engine's name-only allow-list). The bridge's
+    // source-side guard (`decode_header_pairs`) must reject the fetch cleanly
+    // — the page's `.catch` runs — rather than the malformed descriptor
+    // silently reaching the network client or dangling forever.
+    let (mut engine, realm) = engine_and_realm();
+    let doc = doc_with_div_x();
+    let mut client = StubClient::with_body("/api", "{}");
+    let scripts = vec!["fetch('/api', { headers: { 'X': 'a\\r\\nX-Injected: 1' } }) \
+         .then(function () { \
+           document.getElementById('x').setAttribute('data-result', 'ok'); \
+         }).catch(function (e) { \
+           document.getElementById('x').setAttribute('data-result', 'caught:' + String(e.message)); \
+         });"
+    .to_string()];
+
+    let out =
+        run_page_scripts_with_fetch(engine.as_mut(), realm, &doc, &scripts, &env(), &mut client)
+            .expect("run with fetch");
+
+    let x = find_id(out.root(), "x").expect("#x present");
+    assert_eq!(
+        x.attr("data-result"),
+        Some("caught:invalid header value"),
+        "the CRLF-carrying header rejected the fetch instead of reaching the network"
+    );
+    assert!(
+        client.seen.is_empty(),
+        "the malformed request must never reach the network client"
+    );
+}
+
+#[test]
 fn fetch_budget_caps_runaway_then_chain() {
     // Each response schedules another fetch from its .then. With a small request
     // budget the pump must stop at max_requests and report hit_cap. We install +

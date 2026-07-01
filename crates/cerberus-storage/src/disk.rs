@@ -123,6 +123,14 @@ impl<'a> RecordReader<'a> {
         }
         let bad = || io::Error::new(io::ErrorKind::InvalidData, "truncated record");
         let count = self.read_u32().ok_or_else(bad)?;
+        // Each field needs at least a 4-byte length prefix, so a legitimate
+        // `count` can never exceed the remaining bytes divided by 4. Reject
+        // implausible counts here, before allocating, so a corrupted or
+        // malicious file (e.g. count = 0xFFFF_FFFF) can't force a ~4 billion
+        // element `Vec::with_capacity` and abort/OOM the process (issue #10).
+        if count as usize > self.rest.len() / 4 {
+            return Err(bad());
+        }
         let mut fields = Vec::with_capacity(count as usize);
         for _ in 0..count {
             let len = self.read_u32().ok_or_else(bad)? as usize;
@@ -196,6 +204,21 @@ mod tests {
         bytes.truncate(bytes.len() - 2);
         let mut r = RecordReader::new(&bytes, KIND_COOKIES).unwrap();
         assert!(r.next_record().is_err());
+    }
+
+    #[test]
+    fn huge_field_count_is_rejected_without_allocating() {
+        // A minimal valid header followed by a record claiming
+        // `count = u32::MAX` fields but with no actual field data after it.
+        // Before the fix this would reach `Vec::with_capacity(u32::MAX as
+        // usize)` and abort/OOM; now it must be rejected as `InvalidData`
+        // (the same error the per-field length bound already returns).
+        let mut bytes = RecordWriter::new(KIND_COOKIES).finish();
+        bytes.extend_from_slice(&u32::MAX.to_le_bytes());
+
+        let mut r = RecordReader::new(&bytes, KIND_COOKIES).unwrap();
+        let err = r.next_record().unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
     }
 
     #[test]

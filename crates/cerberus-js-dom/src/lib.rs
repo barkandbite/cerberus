@@ -948,6 +948,16 @@ pub struct FetchStats {
 /// it) and parses the array of `{id,url,method,headers:[[n,v]…],body}` objects. An
 /// empty queue yields an empty `Vec`. A malformed entry is skipped rather than
 /// failing the whole drain — a single bad descriptor must not strand the rest.
+///
+/// A descriptor whose headers contain a CR, LF, or NUL byte (source-side guard,
+/// issue #57 — a page could otherwise smuggle e.g. `"X": "a\r\nCookie: c=1"`
+/// past the header-*name* allow-list in `cerberus-net::engine`) is not handed
+/// back at all: since its `id` is still known here, we immediately
+/// [`reject_fetch`] it with a clean network-error message — matching how
+/// `cerberus-app`'s `pump_fetches` already rejects synchronously-invalid
+/// requests (an unsupported URL, a consent-blocked origin) before ever handing
+/// them to the network — rather than silently dropping the request and
+/// leaving its Promise to dangle forever.
 pub fn take_fetches(
     engine: &mut dyn JsEngine,
     realm: RealmId,
@@ -988,11 +998,18 @@ pub fn take_fetches(
             .and_then(Json::as_str)
             .unwrap_or("")
             .to_string();
+        let headers = match decode_header_pairs(item.get("headers")) {
+            Ok(headers) => headers,
+            Err(()) => {
+                reject_fetch(engine, realm, id, "invalid header value")?;
+                continue;
+            }
+        };
         out.push(FetchRequest {
             id,
             url,
             method,
-            headers: decode_header_pairs(item.get("headers")),
+            headers,
             body,
         });
     }
@@ -1000,8 +1017,12 @@ pub fn take_fetches(
 }
 
 /// Decode a wire `headers` value (`[[name, value], …]`) into a `(name, value)`
-/// list. Missing/garbage entries are skipped; a `None` field yields an empty list.
-fn decode_header_pairs(headers: Option<&Json>) -> Vec<(String, String)> {
+/// list. A missing/garbage *pair* is skipped (a `None` field yields an empty
+/// list); a pair whose name or value contains a CR, LF, or NUL byte fails the
+/// whole decode (`Err(())`) instead, so the caller can reject the owning
+/// `fetch()` cleanly rather than silently mangling or forwarding it — see
+/// [`take_fetches`].
+fn decode_header_pairs(headers: Option<&Json>) -> Result<Vec<(String, String)>, ()> {
     let mut out = Vec::new();
     if let Some(arr) = headers.and_then(Json::as_array) {
         for pair in arr {
@@ -1011,11 +1032,20 @@ fn decode_header_pairs(headers: Option<&Json>) -> Vec<(String, String)> {
             let name = pair.first().and_then(Json::as_str);
             let value = pair.get(1).and_then(Json::as_str);
             if let (Some(name), Some(value)) = (name, value) {
+                if has_crlf_or_nul(name) || has_crlf_or_nul(value) {
+                    return Err(());
+                }
                 out.push((name.to_string(), value.to_string()));
             }
         }
     }
-    out
+    Ok(out)
+}
+
+/// Whether `s` contains a CR, LF, or NUL byte — the bytes that let a header
+/// name/value break out of its wire line (see [`decode_header_pairs`]).
+fn has_crlf_or_nul(s: &str) -> bool {
+    s.bytes().any(|b| matches!(b, 0x0D | 0x0A | 0x00))
 }
 
 /// Emit a `FetchResponse` as a JS object literal into `out`, in the wire shape
