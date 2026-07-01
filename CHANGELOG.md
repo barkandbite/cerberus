@@ -3,6 +3,31 @@
 All notable changes to Cerberus are recorded here. Versions are small while the
 browser is pre-1.0; this is the first tagged preview.
 
+## [0.0.7] — 2026-07-01
+
+Continuing the quality/hardening pass: four more self-contained security
+issues from the review backlog, fixed.
+
+### Fixed
+- **`fetch()` header injection.** Page-controlled request headers are now
+  validated (RFC 7230 token name, no CR/LF/NUL in the value) before being
+  written to the wire, and rejected earlier at the `fetch()` decode step too.
+  Previously a CRLF in a header value could smuggle an extra header (e.g. a
+  `Cookie:` line) past the engine's name-only header allow-list.
+- **JS-splice injection via U+2028/U+2029.** The JSON-for-JS escaper used to
+  splice DOM/env values into `eval`'d source now escapes the two code points
+  that are legal raw JSON but act as line terminators in pre-ES2019 JS string
+  literals — closing a latent injection that would matter on a future
+  non-QuickJS engine.
+- **Decompression bomb.** gzip/deflate inflation now bounds its output
+  *during* inflation instead of fully inflating an unbounded stream and
+  checking the size afterward — a small bomb can no longer be materialized
+  in memory before rejection.
+- **Unbounded allocation from a crafted profile file.** The on-disk record
+  reader now validates its field count against the remaining bytes before
+  reserving a `Vec`, so a corrupted `cookies.bin`/`vault.bin` can't force a
+  multi-GB allocation attempt.
+
 ## [0.0.6] — 2026-07-01
 
 A quality/hardening pass: a codebase-wide review reconciled the stale-issue
