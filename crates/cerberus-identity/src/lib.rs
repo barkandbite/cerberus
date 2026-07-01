@@ -17,6 +17,11 @@ pub struct Head {
     pub instance: InstanceId,
     pub label: String,
     pub farbling: SeededFarbling,
+    /// This identity's own egress proxy as a raw `host:port` string, if set.
+    /// `None` means it uses whatever default the app configures (or direct).
+    /// Parsed and enforced in the app/network layer so each mirror window can
+    /// egress through its own proxy while sharing one engine.
+    pub proxy: Option<String>,
 }
 
 impl Head {
@@ -27,7 +32,15 @@ impl Head {
             instance,
             label: label.into(),
             farbling: SeededFarbling::new(seed),
+            proxy: None,
         }
+    }
+
+    /// Set this head's egress proxy (raw `host:port`), returning `self` for
+    /// chaining. `None` clears it (falls back to the app default / direct).
+    pub fn with_proxy(mut self, proxy: Option<String>) -> Self {
+        self.proxy = proxy;
+        self
     }
 
     fn base_realm(&self) -> RealmId {

@@ -6,6 +6,7 @@ use crate::{
     http1, BuiltinHttpClient, CookieJar, DnsResolver, FetchContext, HttpClient, HttpResponse,
     NetError, ReadWrite, TlsProvider,
 };
+use cerberus_types::InstanceId;
 use cerberus_url::Url;
 use std::collections::HashMap;
 use std::io::Read;
@@ -99,8 +100,15 @@ pub struct HttpEngine {
     /// Cookie attach/capture seam, consulted per hop (so redirects are
     /// covered). `None` (tests, tooling) sends and stores nothing.
     jar: Option<Arc<dyn CookieJar>>,
-    /// Single egress proxy. `None` = direct connections.
+    /// Default egress proxy, used by any instance without its own. `None` =
+    /// direct connections.
     proxy: Option<ProxyConfig>,
+    /// Per-instance egress proxy overrides (issue: per-window proxy). A fetch
+    /// carrying a [`FetchContext`] whose `instance` is in this map tunnels
+    /// through *that* proxy instead of [`proxy`](Self::proxy) — so each mirror
+    /// window can egress through its own proxy while sharing one engine. As
+    /// with the global proxy, a proxied target is never resolved locally.
+    proxies: HashMap<InstanceId, ProxyConfig>,
 }
 
 impl HttpEngine {
@@ -118,12 +126,27 @@ impl HttpEngine {
         Self::with_options(tls, dns, jar, None)
     }
 
-    /// Build an engine with the full option set (jar + egress proxy).
+    /// Build an engine with a jar + a single default egress proxy (no
+    /// per-instance overrides).
     pub fn with_options(
         tls: Box<dyn TlsProvider>,
         dns: Box<dyn DnsResolver>,
         jar: Option<Arc<dyn CookieJar>>,
         proxy: Option<ProxyConfig>,
+    ) -> Self {
+        Self::with_proxies(tls, dns, jar, proxy, HashMap::new())
+    }
+
+    /// Build an engine with a jar, a default egress proxy, and per-instance
+    /// proxy overrides (per-window proxy). An instance present in `proxies`
+    /// tunnels through its own proxy; every other instance uses `proxy` (or
+    /// direct if that is `None`).
+    pub fn with_proxies(
+        tls: Box<dyn TlsProvider>,
+        dns: Box<dyn DnsResolver>,
+        jar: Option<Arc<dyn CookieJar>>,
+        proxy: Option<ProxyConfig>,
+        proxies: HashMap<InstanceId, ProxyConfig>,
     ) -> Self {
         Self {
             tls,
@@ -132,15 +155,32 @@ impl HttpEngine {
             ua_memo: Mutex::new(HashMap::new()),
             jar,
             proxy,
+            proxies,
         }
     }
 
+    /// The egress proxy in effect for a fetch: the per-instance override if the
+    /// context's instance has one, otherwise the default proxy (possibly
+    /// `None`, meaning direct). A context-free fetch (built-in pages, tooling)
+    /// always uses the default.
+    fn proxy_for(&self, ctx: Option<&FetchContext>) -> Option<&ProxyConfig> {
+        ctx.and_then(|c| self.proxies.get(&c.instance))
+            .or(self.proxy.as_ref())
+    }
+
     /// Open the transport for `host:port`: direct (resolve + connect), or a
-    /// CONNECT tunnel when a proxy is configured. Proxied targets are *never*
-    /// resolved locally — the proxy sees only `host:port`, and DNS sees only
-    /// the proxy's own name.
-    fn open_transport(&self, host: &str, port: u16) -> Result<TcpStream, NetError> {
-        let (connect_host, connect_port, tunnel) = match &self.proxy {
+    /// CONNECT tunnel through `proxy` when one is given. Proxied targets are
+    /// *never* resolved locally — the proxy sees only `host:port`, and DNS sees
+    /// only the proxy's own name. `proxy` is resolved per fetch by
+    /// [`proxy_for`](Self::proxy_for), so different instances can tunnel
+    /// through different proxies.
+    fn open_transport(
+        &self,
+        host: &str,
+        port: u16,
+        proxy: Option<&ProxyConfig>,
+    ) -> Result<TcpStream, NetError> {
+        let (connect_host, connect_port, tunnel) = match proxy {
             Some(p) => (p.host.as_str(), p.port, true),
             None => (host, port, false),
         };
@@ -195,7 +235,7 @@ impl HttpEngine {
         }
         let port = url.port.unwrap_or(if https { 443 } else { 80 });
 
-        let tcp = self.open_transport(&url.host, port)?;
+        let tcp = self.open_transport(&url.host, port, self.proxy_for(ctx))?;
 
         // TLS still handshakes against the *target* host over the tunnel, so
         // certificate validation is unchanged by a proxy.
@@ -396,7 +436,8 @@ impl Router {
         Self::with_options(tls, dns, jar, None)
     }
 
-    /// Build a router with the full option set (jar + single egress proxy).
+    /// Build a router with a jar + a single default egress proxy (no
+    /// per-instance overrides).
     pub fn with_options(
         tls: Box<dyn TlsProvider>,
         dns: Box<dyn DnsResolver>,
@@ -405,6 +446,21 @@ impl Router {
     ) -> Self {
         Self {
             engine: HttpEngine::with_options(tls, dns, jar, proxy),
+        }
+    }
+
+    /// Build a router with per-instance egress proxies (per-window proxy): an
+    /// instance in `proxies` tunnels through its own proxy, every other uses
+    /// the default `proxy`.
+    pub fn with_proxies(
+        tls: Box<dyn TlsProvider>,
+        dns: Box<dyn DnsResolver>,
+        jar: Option<Arc<dyn CookieJar>>,
+        proxy: Option<ProxyConfig>,
+        proxies: HashMap<InstanceId, ProxyConfig>,
+    ) -> Self {
+        Self {
+            engine: HttpEngine::with_proxies(tls, dns, jar, proxy, proxies),
         }
     }
 
@@ -924,6 +980,129 @@ mod tests {
         server.join().unwrap();
         assert_eq!(resp.status, 200);
         assert_eq!(resp.body, b"tunneled");
+    }
+
+    /// A mock CONNECT proxy that accepts one tunnel, checks the CONNECT line,
+    /// and serves `body` as the tunneled response. Returns its listening port.
+    fn spawn_connect_proxy(body: &'static [u8]) -> (u16, std::thread::JoinHandle<()>) {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let handle = std::thread::spawn(move || {
+            let (mut s, _) = listener.accept().unwrap();
+            let connect = read_request(&mut s);
+            assert!(
+                connect.starts_with("CONNECT example.test:80 HTTP/1.1\r\n"),
+                "CONNECT line: {connect:?}"
+            );
+            s.write_all(b"HTTP/1.1 200 Connection Established\r\n\r\n")
+                .unwrap();
+            let _ = read_request(&mut s);
+            let head = format!(
+                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                body.len()
+            );
+            s.write_all(head.as_bytes()).unwrap();
+            s.write_all(body).unwrap();
+        });
+        (port, handle)
+    }
+
+    #[test]
+    fn each_instance_egresses_through_its_own_proxy() {
+        // Per-window proxy: two instances, two proxies. Each instance's fetch
+        // must tunnel through *its* proxy — proven by the distinct body each
+        // mock proxy serves — while sharing one engine and never resolving the
+        // target locally (NoDns panics on any lookup).
+        let (port_a, srv_a) = spawn_connect_proxy(b"from-a!!");
+        let (port_b, srv_b) = spawn_connect_proxy(b"from-b!!");
+
+        let inst_a = InstanceId::from_u64_pair(0, 1);
+        let inst_b = InstanceId::from_u64_pair(0, 2);
+        let mut proxies = HashMap::new();
+        proxies.insert(
+            inst_a,
+            ProxyConfig {
+                host: "127.0.0.1".into(),
+                port: port_a,
+            },
+        );
+        proxies.insert(
+            inst_b,
+            ProxyConfig {
+                host: "127.0.0.1".into(),
+                port: port_b,
+            },
+        );
+        let engine = HttpEngine::with_proxies(
+            Box::new(NoTls),
+            Box::new(NoDns),
+            None,
+            None, // no default proxy: an unmapped instance would go direct.
+            proxies,
+        );
+
+        let url = cerberus_url::parse("http://example.test/x").unwrap();
+        let resp_a = engine
+            .get_in(
+                &url,
+                &FetchContext {
+                    instance: inst_a,
+                    kind: FetchKind::Navigation,
+                },
+            )
+            .unwrap();
+        let resp_b = engine
+            .get_in(
+                &url,
+                &FetchContext {
+                    instance: inst_b,
+                    kind: FetchKind::Navigation,
+                },
+            )
+            .unwrap();
+        srv_a.join().unwrap();
+        srv_b.join().unwrap();
+
+        assert_eq!(resp_a.body, b"from-a!!", "instance A used proxy A");
+        assert_eq!(resp_b.body, b"from-b!!", "instance B used proxy B");
+    }
+
+    #[test]
+    fn an_unmapped_instance_falls_back_to_the_default_proxy() {
+        // An instance with no per-instance override tunnels through the default
+        // proxy, not direct.
+        let (port, srv) = spawn_connect_proxy(b"default!");
+        let mut proxies = HashMap::new();
+        proxies.insert(
+            InstanceId::from_u64_pair(0, 1),
+            ProxyConfig {
+                host: "127.0.0.1".into(),
+                port,
+            },
+        );
+        let engine = HttpEngine::with_proxies(
+            Box::new(NoTls),
+            Box::new(NoDns),
+            None,
+            Some(ProxyConfig {
+                host: "127.0.0.1".into(),
+                port,
+            }),
+            proxies,
+        );
+        // A *different* instance than the one in the map → default proxy.
+        let url = cerberus_url::parse("http://example.test/x").unwrap();
+        let resp = engine
+            .get_in(
+                &url,
+                &FetchContext {
+                    instance: InstanceId::from_u64_pair(0, 99),
+                    kind: FetchKind::Navigation,
+                },
+            )
+            .unwrap();
+        srv.join().unwrap();
+        assert_eq!(resp.body, b"default!");
     }
 
     #[test]

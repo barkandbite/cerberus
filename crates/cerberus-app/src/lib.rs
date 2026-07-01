@@ -285,7 +285,11 @@ fn fresh_profile_heads() -> Vec<Head> {
 }
 
 /// Parse `heads.txt`: `cerberus-heads v1`, `active <idx>`, then one
-/// `head <head-id> <instance-id> <seed-hex> <label>` line per head.
+/// `head <head-id> <instance-id> <seed-hex> <label>` line per head, each
+/// optionally followed by a `proxy <head-id> <host:port>` line (a head with no
+/// such line has no per-identity proxy). The `proxy` line is a v1-compatible
+/// addition: older files simply have none, and the `head` line format — where
+/// the label is the rest of the line — is unchanged.
 fn load_heads(dir: &Path) -> Option<(Vec<Head>, usize)> {
     let text = std::fs::read_to_string(dir.join(HEADS_FILE)).ok()?;
     let mut lines = text.lines();
@@ -294,6 +298,9 @@ fn load_heads(dir: &Path) -> Option<(Vec<Head>, usize)> {
     }
     let mut active = 0usize;
     let mut heads = Vec::new();
+    // `proxy` lines may appear after the head they name; collect and apply once
+    // all heads are read, so ordering within the file doesn't matter.
+    let mut proxies: HashMap<HeadId, String> = HashMap::new();
     for line in lines {
         let mut parts = line.split_whitespace();
         match parts.next() {
@@ -308,11 +315,21 @@ fn load_heads(dir: &Path) -> Option<(Vec<Head>, usize)> {
                 }
                 heads.push(Head::new(id, instance, label, seed));
             }
+            Some("proxy") => {
+                let id = HeadId::from_hex(parts.next()?)?;
+                let value = parts.next()?.to_string();
+                proxies.insert(id, value);
+            }
             Some(_) | None => continue,
         }
     }
     if heads.is_empty() || active >= heads.len() {
         return None;
+    }
+    for h in &mut heads {
+        if let Some(p) = proxies.get(&h.id) {
+            h.proxy = Some(p.clone());
+        }
     }
     Some((heads, active))
 }
@@ -329,6 +346,9 @@ fn save_heads(dir: &Path, heads: &[Head], active: usize) -> std::io::Result<()> 
             h.farbling.seed(),
             h.label
         ));
+        if let Some(proxy) = &h.proxy {
+            out.push_str(&format!("proxy {} {}\n", h.id, proxy));
+        }
     }
     atomic_write(&dir.join(HEADS_FILE), out.as_bytes())
 }
@@ -341,6 +361,21 @@ pub fn identities_admin(
     dir: &str,
     add: Option<&str>,
     remove: Option<usize>,
+) -> Result<Vec<String>, String> {
+    identities_admin_full(dir, add, remove, None, None)
+}
+
+/// Full identities admin, adding per-identity egress proxy control (per-window
+/// proxy): `set_proxy` is `<idx>=<host:port>` to route that identity's traffic
+/// through its own proxy; `clear_proxy` is an index whose proxy is removed
+/// (falls back to the global `--proxy` / direct). The proxy string is validated
+/// here (fail-closed) so a bad value never reaches `heads.txt`.
+pub fn identities_admin_full(
+    dir: &str,
+    add: Option<&str>,
+    remove: Option<usize>,
+    set_proxy: Option<&str>,
+    clear_proxy: Option<usize>,
 ) -> Result<Vec<String>, String> {
     let path = Path::new(dir);
     std::fs::create_dir_all(path).map_err(|e| e.to_string())?;
@@ -368,7 +403,31 @@ pub fn identities_admin(
             active = heads.len() - 1;
         }
     }
-    if created || add.is_some() || remove.is_some() {
+    let mut proxy_changed = false;
+    if let Some(spec) = set_proxy {
+        let (idx, value) = spec
+            .split_once('=')
+            .ok_or_else(|| format!("--set-proxy needs <idx>=<host:port>, got {spec:?}"))?;
+        let idx: usize = idx
+            .trim()
+            .parse()
+            .map_err(|_| format!("bad identity index in {spec:?}"))?;
+        // Validate now (fail-closed): a malformed proxy must never persist.
+        parse_proxy(value).map_err(|e| format!("invalid proxy {value:?}: {e:?}"))?;
+        let head = heads
+            .get_mut(idx)
+            .ok_or_else(|| format!("no identity at index {idx}"))?;
+        head.proxy = Some(value.trim().to_string());
+        proxy_changed = true;
+    }
+    if let Some(idx) = clear_proxy {
+        let head = heads
+            .get_mut(idx)
+            .ok_or_else(|| format!("no identity at index {idx}"))?;
+        head.proxy = None;
+        proxy_changed = true;
+    }
+    if created || add.is_some() || remove.is_some() || proxy_changed {
         save_heads(path, &heads, active).map_err(|e| e.to_string())?;
     }
     Ok(heads
@@ -376,7 +435,10 @@ pub fn identities_admin(
         .enumerate()
         .map(|(i, h)| {
             let marker = if i == active { "*" } else { " " };
-            format!("{marker} [{i}] {} ({})", h.label, h.instance)
+            match &h.proxy {
+                Some(p) => format!("{marker} [{i}] {} ({}) proxy={p}", h.label, h.instance),
+                None => format!("{marker} [{i}] {} ({})", h.label, h.instance),
+            }
         })
         .collect())
 }
@@ -675,6 +737,20 @@ pub fn network_client(
     jar: Option<Arc<dyn CookieJar>>,
     proxy: Option<ProxyConfig>,
 ) -> Router {
+    network_client_with_proxies(system_roots, jar, proxy, HashMap::new())
+}
+
+/// Like [`network_client`], but with per-instance egress proxies (per-window
+/// proxy): a fetch tagged with an instance in `proxies` tunnels through that
+/// instance's own proxy; every other instance uses the default `proxy` (or
+/// direct). One client serves all instances, so the mirror driver's shared
+/// engine still routes each window through its own egress.
+pub fn network_client_with_proxies(
+    system_roots: bool,
+    jar: Option<Arc<dyn CookieJar>>,
+    proxy: Option<ProxyConfig>,
+    proxies: HashMap<InstanceId, ProxyConfig>,
+) -> Router {
     let provider = || {
         if system_roots {
             RustlsProvider::with_system_roots().unwrap_or_default()
@@ -693,7 +769,28 @@ pub fn network_client(
         Box::new(DohResolver::google(Box::new(provider()))),
         Box::new(SystemResolver),
     ]);
-    Router::with_options(Box::new(provider()), Box::new(dns), jar, proxy)
+    Router::with_proxies(Box::new(provider()), Box::new(dns), jar, proxy, proxies)
+}
+
+/// Parse each head's `proxy` string into a per-instance [`ProxyConfig`] map for
+/// the network client. **Fail-closed:** a malformed proxy string is a hard
+/// error rather than a silent fall-through to direct or default egress — a
+/// window whose proxy is misconfigured must not quietly leak traffic around it,
+/// matching the global `--proxy` behavior.
+pub fn head_proxies(heads: &[Head]) -> Result<HashMap<InstanceId, ProxyConfig>, AppError> {
+    let mut map = HashMap::new();
+    for h in heads {
+        if let Some(raw) = &h.proxy {
+            let cfg = parse_proxy(raw).map_err(|e| {
+                AppError::Net(format!(
+                    "invalid proxy {raw:?} for identity {}: {e:?}",
+                    h.label
+                ))
+            })?;
+            map.insert(h.instance, cfg);
+        }
+    }
+    Ok(map)
 }
 
 /// The cookie seam over sealed storage: attaches only what
@@ -1133,8 +1230,17 @@ pub fn build_mirror_shell(
         .proxy
         .as_deref()
         .map(|p| parse_proxy(p).unwrap_or_else(|e| panic!("invalid --proxy {p:?}: {e:?}")));
-    let client: Arc<dyn HttpClient> =
-        Arc::new(network_client(options.system_roots, Some(jar), proxy));
+    // Per-window proxy: each identity may egress through its own proxy while the
+    // group shares one client. Fail-closed like the global proxy above — a bad
+    // per-head proxy string aborts rather than silently leaking around it.
+    let proxies =
+        head_proxies(&heads).unwrap_or_else(|e| panic!("invalid per-identity proxy: {e:?}"));
+    let client: Arc<dyn HttpClient> = Arc::new(network_client_with_proxies(
+        options.system_roots,
+        Some(jar),
+        proxy,
+        proxies,
+    ));
     let source = Box::new(mirror::AppPageSource::new(client));
     let manager = HeadManager::new(heads, Box::new(QuickJsEngineFactory));
 
@@ -1277,6 +1383,7 @@ impl NetLoader {
         system_roots: bool,
         jar: Option<Arc<dyn CookieJar>>,
         proxy: Option<ProxyConfig>,
+        proxies: HashMap<InstanceId, ProxyConfig>,
     ) -> Self {
         let (req_tx, req_rx) = std::sync::mpsc::channel::<Job>();
         let (out_tx, out_rx) = std::sync::mpsc::channel::<Done>();
@@ -1296,8 +1403,9 @@ impl NetLoader {
                 let worker_waker = waker.clone();
                 let jar = jar.clone();
                 let proxy = proxy.clone();
+                let proxies = proxies.clone();
                 std::thread::spawn(move || {
-                    let client = network_client(system_roots, jar, proxy);
+                    let client = network_client_with_proxies(system_roots, jar, proxy, proxies);
                     loop {
                         // Hold the lock only for the dequeue (released at the `;`),
                         // then fetch unlocked so other workers proceed in parallel.
@@ -2013,8 +2121,18 @@ impl BrowserApp {
                 panic!("invalid --proxy {p:?}: {e:?}")
             })
         });
+        // Per-window proxy: the foreground browser honors each identity's own
+        // proxy too, so switching heads switches egress. Fail-closed like the
+        // global proxy.
+        let proxies =
+            head_proxies(&heads).unwrap_or_else(|e| panic!("invalid per-identity proxy: {e:?}"));
         let mut app = Self::build(
-            Box::new(NetLoader::new(options.system_roots, Some(jar), proxy)),
+            Box::new(NetLoader::new(
+                options.system_roots,
+                Some(jar),
+                proxy,
+                proxies,
+            )),
             storage,
             heads,
             data_dir,

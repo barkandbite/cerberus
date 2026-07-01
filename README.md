@@ -14,7 +14,8 @@ A privacy-first, memory-lean web browser, built from the ground up in Rust.
 The differentiator is the **privacy model**, not the renderer:
 
 - **Three identities ("heads")** — work / personal / throwaway — used one at a
-  time, each with its own sealed cookie partition and farbling seed.
+  time, each with its own sealed cookie partition, farbling seed, and
+  (optionally) its own egress proxy.
 - **Sealed per-instance cookies** — an instance can only ever resolve *its own*
   cookies. Cross-instance correlation is impossible **by construction**, not by a
   policy check.
@@ -74,6 +75,16 @@ cargo run -p cerberus-app --release -- render --url https://example.com --out p.
 
 # Single egress proxy (CONNECT tunnel; target hosts are never resolved locally):
 cargo run -p cerberus-app --release -- render --url https://example.com --out p.png --proxy 127.0.0.1:3128
+
+# Per-identity egress — give a head its own CONNECT proxy, extending the
+# per-head isolation story: each head already has its own sealed cookies and
+# farbling seed, and now its own network egress path too. Under `run --mirror`
+# (one engine, one process driving N windows) each window egresses through its
+# own proxy. Resolution per window is the head's own proxy if set, else the
+# global --proxy, else direct — and a proxied target is never resolved locally:
+cargo run -p cerberus-app --release -- identities --data-dir ~/.cerberus --set-proxy 1=127.0.0.1:3129
+cargo run -p cerberus-app --release -- identities --data-dir ~/.cerberus --clear-proxy 1   # back to --proxy/direct
+cargo run -p cerberus-app --release -- identities --data-dir ~/.cerberus                    # lists heads; a proxied one shows proxy=<host:port>
 
 # Inspect / retune a profile's per-cookie dispositions, headlessly:
 cargo run -p cerberus-app --release -- cookies --data-dir ~/.cerberus
