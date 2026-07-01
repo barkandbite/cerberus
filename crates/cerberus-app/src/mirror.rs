@@ -10,11 +10,12 @@
 //! *own* session while the group runs the single shared engine (ADR-0017).
 
 use std::collections::HashMap;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use cerberus_autofill::{fill_plan, Profile};
 use cerberus_css::CssEngine;
 use cerberus_dom::{parse_html, Document, NodeId, NodeRef};
+use cerberus_farbling::FarblingProvider;
 use cerberus_identity::HeadManager;
 use cerberus_js::JsEngineFactory;
 use cerberus_js_quickjs::QuickJsEngineFactory;
@@ -25,11 +26,14 @@ use cerberus_mirror::{
 use cerberus_net::{BuiltinHttpClient, FetchContext, FetchKind, HttpClient};
 use cerberus_paint::{Framebuffer, Rasterizer};
 use cerberus_shell::MultiSurfaceApp;
+use cerberus_storage::StorageEnvironment;
 use cerberus_style::StyleEngine;
 use cerberus_text::TextEngine;
 use cerberus_types::{Color, InstanceId, Rect, Size};
 use cerberus_ui::DrivenBadge;
 use cerberus_url::parse as parse_url;
+
+use crate::LockRecover;
 
 /// A [`PageSource`] over the app's synchronous load path.
 ///
@@ -93,7 +97,7 @@ pub fn mirror_group_from_heads(
     let members = heads
         .heads()
         .iter()
-        .map(|h| (h.instance, h.label.clone()))
+        .map(|h| (h.instance, h.label.clone(), h.farbling.js_prologue()))
         .collect();
     let engine = QuickJsEngineFactory
         .instantiate()
@@ -104,14 +108,32 @@ pub fn mirror_group_from_heads(
 /// Maps each identity to its autofill [`Profile`] for a [`MirrorGroup`], so one
 /// master `Fill` fills every window from its **own** profile. Built from the
 /// vault-loaded profiles when entering mirror mode.
+///
+/// The map is shared (`Arc<Mutex<..>>`) rather than owned outright so a handle
+/// can be kept outside the `Box<dyn FillProvider>` the group holds: that lets
+/// [`MirrorShell`] (or whoever owns the vault) reach in and
+/// [`clear_secrets`](ProfileFillProvider::clear_secrets) the decrypted profiles
+/// when the vault locks, without the group needing to know about vaults at all
+/// (issue #17 — nothing else may keep the decrypted secrets alive past a lock).
+#[derive(Clone)]
 pub struct ProfileFillProvider {
-    profiles: HashMap<InstanceId, Profile>,
+    profiles: Arc<Mutex<HashMap<InstanceId, Profile>>>,
 }
 
 impl ProfileFillProvider {
     /// Wrap a per-identity profile map.
     pub fn new(profiles: HashMap<InstanceId, Profile>) -> Self {
-        Self { profiles }
+        Self {
+            profiles: Arc::new(Mutex::new(profiles)),
+        }
+    }
+
+    /// Drop every decrypted profile this provider holds. `Login`/`Card` derive
+    /// `ZeroizeOnDrop`, so clearing the map wipes the password/PAN/CVV bytes for
+    /// free — call this as soon as the vault locks so no live structure still
+    /// holds the decrypted secrets.
+    pub fn clear_secrets(&self) {
+        self.profiles.lock().unwrap().clear();
     }
 }
 
@@ -123,7 +145,7 @@ impl FillProvider for ProfileFillProvider {
         doc: &Document,
         page_host: &str,
     ) -> Vec<(NodeId, String)> {
-        match self.profiles.get(&instance) {
+        match self.profiles.lock().unwrap().get(&instance) {
             Some(profile) => fill_plan(doc, profile, kind, page_host),
             None => Vec::new(),
         }
@@ -153,10 +175,20 @@ pub struct MirrorShell {
     /// whole on each [`Action::Input`] (so a follower converges in one replay,
     /// and the log coalesces a run of keystrokes into a single entry).
     input_buffer: String,
+    /// The vault-backed storage this session's autofill profiles were decrypted
+    /// from, if any (mirror mode over an ephemeral profile has none). Kept so
+    /// [`lock_vault`](MirrorShell::lock_vault) can lock it and clear
+    /// `fill_secrets` together — otherwise locking the vault would leave the
+    /// decrypted profiles live in `fill_secrets` (issue #17).
+    storage: Option<Arc<Mutex<StorageEnvironment>>>,
+    /// A handle to the same decrypted-profile map the group's `FillProvider`
+    /// reads from, if one was installed. Cleared by [`lock_vault`].
+    fill_secrets: Option<ProfileFillProvider>,
 }
 
 impl MirrorShell {
-    /// Wrap a built group (e.g. from [`mirror_group_from_heads`]).
+    /// Wrap a built group (e.g. from [`mirror_group_from_heads`]) with no vault
+    /// hookup — used where the group has no fill provider, or in tests.
     pub fn new(group: MirrorGroup) -> Self {
         Self {
             group,
@@ -167,6 +199,36 @@ impl MirrorShell {
             master_fields: Vec::new(),
             focused_target: None,
             input_buffer: String::new(),
+            storage: None,
+            fill_secrets: None,
+        }
+    }
+
+    /// Wrap a built group along with the vault-backed storage its autofill
+    /// profiles were decrypted from and a handle to the same
+    /// [`ProfileFillProvider`] installed on it, so [`lock_vault`] can clear both
+    /// together.
+    pub fn with_vault(
+        group: MirrorGroup,
+        storage: Arc<Mutex<StorageEnvironment>>,
+        fill_secrets: ProfileFillProvider,
+    ) -> Self {
+        let mut shell = Self::new(group);
+        shell.storage = Some(storage);
+        shell.fill_secrets = Some(fill_secrets);
+        shell
+    }
+
+    /// Lock the vault (dropping/zeroizing its key) and clear every decrypted
+    /// autofill profile this session holds, so no live structure still carries
+    /// the plaintext password/PAN/CVV once the vault is locked (issue #17). A
+    /// no-op if this shell was built with [`new`](MirrorShell::new) (no vault).
+    pub fn lock_vault(&mut self) {
+        if let Some(storage) = &self.storage {
+            storage.locked().lock_vault();
+        }
+        if let Some(secrets) = &self.fill_secrets {
+            secrets.clear_secrets();
         }
     }
 
@@ -423,6 +485,138 @@ mod tests {
     }
 
     #[test]
+    fn clear_secrets_empties_the_profile_map() {
+        use cerberus_autofill::Login;
+        let inst = InstanceId::from_u64_pair(0, 1);
+        let mut profiles = HashMap::new();
+        profiles.insert(
+            inst,
+            Profile {
+                login: Login {
+                    username: "ada".into(),
+                    password: "pw".into(),
+                },
+                ..Profile::default()
+            },
+        );
+        let provider = ProfileFillProvider::new(profiles);
+        let doc = parse_html("<input id=\"u\" name=\"username\">");
+        assert_eq!(
+            provider
+                .fills(inst, FillKind::Login, &doc, "any.test")
+                .len(),
+            1,
+            "profile is present before clearing"
+        );
+
+        // A clone shares the same backing map (issue #17: MirrorShell keeps a
+        // clone alongside the one it hands to the group, so it can clear both
+        // through either handle when the vault locks).
+        let handle = provider.clone();
+        handle.clear_secrets();
+
+        assert!(
+            provider
+                .fills(inst, FillKind::Login, &doc, "any.test")
+                .is_empty(),
+            "no profile should remain after clear_secrets"
+        );
+    }
+
+    // Throwaway, test-only KDF. NEVER shipped. Not secure. Real `Argon2idKdf`
+    // deliberately costs ~19 MiB per unlock (PLAN §5); that's fine standalone,
+    // but this test binary already runs several genuine vault unlocks
+    // concurrently with the `mirror_bench_drives_many_instances_within_budget`
+    // RSS-budget test, so a real KDF here risks tipping it over its budget
+    // under parallel `cargo test` load. This exercises the same unlock/lock
+    // code path with O(1) memory instead.
+    struct TestKdf;
+    impl cerberus_crypto::Kdf for TestKdf {
+        fn derive(
+            &self,
+            passphrase: &cerberus_crypto::Secret,
+            salt: &[u8],
+            out_len: usize,
+        ) -> Result<cerberus_crypto::Key, cerberus_crypto::CryptoError> {
+            let pp = passphrase.expose();
+            let out: Vec<u8> = (0..out_len)
+                .map(|i| {
+                    pp.get(i % pp.len().max(1)).copied().unwrap_or(0)
+                        ^ salt.get(i % salt.len().max(1)).copied().unwrap_or(0)
+                        ^ (i as u8)
+                })
+                .collect();
+            Ok(cerberus_crypto::Key::from_bytes(out))
+        }
+    }
+
+    #[test]
+    fn shell_lock_vault_clears_fill_secrets_and_locks_storage() {
+        use cerberus_autofill::Login;
+        use cerberus_crypto::Secret;
+        use cerberus_crypto_rustcrypto::XChaCha20Poly1305Aead;
+        use cerberus_storage::EncryptedVault;
+
+        let heads = two_identities();
+        let inst = heads.heads()[0].instance;
+        let mut group = mirror_group_from_heads(
+            &heads,
+            Box::new(AppPageSource::builtin_only()),
+            (800, 600),
+            "ua",
+        )
+        .unwrap();
+
+        let vault = EncryptedVault::new(
+            Box::new(XChaCha20Poly1305Aead::new()),
+            Box::new(TestKdf),
+            [0u8; 16],
+        );
+        let mut env = StorageEnvironment::new(Box::new(vault));
+        env.unlock_vault(&Secret::from_passphrase("hunter2"))
+            .expect("unlock");
+        let storage = Arc::new(Mutex::new(env));
+
+        let mut profiles = HashMap::new();
+        profiles.insert(
+            inst,
+            Profile {
+                login: Login {
+                    username: "ada".into(),
+                    password: "pw".into(),
+                },
+                ..Profile::default()
+            },
+        );
+        let fill_provider = ProfileFillProvider::new(profiles);
+        group.set_fill_provider(Box::new(fill_provider.clone()));
+        let mut shell = MirrorShell::with_vault(group, storage.clone(), fill_provider.clone());
+
+        let doc = parse_html("<input id=\"u\" name=\"username\">");
+        assert_eq!(
+            fill_provider
+                .fills(inst, FillKind::Login, &doc, "any.test")
+                .len(),
+            1,
+            "profile is loaded before the vault locks"
+        );
+        assert!(!storage.lock().unwrap().vault_locked());
+
+        shell.lock_vault();
+
+        assert!(
+            storage.lock().unwrap().vault_locked(),
+            "lock_vault must lock the underlying storage vault"
+        );
+        assert!(
+            fill_provider
+                .fills(inst, FillKind::Login, &doc, "any.test")
+                .is_empty(),
+            "no live structure should still hold the decrypted profile after lock"
+        );
+    }
+
+    #[test]
     fn group_drives_builtin_pages_across_identities() {
         let heads = two_identities();
         let source = Box::new(AppPageSource::builtin_only());
@@ -517,8 +711,8 @@ mod tests {
         let follower = InstanceId::from_u64_pair(0, 2);
         let engine = QuickJsEngineFactory.instantiate().unwrap();
         let members = vec![
-            (master, "work".to_string()),
-            (follower, "personal".to_string()),
+            (master, "work".to_string(), String::new()),
+            (follower, "personal".to_string(), String::new()),
         ];
         let group =
             MirrorGroup::new(engine, Box::new(InputPage), members, (800, 600), "ua").unwrap();
@@ -596,8 +790,8 @@ mod tests {
         let follower = InstanceId::from_u64_pair(0, 2);
         let engine = QuickJsEngineFactory.instantiate().unwrap();
         let members = vec![
-            (master, "work".to_string()),
-            (follower, "personal".to_string()),
+            (master, "work".to_string(), String::new()),
+            (follower, "personal".to_string(), String::new()),
         ];
         let group =
             MirrorGroup::new(engine, Box::new(InputPage), members, (800, 600), "ua").unwrap();

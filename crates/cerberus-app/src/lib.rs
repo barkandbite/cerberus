@@ -71,6 +71,7 @@ use std::sync::mpsc::{Receiver, Sender};
 use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
+use zeroize::Zeroize;
 
 mod timings;
 use timings::Timings;
@@ -1154,7 +1155,16 @@ pub fn build_mirror_shell(
     let mut group =
         mirror::mirror_group_from_heads(&manager, source, (1280, 800), DEFAULT_USER_AGENT)?;
     if !profiles.is_empty() {
-        group.set_fill_provider(Box::new(mirror::ProfileFillProvider::new(profiles)));
+        // Keep a handle to the same provider alongside the one the group gets,
+        // so a later `lock_vault()` can clear the decrypted profiles out from
+        // under it (issue #17) without the group needing to know about vaults.
+        let fill_provider = mirror::ProfileFillProvider::new(profiles);
+        group.set_fill_provider(Box::new(fill_provider.clone()));
+        return Ok(mirror::MirrorShell::with_vault(
+            group,
+            storage,
+            fill_provider,
+        ));
     }
     Ok(mirror::MirrorShell::new(group))
 }
@@ -3260,14 +3270,16 @@ impl BrowserApp {
     }
 
     /// Attempt a vault unlock with the passphrase typed into the settings
-    /// overlay. The input is cleared either way; the derived key (and the
-    /// Secret's copy of the passphrase) zeroize on drop.
+    /// overlay. The input is wiped either way: `vault_input.zeroize()` scrubs
+    /// the backing buffer (not just its length, unlike `String::clear()`), and
+    /// the derived key (and the `Secret`'s own copy of the passphrase) zeroize
+    /// on drop.
     fn try_unlock_vault(&mut self) {
         if self.vault_input.is_empty() {
             return;
         }
         let pass = Secret::from_passphrase(&self.vault_input);
-        self.vault_input.clear();
+        self.vault_input.zeroize();
         let result = self.storage.locked().unlock_vault(&pass);
         self.vault_msg = Some(match result {
             Ok(()) => "vault unlocked".to_string(),
@@ -3525,6 +3537,11 @@ impl BrowserApp {
             }
             ToolbarAction::OpenSettings => {
                 self.settings_open = !self.settings_open;
+                if !self.settings_open {
+                    // Closing the overlay must wipe any typed-but-unsubmitted
+                    // passphrase, not just drop the reference to it (issue #30).
+                    self.vault_input.zeroize();
+                }
                 true
             }
             ToolbarAction::OpenSync => {
@@ -3910,6 +3927,9 @@ impl FrameApp for BrowserApp {
             if point_in_rect(settings_cookies_rect(self.last_size), x, y) {
                 self.settings_open = false;
                 self.vault_msg = None;
+                // Leaving the overlay wipes any typed-but-unsubmitted passphrase
+                // (issue #30) — `zeroize()`, not `clear()`, actually scrubs it.
+                self.vault_input.zeroize();
                 self.cookie_manager_open = true;
                 self.cookie_scroll = 0;
                 return true;
@@ -3924,6 +3944,7 @@ impl FrameApp for BrowserApp {
             if !point_in_rect(settings_panel_rect(self.last_size), x, y) {
                 self.settings_open = false;
                 self.vault_msg = None;
+                self.vault_input.zeroize();
             }
             return true;
         }
@@ -4937,8 +4958,14 @@ pub struct MirrorBench {
 /// snapshots. Guards the catch-up perf (E1/E2) and the bounded-memory model that
 /// keeps thousands of profiles affordable (PLAN §1).
 pub fn mirror_bench(n: usize) -> Result<MirrorBench, String> {
-    let members: Vec<(InstanceId, String)> = (0..n)
-        .map(|i| (InstanceId::from_u64_pair(0, i as u64 + 1), format!("id{i}")))
+    let members: Vec<(InstanceId, String, String)> = (0..n)
+        .map(|i| {
+            (
+                InstanceId::from_u64_pair(0, i as u64 + 1),
+                format!("id{i}"),
+                String::new(),
+            )
+        })
         .collect();
     let engine = QuickJsEngineFactory
         .instantiate()

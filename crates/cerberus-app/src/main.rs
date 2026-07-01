@@ -14,6 +14,7 @@
 use cerberus_app::{head_switch_rss, render, resident_set_kb, RenderConfig};
 use cerberus_types::{Color, Size};
 use std::process::ExitCode;
+use zeroize::Zeroize;
 
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
@@ -421,13 +422,17 @@ fn cmd_profile(args: &[String]) -> ExitCode {
         eprintln!("profile: --data-dir <DIR> is required");
         return ExitCode::FAILURE;
     };
-    let Ok(passphrase) = std::env::var("CERBERUS_VAULT_PASS") else {
+    let Ok(mut passphrase) = std::env::var("CERBERUS_VAULT_PASS") else {
         eprintln!("profile: set CERBERUS_VAULT_PASS to the vault passphrase");
         return ExitCode::FAILURE;
     };
 
-    if let Some(file) = flag(args, "--export") {
-        return match cerberus_app::profile_export(&dir, &file, &passphrase, delim) {
+    // `passphrase` is a plain String for as short a time as possible: it is
+    // wrapped in the zeroizing `Secret` immediately inside each call below, and
+    // this original copy is wiped (not just dropped) before `cmd_profile`
+    // returns on every path (issue #30).
+    let code = if let Some(file) = flag(args, "--export") {
+        match cerberus_app::profile_export(&dir, &file, &passphrase, delim) {
             Ok(n) => {
                 println!("profile: exported {n} identities to {file}");
                 ExitCode::SUCCESS
@@ -436,10 +441,9 @@ fn cmd_profile(args: &[String]) -> ExitCode {
                 eprintln!("profile: {e}");
                 ExitCode::FAILURE
             }
-        };
-    }
-    if let Some(file) = flag(args, "--import") {
-        return match cerberus_app::profile_import(&dir, &file, &passphrase) {
+        }
+    } else if let Some(file) = flag(args, "--import") {
+        match cerberus_app::profile_import(&dir, &file, &passphrase) {
             Ok(lines) => {
                 for line in lines {
                     println!("{line}");
@@ -450,25 +454,27 @@ fn cmd_profile(args: &[String]) -> ExitCode {
                 eprintln!("profile: {e}");
                 ExitCode::FAILURE
             }
-        };
-    }
-
-    let identity = flag(args, "--identity")
-        .and_then(|s| s.parse::<usize>().ok())
-        .unwrap_or(0);
-    let set = flag(args, "--set");
-    match cerberus_app::profile_admin(&dir, identity, set.as_deref(), &passphrase) {
-        Ok(lines) => {
-            for line in lines {
-                println!("{line}");
+        }
+    } else {
+        let identity = flag(args, "--identity")
+            .and_then(|s| s.parse::<usize>().ok())
+            .unwrap_or(0);
+        let set = flag(args, "--set");
+        match cerberus_app::profile_admin(&dir, identity, set.as_deref(), &passphrase) {
+            Ok(lines) => {
+                for line in lines {
+                    println!("{line}");
+                }
+                ExitCode::SUCCESS
             }
-            ExitCode::SUCCESS
+            Err(e) => {
+                eprintln!("profile: {e}");
+                ExitCode::FAILURE
+            }
         }
-        Err(e) => {
-            eprintln!("profile: {e}");
-            ExitCode::FAILURE
-        }
-    }
+    };
+    passphrase.zeroize();
+    code
 }
 
 fn print_usage() {

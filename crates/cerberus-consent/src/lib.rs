@@ -58,6 +58,63 @@ struct Rule {
     allow: bool,
 }
 
+/// Percent-escape whitespace (and `%` itself) in a rule-line field.
+///
+/// `Origin::site()` embeds the host as-is, and nothing upstream forbids
+/// whitespace in a host (an opaque-scheme "host", e.g. from a `mailto:` or
+/// `data:` URL, legitimately can contain spaces). `load_rules` splits each
+/// line on whitespace, so an unescaped space in a site would shift the field
+/// boundaries and corrupt the adjacent field. Escaping only whitespace/`%`
+/// keeps the format human-auditable for the overwhelmingly common case of
+/// ordinary hostnames, which round-trip completely unescaped.
+///
+/// Works byte-wise (not char-wise): every other byte, including any
+/// multi-byte UTF-8 sequence, is copied through untouched so non-ASCII hosts
+/// still round-trip.
+fn escape_field(s: &str) -> String {
+    let mut out = Vec::with_capacity(s.len());
+    for &b in s.as_bytes() {
+        match b {
+            b'%' => out.extend_from_slice(b"%25"),
+            b' ' => out.extend_from_slice(b"%20"),
+            b'\t' => out.extend_from_slice(b"%09"),
+            b'\n' => out.extend_from_slice(b"%0A"),
+            b'\r' => out.extend_from_slice(b"%0D"),
+            _ => out.push(b),
+        }
+    }
+    // `s` was valid UTF-8 and every substitution above is pure ASCII, so the
+    // result is valid UTF-8 too.
+    String::from_utf8(out).expect("escaping preserves UTF-8 validity")
+}
+
+/// Reverse [`escape_field`]. Invalid or truncated `%XX` escapes are passed
+/// through literally rather than erroring — this is a best-effort decode of
+/// a file we ourselves wrote (forward-compatible with `escape_field` changes).
+fn unescape_field(s: &str) -> String {
+    let bytes = s.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'%' && i + 3 <= bytes.len() {
+            if let Ok(hex) = std::str::from_utf8(&bytes[i + 1..i + 3]) {
+                if let Ok(byte) = u8::from_str_radix(hex, 16) {
+                    out.push(byte);
+                    i += 3;
+                    continue;
+                }
+            }
+        }
+        out.push(bytes[i]);
+        i += 1;
+    }
+    // A well-formed escape only ever substitutes single bytes for `%XX`
+    // triples that decode ASCII whitespace/`%`, so this cannot introduce
+    // invalid UTF-8 that wasn't already in `s`; fall back to a lossy
+    // decode defensively rather than panic on a corrupted rule file.
+    String::from_utf8(out).unwrap_or_else(|e| String::from_utf8_lossy(e.as_bytes()).into_owned())
+}
+
 /// Default-deny policy: first-party is allowed; third-party is denied unless a
 /// rule allows it, and raises a prompt event when headed.
 #[derive(Default)]
@@ -116,8 +173,8 @@ impl DefaultDenyPolicy {
                 "{} {} {} {}\n",
                 if r.allow { "allow" } else { "deny" },
                 r.instance,
-                r.first_party_site,
-                r.request_site,
+                escape_field(&r.first_party_site),
+                escape_field(&r.request_site),
             ));
         }
         out
@@ -148,8 +205,8 @@ impl DefaultDenyPolicy {
             };
             self.rules.push(Rule {
                 instance,
-                request_site: req.to_string(),
-                first_party_site: fp.to_string(),
+                request_site: unescape_field(req),
+                first_party_site: unescape_field(fp),
                 allow,
             });
         }
@@ -290,6 +347,58 @@ mod tests {
         assert_eq!(
             q.evaluate(other, &third_party(), &fp()).decision,
             Decision::Prompt
+        );
+    }
+
+    #[test]
+    fn escape_field_round_trips_arbitrary_bytes() {
+        for s in [
+            "news.example.com",
+            "foo bar",
+            "a%b",
+            "tab\ttab",
+            "line\nbreak",
+        ] {
+            assert_eq!(unescape_field(&escape_field(s)), s);
+        }
+    }
+
+    #[test]
+    fn rule_with_a_whitespace_containing_site_round_trips_without_corrupting_fields() {
+        // `Origin::site()` embeds the host as-is, and an opaque-scheme "host"
+        // (e.g. from a `mailto:` URL) can legitimately contain a space — there
+        // is no validation upstream that forbids it. Before escaping was
+        // added, an unescaped space would have split into an extra
+        // `split_whitespace()` token on load, shifting every field after it.
+        let mut p = DefaultDenyPolicy::new(true);
+        let malformed_first_party = Origin::new("mailto", "foo bar", None);
+        p.add_rule(inst(), &third_party(), &malformed_first_party, true);
+        // A second, well-formed rule sits right after it in the file; if the
+        // first line's fields shifted, this one would be misparsed too.
+        p.add_rule(
+            inst(),
+            &Origin::new("https", "cdn.widgets.example", None),
+            &fp(),
+            false,
+        );
+        let text = p.serialize_rules();
+
+        let mut q = DefaultDenyPolicy::new(true);
+        q.load_rules(&text);
+        assert_eq!(q.rule_count(), 2);
+        assert_eq!(
+            q.evaluate(inst(), &third_party(), &malformed_first_party)
+                .decision,
+            Decision::Allow
+        );
+        assert_eq!(
+            q.evaluate(
+                inst(),
+                &Origin::new("https", "cdn.widgets.example", None),
+                &fp()
+            )
+            .decision,
+            Decision::Deny
         );
     }
 

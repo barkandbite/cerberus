@@ -71,8 +71,8 @@ fn group(
         .instantiate()
         .expect("instantiate engine");
     let members = vec![
-        (master, "master".to_string()),
-        (follower, "follower".to_string()),
+        (master, "master".to_string(), String::new()),
+        (follower, "follower".to_string(), String::new()),
     ];
     let g = MirrorGroup::new(engine, Box::new(source), members, (1024, 768), UA).expect("group");
     (g, master, follower)
@@ -308,8 +308,8 @@ fn typing_coalesces_into_one_input_and_followers_converge() {
     let follower = InstanceId::from_u64_pair(0, 2);
     let engine = QuickJsEngineFactory.instantiate().unwrap();
     let members = vec![
-        (master, "master".to_string()),
-        (follower, "follower".to_string()),
+        (master, "master".to_string(), String::new()),
+        (follower, "follower".to_string(), String::new()),
     ];
     let mut g = MirrorGroup::new(engine, Box::new(FillForm), members, (1024, 768), UA).unwrap();
 
@@ -373,8 +373,8 @@ fn fill_uses_each_windows_own_profile() {
     let follower = InstanceId::from_u64_pair(0, 2);
     let engine = QuickJsEngineFactory.instantiate().unwrap();
     let members = vec![
-        (master, "master".to_string()),
-        (follower, "follower".to_string()),
+        (master, "master".to_string(), String::new()),
+        (follower, "follower".to_string(), String::new()),
     ];
     let mut g = MirrorGroup::new(engine, Box::new(FillForm), members, (1024, 768), UA).unwrap();
     g.set_fill_provider(Box::new(PerProfileFill { master }));
@@ -391,4 +391,73 @@ fn fill_uses_each_windows_own_profile() {
         Some("follower-user")
     );
     assert!(g.live_realms() <= 1);
+}
+
+/// A page whose script reads back whatever global the realm's prologue set
+/// (standing in for a farbling shim's seed) into `#seed`, so a test can observe
+/// — through the DOM, the same surface this crate's other tests already use —
+/// which prologue actually ran in a given instance's realm.
+struct SeedEchoPage;
+
+impl PageSource for SeedEchoPage {
+    fn load(&self, _instance: InstanceId, _url: &str) -> Result<Document, String> {
+        Ok(parse_html(
+            "<html><body><div id=\"seed\">none</div>\
+             <script>document.getElementById('seed').textContent = \
+             String(globalThis.__testSeed);</script>\
+             </body></html>",
+        ))
+    }
+}
+
+#[test]
+fn each_instance_gets_its_own_farbling_prologue_injected() {
+    // Issue #69: mirror-group windows never got the per-head farbling prologue
+    // injected, so every mirrored identity shared one fingerprint. Two distinct
+    // literal prologues stand in for two heads' `SeededFarbling::js_prologue()`
+    // (a real dependency would need a new `cerberus-farbling` dev-dependency,
+    // which this crate's `Cargo.toml` deliberately does not carry).
+    let master = InstanceId::from_u64_pair(0, 1);
+    let follower = InstanceId::from_u64_pair(0, 2);
+    let engine = QuickJsEngineFactory.instantiate().unwrap();
+    let members = vec![
+        (
+            master,
+            "master".to_string(),
+            "globalThis.__testSeed = 111;".to_string(),
+        ),
+        (
+            follower,
+            "follower".to_string(),
+            "globalThis.__testSeed = 222;".to_string(),
+        ),
+    ];
+    let mut g = MirrorGroup::new(engine, Box::new(SeedEchoPage), members, (1024, 768), UA).unwrap();
+
+    // The master's own realm gets its prologue before its page script runs.
+    g.act(Action::Navigate(URL.into())).unwrap();
+    assert_eq!(
+        g.master().text_of_id("seed").as_deref(),
+        Some("111"),
+        "the master's realm ran its own farbling prologue"
+    );
+
+    // Focusing the follower catches it up in its OWN realm — a distinct
+    // prologue, not the master's, and not the pre-fix no-op.
+    g.focus(1).unwrap();
+    assert_eq!(
+        g.instance(1).unwrap().text_of_id("seed").as_deref(),
+        Some("222"),
+        "the follower's realm ran its OWN farbling prologue, not the master's"
+    );
+    assert!(g.live_realms() <= 1, "still at most one live realm");
+
+    // Re-focusing the master (a fresh realm + catch-up) re-injects its own
+    // prologue rather than leaking the follower's.
+    g.focus(0).unwrap();
+    assert_eq!(
+        g.master().text_of_id("seed").as_deref(),
+        Some("111"),
+        "re-focusing the master reinjects its own prologue"
+    );
 }

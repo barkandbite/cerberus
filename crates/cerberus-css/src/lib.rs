@@ -611,6 +611,10 @@ fn apply_declarations(
                 if prop == "background" {
                     style.background_image = parse_url_value(v);
                     style.background_gradient = parse_gradient(v).map(Box::new);
+                    // The shorthand resets every longhand it can set, including
+                    // position/size, before applying whatever the value specifies.
+                    style.background_position = ImagePos::TOP_LEFT;
+                    style.background_size = ImageFit::Fill;
                     apply_background_shorthand_geometry(style, v);
                 }
             }
@@ -1302,6 +1306,10 @@ fn combine_pos(parts: &[(u8, f32)]) -> Option<ImagePos> {
             ImagePos { x: *f, y: 0.5 }
         }),
         [(a0, f0), (a1, f1), ..] => {
+            // Same-axis keyword pairs (two horizontal or two vertical) are invalid CSS.
+            if (*a0 == 0 && *a1 == 0) || (*a0 == 1 && *a1 == 1) {
+                return None;
+            }
             // Swap when the order is vertical-first or horizontal-second.
             if *a0 == 1 || *a1 == 0 {
                 Some(ImagePos { x: *f1, y: *f0 })
@@ -2093,8 +2101,40 @@ mod tests {
             ImagePos { x: 1.0, y: 1.0 },
             "vertical-first keywords swap to (x,y)"
         );
+        assert_eq!(
+            pos("object-position: top left"),
+            ImagePos { x: 0.0, y: 0.0 },
+            "top left"
+        );
+        assert_eq!(
+            pos("object-position: left top"),
+            ImagePos { x: 0.0, y: 0.0 },
+            "left top swaps the same as top left"
+        );
+        assert_eq!(
+            pos("object-position: center top"),
+            ImagePos { x: 0.5, y: 0.0 }
+        );
+        assert_eq!(
+            pos("object-position: right center"),
+            ImagePos { x: 1.0, y: 0.5 }
+        );
+        assert_eq!(pos("object-position: 30% 40%"), ImagePos { x: 0.3, y: 0.4 });
         // Lengths are ignored (no box at parse time) — falls back to default.
         assert_eq!(pos("object-position: 10px 20px"), ImagePos::CENTER);
+    }
+
+    #[test]
+    fn object_position_same_axis_keywords_are_invalid() {
+        let pos = |css: &str| {
+            let dom = CssEngine::new().style(&parse_html(&format!("<img style='{css}'>")));
+            first(&dom.root, "img").unwrap().style.object_position
+        };
+        // Two keywords on the same axis are invalid CSS; the declaration is
+        // ignored and the initial value (center) is kept.
+        assert_eq!(pos("object-position: left right"), ImagePos::CENTER);
+        assert_eq!(pos("object-position: top bottom"), ImagePos::CENTER);
+        assert_eq!(pos("object-position: left left"), ImagePos::CENTER);
     }
 
     #[test]
@@ -2130,6 +2170,31 @@ mod tests {
         assert_eq!(g.background_size, ImageFit::Fill);
         assert_eq!(g.background_position, ImagePos::TOP_LEFT);
         assert!(g.background_gradient.is_some());
+
+        // The shorthand resets position/size longhands to their initial value
+        // even when the shorthand's own value carries no geometry group.
+        let reset_size = s("background-size: cover; background: url(x)");
+        assert_eq!(
+            reset_size.background_size,
+            ImageFit::Fill,
+            "background shorthand resets a prior background-size longhand"
+        );
+        let reset_pos = s("background-position: right; background: url(x)");
+        assert_eq!(
+            reset_pos.background_position,
+            ImagePos::TOP_LEFT,
+            "background shorthand resets a prior background-position longhand"
+        );
+        // Positive case: geometry present in the shorthand still applies.
+        let both =
+            s("background-position: right; background-size: cover; background: center / cover");
+        assert_eq!(both.background_position, ImagePos::CENTER);
+        assert_eq!(both.background_size, ImageFit::Cover);
+        // `background-color` alone is not the shorthand and must not reset geometry.
+        let color_only =
+            s("background-position: right; background-size: cover; background-color: red");
+        assert_eq!(color_only.background_position, ImagePos { x: 1.0, y: 0.5 });
+        assert_eq!(color_only.background_size, ImageFit::Cover);
     }
 
     #[test]

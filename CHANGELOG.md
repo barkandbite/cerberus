@@ -3,6 +3,38 @@
 All notable changes to Cerberus are recorded here. Versions are small while the
 browser is pre-1.0; this is the first tagged preview.
 
+## [0.0.6] — 2026-07-01
+
+A quality/hardening pass: a codebase-wide review reconciled the stale-issue
+backlog and fixed nine issues it surfaced, four of them security-relevant.
+
+### Fixed
+- **QuickJS runtime sandboxing.** The JS engine now caps its per-engine heap,
+  sets an explicit interpreter stack limit, and enforces a wall-clock deadline
+  on every top-level script evaluation. A page script can no longer hang or
+  OOM the whole browser process with an infinite loop or an unbounded
+  allocation.
+- **Mirror-mode farbling.** Windows in a mirror group (multiple identities
+  side-by-side) now each get their own anti-fingerprinting JS prologue
+  injected, matching the single-window path. Mirrored identities no longer
+  share a byte-identical canvas/audio/WebGL fingerprint.
+- **Decrypted-secret hygiene.** Locking the vault now also clears any
+  decrypted autofill profiles a mirror session is holding, and the vault
+  passphrase (both the GUI field and the CLI path) is actually zeroized on
+  every reset, not just `.clear()`ed (which doesn't wipe the backing buffer).
+- **`is_public_suffix` operator-precedence bug.** A bare single-label host
+  (e.g. `localhost`) was incorrectly treated as a public suffix regardless of
+  the PSL data, breaking cookie storage on local/intranet hosts.
+- **CSS correctness.** `object-position`/`background-position` with two
+  same-axis keywords (e.g. `left right`) no longer silently misparses; the
+  `background` shorthand now resets `background-position`/`background-size`
+  to their initial values instead of leaking a prior longhand; `srcset`
+  candidate parsing no longer shears a URL that legitimately contains a comma
+  (query string, `data:` URI).
+- **Consent rule persistence.** Site fields are now percent-escaped on
+  serialization, so a whitespace-containing host can no longer shift
+  adjacent fields when the rule file round-trips.
+
 ## [0.0.5] — 2026-06-22
 
 Responsive-image fidelity: pictures now keep their aspect ratio, anchor where the

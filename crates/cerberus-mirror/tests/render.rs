@@ -78,8 +78,8 @@ fn each_window_renders_its_own_session_independently() {
     let follower = InstanceId::from_u64_pair(0, 2);
     let engine = QuickJsEngineFactory.instantiate().expect("engine");
     let members = vec![
-        (master, "master".to_string()),
-        (follower, "follower".to_string()),
+        (master, "master".to_string(), String::new()),
+        (follower, "follower".to_string(), String::new()),
     ];
     let source = VariablePage { master };
     let mut g =
