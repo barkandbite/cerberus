@@ -323,8 +323,10 @@ fn cmd_cookies(args: &[String]) -> ExitCode {
 }
 
 /// `identities` — list, add (`--add <label>`), or remove (`--remove <index>`)
-/// a persistent profile's sealed identities. A profile holds arbitrary N; the
-/// mirror driver (`run --mirror`) drives every one of them.
+/// a persistent profile's sealed identities, and set each one's own egress
+/// proxy (`--set-proxy <idx>=<host:port>` / `--clear-proxy <idx>`). A profile
+/// holds arbitrary N; the mirror driver (`run --mirror`) drives every one of
+/// them, each through its own proxy.
 fn cmd_identities(args: &[String]) -> ExitCode {
     let Some(dir) = flag(args, "--data-dir") else {
         eprintln!("identities: --data-dir <DIR> is required");
@@ -332,7 +334,15 @@ fn cmd_identities(args: &[String]) -> ExitCode {
     };
     let add = flag(args, "--add");
     let remove = flag(args, "--remove").and_then(|s| s.parse::<usize>().ok());
-    match cerberus_app::identities_admin(&dir, add.as_deref(), remove) {
+    let set_proxy = flag(args, "--set-proxy");
+    let clear_proxy = flag(args, "--clear-proxy").and_then(|s| s.parse::<usize>().ok());
+    match cerberus_app::identities_admin_full(
+        &dir,
+        add.as_deref(),
+        remove,
+        set_proxy.as_deref(),
+        clear_proxy,
+    ) {
         Ok(lines) => {
             for line in lines {
                 println!("{line}");
@@ -490,7 +500,8 @@ fn print_usage() {
          \x20 bench      Time the render pipeline stages (see --assert-total-ms)\n\
          \x20 mirror-bench  Large-N mirror gate: focus-sweep N instances, assert RSS\n\
          \x20 cookies    Inspect/retune a profile's cookie dispositions (--data-dir)\n\
-         \x20 identities Manage a profile's identities (--data-dir; --add/--remove)\n\
+         \x20 identities Manage a profile's identities (--data-dir; --add/--remove;\n\
+         \x20            --set-proxy <idx>=<host:port> / --clear-proxy <idx>)\n\
          \x20 profile    Show/set an identity's autofill profile, or bulk\n\
          \x20            import/export via CSV (--data-dir; --identity N;\n\
          \x20            --set \"key=value;...\"; --template/--export/--import\n\

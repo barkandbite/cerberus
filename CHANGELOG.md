@@ -3,6 +3,27 @@
 All notable changes to Cerberus are recorded here. Versions are small while the
 browser is pre-1.0; this is the first tagged preview.
 
+## [0.0.8] — 2026-07-01
+
+Per-window egress proxy: the last axis of per-identity isolation.
+
+### Added
+- **Per-identity ("per-window") proxy.** Each head can now egress through its
+  own `HTTP CONNECT` proxy, in addition to the global `--proxy`. Under
+  `run --mirror` — one process, one shared engine driving N sealed windows —
+  each window tunnels through its own proxy, so identities driven in lockstep
+  no longer share a network vantage point. Combined with the existing sealed
+  per-head cookies and farbling seed, an identity is now isolated across
+  storage, fingerprint, **and** egress (ADR-0047).
+  - Set it with `identities --set-proxy <idx>=<host:port>` and remove it with
+    `--clear-proxy <idx>`; the `identities` listing shows `proxy=<host:port>`
+    on a head that has one.
+  - Persisted in `heads.txt` as an optional, backward-compatible
+    `proxy <head-id> <host:port>` line.
+  - Resolution per window: the head's own proxy if set, else the global
+    `--proxy`, else direct. A proxied target is never resolved locally (no DNS
+    leak), and a malformed proxy fails closed rather than leaking around it.
+
 ## [0.0.7] — 2026-07-01
 
 Continuing the quality/hardening pass: four more self-contained security
