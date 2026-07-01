@@ -30,6 +30,17 @@ pub fn send(stream: &mut dyn ReadWrite, req: &Request<'_>) -> Result<HttpRespons
         req.method, req.path, req.host, req.user_agent
     );
     for (k, v) in req.headers {
+        // Sink-side guard (issue #57): every header line is validated here,
+        // regardless of where it originated (page-controlled `fetch()`
+        // headers, a `Set-Cookie`-derived `Cookie:` value, or a header built
+        // internally). A page can smuggle a CR/LF/NUL byte into a header
+        // *value* past `is_engine_owned_header`'s name-only allow-list (e.g.
+        // `"X": "a\r\nCookie: stolen=1"`) to inject an arbitrary extra header
+        // or split the request; rejecting here — the one chokepoint every
+        // caller funnels through — closes that off for good instead of
+        // requiring every call site to remember to sanitize.
+        validate_header_name(k)?;
+        validate_header_value(v)?;
         head.push_str(&format!("{k}: {v}\r\n"));
     }
     if !req.body.is_empty() {
@@ -49,6 +60,42 @@ pub fn send(stream: &mut dyn ReadWrite, req: &Request<'_>) -> Result<HttpRespons
 
     let raw = read_to_end_tolerant(stream)?;
     parse_response(&raw)
+}
+
+/// Reject a header name that is not a valid RFC 7230 `token` (the grammar a
+/// header field-name must satisfy): non-empty, and every byte one of the
+/// allowed `tchar`s (`[!#$%&'*+\-.^_`|~0-9A-Za-z]`). This excludes `:`,
+/// whitespace, and all CTLs — in particular CR/LF/NUL — so a name can never
+/// terminate the header line early or introduce a new one.
+fn validate_header_name(name: &str) -> Result<(), NetError> {
+    fn is_tchar(b: u8) -> bool {
+        matches!(b,
+            b'!' | b'#' | b'$' | b'%' | b'&' | b'\'' | b'*' | b'+' | b'-' | b'.'
+            | b'^' | b'_' | b'`' | b'|' | b'~'
+            | b'0'..=b'9' | b'A'..=b'Z' | b'a'..=b'z')
+    }
+    if !name.is_empty() && name.bytes().all(is_tchar) {
+        Ok(())
+    } else {
+        Err(NetError::Protocol(format!("invalid header name {name:?}")))
+    }
+}
+
+/// Reject a header value containing a CR, LF, or NUL byte. These are the
+/// bytes that let a page-controlled (or otherwise untrusted) header value
+/// break out of its own line — injecting an extra header (e.g. smuggling a
+/// `Cookie:` line past [`crate::engine`]'s name-only allow-list) or splitting/
+/// desyncing the request entirely. This is a byte-validity check only: it does
+/// not second-guess *which* headers are allowed (see `is_engine_owned_header`
+/// in [`crate::engine`], which is unrelated and untouched by this).
+fn validate_header_value(value: &str) -> Result<(), NetError> {
+    if value.bytes().any(|b| matches!(b, 0x0D | 0x0A | 0x00)) {
+        Err(NetError::Protocol(format!(
+            "header value contains CR, LF, or NUL: {value:?}"
+        )))
+    } else {
+        Ok(())
+    }
 }
 
 /// Hard cap on a single response (raw bytes off the wire, pre-decompression):
@@ -262,5 +309,136 @@ mod tests {
             req.contains("Accept-Language: en-US,en;q=0.9\r\n"),
             "missing uniform Accept-Language: {req:?}"
         );
+    }
+
+    /// A minimal in-memory `Read + Write` used to capture what `send` writes
+    /// to the wire, and hand back a canned response (mirrors the `Mock` in
+    /// `request_carries_uniform_identity_headers`).
+    struct Mock {
+        written: Vec<u8>,
+        resp: std::io::Cursor<Vec<u8>>,
+    }
+    impl std::io::Read for Mock {
+        fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+            self.resp.read(buf)
+        }
+    }
+    impl std::io::Write for Mock {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.written.extend_from_slice(buf);
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+    fn mock_ok() -> Mock {
+        Mock {
+            written: Vec::new(),
+            resp: std::io::Cursor::new(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nhi".to_vec()),
+        }
+    }
+
+    #[test]
+    fn rejects_crlf_injected_header_value() {
+        // A page-controlled header value carrying "\r\nX-Injected: 1" must not
+        // reach the wire as a second header line (issue #57): either `send`
+        // errors, or — if it somehow didn't — the serialized request must not
+        // contain the injected line. We assert the stronger property: an error.
+        let mut mock = mock_ok();
+        let err = send(
+            &mut mock,
+            &Request {
+                method: "GET",
+                host: "example.test",
+                path: "/p",
+                user_agent: "Cerberus/0.0",
+                headers: &[("X", "a\r\nX-Injected: 1")],
+                body: &[],
+            },
+        )
+        .unwrap_err();
+        assert!(matches!(err, NetError::Protocol(_)), "got {err:?}");
+        assert!(
+            !String::from_utf8_lossy(&mock.written).contains("X-Injected"),
+            "the injected header must never reach the wire"
+        );
+    }
+
+    #[test]
+    fn rejects_nul_byte_in_header_value() {
+        let mut mock = mock_ok();
+        let err = send(
+            &mut mock,
+            &Request {
+                method: "GET",
+                host: "example.test",
+                path: "/p",
+                user_agent: "Cerberus/0.0",
+                headers: &[("X", "a\0b")],
+                body: &[],
+            },
+        )
+        .unwrap_err();
+        assert!(matches!(err, NetError::Protocol(_)), "got {err:?}");
+    }
+
+    #[test]
+    fn rejects_invalid_header_name() {
+        // A name containing a colon or CTL is not a valid RFC 7230 token.
+        let mut mock = mock_ok();
+        let err = send(
+            &mut mock,
+            &Request {
+                method: "GET",
+                host: "example.test",
+                path: "/p",
+                user_agent: "Cerberus/0.0",
+                headers: &[("X-Bad:\r\nHeader", "1")],
+                body: &[],
+            },
+        )
+        .unwrap_err();
+        assert!(matches!(err, NetError::Protocol(_)), "got {err:?}");
+    }
+
+    #[test]
+    fn well_formed_header_round_trips_unchanged() {
+        let mut mock = mock_ok();
+        send(
+            &mut mock,
+            &Request {
+                method: "GET",
+                host: "example.test",
+                path: "/p",
+                user_agent: "Cerberus/0.0",
+                headers: &[("X-Custom", "value")],
+                body: &[],
+            },
+        )
+        .unwrap();
+        let req = String::from_utf8(mock.written).unwrap();
+        assert!(
+            req.contains("X-Custom: value\r\n"),
+            "well-formed header missing: {req:?}"
+        );
+    }
+
+    #[test]
+    fn validate_header_name_accepts_tokens_and_rejects_separators() {
+        assert!(validate_header_name("Content-Type").is_ok());
+        assert!(validate_header_name("X-Foo_Bar.Baz~1").is_ok());
+        assert!(validate_header_name("").is_err());
+        assert!(validate_header_name("Bad:Name").is_err());
+        assert!(validate_header_name("Bad Name").is_err());
+        assert!(validate_header_name("Bad\r\nName").is_err());
+    }
+
+    #[test]
+    fn validate_header_value_rejects_cr_lf_nul() {
+        assert!(validate_header_value("normal value").is_ok());
+        assert!(validate_header_value("a\r\nInjected: 1").is_err());
+        assert!(validate_header_value("a\nb").is_err());
+        assert!(validate_header_value("a\0b").is_err());
     }
 }

@@ -22,6 +22,17 @@ use std::fmt::Write as _;
 /// every other `char` through verbatim as UTF-8. Forward slashes and non-ASCII
 /// text (e.g. `café`, `日本語`) are emitted literally — valid JSON and far more
 /// readable than `\u`-escaping everything.
+///
+/// U+2028 (LINE SEPARATOR) and U+2029 (PARAGRAPH SEPARATOR) are the one
+/// exception: JSON and JS string-literal grammars agree on every other code
+/// point, but pre-ES2019 JS treats these two as line terminators inside a
+/// `"..."` literal. This escaper's output is spliced directly as JS source
+/// (see `install_page` in `lib.rs`, which evals strings built with this
+/// escaper), so an unescaped U+2028/U+2029 in page-controlled text (DOM text,
+/// an attribute, the document URL) would prematurely terminate that literal
+/// and let the rest of the string execute as JS. Escaping them as ` `/
+/// ` ` is still valid JSON, so this one function serves both the
+/// wire-format and the eval-splice use without forking it.
 pub fn write_json_string(out: &mut String, s: &str) {
     out.push('"');
     for ch in s.chars() {
@@ -36,6 +47,8 @@ pub fn write_json_string(out: &mut String, s: &str) {
                 // since c < 0x20 fits in one byte).
                 let _ = write!(out, "\\u{:04x}", c as u32);
             }
+            '\u{2028}' => out.push_str("\\u2028"),
+            '\u{2029}' => out.push_str("\\u2029"),
             c => out.push(c),
         }
     }
@@ -438,6 +451,19 @@ mod tests {
         let mut out = String::new();
         write_json_string(&mut out, "x\u{0001}y café 日本語");
         assert_eq!(out, "\"x\\u0001y café 日本語\"");
+    }
+
+    #[test]
+    fn emitter_escapes_js_line_and_paragraph_separators() {
+        // U+2028/U+2029 are legal unescaped in JSON but are JS line terminators
+        // inside a "..." literal; this escaper's output is spliced as JS source
+        // (install_page), so they must come out as  / , not raw bytes
+        // (issue #31).
+        let mut out = String::new();
+        write_json_string(&mut out, "a\u{2028}b\u{2029}c");
+        assert_eq!(out, "\"a\\u2028b\\u2029c\"");
+        assert!(!out.contains('\u{2028}'));
+        assert!(!out.contains('\u{2029}'));
     }
 
     #[test]
