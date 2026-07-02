@@ -112,6 +112,93 @@ fn script_sets_attribute_and_class() {
 }
 
 #[test]
+fn element_sibling_and_count_accessors() {
+    // `childElementCount` and element-only sibling walking skip text nodes, which
+    // is how pages iterate a list without tripping over whitespace.
+    let mut b = DocumentBuilder::new();
+    let a = b.element_attrs("span", vec![("id".into(), "a".into())], []);
+    let mid = b.text(" ws ");
+    let c = b.element_attrs("span", vec![("id".into(), "c".into())], []);
+    let wrap = b.element_attrs("div", vec![("id".into(), "wrap".into())], [a, mid, c]);
+    let probe = b.element_attrs("p", vec![("id".into(), "p".into())], []);
+    let body = b.element("body", [wrap, probe]);
+    let html = b.element("html", [body]);
+    let doc = b.finish(html);
+
+    let (mut engine, realm) = engine_and_realm();
+    let scripts = vec!["var p = document.getElementById('p'); \
+         var wrap = document.getElementById('wrap'); \
+         var a = document.getElementById('a'); \
+         var c = document.getElementById('c'); \
+         p.setAttribute('data-count', String(wrap.childElementCount)); \
+         p.setAttribute('data-next', a.nextElementSibling.id); \
+         p.setAttribute('data-prev', c.previousElementSibling.id); \
+         p.setAttribute('data-end', String(c.nextElementSibling));"
+        .to_string()];
+
+    let out = run_page_scripts(engine.as_mut(), realm, &doc, &scripts, &env()).expect("run");
+    let p = find_id(out.root(), "p").expect("#p present");
+    assert_eq!(p.attr("data-count"), Some("2"), "two element children");
+    assert_eq!(
+        p.attr("data-next"),
+        Some("c"),
+        "nextElementSibling skips the text node"
+    );
+    assert_eq!(
+        p.attr("data-prev"),
+        Some("a"),
+        "previousElementSibling skips the text node"
+    );
+    assert_eq!(
+        p.attr("data-end"),
+        Some("null"),
+        "no element sibling at the end"
+    );
+}
+
+#[test]
+fn toggle_attribute_flips_and_honors_force() {
+    // `toggleAttribute` flips presence, honors an explicit `force`, and returns
+    // whether the attribute is present afterwards.
+    let mut b = DocumentBuilder::new();
+    let el = b.element_attrs("div", vec![("id".into(), "el".into())], []);
+    let probe = b.element_attrs("p", vec![("id".into(), "p".into())], []);
+    let body = b.element("body", [el, probe]);
+    let html = b.element("html", [body]);
+    let doc = b.finish(html);
+
+    let (mut engine, realm) = engine_and_realm();
+    let scripts = vec!["var p = document.getElementById('p'); \
+         var el = document.getElementById('el'); \
+         p.setAttribute('r1', String(el.toggleAttribute('hidden'))); \
+         p.setAttribute('r2', String(el.toggleAttribute('hidden'))); \
+         el.toggleAttribute('data-keep', true); \
+         el.toggleAttribute('data-drop', false); \
+         p.setAttribute('r3', String(el.hasAttribute('data-keep'))); \
+         p.setAttribute('r4', String(el.hasAttribute('data-drop')));"
+        .to_string()];
+
+    let out = run_page_scripts(engine.as_mut(), realm, &doc, &scripts, &env()).expect("run");
+    let p = find_id(out.root(), "p").expect("#p present");
+    assert_eq!(p.attr("r1"), Some("true"), "first toggle adds → present");
+    assert_eq!(
+        p.attr("r2"),
+        Some("false"),
+        "second toggle removes → absent"
+    );
+    assert_eq!(p.attr("r3"), Some("true"), "force:true adds");
+    assert_eq!(
+        p.attr("r4"),
+        Some("false"),
+        "force:false removes/keeps absent"
+    );
+    // The forced-on attribute survives to the reconciled DOM.
+    let el = find_id(out.root(), "el").expect("#el present");
+    assert!(el.attr("data-keep").is_some(), "data-keep persisted");
+    assert!(el.attr("hidden").is_none(), "hidden toggled back off");
+}
+
+#[test]
 fn hidden_property_reflects_the_attribute() {
     // `el.hidden` reads the `hidden` attribute and writing it toggles the
     // attribute (which the UA sheet renders as display:none).
