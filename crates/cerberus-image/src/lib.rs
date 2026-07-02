@@ -9,7 +9,10 @@
 //! bitmap), images whose header-declared resolution exceeds a pixel ceiling are
 //! declined before any full-resolution buffer is allocated. SVG is a vector
 //! format, so it is rasterized at its intrinsic size, capped to the same
-//! longest-side budget.
+//! longest-side budget — and, because its decode cost scales with document
+//! *complexity* rather than pixels, SVG payloads above a byte ceiling are
+//! declined before the `usvg` tree is built (a small `100×100` SVG can still be
+//! a multi-megabyte complexity bomb that the pixel guard would wave through).
 
 use cerberus_paint::{DecodedImage, ImageDecoder, PaintError};
 use cerberus_types::Size;
@@ -26,6 +29,15 @@ use std::io::Cursor;
 /// pathological ones that would blow the budget.
 pub const DEFAULT_MAX_DECODE_PIXELS: u64 = 6_000_000;
 
+/// Default ceiling on an SVG payload's *byte* size before we will parse/render
+/// it. The raster guard keys on pixel dimensions, but SVG cost is driven by
+/// document complexity, not declared size — a tiny `100×100` SVG can carry
+/// megabytes of elements that build a huge `usvg::Tree` and render for a long
+/// time. Bounding the input bytes before parsing is the cheap analogue of the
+/// raster "precheck before allocate" guard. 4 MiB is far above any normal icon
+/// or illustration while refusing the pathological complexity bombs.
+pub const DEFAULT_MAX_SVG_BYTES: usize = 4 * 1024 * 1024;
+
 /// Decoder over the `image` crate.
 pub struct ImageCodec {
     /// Longest-side cap in pixels; larger images are downscaled.
@@ -33,6 +45,9 @@ pub struct ImageCodec {
     /// Intrinsic pixel-count ceiling for full decode (see
     /// [`DEFAULT_MAX_DECODE_PIXELS`]); larger images are declined, not decoded.
     max_decode_pixels: u64,
+    /// Byte ceiling for an SVG payload (see [`DEFAULT_MAX_SVG_BYTES`]); larger
+    /// SVGs are declined before the `usvg` tree is built.
+    max_svg_bytes: usize,
 }
 
 impl ImageCodec {
@@ -42,6 +57,7 @@ impl ImageCodec {
         Self {
             max_dim: 1600,
             max_decode_pixels: DEFAULT_MAX_DECODE_PIXELS,
+            max_svg_bytes: DEFAULT_MAX_SVG_BYTES,
         }
     }
 
@@ -50,6 +66,7 @@ impl ImageCodec {
         Self {
             max_dim: max_dim.max(1),
             max_decode_pixels: DEFAULT_MAX_DECODE_PIXELS,
+            max_svg_bytes: DEFAULT_MAX_SVG_BYTES,
         }
     }
 
@@ -59,7 +76,14 @@ impl ImageCodec {
         Self {
             max_dim: max_dim.max(1),
             max_decode_pixels: max_decode_pixels.max(1),
+            max_svg_bytes: DEFAULT_MAX_SVG_BYTES,
         }
+    }
+
+    /// Override the SVG byte ceiling (see [`DEFAULT_MAX_SVG_BYTES`]).
+    pub fn with_max_svg_bytes(mut self, max_svg_bytes: usize) -> Self {
+        self.max_svg_bytes = max_svg_bytes.max(1);
+        self
     }
 
     /// Rasterize an SVG document into straight-alpha RGBA at its intrinsic size,
@@ -69,6 +93,18 @@ impl ImageCodec {
     /// straight colour and the A byte as coverage).
     fn decode_svg(&self, bytes: &[u8]) -> Result<DecodedImage, PaintError> {
         use resvg::{tiny_skia, usvg};
+
+        // Bound decode cost before parsing: `usvg::Options::default()` sets no
+        // node/size limits, so a multi-megabyte SVG builds an unbounded tree and
+        // renders for a long time regardless of its (tiny) declared dimensions.
+        // This is the SVG analogue of the raster pixel precheck.
+        if bytes.len() > self.max_svg_bytes {
+            return Err(PaintError::Decode(format!(
+                "svg payload {} bytes exceeds {}-byte decode budget",
+                bytes.len(),
+                self.max_svg_bytes
+            )));
+        }
 
         let tree = usvg::Tree::from_data(bytes, &usvg::Options::default())
             .map_err(|e| PaintError::Decode(format!("svg: {e}")))?;
@@ -253,6 +289,32 @@ mod tests {
             decoded.size,
             Size::new(100, 50),
             "longest side capped, aspect kept"
+        );
+    }
+
+    #[test]
+    fn declines_oversized_svg_before_parsing() {
+        // A tiny declared size but a huge payload: many <rect> elements pad the
+        // document past the byte ceiling. The pixel guard (10x10) would wave it
+        // through; the byte guard declines it before `usvg` builds the tree.
+        let mut svg =
+            String::from(r#"<svg xmlns="http://www.w3.org/2000/svg" width="10" height="10">"#);
+        while svg.len() < 300_000 {
+            svg.push_str(r##"<rect width="1" height="1" fill="#ff0000"/>"##);
+        }
+        svg.push_str("</svg>");
+        // A small ceiling declines the bomb...
+        let codec = ImageCodec::new().with_max_svg_bytes(64 * 1024);
+        assert!(
+            codec.decode(svg.as_bytes()).is_err(),
+            "oversized SVG declined before render"
+        );
+        // ...while a normal small icon still decodes under the same ceiling.
+        assert!(codec.decode(RED_SVG).is_ok(), "small SVG still decodes");
+        // The default ceiling is generous enough for this same document.
+        assert!(
+            ImageCodec::new().decode(svg.as_bytes()).is_ok(),
+            "under the 4 MiB default, the document still renders"
         );
     }
 }
