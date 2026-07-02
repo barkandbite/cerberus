@@ -29,6 +29,8 @@ pub enum UrlError {
     MissingScheme,
     /// The port component was not a valid `u16`.
     BadPort,
+    /// The host was malformed (e.g. an IPv6 literal missing its closing `]`).
+    BadHost,
 }
 
 impl fmt::Display for UrlError {
@@ -37,6 +39,7 @@ impl fmt::Display for UrlError {
             UrlError::Empty => write!(f, "empty URL"),
             UrlError::MissingScheme => write!(f, "URL has no scheme"),
             UrlError::BadPort => write!(f, "URL has an invalid port"),
+            UrlError::BadHost => write!(f, "URL has an invalid host"),
         }
     }
 }
@@ -155,9 +158,51 @@ fn has_scheme(s: &str) -> bool {
 }
 
 fn authority_of(url: &Url) -> String {
+    // Re-bracket an IPv6 literal so `host:port` reconstruction (used by `join`)
+    // stays unambiguous — the bare address contains its own colons.
+    let host = if url.host.contains(':') {
+        format!("[{}]", url.host)
+    } else {
+        url.host.clone()
+    };
     match url.port {
-        Some(p) => format!("{}:{}", url.host, p),
-        None => url.host.clone(),
+        Some(p) => format!("{host}:{p}"),
+        None => host,
+    }
+}
+
+/// Split an authority (`[userinfo@]host[:port]`) into `(host, port)` per the
+/// WHATWG grammar. Userinfo is **dropped** — a browser never surfaces it as the
+/// host/origin, and letting `trusted.com@evil.com` through as the host is the
+/// classic origin-confusion / phishing-redirect vector. IPv6 literals are kept
+/// intact: the port is only sought *after* the closing `]`, so a colon inside
+/// the address can't mis-split the host. The returned host carries no brackets.
+fn split_authority(authority: &str) -> Result<(String, Option<u16>), UrlError> {
+    // Userinfo may itself contain `@`/`:`, so split on the LAST `@`.
+    let host_port = match authority.rsplit_once('@') {
+        Some((_userinfo, hp)) => hp,
+        None => authority,
+    };
+    if let Some(rest) = host_port.strip_prefix('[') {
+        // IPv6 literal `[addr]` optionally followed by `:port`.
+        let close = rest.find(']').ok_or(UrlError::BadHost)?;
+        let host = rest[..close].to_string();
+        let port = match &rest[close + 1..] {
+            "" => None,
+            after => {
+                let p = after.strip_prefix(':').ok_or(UrlError::BadPort)?;
+                Some(p.parse::<u16>().map_err(|_| UrlError::BadPort)?)
+            }
+        };
+        return Ok((host, port));
+    }
+    // Regular `host[:port]`.
+    match host_port.rsplit_once(':') {
+        Some((h, p)) if !p.is_empty() => {
+            let port = p.parse::<u16>().map_err(|_| UrlError::BadPort)?;
+            Ok((h.to_string(), Some(port)))
+        }
+        _ => Ok((host_port.to_string(), None)),
     }
 }
 
@@ -168,13 +213,7 @@ fn parse_authority_form(scheme: String, after: &str) -> Result<Url, UrlError> {
         None => (after, ""),
     };
 
-    let (host, port) = match authority.rsplit_once(':') {
-        Some((h, p)) if !p.is_empty() => {
-            let port = p.parse::<u16>().map_err(|_| UrlError::BadPort)?;
-            (h.to_string(), Some(port))
-        }
-        _ => (authority.to_string(), None),
-    };
+    let (host, port) = split_authority(authority)?;
 
     let (before_frag, fragment) = split_off(tail, '#');
     let (path, query) = split_off(before_frag, '?');
@@ -229,6 +268,43 @@ mod tests {
         assert_eq!(parse(""), Err(UrlError::Empty));
         assert_eq!(parse("no-scheme"), Err(UrlError::MissingScheme));
         assert_eq!(parse("http://h:notaport/"), Err(UrlError::BadPort));
+    }
+
+    #[test]
+    fn drops_userinfo_from_the_host() {
+        // Userinfo must never reach `host` — that is the origin-confusion vector.
+        let u = parse("https://trusted.com@evil.com/").unwrap();
+        assert_eq!(u.host, "evil.com");
+        assert_eq!(u.origin().unwrap().host, "evil.com");
+        // A colon inside the userinfo must not be mistaken for the port sep:
+        // the real authority is after the LAST '@'.
+        let u = parse("https://evil.com:8080@trusted.com/path").unwrap();
+        assert_eq!(u.host, "trusted.com");
+        assert_eq!(u.port, None);
+        assert_eq!(u.path, "/path");
+        // Userinfo with a port on the real host.
+        let u = parse("https://user:pass@host.test:9000/").unwrap();
+        assert_eq!(u.host, "host.test");
+        assert_eq!(u.port, Some(9000));
+    }
+
+    #[test]
+    fn parses_ipv6_literals() {
+        // The colons inside the address must not be split as host:port.
+        let u = parse("https://[2001:db8::1]:8443/a").unwrap();
+        assert_eq!(u.host, "2001:db8::1");
+        assert_eq!(u.port, Some(8443));
+        assert_eq!(u.path, "/a");
+        // No port.
+        let u = parse("http://[::1]/").unwrap();
+        assert_eq!(u.host, "::1");
+        assert_eq!(u.port, None);
+        // Round-trips through join (authority reconstruction re-brackets it).
+        let joined = join(&u, "/b").unwrap();
+        assert_eq!(joined.host, "::1");
+        assert_eq!(joined.path, "/b");
+        // A missing closing bracket is rejected, not silently mangled.
+        assert_eq!(parse("http://[::1/"), Err(UrlError::BadHost));
     }
 
     #[test]
