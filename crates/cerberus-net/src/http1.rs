@@ -50,16 +50,28 @@ pub fn send(stream: &mut dyn ReadWrite, req: &Request<'_>) -> Result<HttpRespons
 
     stream
         .write_all(head.as_bytes())
-        .map_err(|e| NetError::Io(e.to_string()))?;
+        .map_err(io_err)?;
     if !req.body.is_empty() {
-        stream
-            .write_all(req.body)
-            .map_err(|e| NetError::Io(e.to_string()))?;
+        stream.write_all(req.body).map_err(io_err)?;
     }
-    stream.flush().map_err(|e| NetError::Io(e.to_string()))?;
+    stream.flush().map_err(io_err)?;
 
     let raw = read_to_end_tolerant(stream)?;
     parse_response(&raw)
+}
+
+/// Map a socket I/O error to a [`NetError`], giving a clear message for a
+/// read/write timeout (`WouldBlock`/`TimedOut`, i.e. EAGAIN from the socket's
+/// `SO_RCVTIMEO`/`SO_SNDTIMEO`) instead of the opaque "Resource temporarily
+/// unavailable (os error 11)". Because rustls handshakes lazily on the first
+/// I/O, a timeout during the request write is the TLS handshake stalling on an
+/// unresponsive server — hence the general wording.
+fn io_err(e: std::io::Error) -> NetError {
+    if matches!(e.kind(), ErrorKind::WouldBlock | ErrorKind::TimedOut) {
+        NetError::Io("connection timed out: the server did not respond in time".into())
+    } else {
+        NetError::Io(e.to_string())
+    }
 }
 
 /// Reject a header name that is not a valid RFC 7230 `token` (the grammar a
@@ -122,13 +134,109 @@ fn read_to_end_tolerant(stream: &mut dyn ReadWrite) -> Result<Vec<u8>, NetError>
             }
             Err(e) if e.kind() == ErrorKind::UnexpectedEof => break,
             Err(e) if e.kind() == ErrorKind::Interrupted => continue,
+            // A socket read timeout / not-ready read (`WouldBlock`/`TimedOut`,
+            // i.e. EAGAIN from `SO_RCVTIMEO`). We send `Connection: close`, so a
+            // well-behaved peer closes after the body — but an intermediary
+            // (e.g. a CONNECT proxy) may hold the connection open, leaving our
+            // read to stall *after* the whole response has already arrived. If
+            // what we have is a complete response, return it. Otherwise the
+            // server stalled mid-response: surface a clear timeout rather than
+            // the opaque "Resource temporarily unavailable (os error 11)".
+            Err(e) if matches!(e.kind(), ErrorKind::WouldBlock | ErrorKind::TimedOut) => {
+                if response_is_complete(&raw) {
+                    break;
+                }
+                return Err(NetError::Io(
+                    "read timed out: the server stalled before the response completed".into(),
+                ));
+            }
             Err(e) => return Err(NetError::Io(e.to_string())),
         }
     }
     Ok(raw)
 }
 
+/// Whether `raw` already holds a complete HTTP/1.1 response: a full header block
+/// plus a body satisfying its framing — `Content-Length` reached, a chunked
+/// stream closed by its `0`-size chunk, or a status that carries no body
+/// (`1xx`/`204`/`304`). Used to tell a benign "peer went quiet after sending the
+/// whole response" apart from a truncating mid-body stall when a read times out.
+/// A response with no length framing is delimited by connection close, so it is
+/// only "complete" at EOF and this returns `false` for it.
+fn response_is_complete(raw: &[u8]) -> bool {
+    let Some(sep) = find(raw, b"\r\n\r\n") else {
+        return false;
+    };
+    let Ok(head) = std::str::from_utf8(&raw[..sep]) else {
+        return false;
+    };
+    let mut lines = head.split("\r\n");
+    let status = lines.next().and_then(|l| parse_status(l).ok());
+    let mut content_length = None;
+    let mut chunked = false;
+    for line in lines {
+        if let Some((k, v)) = line.split_once(':') {
+            let k = k.trim();
+            if k.eq_ignore_ascii_case("content-length") {
+                content_length = v.trim().parse::<usize>().ok();
+            } else if k.eq_ignore_ascii_case("transfer-encoding")
+                && v.to_ascii_lowercase().contains("chunked")
+            {
+                chunked = true;
+            }
+        }
+    }
+    // 1xx / 204 / 304 never carry a body, regardless of headers.
+    if matches!(status, Some(s) if (100..200).contains(&s) || s == 204 || s == 304) {
+        return true;
+    }
+    let body = &raw[sep + 4..];
+    if chunked {
+        chunked_complete(body)
+    } else if let Some(cl) = content_length {
+        body.len() >= cl
+    } else {
+        false
+    }
+}
+
+/// Whether `body` is a complete chunked stream (walks the chunk framing and
+/// reaches the terminating `0`-size chunk). Conservative: any malformed or
+/// truncated framing returns `false` (treat as not-yet-complete).
+fn chunked_complete(mut body: &[u8]) -> bool {
+    loop {
+        let Some(nl) = find(body, b"\r\n") else {
+            return false;
+        };
+        let size_hex = std::str::from_utf8(&body[..nl])
+            .unwrap_or("")
+            .split(';')
+            .next()
+            .unwrap_or("")
+            .trim();
+        let Ok(size) = usize::from_str_radix(size_hex, 16) else {
+            return false;
+        };
+        body = &body[nl + 2..];
+        if size == 0 {
+            return true;
+        }
+        if body.len() < size {
+            return false;
+        }
+        body = &body[size..];
+        if body.starts_with(b"\r\n") {
+            body = &body[2..];
+        }
+    }
+}
+
 fn parse_response(raw: &[u8]) -> Result<HttpResponse, NetError> {
+    if raw.is_empty() {
+        return Err(NetError::Protocol(
+            "empty response: the server closed the connection without sending anything".into(),
+        ));
+    }
     let sep =
         find(raw, b"\r\n\r\n").ok_or_else(|| NetError::Protocol("no header terminator".into()))?;
     let head = std::str::from_utf8(&raw[..sep])
@@ -231,6 +339,102 @@ mod tests {
     #[test]
     fn rejects_garbage() {
         assert!(parse_response(b"not http").is_err());
+    }
+
+    #[test]
+    fn response_completeness_respects_framing() {
+        // Content-Length satisfied / not.
+        assert!(response_is_complete(
+            b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nhi"
+        ));
+        assert!(!response_is_complete(
+            b"HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\nhi"
+        ));
+        // Headers not yet fully received.
+        assert!(!response_is_complete(b"HTTP/1.1 200 OK\r\nContent-Len"));
+        // Bodyless statuses are complete once the headers are in.
+        assert!(response_is_complete(b"HTTP/1.1 304 Not Modified\r\n\r\n"));
+        assert!(response_is_complete(b"HTTP/1.1 204 No Content\r\n\r\n"));
+        // Chunked: complete only once the 0-size terminator arrives.
+        assert!(response_is_complete(
+            b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n2\r\nhi\r\n0\r\n\r\n"
+        ));
+        assert!(!response_is_complete(
+            b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n2\r\nhi\r\n"
+        ));
+        // No length framing (close-delimited) is never "complete" without EOF.
+        assert!(!response_is_complete(b"HTTP/1.1 200 OK\r\n\r\nsome body"));
+    }
+
+    #[test]
+    fn read_tolerates_a_timeout_after_a_complete_response() {
+        use std::io::{Read, Write};
+        // A peer that hands back one complete (Content-Length) response and then
+        // stalls with a read timeout (EAGAIN) — as a CONNECT proxy holding the
+        // connection open would. The full response must be returned, not failed.
+        struct HeldOpen {
+            sent: bool,
+        }
+        impl Read for HeldOpen {
+            fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+                if self.sent {
+                    return Err(std::io::Error::from(ErrorKind::WouldBlock));
+                }
+                self.sent = true;
+                let resp = b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nhi";
+                buf[..resp.len()].copy_from_slice(resp);
+                Ok(resp.len())
+            }
+        }
+        impl Write for HeldOpen {
+            fn write(&mut self, b: &[u8]) -> std::io::Result<usize> {
+                Ok(b.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        let raw = read_to_end_tolerant(&mut HeldOpen { sent: false }).expect("complete response");
+        let resp = parse_response(&raw).unwrap();
+        assert_eq!(resp.status, 200);
+        assert_eq!(resp.body, b"hi");
+    }
+
+    #[test]
+    fn read_still_errors_on_a_timeout_mid_body() {
+        use std::io::{Read, Write};
+        // A timeout while the body is still short of its Content-Length is a
+        // genuine truncation and must stay an error (not silently truncated).
+        struct StallMidBody {
+            sent: bool,
+        }
+        impl Read for StallMidBody {
+            fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+                if self.sent {
+                    return Err(std::io::Error::from(ErrorKind::WouldBlock));
+                }
+                self.sent = true;
+                let resp = b"HTTP/1.1 200 OK\r\nContent-Length: 100\r\n\r\nhi";
+                buf[..resp.len()].copy_from_slice(resp);
+                Ok(resp.len())
+            }
+        }
+        impl Write for StallMidBody {
+            fn write(&mut self, b: &[u8]) -> std::io::Result<usize> {
+                Ok(b.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        let err = read_to_end_tolerant(&mut StallMidBody { sent: false }).unwrap_err();
+        match err {
+            NetError::Io(msg) => assert!(
+                msg.contains("timed out"),
+                "a mid-body stall should read as a timeout, got {msg:?}"
+            ),
+            other => panic!("expected Io timeout, got {other:?}"),
+        }
     }
 
     #[test]

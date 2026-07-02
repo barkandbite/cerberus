@@ -521,9 +521,18 @@ fn read_connect_status(stream: &mut TcpStream) -> Result<u16, NetError> {
         if buf.len() > 8192 {
             return Err(NetError::Protocol("oversized CONNECT response".into()));
         }
-        let n = stream
-            .read(&mut byte)
-            .map_err(|e| NetError::Io(e.to_string()))?;
+        let n = stream.read(&mut byte).map_err(|e| {
+            // A stalled proxy trips the socket read timeout (EAGAIN); give a
+            // clear message instead of the opaque "os error 11".
+            if matches!(
+                e.kind(),
+                std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+            ) {
+                NetError::Io("read timed out waiting for the proxy's CONNECT response".into())
+            } else {
+                NetError::Io(e.to_string())
+            }
+        })?;
         if n == 0 {
             return Err(NetError::Protocol("proxy closed during CONNECT".into()));
         }
