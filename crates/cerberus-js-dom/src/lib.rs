@@ -1244,14 +1244,16 @@ pub fn run_page_scripts_with_fetch(
 ///   node), `innerHTML`/`outerHTML` (get serializes to HTML in JS; set stores a
 ///   raw fragment reparsed in Rust — see below), `insertAdjacentHTML`,
 ///   `getAttribute`/`setAttribute`/`removeAttribute`/`hasAttribute`/
-///   `getAttributeNames`, `id`, `className`, `classList`
+///   `toggleAttribute`/`getAttributeNames`, `id`, `className`, `classList`
 ///   (`add`/`remove`/`toggle`/`contains`/`length`), form-control `value`
 ///   (`<textarea>`/`<select>`/`<option>` aware), `type` (spec defaults),
 ///   `checked`/`hidden` (reflect the like-named attribute), `<select>` `options`/
 ///   `selectedIndex` and `<option>` `selected`/`text` (backed by the `selected`
-///   attribute the renderer reads), `children`/`childNodes`,
+///   attribute the renderer reads), `children`/`childNodes`/`childElementCount`,
 ///   `parentNode`/`parentElement`, `firstChild`/`lastChild`/`nextSibling`/
-///   `previousSibling`, `appendChild`/`removeChild`/`insertBefore`/`remove`, a
+///   `previousSibling`, `firstElementChild`/`lastElementChild`/
+///   `nextElementSibling`/`previousElementSibling`,
+///   `appendChild`/`removeChild`/`insertBefore`/`remove`, a
 ///   `dataset` (live `data-*` <-> camelCase map), `href`/`src` (resolved to an
 ///   absolute URL against the document location), store-only `style`,
 ///   `getBoundingClientRect` (all-zero), scoped
@@ -1750,6 +1752,22 @@ pub const DOM_MODEL_PRELUDE: &str = r##"
     defAccessor(ELEMENT_PROTO, "children", function () { return elementChildren(this); });
     defAccessor(ELEMENT_PROTO, "firstElementChild", function () { var c = elementChildren(this); return c[0] || null; });
     defAccessor(ELEMENT_PROTO, "lastElementChild", function () { var c = elementChildren(this); return c[c.length - 1] || null; });
+    defAccessor(ELEMENT_PROTO, "childElementCount", function () { return elementChildren(this).length; });
+    // Element-only siblings: skip text/comment nodes, which `nextSibling`/
+    // `previousSibling` (on NODE_PROTO) would return. Pages walk these constantly
+    // to iterate a list without tripping over whitespace text nodes.
+    defAccessor(ELEMENT_PROTO, "nextElementSibling", function () {
+      var p = this.__parent; if (!p) return null;
+      var kids = p.__kids, i = kids.indexOf(this);
+      for (var j = i + 1; j < kids.length; j++) { if (kids[j].__type === ELEMENT_NODE) return kids[j]; }
+      return null;
+    });
+    defAccessor(ELEMENT_PROTO, "previousElementSibling", function () {
+      var p = this.__parent; if (!p) return null;
+      var kids = p.__kids, i = kids.indexOf(this);
+      for (var j = i - 1; j >= 0; j--) { if (kids[j].__type === ELEMENT_NODE) return kids[j]; }
+      return null;
+    });
     defAccessor(ELEMENT_PROTO, "id",
       function () { return getAttr(this, "id") || ""; },
       function (v) { setAttr(this, "id", v); });
@@ -2051,6 +2069,18 @@ pub const DOM_MODEL_PRELUDE: &str = r##"
     ELEMENT_PROTO.removeAttribute = function (n) { removeAttr(this, String(n)); };
     ELEMENT_PROTO.hasAttribute = function (n) { return attrIndex(this, String(n)) !== -1; };
     ELEMENT_PROTO.getAttributeNames = function () { return this.__attrs.map(function (p) { return p[0]; }); };
+    // `toggleAttribute(name[, force])`: with no `force`, flip presence; with a
+    // `force` argument, add when truthy / remove when falsy. Returns whether the
+    // attribute is present afterwards (per DOM). A common toggle idiom for
+    // boolean attributes like `disabled`/`hidden`/`aria-*`.
+    ELEMENT_PROTO.toggleAttribute = function (n, force) {
+      n = String(n);
+      var present = attrIndex(this, n) !== -1;
+      var want = (arguments.length > 1) ? !!force : !present;
+      if (want === present) return present;
+      if (want) { setAttr(this, n, ""); } else { removeAttr(this, n); }
+      return want;
+    };
 
     ELEMENT_PROTO.getElementsByTagName = function (t) { return queryAll(this, String(t)); };
     ELEMENT_PROTO.getElementsByClassName = function (c) { return queryAll(this, "." + String(c)); };
