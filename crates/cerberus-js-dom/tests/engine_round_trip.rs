@@ -112,6 +112,40 @@ fn script_sets_attribute_and_class() {
 }
 
 #[test]
+fn hidden_property_reflects_the_attribute() {
+    // `el.hidden` reads the `hidden` attribute and writing it toggles the
+    // attribute (which the UA sheet renders as display:none).
+    let mut b = DocumentBuilder::new();
+    let h = b.element_attrs(
+        "p",
+        vec![("id".into(), "h".into()), ("hidden".into(), "".into())],
+        [],
+    );
+    let v = b.element_attrs("p", vec![("id".into(), "v".into())], []);
+    let probe = b.element_attrs("div", vec![("id".into(), "p".into())], []);
+    let body = b.element("body", [h, v, probe]);
+    let html = b.element("html", [body]);
+    let doc = b.finish(html);
+
+    let (mut engine, realm) = engine_and_realm();
+    let scripts = vec!["var p = document.getElementById('p'); \
+         p.setAttribute('h0', String(document.getElementById('h').hidden)); \
+         p.setAttribute('v0', String(document.getElementById('v').hidden)); \
+         document.getElementById('v').hidden = true;"
+        .to_string()];
+
+    let out = run_page_scripts(engine.as_mut(), realm, &doc, &scripts, &env()).expect("run");
+    let p = find_id(out.root(), "p").expect("#p present");
+    assert_eq!(p.attr("h0"), Some("true"), "<p hidden>.hidden is true");
+    assert_eq!(p.attr("v0"), Some("false"), "plain <p>.hidden is false");
+    let v = find_id(out.root(), "v").expect("#v present");
+    assert!(
+        v.attr("hidden").is_some(),
+        "v.hidden = true set the attribute"
+    );
+}
+
+#[test]
 fn href_and_src_resolve_to_absolute_urls() {
     // `a.href` / `img.src` return the attribute resolved against the document
     // location (env url is https://example.test/path?q=1#frag). A non-href

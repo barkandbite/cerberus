@@ -59,6 +59,9 @@ code, kbd, samp { white-space: pre; }
 a { color: #154fd2; text-decoration: underline; }
 b, strong { font-weight: bold; }
 i, em, cite, var { font-style: italic; }
+/* The `hidden` boolean attribute hides the element (HTML UA stylesheet). Low
+   specificity (one attribute selector), so an author `display` still wins. */
+[hidden] { display: none; }
 "#;
 
 /// CSS engine built on our parser + cascade.
@@ -1779,6 +1782,38 @@ mod tests {
         let p = first(&dom.root, "p").unwrap();
         // inline beats #id beats type.
         assert_eq!(p.style.color, Color::rgb(0, 0, 255));
+    }
+
+    #[test]
+    fn hidden_attribute_computes_display_none() {
+        // The `hidden` boolean attribute hides the element via the UA sheet's
+        // `[hidden] { display: none }`, but an author `display` overrides it
+        // (higher/equal specificity + later origin).
+        let dom = CssEngine::new().style(&parse_html(
+            "<p hidden>a</p><p>b</p><p hidden style='display:block'>c</p>",
+        ));
+        let ps: Vec<_> = {
+            fn collect<'a>(n: &'a StyledNode, out: &mut Vec<&'a StyledNode>) {
+                if n.tag == "p" {
+                    out.push(n);
+                }
+                for c in &n.children {
+                    if let StyledChild::Element(e) = c {
+                        collect(e, out);
+                    }
+                }
+            }
+            let mut v = Vec::new();
+            collect(&dom.root, &mut v);
+            v
+        };
+        assert_eq!(ps[0].style.display, Display::None, "[hidden] hides");
+        assert_eq!(ps[1].style.display, Display::Block, "no hidden → block");
+        assert_eq!(
+            ps[2].style.display,
+            Display::Block,
+            "author display:block overrides [hidden]"
+        );
     }
 
     #[test]

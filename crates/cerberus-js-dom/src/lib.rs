@@ -1247,7 +1247,7 @@ pub fn run_page_scripts_with_fetch(
 ///   `getAttributeNames`, `id`, `className`, `classList`
 ///   (`add`/`remove`/`toggle`/`contains`/`length`), form-control `value`
 ///   (`<textarea>`/`<select>`/`<option>` aware), `type` (spec defaults),
-///   `checked` (reflects the `checked` attribute), `<select>` `options`/
+///   `checked`/`hidden` (reflect the like-named attribute), `<select>` `options`/
 ///   `selectedIndex` and `<option>` `selected`/`text` (backed by the `selected`
 ///   attribute the renderer reads), `children`/`childNodes`,
 ///   `parentNode`/`parentElement`, `firstChild`/`lastChild`/`nextSibling`/
@@ -1846,6 +1846,12 @@ pub const DOM_MODEL_PRELUDE: &str = r##"
     defAccessor(ELEMENT_PROTO, "checked",
       function () { return getAttr(this, "checked") !== null; },
       function (v) { if (v) { setAttr(this, "checked", ""); } else { removeAttr(this, "checked"); } });
+    // `el.hidden` reflects the `hidden` boolean attribute, so `el.hidden = true`
+    // hides the element via the UA `[hidden] { display: none }` rule (and reads
+    // back the initial `<x hidden>` state).
+    defAccessor(ELEMENT_PROTO, "hidden",
+      function () { return getAttr(this, "hidden") !== null; },
+      function (v) { if (v) { setAttr(this, "hidden", ""); } else { removeAttr(this, "hidden"); } });
     defAccessor(ELEMENT_PROTO, "className",
       function () { return getAttr(this, "class") || ""; },
       function (v) { setAttr(this, "class", v); });
