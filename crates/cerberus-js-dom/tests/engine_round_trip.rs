@@ -112,6 +112,95 @@ fn script_sets_attribute_and_class() {
 }
 
 #[test]
+fn href_and_src_resolve_to_absolute_urls() {
+    // `a.href` / `img.src` return the attribute resolved against the document
+    // location (env url is https://example.test/path?q=1#frag). A non-href
+    // element has no `.href`.
+    let mut b = DocumentBuilder::new();
+    let a_abs = b.element_attrs(
+        "a",
+        vec![
+            ("id".into(), "abs".into()),
+            ("href".into(), "https://other.test/x".into()),
+        ],
+        [],
+    );
+    let a_root = b.element_attrs(
+        "a",
+        vec![
+            ("id".into(), "root".into()),
+            ("href".into(), "/root/p?q=1".into()),
+        ],
+        [],
+    );
+    let a_dot = b.element_attrs(
+        "a",
+        vec![("id".into(), "dot".into()), ("href".into(), "../up".into())],
+        [],
+    );
+    let a_frag = b.element_attrs(
+        "a",
+        vec![("id".into(), "frag".into()), ("href".into(), "#sec".into())],
+        [],
+    );
+    let im = b.element_attrs(
+        "img",
+        vec![
+            ("id".into(), "im".into()),
+            ("src".into(), "/img/a.png".into()),
+        ],
+        [],
+    );
+    let probe = b.element_attrs("div", vec![("id".into(), "p".into())], []);
+    let body = b.element("body", [a_abs, a_root, a_dot, a_frag, im, probe]);
+    let html = b.element("html", [body]);
+    let doc = b.finish(html);
+
+    let (mut engine, realm) = engine_and_realm();
+    let scripts = vec!["var p = document.getElementById('p'); var $ = function (id) { return document.getElementById(id); }; \
+         p.setAttribute('abs', $('abs').href); \
+         p.setAttribute('root', $('root').href); \
+         p.setAttribute('dot', $('dot').href); \
+         p.setAttribute('frag', $('frag').href); \
+         p.setAttribute('img', $('im').src); \
+         p.setAttribute('div', String($('p').href));"
+        .to_string()];
+
+    let out = run_page_scripts(engine.as_mut(), realm, &doc, &scripts, &env()).expect("run");
+    let p = find_id(out.root(), "p").expect("#p present");
+    assert_eq!(
+        p.attr("abs"),
+        Some("https://other.test/x"),
+        "absolute unchanged"
+    );
+    assert_eq!(
+        p.attr("root"),
+        Some("https://example.test/root/p?q=1"),
+        "root-relative"
+    );
+    assert_eq!(
+        p.attr("dot"),
+        Some("https://example.test/up"),
+        "dot-segment normalized"
+    );
+    assert_eq!(
+        p.attr("frag"),
+        Some("https://example.test/path?q=1#sec"),
+        "fragment on base"
+    );
+    assert_eq!(
+        p.attr("img"),
+        Some("https://example.test/img/a.png"),
+        "img.src absolute"
+    );
+    assert_eq!(
+        p.attr("div"),
+        Some("undefined"),
+        "non-href element has no href"
+    );
+}
+
+#[test]
 fn dataset_maps_camelcase_to_data_attributes() {
     // `el.dataset.userId` reads `data-user-id`; assigning `dataset.newKey`
     // writes `data-new-key`; enumeration lists the camelCased keys.
