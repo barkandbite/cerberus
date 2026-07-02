@@ -1252,7 +1252,8 @@ pub fn run_page_scripts_with_fetch(
 ///   attribute the renderer reads), `children`/`childNodes`,
 ///   `parentNode`/`parentElement`, `firstChild`/`lastChild`/`nextSibling`/
 ///   `previousSibling`, `appendChild`/`removeChild`/`insertBefore`/`remove`, a
-///   store-only `style`, `getBoundingClientRect` (all-zero), scoped
+///   `dataset` (live `data-*` <-> camelCase map), store-only `style`,
+///   `getBoundingClientRect` (all-zero), scoped
 ///   `querySelector`/`querySelectorAll`/`matches`/`closest`,
 ///   `addEventListener`/`removeEventListener`/`dispatchEvent` and the
 ///   `click`/`focus`/`blur` convenience methods (dispatch through the same
@@ -1850,6 +1851,44 @@ pub const DOM_MODEL_PRELUDE: &str = r##"
     defAccessor(ELEMENT_PROTO, "classList", function () {
       if (!this.__classList) this.__classList = makeClassList(this);
       return this.__classList;
+    });
+    // `el.dataset.fooBar` <-> the `data-foo-bar` attribute (the HTML camelCase
+    // <-> kebab-case mapping). A live Proxy over the element's attributes so both
+    // reads and writes go straight through `getAttr`/`setAttr` — a very common
+    // page idiom (`el.dataset.id`) that otherwise read back undefined.
+    defAccessor(ELEMENT_PROTO, "dataset", function () {
+      if (this.__dataset) return this.__dataset;
+      var el = this;
+      function toAttr(k) {
+        return "data-" + String(k).replace(/[A-Z]/g, function (m) { return "-" + m.toLowerCase(); });
+      }
+      function toKey(a) {
+        return a.slice(5).replace(/-([a-z])/g, function (_, c) { return c.toUpperCase(); });
+      }
+      function keys() {
+        var ks = [];
+        for (var i = 0; i < el.__attrs.length; i++) {
+          if (el.__attrs[i][0].indexOf("data-") === 0) ks.push(toKey(el.__attrs[i][0]));
+        }
+        return ks;
+      }
+      this.__dataset = new Proxy({}, {
+        get: function (_, k) {
+          if (typeof k !== "string") return undefined;
+          var v = getAttr(el, toAttr(k)); return v === null ? undefined : v;
+        },
+        set: function (_, k, v) { setAttr(el, toAttr(k), String(v)); return true; },
+        has: function (_, k) { return typeof k === "string" && getAttr(el, toAttr(k)) !== null; },
+        deleteProperty: function (_, k) { removeAttr(el, toAttr(k)); return true; },
+        ownKeys: function () { return keys(); },
+        getOwnPropertyDescriptor: function (_, k) {
+          if (typeof k === "string" && getAttr(el, toAttr(k)) !== null) {
+            return { enumerable: true, configurable: true, writable: true, value: getAttr(el, toAttr(k)) };
+          }
+          return undefined;
+        },
+      });
+      return this.__dataset;
     });
     defAccessor(ELEMENT_PROTO, "innerText",
       function () { var acc = []; collectText(this, acc); return acc.join(""); },

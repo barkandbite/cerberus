@@ -112,6 +112,56 @@ fn script_sets_attribute_and_class() {
 }
 
 #[test]
+fn dataset_maps_camelcase_to_data_attributes() {
+    // `el.dataset.userId` reads `data-user-id`; assigning `dataset.newKey`
+    // writes `data-new-key`; enumeration lists the camelCased keys.
+    let mut b = DocumentBuilder::new();
+    let d = b.element_attrs(
+        "div",
+        vec![
+            ("id".into(), "d".into()),
+            ("data-user-id".into(), "42".into()),
+            ("data-role".into(), "admin".into()),
+        ],
+        [],
+    );
+    // A separate probe element, so writing results here doesn't add `data-*`
+    // attributes to `#d` (which would show up in its own dataset enumeration).
+    let p = b.element_attrs("div", vec![("id".into(), "p".into())], []);
+    let body = b.element("body", [d, p]);
+    let html = b.element("html", [body]);
+    let doc = b.finish(html);
+
+    let (mut engine, realm) = engine_and_realm();
+    let scripts = vec!["var d = document.getElementById('d'); \
+         var p = document.getElementById('p'); \
+         p.setAttribute('read', d.dataset.userId + ',' + d.dataset.role); \
+         d.dataset.newKey = 'nv'; \
+         p.setAttribute('keys', Object.keys(d.dataset).sort().join(','));"
+        .to_string()];
+
+    let out = run_page_scripts(engine.as_mut(), realm, &doc, &scripts, &env()).expect("run");
+    let d = find_id(out.root(), "d").expect("#d present");
+    let p = find_id(out.root(), "p").expect("#p present");
+    assert_eq!(
+        p.attr("read"),
+        Some("42,admin"),
+        "camelCase read maps to data-*"
+    );
+    assert_eq!(
+        d.attr("data-new-key"),
+        Some("nv"),
+        "dataset write maps to kebab attr"
+    );
+    // Enumeration lists camelCased keys (including the just-added one).
+    assert_eq!(
+        p.attr("keys"),
+        Some("newKey,role,userId"),
+        "Object.keys(dataset) lists camelCase keys"
+    );
+}
+
+#[test]
 fn select_value_index_and_options_reflect() {
     // `<select>.value`/`.selectedIndex`/`.options` read the chosen option, and
     // setting either selects an option by writing the `selected` attribute the
