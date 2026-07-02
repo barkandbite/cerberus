@@ -112,6 +112,60 @@ fn script_sets_attribute_and_class() {
 }
 
 #[test]
+fn insert_adjacent_element_and_text_all_positions() {
+    // insertAdjacentElement places a real node at any of the four positions and
+    // returns it (null for an unknown position); insertAdjacentText wraps a string.
+    let mut b = DocumentBuilder::new();
+    let mt = b.text("M");
+    let mid = b.element_attrs("span", vec![("id".into(), "mid".into())], [mt]);
+    let wrap = b.element_attrs("div", vec![("id".into(), "wrap".into())], [mid]);
+    let probe = b.element_attrs("p", vec![("id".into(), "p".into())], []);
+    let body = b.element("body", [wrap, probe]);
+    let html = b.element("html", [body]);
+    let doc = b.finish(html);
+
+    let (mut engine, realm) = engine_and_realm();
+    let scripts = vec!["var p = document.getElementById('p'); \
+         var wrap = document.getElementById('wrap'); \
+         var mid = document.getElementById('mid'); \
+         var mk = function (t) { var e = document.createElement('i'); e.textContent = t; return e; }; \
+         var ret = mid.insertAdjacentElement('beforebegin', mk('B')); \
+         mid.insertAdjacentElement('afterbegin', mk('A')); \
+         mid.insertAdjacentElement('beforeend', mk('E')); \
+         mid.insertAdjacentElement('afterend', mk('F')); \
+         mid.insertAdjacentText('beforeend', 'T'); \
+         p.setAttribute('data-wrap', wrap.textContent); \
+         p.setAttribute('data-mid', mid.textContent); \
+         p.setAttribute('data-ret', String(ret.textContent)); \
+         p.setAttribute('data-bad', String(mid.insertAdjacentElement('nope', mk('X'))));"
+        .to_string()];
+
+    let out = run_page_scripts(engine.as_mut(), realm, &doc, &scripts, &env()).expect("run");
+    let p = find_id(out.root(), "p").expect("#p present");
+    // wrap: B, then mid("A M E T"), then F.
+    assert_eq!(
+        p.attr("data-wrap"),
+        Some("BAMETF"),
+        "all four positions place content"
+    );
+    assert_eq!(
+        p.attr("data-mid"),
+        Some("AMET"),
+        "afterbegin/beforeend/text land inside"
+    );
+    assert_eq!(
+        p.attr("data-ret"),
+        Some("B"),
+        "returns the inserted element"
+    );
+    assert_eq!(
+        p.attr("data-bad"),
+        Some("null"),
+        "unknown position returns null"
+    );
+}
+
+#[test]
 fn clone_node_shallow_and_deep() {
     // Shallow clone copies attributes but no children; deep clone copies the
     // subtree; clones are independent (mutating one attribute leaves the source

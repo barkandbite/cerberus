@@ -1243,6 +1243,7 @@ pub fn run_page_scripts_with_fetch(
 ///   (get concatenates descendant text; set replaces children with one text
 ///   node), `innerHTML`/`outerHTML` (get serializes to HTML in JS; set stores a
 ///   raw fragment reparsed in Rust — see below), `insertAdjacentHTML`,
+///   `insertAdjacentElement`/`insertAdjacentText` (all four positions),
 ///   `getAttribute`/`setAttribute`/`removeAttribute`/`hasAttribute`/
 ///   `toggleAttribute`/`getAttributeNames`, `id`, `className`, `classList`
 ///   (`add`/`remove`/`toggle`/`contains`/`length`), form-control `value`
@@ -2114,6 +2115,25 @@ pub const DOM_MODEL_PRELUDE: &str = r##"
         this.__rawHTML = current + html;
       }
       /* else: beforebegin/afterend unsupported -> no-op. */
+    };
+    // insertAdjacentElement/Text: unlike insertAdjacentHTML (which routes through
+    // the deferred __rawHTML reparse and only supports the two in-element spots),
+    // these insert a real node with preserved identity, so all four positions work
+    // by delegating to the ParentNode/ChildNode primitives. `insertAdjacentElement`
+    // returns the inserted node (or null for an unknown position); `Text` wraps the
+    // string in a text node.
+    ELEMENT_PROTO.insertAdjacentElement = function (position, el) {
+      switch (String(position).toLowerCase()) {
+        case "beforebegin": this.before(el); break;
+        case "afterbegin": this.prepend(el); break;
+        case "beforeend": this.append(el); break;
+        case "afterend": this.after(el); break;
+        default: return null;
+      }
+      return el;
+    };
+    ELEMENT_PROTO.insertAdjacentText = function (position, text) {
+      this.insertAdjacentElement(String(position), makeText(String(text)));
     };
 
     ELEMENT_PROTO.getAttribute = function (n) { return getAttr(this, String(n)); };
