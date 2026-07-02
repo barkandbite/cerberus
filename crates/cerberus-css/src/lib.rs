@@ -32,7 +32,7 @@ use std::rc::Rc;
 type Vars = Rc<HashMap<String, String>>;
 
 /// A matched rule during the cascade: (origin, specificity, source-order, decls).
-type MatchedRule<'a> = (u8, Specificity, usize, &'a Vec<(String, String)>);
+type MatchedRule<'a> = (u8, Specificity, usize, &'a Vec<(String, String, bool)>);
 
 /// The user-agent default stylesheet.
 const UA_CSS: &str = r#"
@@ -143,11 +143,25 @@ impl CssEngine {
             // resolves against the winning value regardless of declaration order.
             vars = collect_vars(parent_vars, &matched, inline.as_deref());
 
+            // Two cascade passes: all *normal* declarations first (UA, author,
+            // then inline — each already sorted by origin/specificity/order), then
+            // all *important* declarations in the same order. Because the important
+            // pass runs last and last-wins, any `!important` value overrides every
+            // normal one regardless of specificity, and among important values the
+            // higher origin/specificity/order still wins (inline `!important`,
+            // applied last, tops author `!important`). The UA sheet declares no
+            // `!important`, so UA-important is not separately elevated.
             for (_, _, _, decls) in &matched {
-                apply_declarations(&mut style, decls, parent.font_size, &vars);
+                apply_declarations(&mut style, decls, parent.font_size, &vars, false);
             }
             if let Some(decls) = &inline {
-                apply_declarations(&mut style, decls, parent.font_size, &vars);
+                apply_declarations(&mut style, decls, parent.font_size, &vars, false);
+            }
+            for (_, _, _, decls) in &matched {
+                apply_declarations(&mut style, decls, parent.font_size, &vars, true);
+            }
+            if let Some(decls) = &inline {
+                apply_declarations(&mut style, decls, parent.font_size, &vars, true);
             }
         }
 
@@ -275,17 +289,17 @@ fn link_is_stylesheet(node: NodeRef<'_>) -> bool {
 fn collect_vars(
     parent: &Vars,
     matched: &[MatchedRule<'_>],
-    inline: Option<&[(String, String)]>,
+    inline: Option<&[(String, String, bool)]>,
 ) -> Vars {
-    let is_custom = |d: &(String, String)| d.0.starts_with("--");
+    let is_custom = |d: &(String, String, bool)| d.0.starts_with("--");
     let declares = matched.iter().any(|(_, _, _, d)| d.iter().any(is_custom))
         || inline.is_some_and(|d| d.iter().any(is_custom));
     if !declares {
         return parent.clone();
     }
     let mut map = (**parent).clone();
-    let mut insert = |decls: &[(String, String)]| {
-        for (p, v) in decls {
+    let mut insert = |decls: &[(String, String, bool)]| {
+        for (p, v, _) in decls {
             if p.starts_with("--") {
                 // Keys are already lowercased by the parser; store the raw value
                 // (its own `var()`s resolve lazily, at use, in `substitute_vars`).
@@ -584,11 +598,17 @@ impl CalcParser<'_> {
 
 fn apply_declarations(
     style: &mut ComputedStyle,
-    decls: &[(String, String)],
+    decls: &[(String, String, bool)],
     parent_font_size: u32,
     vars: &Vars,
+    important: bool,
 ) {
-    for (prop, value) in decls {
+    for (prop, value, is_important) in decls {
+        // This pass only applies declarations of the matching importance, so the
+        // caller can run all normal declarations before all important ones.
+        if *is_important != important {
+            continue;
+        }
         // Custom properties are collected separately (`collect_vars`); they do
         // not set any computed value here.
         if prop.starts_with("--") {
@@ -2046,6 +2066,64 @@ mod tests {
         assert_eq!(
             first(&dom.root, "p").unwrap().style.color,
             Color::rgb(0x33, 0x66, 0xcc)
+        );
+    }
+
+    #[test]
+    fn important_overrides_higher_specificity_and_source_order() {
+        // A low-specificity `!important` beats a later, higher-specificity normal
+        // rule — the whole point of `!important` (previously the flag was dropped,
+        // so specificity/order alone decided and this read green).
+        let html = "<html><head><style>\
+            p { color: #ff0000 !important }\
+            #x { color: #00ff00 }\
+            </style></head><body><p id='x'>hi</p></body></html>";
+        let dom = CssEngine::new().style(&parse_html(html));
+        assert_eq!(
+            first(&dom.root, "p").unwrap().style.color,
+            Color::rgb(0xff, 0, 0),
+            "the !important type rule wins over the normal #id rule"
+        );
+    }
+
+    #[test]
+    fn important_beats_inline_but_inline_important_wins() {
+        // Author `!important` overrides an inline (normal) style, but an inline
+        // `!important` still tops the author `!important` (inline is applied last
+        // in the important pass).
+        let beats_inline = CssEngine::new().style(&parse_html(
+            "<html><head><style>p{color:#ff0000 !important}</style></head>\
+             <body><p style='color:#0000ff'>x</p></body></html>",
+        ));
+        assert_eq!(
+            first(&beats_inline.root, "p").unwrap().style.color,
+            Color::rgb(0xff, 0, 0),
+            "author !important beats inline normal"
+        );
+        let inline_wins = CssEngine::new().style(&parse_html(
+            "<html><head><style>p{color:#ff0000 !important}</style></head>\
+             <body><p style='color:#0000ff !important'>x</p></body></html>",
+        ));
+        assert_eq!(
+            first(&inline_wins.root, "p").unwrap().style.color,
+            Color::rgb(0, 0, 0xff),
+            "inline !important beats author !important"
+        );
+    }
+
+    #[test]
+    fn important_among_rules_still_respects_specificity() {
+        // Between two `!important` declarations the normal cascade still decides:
+        // the higher-specificity `#x` wins over the type selector.
+        let html = "<html><head><style>\
+            p { color: #ff0000 !important }\
+            #x { color: #00ff00 !important }\
+            </style></head><body><p id='x'>hi</p></body></html>";
+        let dom = CssEngine::new().style(&parse_html(html));
+        assert_eq!(
+            first(&dom.root, "p").unwrap().style.color,
+            Color::rgb(0, 0xff, 0),
+            "higher-specificity !important wins among important declarations"
         );
     }
 
