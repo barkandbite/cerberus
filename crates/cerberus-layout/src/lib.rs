@@ -967,10 +967,7 @@ impl<'a> Ctx<'a> {
         let attr_h = node.attr("height").and_then(parse_dim);
 
         if let Some(image) = self.images.get(src) {
-            let (mut w, mut h) = (
-                attr_w.filter(|v| *v > 0).unwrap_or(image.size.w),
-                attr_h.filter(|v| *v > 0).unwrap_or(image.size.h),
-            );
+            let (mut w, mut h) = replaced_size(attr_w, attr_h, image.size);
             let max_w = (self.right - self.left).max(1) as u32;
             if w > max_w {
                 h = (h as f32 * max_w as f32 / w as f32).round() as u32;
@@ -2782,6 +2779,37 @@ fn parse_dim(v: &str) -> Option<u32> {
     v.trim().trim_end_matches("px").trim().parse().ok()
 }
 
+/// Resolve a decoded `<img>`'s box from its `width`/`height` presentation
+/// attributes and its intrinsic (decoded) size, per the CSS replaced-element
+/// sizing rule.
+///
+/// The subtlety: when the author gives only ONE axis, the other must be derived
+/// from the *intrinsic aspect ratio*, not carried over from the intrinsic pixel
+/// size of that axis independently — otherwise a 400×300 image with `width="200"`
+/// renders 200×300 (distorted) instead of the correct 200×150 (issue #34). Both
+/// axes authored honors both exactly (an intentional override may break the
+/// ratio); neither authored keeps the intrinsic size. A degenerate intrinsic
+/// ratio (either dimension zero) falls back to the intrinsic axis, matching the
+/// pre-fix behavior. The derived axis is computed in `f64` so large decoded
+/// dimensions cannot overflow a `u32` multiply, and floored at 1 to match the
+/// caller's `h.max(1)` convention.
+fn replaced_size(attr_w: Option<u32>, attr_h: Option<u32>, intrinsic: Size) -> (u32, u32) {
+    let aw = attr_w.filter(|v| *v > 0);
+    let ah = attr_h.filter(|v| *v > 0);
+    let ratio_ok = intrinsic.w > 0 && intrinsic.h > 0;
+    let derive = |known: u32, num: u32, den: u32| {
+        (known as f64 * num as f64 / den as f64).round().max(1.0) as u32
+    };
+    match (aw, ah) {
+        (Some(w), Some(h)) => (w, h),
+        (Some(w), None) if ratio_ok => (w, derive(w, intrinsic.h, intrinsic.w)),
+        (None, Some(h)) if ratio_ok => (derive(h, intrinsic.w, intrinsic.h), h),
+        (Some(w), None) => (w, intrinsic.h),
+        (None, Some(h)) => (intrinsic.w, h),
+        (None, None) => (intrinsic.w, intrinsic.h),
+    }
+}
+
 /// Choose the URL to fetch and draw for an `<img>` (ADR-0046): the explicit
 /// `data-src` lazy alias wins; otherwise the best `srcset` candidate (honoring
 /// `sizes`); otherwise plain `src`. Both the fetch-time collector and layout call
@@ -4060,6 +4088,107 @@ mod tests {
                 .iter()
                 .any(|i| matches!(i, DisplayItem::Image { .. })),
             "srcset selected small.png (the only key the provider serves)"
+        );
+    }
+
+    /// Lay out an `<img>` backed by a decoded image of `intrinsic` size and return
+    /// the emitted `Image` rect (w, h). Used by the replaced-sizing tests below.
+    fn img_box(html: &str, intrinsic: Size, container_w: u32) -> (u32, u32) {
+        let styled = CssEngine::new().style(&parse_html(html));
+        let img = Arc::new(DecodedImage {
+            size: intrinsic,
+            rgba: vec![255; (intrinsic.area() as usize) * 4],
+        });
+        let laid = BlockLayout::default().layout(
+            &styled,
+            Size::new(container_w, 2000),
+            &MonoShaper,
+            &OneImage(img),
+            &NoForms,
+        );
+        laid.display
+            .items
+            .iter()
+            .find_map(|i| match i {
+                DisplayItem::Image { rect, .. } => Some((rect.w, rect.h)),
+                _ => None,
+            })
+            .expect("decoded image emitted")
+    }
+
+    #[test]
+    fn img_width_only_derives_height_from_intrinsic_ratio() {
+        // 400×300 with width=200 → height must follow the ratio (150), not the
+        // intrinsic 300 (issue #34).
+        assert_eq!(
+            img_box("<img src='p.png' width='200'>", Size::new(400, 300), 800),
+            (200, 150)
+        );
+    }
+
+    #[test]
+    fn img_height_only_derives_width_from_intrinsic_ratio() {
+        // 400×300 with height=150 → width follows the ratio (200), not intrinsic 400.
+        assert_eq!(
+            img_box("<img src='p.png' height='150'>", Size::new(400, 300), 800),
+            (200, 150)
+        );
+    }
+
+    #[test]
+    fn img_both_attrs_are_honored_even_against_the_ratio() {
+        // Both authored → both honored exactly, even when they contradict the
+        // intrinsic 4:3 ratio (an intentional distortion).
+        assert_eq!(
+            img_box(
+                "<img src='p.png' width='200' height='80'>",
+                Size::new(400, 300),
+                800
+            ),
+            (200, 80)
+        );
+    }
+
+    #[test]
+    fn img_no_size_attrs_uses_intrinsic_size() {
+        assert_eq!(
+            img_box("<img src='p.png'>", Size::new(400, 300), 800),
+            (400, 300)
+        );
+    }
+
+    #[test]
+    fn img_single_axis_ratio_still_clamps_on_container_overflow() {
+        // width=600 on a 400×300 image derives height 450; a container whose content
+        // area is 500px then clamps width→500 and scales height proportionally
+        // (450 * 500/600 = 375). Proves the overflow clamp runs AFTER the ratio
+        // derivation. Content area = container - 2*8px page margin, so 516 → 500.
+        assert_eq!(
+            img_box("<img src='p.png' width='600'>", Size::new(400, 300), 516),
+            (500, 375)
+        );
+    }
+
+    #[test]
+    fn replaced_size_covers_the_four_cases() {
+        let intr = Size::new(400, 300);
+        // Both present → honored verbatim.
+        assert_eq!(replaced_size(Some(200), Some(80), intr), (200, 80));
+        // Width only → height from ratio.
+        assert_eq!(replaced_size(Some(200), None, intr), (200, 150));
+        // Height only → width from ratio.
+        assert_eq!(replaced_size(None, Some(150), intr), (200, 150));
+        // Neither → intrinsic.
+        assert_eq!(replaced_size(None, None, intr), (400, 300));
+        // Rounding: a 3:2 image (300×200) with width=100 → h = round(100*200/300)=67.
+        assert_eq!(
+            replaced_size(Some(100), None, Size::new(300, 200)),
+            (100, 67)
+        );
+        // Degenerate intrinsic ratio → fall back to the intrinsic axis.
+        assert_eq!(
+            replaced_size(Some(200), None, Size::new(0, 300)),
+            (200, 300)
         );
     }
 

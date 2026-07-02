@@ -1856,6 +1856,13 @@ fn subresource_allowed(
 /// Recursively inline `@import`ed stylesheets, resolved against `base` and
 /// consent-gated, ahead of the importing sheet's rules (bounded depth). Imports
 /// we can't fetch are dropped; the cascade parser skips any leftover `@import`.
+///
+/// Discovery is intentionally split into a pure, lex-aware scan
+/// ([`inline_imports_core`] over [`prologue_import_spans`]): a raw substring hunt
+/// for `@import` (issue #64) would fetch URLs sitting inside comments or string
+/// values — a consent-gated request triggered by attacker-controlled *content* —
+/// so fetching is threaded through a closure the scanner only calls for genuine
+/// prologue at-rules.
 fn inline_imports(
     css: &str,
     base: &str,
@@ -1865,42 +1872,192 @@ fn inline_imports(
     first_party: &Origin,
     depth: usize,
 ) -> String {
-    if depth >= 4 || !css.contains("@import") {
+    if depth >= 4 {
         return css.to_string();
     }
     let base_url = parse_url(base).ok();
+    inline_imports_core(css, &mut |url| {
+        let abs = resolve_subresource(base_url.as_ref(), url);
+        if !(abs.starts_with("http://") || abs.starts_with("https://"))
+            || !subresource_allowed(&abs, policy, ctx.instance, first_party)
+        {
+            return None;
+        }
+        let bytes = fetch_bytes(client, &abs, ctx).ok()?;
+        let text = String::from_utf8_lossy(&bytes).into_owned();
+        Some(inline_imports(
+            &text,
+            &abs,
+            client,
+            ctx,
+            policy,
+            first_party,
+            depth + 1,
+        ))
+    })
+}
+
+/// Splice each legal prologue `@import` (found by [`prologue_import_spans`]) with
+/// the CSS `fetch` yields for its URL, dropping the original at-rule; text around
+/// the imports is emitted verbatim and in order, so a successful import's content
+/// lands ahead of the sheet's own rules. Factored out of [`inline_imports`] so the
+/// discovery/ordering logic is testable without a live network `Router`.
+fn inline_imports_core(css: &str, fetch: &mut impl FnMut(&str) -> Option<String>) -> String {
+    // Cheap bail-out: no literal `@import` anywhere means nothing to inline.
+    if !css.contains("@import") {
+        return css.to_string();
+    }
+    let spans = prologue_import_spans(css);
+    if spans.is_empty() {
+        return css.to_string();
+    }
     let mut out = String::new();
-    let mut rest = css;
-    while let Some(pos) = rest.find("@import") {
-        out.push_str(&rest[..pos]);
-        let stmt_end = rest[pos..]
-            .find(';')
-            .map(|s| pos + s + 1)
-            .unwrap_or(rest.len());
-        if let Some(url) = parse_import_url(&rest[pos..stmt_end]) {
-            let abs = resolve_subresource(base_url.as_ref(), &url);
-            if (abs.starts_with("http://") || abs.starts_with("https://"))
-                && subresource_allowed(&abs, policy, ctx.instance, first_party)
-            {
-                if let Ok(bytes) = fetch_bytes(client, &abs, ctx) {
-                    let text = String::from_utf8_lossy(&bytes).into_owned();
-                    out.push_str(&inline_imports(
-                        &text,
-                        &abs,
-                        client,
-                        ctx,
-                        policy,
-                        first_party,
-                        depth + 1,
-                    ));
-                    out.push('\n');
-                }
+    let mut cursor = 0;
+    for (start, end) in spans {
+        out.push_str(&css[cursor..start]);
+        if let Some(url) = parse_import_url(&css[start..end]) {
+            if let Some(inlined) = fetch(&url) {
+                out.push_str(&inlined);
+                out.push('\n');
             }
         }
-        rest = &rest[stmt_end..];
+        cursor = end;
     }
-    out.push_str(rest);
+    out.push_str(&css[cursor..]);
     out
+}
+
+/// Byte spans (`@`..just past the terminating `;`) of the `@import` statements
+/// that are *valid* per the CSS spec: they sit at code positions (never inside a
+/// comment or string) in the sheet's prologue, where only `@charset` and `@layer`
+/// statements may precede them. The first ordinary style rule — or any other
+/// at-rule or `@layer` block — closes the prologue and stops the scan, so a stray
+/// `@import` deeper in the sheet is ignored (issue #64).
+fn prologue_import_spans(css: &str) -> Vec<(usize, usize)> {
+    let bytes = css.as_bytes();
+    let mut spans = Vec::new();
+    let mut i = 0;
+    loop {
+        i = skip_ws_and_comments(bytes, i);
+        // Only an at-rule can extend the prologue; anything else (a selector, and
+        // thus the start of a style rule) ends it.
+        if i >= bytes.len() || bytes[i] != b'@' {
+            break;
+        }
+        let kw_end = ident_end(bytes, i + 1);
+        let keyword = &css[i + 1..kw_end];
+        if keyword.eq_ignore_ascii_case("import") {
+            let end = statement_end(bytes, kw_end);
+            spans.push((i, end));
+            i = end;
+        } else if keyword.eq_ignore_ascii_case("charset") {
+            i = statement_end(bytes, kw_end);
+        } else if keyword.eq_ignore_ascii_case("layer") {
+            // Only the *statement* form (`@layer a, b;`) keeps the prologue open;
+            // a `@layer { … }` block is an ordinary rule that closes it.
+            match statement_or_block_end(bytes, kw_end) {
+                Some(end) => i = end,
+                None => break,
+            }
+        } else {
+            break;
+        }
+    }
+    spans
+}
+
+/// Advance past ASCII whitespace and `/* … */` comments (comments may not nest in
+/// CSS), returning the next code position.
+fn skip_ws_and_comments(bytes: &[u8], mut i: usize) -> usize {
+    loop {
+        while i < bytes.len() && bytes[i].is_ascii_whitespace() {
+            i += 1;
+        }
+        match skip_comment(bytes, i) {
+            Some(next) => i = next,
+            None => return i,
+        }
+    }
+}
+
+/// If `bytes[i..]` opens a `/* … */` comment, return the index just past its `*/`
+/// (or end-of-input for an unterminated comment); otherwise `None`.
+fn skip_comment(bytes: &[u8], i: usize) -> Option<usize> {
+    if bytes.get(i) != Some(&b'/') || bytes.get(i + 1) != Some(&b'*') {
+        return None;
+    }
+    let mut j = i + 2;
+    while j + 1 < bytes.len() {
+        if bytes[j] == b'*' && bytes[j + 1] == b'/' {
+            return Some(j + 2);
+        }
+        j += 1;
+    }
+    Some(bytes.len())
+}
+
+/// Index just past a `"…"`/`'…'` string literal that opens at `bytes[i]`,
+/// honouring backslash escapes (or end-of-input if unterminated).
+fn skip_string(bytes: &[u8], i: usize) -> usize {
+    let quote = bytes[i];
+    let mut j = i + 1;
+    while j < bytes.len() {
+        match bytes[j] {
+            b'\\' => j += 2,
+            c if c == quote => return j + 1,
+            _ => j += 1,
+        }
+    }
+    bytes.len()
+}
+
+/// End of an identifier (`[A-Za-z0-9_-]*`) starting at `start` — the at-keyword
+/// after a leading `@`.
+fn ident_end(bytes: &[u8], mut i: usize) -> usize {
+    while i < bytes.len()
+        && (bytes[i].is_ascii_alphanumeric() || bytes[i] == b'-' || bytes[i] == b'_')
+    {
+        i += 1;
+    }
+    i
+}
+
+/// Index just past the `;` that ends the statement beginning at `from`, skipping
+/// `;`s that live inside comments or string values (or end-of-input if none).
+fn statement_end(bytes: &[u8], from: usize) -> usize {
+    let mut i = from;
+    while i < bytes.len() {
+        if let Some(next) = skip_comment(bytes, i) {
+            i = next;
+            continue;
+        }
+        match bytes[i] {
+            b'"' | b'\'' => i = skip_string(bytes, i),
+            b';' => return i + 1,
+            _ => i += 1,
+        }
+    }
+    bytes.len()
+}
+
+/// For a `@layer` at-rule beginning at `from`: `Some(end)` (just past `;`) when it
+/// is a bare *statement*, or `None` when a `{` arrives first (a `@layer` block).
+/// Comments and strings are skipped so their `;`/`{` don't mislead the decision.
+fn statement_or_block_end(bytes: &[u8], from: usize) -> Option<usize> {
+    let mut i = from;
+    while i < bytes.len() {
+        if let Some(next) = skip_comment(bytes, i) {
+            i = next;
+            continue;
+        }
+        match bytes[i] {
+            b'"' | b'\'' => i = skip_string(bytes, i),
+            b';' => return Some(i + 1),
+            b'{' => return None,
+            _ => i += 1,
+        }
+    }
+    Some(bytes.len())
 }
 
 /// Extract the URL from an `@import url("…")` / `@import "…"` statement.
@@ -7005,5 +7162,104 @@ mod tests {
         assert!(b.pointer_down(sel.rect.x + 1, sel.rect.y + 1));
         assert!(b.pointer_down(submit.x + 1, submit.y + 1));
         assert_eq!(b.toolbar.url_text, "https://site.test/s?k=b");
+    }
+
+    // ---- `@import` inlining discovery (issue #64) ----
+    //
+    // These exercise the lex-aware, prologue-restricted discovery through
+    // `inline_imports_core`, whose fetch closure stands in for the consent-gated
+    // network `Router`. A closure recording every URL it is asked for lets us
+    // assert that content-controlled `@import` look-alikes never trigger a fetch.
+
+    #[test]
+    fn inline_imports_ignores_commented_at_import() {
+        // (a) A commented-out `@import` must neither fetch nor inline; the comment
+        // is passed through untouched.
+        let css = "/* @import url(\"https://evil.example/x.css\"); */\n.a { color: red }";
+        let mut fetched: Vec<String> = Vec::new();
+        let out = inline_imports_core(css, &mut |u| {
+            fetched.push(u.to_string());
+            Some("EVIL".to_string())
+        });
+        assert!(fetched.is_empty(), "commented @import must not fetch");
+        assert_eq!(out, css, "comment (and sheet) pass through verbatim");
+        assert!(!out.contains("EVIL"));
+    }
+
+    #[test]
+    fn inline_imports_ignores_at_import_inside_string_value() {
+        // (b) The literal `@import` inside a `content` string is a value, not an
+        // at-rule: no fetch, output unchanged.
+        let css = "a::after { content: \"@import url(x.css)\"; }";
+        let mut fetched: Vec<String> = Vec::new();
+        let out = inline_imports_core(css, &mut |u| {
+            fetched.push(u.to_string());
+            Some("X".to_string())
+        });
+        assert!(
+            fetched.is_empty(),
+            "@import in a string value must not fetch"
+        );
+        assert_eq!(out, css);
+    }
+
+    #[test]
+    fn inline_imports_inlines_leading_import_ahead_of_rules() {
+        // (c) A genuine leading `@import` is fetched once and its content spliced
+        // in ahead of the sheet's own rules; the original at-rule is dropped.
+        let css = "@import url(\"sub.css\");\n.a { color: red }";
+        let mut fetched: Vec<String> = Vec::new();
+        let out = inline_imports_core(css, &mut |u| {
+            fetched.push(u.to_string());
+            Some(".imported { color: blue }".to_string())
+        });
+        assert_eq!(fetched, vec!["sub.css".to_string()]);
+        let imported_at = out.find(".imported").expect("imported content present");
+        let rule_at = out.find(".a {").expect("own rule present");
+        assert!(imported_at < rule_at, "import inlined ahead of the rules");
+        assert!(!out.contains("@import"), "the at-rule itself is replaced");
+    }
+
+    #[test]
+    fn inline_imports_ignores_stray_import_after_rules() {
+        // (d) `@import` is only valid in the prologue; one appearing after an
+        // ordinary rule is ignored (no fetch) and left as inert text.
+        let css = ".a { color: red }\n@import url(\"late.css\");";
+        let mut fetched: Vec<String> = Vec::new();
+        let out = inline_imports_core(css, &mut |u| {
+            fetched.push(u.to_string());
+            Some("X".to_string())
+        });
+        assert!(fetched.is_empty(), "post-rule @import must not fetch");
+        assert_eq!(out, css);
+    }
+
+    #[test]
+    fn inline_imports_honors_charset_and_layer_prologue() {
+        // `@charset` and `@layer` *statements* may precede a valid `@import`; a
+        // `;` inside a string must not prematurely end a statement.
+        let css = "@charset \"utf-8\";\n@layer base, theme;\n@import url(\"a;b.css\");\n.r {}";
+        let mut fetched: Vec<String> = Vec::new();
+        let out = inline_imports_core(css, &mut |u| {
+            fetched.push(u.to_string());
+            Some(".imported {}".to_string())
+        });
+        assert_eq!(
+            fetched,
+            vec!["a;b.css".to_string()],
+            "url with inner ; intact"
+        );
+        assert!(out.contains(".imported {}"));
+        // A `@layer { … }` block, by contrast, closes the prologue.
+        let blocked = "@layer { .x {} }\n@import url(\"late.css\");";
+        let mut fetched2: Vec<String> = Vec::new();
+        inline_imports_core(blocked, &mut |u| {
+            fetched2.push(u.to_string());
+            Some("X".to_string())
+        });
+        assert!(
+            fetched2.is_empty(),
+            "@import after a @layer block is ignored"
+        );
     }
 }
