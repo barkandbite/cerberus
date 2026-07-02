@@ -112,6 +112,45 @@ fn script_sets_attribute_and_class() {
 }
 
 #[test]
+fn programmatic_click_fires_listeners_and_bubbles() {
+    // `element.click()` must dispatch a click event to the element's own
+    // listeners and bubble to ancestors — a page toggling a menu via
+    // `el.click()` is a common pattern. `focus`/`blur` must at least be
+    // callable (they fire their listeners and track activeElement).
+    let (mut engine, realm) = engine_and_realm();
+    let doc = doc_with_div_x();
+    let scripts = vec!["var x = document.getElementById('x'); \
+         var hits = 0; \
+         x.addEventListener('click', function () { hits++; }); \
+         var bodyHits = 0; \
+         document.body.addEventListener('click', function () { bodyHits++; }); \
+         x.click(); \
+         x.focus(); x.blur(); \
+         x.setAttribute('data-hits', String(hits)); \
+         x.setAttribute('data-body-hits', String(bodyHits)); \
+         x.setAttribute('data-active', String(document.activeElement === null));"
+        .to_string()];
+
+    let out = run_page_scripts(engine.as_mut(), realm, &doc, &scripts, &env()).expect("run");
+    let x = find_id(out.root(), "x").expect("#x present");
+    assert_eq!(
+        x.attr("data-hits"),
+        Some("1"),
+        "own click listener fired once"
+    );
+    assert_eq!(
+        x.attr("data-body-hits"),
+        Some("1"),
+        "click bubbled to the body listener"
+    );
+    assert_eq!(
+        x.attr("data-active"),
+        Some("true"),
+        "blur() cleared document.activeElement"
+    );
+}
+
+#[test]
 fn dom_content_loaded_listener_runs() {
     let (mut engine, realm) = engine_and_realm();
     let doc = doc_with_div_x();

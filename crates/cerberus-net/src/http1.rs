@@ -48,9 +48,7 @@ pub fn send(stream: &mut dyn ReadWrite, req: &Request<'_>) -> Result<HttpRespons
     }
     head.push_str("\r\n");
 
-    stream
-        .write_all(head.as_bytes())
-        .map_err(io_err)?;
+    stream.write_all(head.as_bytes()).map_err(io_err)?;
     if !req.body.is_empty() {
         stream.write_all(req.body).map_err(io_err)?;
     }
