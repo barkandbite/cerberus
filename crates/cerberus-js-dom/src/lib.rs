@@ -1255,7 +1255,7 @@ pub fn run_page_scripts_with_fetch(
 ///   `nextElementSibling`/`previousElementSibling`,
 ///   `appendChild`/`removeChild`/`insertBefore`/`remove`,
 ///   `append`/`prepend`/`before`/`after`/`replaceWith` (variadic node-or-string
-///   insertion), a
+///   insertion), `cloneNode` (shallow/deep), a
 ///   `dataset` (live `data-*` <-> camelCase map), `href`/`src` (resolved to an
 ///   absolute URL against the document location), store-only `style`,
 ///   `getBoundingClientRect` (all-zero), scoped
@@ -1776,6 +1776,26 @@ pub const DOM_MODEL_PRELUDE: &str = r##"
       var p = this.__parent; if (!p) return;
       for (var i = 0; i < arguments.length; i++) insertBefore(p, coerceInsertable(arguments[i]), this);
       detach(this);
+    };
+    // `cloneNode(deep)`: a fresh node (new id, no parent, no event listeners),
+    // with attributes copied into independent pairs so mutating the clone can't
+    // leak back to the original. A shallow clone has no children; a deep clone
+    // recursively clones the subtree (or carries over a pending innerHTML
+    // fragment). Pages clone `<template>`/list rows constantly.
+    NODE_PROTO.cloneNode = function (deep) {
+      if (this.__type === TEXT_NODE) return makeText(this.__text);
+      var copy = makeElement(this.__tag);
+      copy.__attrs = this.__attrs.map(function (p) { return [p[0], p[1]]; });
+      if (deep) {
+        if (typeof this.__rawHTML === "string") {
+          copy.__rawHTML = this.__rawHTML;
+        } else {
+          for (var i = 0; i < this.__kids.length; i++) {
+            appendChild(copy, this.__kids[i].cloneNode(true));
+          }
+        }
+      }
+      return copy;
     };
 
     // -- elements (ELEMENT_PROTO) --

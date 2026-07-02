@@ -112,6 +112,66 @@ fn script_sets_attribute_and_class() {
 }
 
 #[test]
+fn clone_node_shallow_and_deep() {
+    // Shallow clone copies attributes but no children; deep clone copies the
+    // subtree; clones are independent (mutating one attribute leaves the source
+    // untouched) and start with no parent.
+    let mut b = DocumentBuilder::new();
+    let child_text = b.text("child");
+    let span = b.element("span", [child_text]);
+    let src = b.element_attrs(
+        "div",
+        vec![
+            ("id".into(), "src".into()),
+            ("class".into(), "orig".into()),
+            ("data-x".into(), "1".into()),
+        ],
+        [span],
+    );
+    let probe = b.element_attrs("p", vec![("id".into(), "p".into())], []);
+    let body = b.element("body", [src, probe]);
+    let html = b.element("html", [body]);
+    let doc = b.finish(html);
+
+    let (mut engine, realm) = engine_and_realm();
+    let scripts = vec!["var p = document.getElementById('p'); \
+         var src = document.getElementById('src'); \
+         var sh = src.cloneNode(false); \
+         p.setAttribute('sh-kids', String(sh.children.length)); \
+         p.setAttribute('sh-class', sh.className); \
+         var dp = src.cloneNode(true); \
+         p.setAttribute('dp-text', dp.querySelector('span').textContent); \
+         p.setAttribute('dp-parent', String(dp.parentNode)); \
+         dp.setAttribute('data-x', '99'); \
+         p.setAttribute('indep', src.getAttribute('data-x') + '/' + dp.getAttribute('data-x'));"
+        .to_string()];
+
+    let out = run_page_scripts(engine.as_mut(), realm, &doc, &scripts, &env()).expect("run");
+    let p = find_id(out.root(), "p").expect("#p present");
+    assert_eq!(
+        p.attr("sh-kids"),
+        Some("0"),
+        "shallow clone has no children"
+    );
+    assert_eq!(
+        p.attr("sh-class"),
+        Some("orig"),
+        "shallow clone copies attributes"
+    );
+    assert_eq!(
+        p.attr("dp-text"),
+        Some("child"),
+        "deep clone copies the subtree"
+    );
+    assert_eq!(p.attr("dp-parent"), Some("null"), "a clone has no parent");
+    assert_eq!(
+        p.attr("indep"),
+        Some("1/99"),
+        "mutating the clone's attribute does not affect the source"
+    );
+}
+
+#[test]
 fn parentnode_childnode_insertion_methods() {
     // `append`/`prepend`/`before`/`after`/`replaceWith` accept a variadic mix of
     // nodes and strings (strings become text) in argument order, and `replaceWith`
