@@ -2795,7 +2795,10 @@ fn resolve_flex(basis: &[f32], grow: &[f32], shrink: &[f32], mins: &[f32], avail
 }
 
 fn space_width(shaper: &dyn TextShaper, px: u32) -> u32 {
-    shaper.shape(" ", px).iter().map(|g| g.advance).sum()
+    // Delegates to the shaper's `space_advance`, which real shapers implement
+    // without the per-call `Vec` allocation `shape(" ", …)` would incur — this
+    // runs once per word in the inline loop.
+    shaper.space_advance(px)
 }
 
 /// Parse an `<img width/height>` attribute (a bare number or `Npx`).
@@ -3133,6 +3136,49 @@ mod tests {
             &NoImages,
             &NoForms,
         )
+    }
+
+    /// Wraps `MonoShaper` but counts how many times a bare `" "` is shaped, and
+    /// serves the inter-word gap through the allocation-free `space_advance`
+    /// override — so a regression that re-introduces per-word `shape(" ")` in the
+    /// inline loop is caught (issue #27).
+    struct SpaceCountingShaper {
+        space_shapes: std::sync::atomic::AtomicUsize,
+    }
+    impl TextShaper for SpaceCountingShaper {
+        fn shape(&self, text: &str, px: u32) -> Vec<GlyphBox> {
+            if text == " " {
+                self.space_shapes
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            }
+            MonoShaper.shape(text, px)
+        }
+        fn space_advance(&self, px: u32) -> u32 {
+            // Matches MonoShaper's space advance without allocating a Vec.
+            px.max(2) / 2
+        }
+    }
+
+    #[test]
+    fn inter_word_gaps_do_not_shape_a_space_per_word() {
+        let shaper = SpaceCountingShaper {
+            space_shapes: std::sync::atomic::AtomicUsize::new(0),
+        };
+        let styled = CssEngine::new().style(&parse_html("<p>one two three four five six</p>"));
+        let _ = BlockLayout::default().layout(
+            &styled,
+            Size::new(800, 2000),
+            &shaper,
+            &NoImages,
+            &NoForms,
+        );
+        assert_eq!(
+            shaper
+                .space_shapes
+                .load(std::sync::atomic::Ordering::Relaxed),
+            0,
+            "inter-word spacing must route through space_advance, not shape(\" \")"
+        );
     }
 
     struct OneImage(Arc<DecodedImage>);
