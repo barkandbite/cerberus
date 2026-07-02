@@ -162,7 +162,7 @@ fn read_to_end_tolerant(stream: &mut dyn ReadWrite) -> Result<Vec<u8>, NetError>
 /// A response with no length framing is delimited by connection close, so it is
 /// only "complete" at EOF and this returns `false` for it.
 fn response_is_complete(raw: &[u8]) -> bool {
-    let Some(sep) = find(raw, b"\r\n\r\n") else {
+    let Some(sep) = find_header_end(raw) else {
         return false;
     };
     let Ok(head) = std::str::from_utf8(&raw[..sep]) else {
@@ -235,8 +235,8 @@ fn parse_response(raw: &[u8]) -> Result<HttpResponse, NetError> {
             "empty response: the server closed the connection without sending anything".into(),
         ));
     }
-    let sep =
-        find(raw, b"\r\n\r\n").ok_or_else(|| NetError::Protocol("no header terminator".into()))?;
+    let sep = find_header_end(raw)
+        .ok_or_else(|| NetError::Protocol("no header terminator (or headers too large)".into()))?;
     let head = std::str::from_utf8(&raw[..sep])
         .map_err(|_| NetError::Protocol("non-utf8 headers".into()))?;
     let mut lines = head.split("\r\n");
@@ -313,6 +313,22 @@ fn find(haystack: &[u8], needle: &[u8]) -> Option<usize> {
         .position(|window| window == needle)
 }
 
+/// The most header bytes we scan for the `\r\n\r\n` terminator. A real response
+/// puts it in the first few KB; bounding the search means a large body is never
+/// scanned end-to-end just to locate the headers (the terminator is at the
+/// front), and it caps the work a hostile never-terminating header block can
+/// cost. 256 KiB is far above any real header block.
+const MAX_HEADER_BYTES: usize = 256 * 1024;
+
+/// Index of the header/body separator (`\r\n\r\n`), searching only the bounded
+/// header prefix. `None` if it is absent there — the headers are incomplete or
+/// implausibly large (over [`MAX_HEADER_BYTES`]).
+fn find_header_end(raw: &[u8]) -> Option<usize> {
+    // `+4` so a terminator ending exactly at the cap is still found.
+    let limit = raw.len().min(MAX_HEADER_BYTES + 4);
+    find(&raw[..limit], b"\r\n\r\n")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -337,6 +353,25 @@ mod tests {
     #[test]
     fn rejects_garbage() {
         assert!(parse_response(b"not http").is_err());
+    }
+
+    #[test]
+    fn header_search_is_bounded_but_still_parses_large_bodies() {
+        // A normal response with a big body still parses: the header terminator
+        // is at the front, well within the cap.
+        let mut raw = b"HTTP/1.1 200 OK\r\nContent-Length: 1000000\r\n\r\n".to_vec();
+        raw.extend(std::iter::repeat_n(b'x', 1_000_000));
+        let resp = parse_response(&raw).expect("large body parses");
+        assert_eq!(resp.status, 200);
+        assert_eq!(resp.body.len(), 1_000_000);
+
+        // A header block with no terminator inside the cap is rejected rather
+        // than scanned to the end (here: a `\r\n\r\n` only past MAX_HEADER_BYTES).
+        let mut big = b"HTTP/1.1 200 OK\r\n".to_vec();
+        big.extend(std::iter::repeat_n(b'a', MAX_HEADER_BYTES + 16));
+        big.extend_from_slice(b"\r\n\r\nbody");
+        assert!(find_header_end(&big).is_none(), "terminator past the cap");
+        assert!(parse_response(&big).is_err(), "oversized headers rejected");
     }
 
     #[test]
