@@ -53,9 +53,11 @@ instance. This keeps the ≤1-live-engine / one-process memory model intact.
   unchanged. Ordering within the file does not matter — proxy lines are matched
   to heads by id after all heads are read.
 - `cerberus-app::head_proxies(&[Head])` builds the per-instance map, and
-  `network_client_with_proxies` wires it into both the mirror client and the
-  foreground browser's loader — so switching heads in the single window also
-  switches egress.
+  `network_client_with_proxies` wires it into every network entry point: the
+  mirror client, the foreground browser's loader (so switching heads in the
+  single window also switches egress), and the one-shot `render` path (which
+  fetches under the active head's instance, so it egresses through that head's
+  proxy too).
 
 ### CLI
 

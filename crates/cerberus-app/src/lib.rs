@@ -976,6 +976,11 @@ pub fn render(config: &RenderConfig) -> Result<RenderOutcome, AppError> {
         Some(p) => Some(parse_proxy(p).map_err(|e| AppError::Net(format!("{e:?}")))?),
         None => None,
     };
+    // Per-window proxy (ADR-0047): a one-shot render fetches under the active
+    // head's instance, so it egresses through that head's own proxy if set —
+    // matching the interactive browser and mirror driver. The global `--proxy`
+    // above is the default for a head with none. Fail-closed on a bad string.
+    let proxies = head_proxies(heads.heads())?;
     let fetch_t = Instant::now();
     let (response, active_ua, client) = if url.is_builtin() {
         let resp = BuiltinHttpClient
@@ -983,7 +988,8 @@ pub fn render(config: &RenderConfig) -> Result<RenderOutcome, AppError> {
             .map_err(|e| AppError::Net(format!("{e:?}")))?;
         (resp, DEFAULT_USER_AGENT.to_string(), None)
     } else {
-        let client = network_client(config.system_roots, Some(jar.clone()), proxy);
+        let client =
+            network_client_with_proxies(config.system_roots, Some(jar.clone()), proxy, proxies);
         let resp = client
             .get_in(&url, &nav_ctx)
             .map_err(|e| AppError::Net(format!("{e:?}")))?;
