@@ -760,6 +760,13 @@ fn apply_declarations(
                     style.letter_spacing = px;
                 }
             }
+            "word-spacing" => {
+                if v.trim().eq_ignore_ascii_case("normal") {
+                    style.word_spacing = 0;
+                } else if let Some(px) = parse_len(v, style.font_size as f32) {
+                    style.word_spacing = px;
+                }
+            }
             "text-decoration" | "text-decoration-line" => {
                 let low = v.to_ascii_lowercase();
                 if low.contains("underline") {
@@ -2199,6 +2206,19 @@ mod tests {
             Color::rgb(0, 0xff, 0),
             "currentColor inherits the parent's color"
         );
+    }
+
+    #[test]
+    fn word_spacing_parses_and_inherits() {
+        let dom = CssEngine::new().style(&parse_html(
+            "<div style='word-spacing:12px'><span>x</span></div>",
+        ));
+        assert_eq!(first(&dom.root, "div").unwrap().style.word_spacing, 12);
+        // word-spacing is inherited, so the child sees it too.
+        assert_eq!(first(&dom.root, "span").unwrap().style.word_spacing, 12);
+        // `normal` resets to 0.
+        let dom2 = CssEngine::new().style(&parse_html("<div style='word-spacing:normal'>x</div>"));
+        assert_eq!(first(&dom2.root, "div").unwrap().style.word_spacing, 0);
     }
 
     #[test]

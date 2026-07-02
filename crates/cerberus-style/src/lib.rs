@@ -242,6 +242,9 @@ pub struct ComputedStyle {
     pub line_height: Option<i32>,
     pub text_transform: TextTransform,
     pub letter_spacing: i32,
+    /// `word-spacing` in px (may be negative): extra space added to each
+    /// inter-word gap on top of the normal space advance. Inherited.
+    pub word_spacing: i32,
     pub margin_top: i32,
     pub margin_bottom: i32,
     pub margin_left: i32,
@@ -367,6 +370,7 @@ impl ComputedStyle {
             line_height: None,
             text_transform: TextTransform::None,
             letter_spacing: 0,
+            word_spacing: 0,
             margin_top: 0,
             margin_bottom: 0,
             margin_left: 0,
@@ -441,6 +445,7 @@ impl ComputedStyle {
             line_height: self.line_height,
             text_transform: self.text_transform,
             letter_spacing: self.letter_spacing,
+            word_spacing: self.word_spacing,
             preformatted: self.preformatted,
             visibility: self.visibility,
             // Reset per element:
