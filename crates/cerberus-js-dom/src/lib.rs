@@ -1253,7 +1253,9 @@ pub fn run_page_scripts_with_fetch(
 ///   `parentNode`/`parentElement`, `firstChild`/`lastChild`/`nextSibling`/
 ///   `previousSibling`, `firstElementChild`/`lastElementChild`/
 ///   `nextElementSibling`/`previousElementSibling`,
-///   `appendChild`/`removeChild`/`insertBefore`/`remove`, a
+///   `appendChild`/`removeChild`/`insertBefore`/`remove`,
+///   `append`/`prepend`/`before`/`after`/`replaceWith` (variadic node-or-string
+///   insertion), a
 ///   `dataset` (live `data-*` <-> camelCase map), `href`/`src` (resolved to an
 ///   absolute URL against the document location), store-only `style`,
 ///   `getBoundingClientRect` (all-zero), scoped
@@ -1745,6 +1747,36 @@ pub const DOM_MODEL_PRELUDE: &str = r##"
       return false;
     };
     NODE_PROTO.hasChildNodes = function () { return this.__kids.length > 0; };
+    // ParentNode/ChildNode convenience insertion (`append`/`prepend`/`before`/
+    // `after`/`replaceWith`). Each accepts a variadic mix of nodes and strings
+    // (strings become text nodes), preserving argument order — the modern idiom
+    // pages use in place of createTextNode + appendChild/insertBefore chains.
+    function coerceInsertable(arg) {
+      return (arg && typeof arg === "object" && typeof arg.__type === "number")
+        ? arg : makeText(String(arg));
+    }
+    NODE_PROTO.append = function () {
+      for (var i = 0; i < arguments.length; i++) appendChild(this, coerceInsertable(arguments[i]));
+    };
+    NODE_PROTO.prepend = function () {
+      var ref = this.__kids[0] || null;
+      for (var i = 0; i < arguments.length; i++) insertBefore(this, coerceInsertable(arguments[i]), ref);
+    };
+    NODE_PROTO.before = function () {
+      var p = this.__parent; if (!p) return;
+      for (var i = 0; i < arguments.length; i++) insertBefore(p, coerceInsertable(arguments[i]), this);
+    };
+    NODE_PROTO.after = function () {
+      var p = this.__parent; if (!p) return;
+      var idx = p.__kids.indexOf(this);
+      var ref = p.__kids[idx + 1] || null;
+      for (var i = 0; i < arguments.length; i++) insertBefore(p, coerceInsertable(arguments[i]), ref);
+    };
+    NODE_PROTO.replaceWith = function () {
+      var p = this.__parent; if (!p) return;
+      for (var i = 0; i < arguments.length; i++) insertBefore(p, coerceInsertable(arguments[i]), this);
+      detach(this);
+    };
 
     // -- elements (ELEMENT_PROTO) --
     defAccessor(ELEMENT_PROTO, "tagName", function () { return this.__tag.toUpperCase(); });
