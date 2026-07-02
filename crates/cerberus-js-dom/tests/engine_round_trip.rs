@@ -112,6 +112,53 @@ fn script_sets_attribute_and_class() {
 }
 
 #[test]
+fn parentnode_childnode_insertion_methods() {
+    // `append`/`prepend`/`before`/`after`/`replaceWith` accept a variadic mix of
+    // nodes and strings (strings become text) in argument order, and `replaceWith`
+    // removes the target. This mirrors the modern insertion idiom pages use.
+    let mut b = DocumentBuilder::new();
+    let bt = b.text("B");
+    let mid = b.element_attrs("li", vec![("id".into(), "mid".into())], [bt]);
+    let list = b.element_attrs("ul", vec![("id".into(), "list".into())], [mid]);
+    let probe = b.element_attrs("p", vec![("id".into(), "p".into())], []);
+    let body = b.element("body", [list, probe]);
+    let html = b.element("html", [body]);
+    let doc = b.finish(html);
+
+    let (mut engine, realm) = engine_and_realm();
+    let scripts = vec!["var p = document.getElementById('p'); \
+         var list = document.getElementById('list'); \
+         var mid = document.getElementById('mid'); \
+         var a = document.createElement('li'); a.textContent = 'A'; list.prepend(a); \
+         var c = document.createElement('li'); c.textContent = 'C'; list.append(c, ' tail'); \
+         mid.before('X'); mid.after('Y'); \
+         p.setAttribute('data-text', list.textContent); \
+         var box = document.createElement('div'); box.append('1', '2', '3'); \
+         p.setAttribute('data-order', box.textContent); \
+         var r = document.createElement('li'); r.textContent = 'R'; mid.replaceWith(r); \
+         p.setAttribute('data-gone', String(list.querySelector('#mid') === null));"
+        .to_string()];
+
+    let out = run_page_scripts(engine.as_mut(), realm, &doc, &scripts, &env()).expect("run");
+    let p = find_id(out.root(), "p").expect("#p present");
+    assert_eq!(
+        p.attr("data-text"),
+        Some("AXBYC tail"),
+        "prepend/append/before/after place content in order"
+    );
+    assert_eq!(
+        p.attr("data-order"),
+        Some("123"),
+        "variadic strings keep order"
+    );
+    assert_eq!(
+        p.attr("data-gone"),
+        Some("true"),
+        "replaceWith removed the target"
+    );
+}
+
+#[test]
 fn element_sibling_and_count_accessors() {
     // `childElementCount` and element-only sibling walking skip text nodes, which
     // is how pages iterate a list without tripping over whitespace.
