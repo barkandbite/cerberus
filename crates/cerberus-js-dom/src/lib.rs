@@ -1246,8 +1246,10 @@ pub fn run_page_scripts_with_fetch(
 ///   `getAttribute`/`setAttribute`/`removeAttribute`/`hasAttribute`/
 ///   `getAttributeNames`, `id`, `className`, `classList`
 ///   (`add`/`remove`/`toggle`/`contains`/`length`), form-control `value`
-///   (`<textarea>` falls back to its text), `type` (spec defaults), `checked`
-///   (reflects the `checked` attribute), `children`/`childNodes`,
+///   (`<textarea>`/`<select>`/`<option>` aware), `type` (spec defaults),
+///   `checked` (reflects the `checked` attribute), `<select>` `options`/
+///   `selectedIndex` and `<option>` `selected`/`text` (backed by the `selected`
+///   attribute the renderer reads), `children`/`childNodes`,
 ///   `parentNode`/`parentElement`, `firstChild`/`lastChild`/`nextSibling`/
 ///   `previousSibling`, `appendChild`/`removeChild`/`insertBefore`/`remove`, a
 ///   store-only `style`, `getBoundingClientRect` (all-zero), scoped
@@ -1753,14 +1755,72 @@ pub const DOM_MODEL_PRELUDE: &str = r##"
     // can read/modify `el.value` and the change reflects in serialize/layout
     // (M12b input events). A <textarea> has no value attribute — its value is its
     // text content — so fall back to that when the attribute is unset.
+    // The option elements of a <select>, in document order (descending into
+    // <optgroup>). Shared by the select/option accessors below and mirrors the
+    // layout side's `collect_options`, so JS selection and rendering agree.
+    function selectOptions(sel) {
+      var out = [];
+      (function walk(n) {
+        var kids = n.__kids || [];
+        for (var i = 0; i < kids.length; i++) {
+          var c = kids[i];
+          if (c.__type !== ELEMENT_NODE) continue;
+          if (c.__tag === "option") out.push(c);
+          else if (c.__tag === "optgroup") walk(c);
+        }
+      })(sel);
+      return out;
+    }
+    function optionText(opt) { var acc = []; collectText(opt, acc); return acc.join("").trim(); }
+    function optionValue(opt) { var v = getAttr(opt, "value"); return v === null ? optionText(opt) : v; }
     defAccessor(ELEMENT_PROTO, "value",
       function () {
+        if (this.__tag === "select") {
+          var opts = selectOptions(this);
+          var sel = null;
+          for (var i = 0; i < opts.length; i++) { if (getAttr(opts[i], "selected") !== null) { sel = opts[i]; break; } }
+          if (!sel && opts.length) sel = opts[0];
+          return sel ? optionValue(sel) : "";
+        }
+        if (this.__tag === "option") return optionValue(this);
         var v = getAttr(this, "value");
         if (v !== null) return v;
         if (this.__tag === "textarea") { var acc = []; collectText(this, acc); return acc.join(""); }
         return "";
       },
-      function (v) { setAttr(this, "value", String(v)); });
+      function (v) {
+        if (this.__tag === "select") {
+          // Selecting by value: mark the first matching option selected, clear
+          // the rest (reflected via the `selected` attribute layout reads).
+          var opts = selectOptions(this), target = String(v);
+          for (var i = 0; i < opts.length; i++) {
+            if (optionValue(opts[i]) === target) { setAttr(opts[i], "selected", ""); }
+            else { removeAttr(opts[i], "selected"); }
+          }
+          return;
+        }
+        setAttr(this, "value", String(v));
+      });
+    // <select>.selectedIndex / .options and <option>.selected / .text, all
+    // backed by the `selected` attribute so scripted selection reflects into
+    // serialize/layout (which renders the chosen option from that attribute).
+    defAccessor(ELEMENT_PROTO, "options", function () { return selectOptions(this); });
+    defAccessor(ELEMENT_PROTO, "selectedIndex",
+      function () {
+        var opts = selectOptions(this);
+        for (var i = 0; i < opts.length; i++) { if (getAttr(opts[i], "selected") !== null) return i; }
+        return opts.length ? 0 : -1;
+      },
+      function (idx) {
+        var opts = selectOptions(this); idx = Number(idx);
+        for (var i = 0; i < opts.length; i++) {
+          if (i === idx) { setAttr(opts[i], "selected", ""); } else { removeAttr(opts[i], "selected"); }
+        }
+      });
+    defAccessor(ELEMENT_PROTO, "selected",
+      function () { return getAttr(this, "selected") !== null; },
+      function (v) { if (v) { setAttr(this, "selected", ""); } else { removeAttr(this, "selected"); } });
+    defAccessor(ELEMENT_PROTO, "text", function () { return optionText(this); });
     // `input.type` (and friends): reflect the `type` attribute, defaulting per
     // element as the DOM spec does (input→"text", button→"submit", …), so a
     // page that branches on `el.type` sees a sensible value instead of undefined.

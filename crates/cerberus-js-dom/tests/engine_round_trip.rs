@@ -112,6 +112,51 @@ fn script_sets_attribute_and_class() {
 }
 
 #[test]
+fn select_value_index_and_options_reflect() {
+    // `<select>.value`/`.selectedIndex`/`.options` read the chosen option, and
+    // setting either selects an option by writing the `selected` attribute the
+    // layout renderer reads — so JS selection and rendering stay in sync.
+    let mut b = DocumentBuilder::new();
+    let xo = b.text("X");
+    let yo = b.text("Y");
+    let zo = b.text("Z");
+    let o1 = b.element_attrs("option", vec![("value".into(), "x".into())], [xo]);
+    let o2 = b.element_attrs(
+        "option",
+        vec![("value".into(), "y".into()), ("selected".into(), "".into())],
+        [yo],
+    );
+    let o3 = b.element_attrs("option", vec![("value".into(), "z".into())], [zo]);
+    let sel = b.element_attrs("select", vec![("id".into(), "s".into())], [o1, o2, o3]);
+    let probe = b.element_attrs("div", vec![("id".into(), "p".into())], []);
+    let body = b.element("body", [sel, probe]);
+    let html = b.element("html", [body]);
+    let doc = b.finish(html);
+
+    let (mut engine, realm) = engine_and_realm();
+    let scripts = vec!["var s = document.getElementById('s'); \
+         var p = document.getElementById('p'); \
+         p.setAttribute('data-v', s.value); \
+         p.setAttribute('data-i', String(s.selectedIndex)); \
+         p.setAttribute('data-n', String(s.options.length)); \
+         p.setAttribute('data-t2', s.options[2].text); \
+         s.selectedIndex = 2; \
+         p.setAttribute('data-v2', s.value); \
+         s.value = 'x'; \
+         p.setAttribute('data-i2', String(s.selectedIndex));"
+        .to_string()];
+
+    let out = run_page_scripts(engine.as_mut(), realm, &doc, &scripts, &env()).expect("run");
+    let p = find_id(out.root(), "p").expect("#p present");
+    assert_eq!(p.attr("data-v"), Some("y"), "value is the selected option");
+    assert_eq!(p.attr("data-i"), Some("1"), "selectedIndex of the selected");
+    assert_eq!(p.attr("data-n"), Some("3"), "options.length");
+    assert_eq!(p.attr("data-t2"), Some("Z"), "options[2].text");
+    assert_eq!(p.attr("data-v2"), Some("z"), "selectedIndex=2 → value z");
+    assert_eq!(p.attr("data-i2"), Some("0"), "value='x' → selectedIndex 0");
+}
+
+#[test]
 fn form_control_type_checked_and_textarea_value_reflect() {
     // `input.type` defaults to "text"; `input.checked` reflects (and writes) the
     // `checked` attribute so it drives rendering; `textarea.value` falls back to
