@@ -2810,6 +2810,67 @@ pub const DOM_MODEL_PRELUDE: &str = r##"
     }
     g.Headers = function (init) { return makeHeaders(init); };
 
+    // URLSearchParams: query-string parsing/building, a near-universal page idiom
+    // (reading `?a=1&b=2`, mutating params, `.toString()` for a new URL). Pure
+    // JS over an ordered [name, value] list; `+` decodes to space and values are
+    // percent-encoded on serialize, per the WHATWG application/x-www-form-urlencoded
+    // rules. Returns an object (works with or without `new`, like `Headers`).
+    g.URLSearchParams = function (init) {
+      var pairs = [];
+      var dec = function (x) {
+        try { return decodeURIComponent(String(x).replace(/\+/g, " ")); }
+        catch (e) { return String(x); }
+      };
+      var enc = function (x) { return encodeURIComponent(String(x)).replace(/%20/g, "+"); };
+      var parse = function (s) {
+        s = String(s);
+        if (s.charAt(0) === "?") s = s.slice(1);
+        if (!s) return;
+        var parts = s.split("&");
+        for (var i = 0; i < parts.length; i++) {
+          if (!parts[i]) continue;
+          var eq = parts[i].indexOf("=");
+          if (eq === -1) pairs.push([dec(parts[i]), ""]);
+          else pairs.push([dec(parts[i].slice(0, eq)), dec(parts[i].slice(eq + 1))]);
+        }
+      };
+      if (init != null) {
+        if (typeof init === "string") {
+          parse(init);
+        } else if (typeof init.length === "number") {
+          for (var i = 0; i < init.length; i++) pairs.push([String(init[i][0]), String(init[i][1])]);
+        } else if (typeof init === "object") {
+          for (var k in init) {
+            if (Object.prototype.hasOwnProperty.call(init, k)) pairs.push([k, String(init[k])]);
+          }
+        }
+      }
+      var api = {
+        get: function (n) { n = String(n); for (var i = 0; i < pairs.length; i++) if (pairs[i][0] === n) return pairs[i][1]; return null; },
+        getAll: function (n) { n = String(n); var out = []; for (var i = 0; i < pairs.length; i++) if (pairs[i][0] === n) out.push(pairs[i][1]); return out; },
+        has: function (n) { n = String(n); for (var i = 0; i < pairs.length; i++) if (pairs[i][0] === n) return true; return false; },
+        append: function (n, v) { pairs.push([String(n), String(v)]); },
+        set: function (n, v) {
+          // Update the FIRST occurrence in place (preserving its position) and
+          // drop any later ones; append if absent — per the WHATWG set() steps.
+          n = String(n); v = String(v);
+          var first = -1;
+          for (var i = 0; i < pairs.length; i++) { if (pairs[i][0] === n) { first = i; break; } }
+          if (first === -1) { pairs.push([n, v]); return; }
+          pairs[first][1] = v;
+          for (var j = pairs.length - 1; j > first; j--) { if (pairs[j][0] === n) pairs.splice(j, 1); }
+        },
+        "delete": function (n) { n = String(n); for (var i = pairs.length - 1; i >= 0; i--) if (pairs[i][0] === n) pairs.splice(i, 1); },
+        sort: function () { pairs.sort(function (a, b) { return a[0] < b[0] ? -1 : a[0] > b[0] ? 1 : 0; }); },
+        forEach: function (fn, thisArg) { for (var i = 0; i < pairs.length; i++) fn.call(thisArg, pairs[i][1], pairs[i][0], api); },
+        keys: function () { return pairs.map(function (p) { return p[0]; }); },
+        values: function () { return pairs.map(function (p) { return p[1]; }); },
+        entries: function () { return pairs.map(function (p) { return [p[0], p[1]]; }); },
+        toString: function () { return pairs.map(function (p) { return enc(p[0]) + "=" + enc(p[1]); }).join("&"); },
+      };
+      return api;
+    };
+
     // ---- normalize an init.headers into [[name,value],...] -------------
     function normalizeHeaders(init) {
       var out = [];

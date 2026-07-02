@@ -66,6 +66,34 @@ fn doc_with_div_x() -> Document {
 }
 
 #[test]
+fn url_search_params_parses_mutates_and_serializes() {
+    // A page-side URLSearchParams round-trip: parse (with `?`, `+`, `%`), the
+    // multi-value accessors, set/append/delete, and encoded `toString`.
+    let (mut engine, realm) = engine_and_realm();
+    let doc = doc_with_div_x();
+    let scripts = vec!["var x = document.getElementById('x'); \
+         var u = new URLSearchParams('?a=1&b=hello%20world&a=3'); \
+         x.setAttribute('get', u.get('a')); \
+         x.setAttribute('all', u.getAll('a').join(',')); \
+         x.setAttribute('dec', u.get('b')); \
+         u.append('c', 'x+y'); u.set('a', '9'); u.delete('b'); \
+         x.setAttribute('str', u.toString());"
+        .to_string()];
+
+    let out = run_page_scripts(engine.as_mut(), realm, &doc, &scripts, &env()).expect("run");
+    let x = find_id(out.root(), "x").expect("#x present");
+    assert_eq!(x.attr("get"), Some("1"), "get returns the first value");
+    assert_eq!(x.attr("all"), Some("1,3"), "getAll returns every value");
+    assert_eq!(x.attr("dec"), Some("hello world"), "%20 and query decode");
+    // set collapses the two `a`s to one (=9), b removed, appended c encoded.
+    assert_eq!(
+        x.attr("str"),
+        Some("a=9&c=x%2By"),
+        "toString reflects mutations, encoded"
+    );
+}
+
+#[test]
 fn script_sets_text_content() {
     let (mut engine, realm) = engine_and_realm();
     let doc = doc_with_div_x();
