@@ -330,6 +330,86 @@ fn select_value_index_and_options_reflect() {
 }
 
 #[test]
+fn form_elements_collects_controls_with_index_and_named_access() {
+    // `form.elements` is the form's listed controls in tree order: `.length`
+    // and indexing work, each control is reachable by `name`/`id` and via
+    // `namedItem`, and `el.name` reflects the `name` attribute — the two idioms
+    // pages use to read a form for submission.
+    let mut b = DocumentBuilder::new();
+    let user = b.element_attrs(
+        "input",
+        vec![
+            ("name".into(), "user".into()),
+            ("value".into(), "alice".into()),
+        ],
+        [],
+    );
+    let oa = b.text("A");
+    let ob = b.text("B");
+    let opt_a = b.element_attrs("option", vec![("value".into(), "a".into())], [oa]);
+    let opt_b = b.element_attrs("option", vec![("value".into(), "b".into())], [ob]);
+    let role = b.element_attrs(
+        "select",
+        vec![("name".into(), "role".into())],
+        [opt_a, opt_b],
+    );
+    let go = b.element_attrs("button", vec![("id".into(), "go".into())], []);
+    // A stray non-control descendant must NOT be counted.
+    let span = b.element_attrs("span", vec![("name".into(), "nope".into())], []);
+    let form = b.element_attrs(
+        "form",
+        vec![("id".into(), "f".into())],
+        [user, role, go, span],
+    );
+    let probe = b.element_attrs("div", vec![("id".into(), "p".into())], []);
+    let body = b.element("body", [form, probe]);
+    let html = b.element("html", [body]);
+    let doc = b.finish(html);
+
+    let (mut engine, realm) = engine_and_realm();
+    let scripts = vec!["var f = document.getElementById('f'); \
+         var p = document.getElementById('p'); \
+         var els = f.elements; \
+         p.setAttribute('data-len', String(els.length)); \
+         p.setAttribute('data-i0', els[0].name); \
+         p.setAttribute('data-user', els.user.value); \
+         p.setAttribute('data-named', els.namedItem('role') ? els.namedItem('role').tagName : '?'); \
+         p.setAttribute('data-byid', els.go ? els.go.tagName : '?'); \
+         var order = []; for (var i = 0; i < els.length; i++) order.push(els[i].name || els[i].id); \
+         p.setAttribute('data-order', order.join(','));"
+        .to_string()];
+
+    let out = run_page_scripts(engine.as_mut(), realm, &doc, &scripts, &env()).expect("run");
+    let p = find_id(out.root(), "p").expect("#p present");
+    assert_eq!(
+        p.attr("data-len"),
+        Some("3"),
+        "three listed controls (span excluded)"
+    );
+    assert_eq!(
+        p.attr("data-i0"),
+        Some("user"),
+        "els[0].name reflects the name attr"
+    );
+    assert_eq!(p.attr("data-user"), Some("alice"), "named access by name");
+    assert_eq!(
+        p.attr("data-named"),
+        Some("SELECT"),
+        "namedItem looks up by name"
+    );
+    assert_eq!(
+        p.attr("data-byid"),
+        Some("BUTTON"),
+        "named access falls back to id"
+    );
+    assert_eq!(
+        p.attr("data-order"),
+        Some("user,role,go"),
+        "tree order preserved"
+    );
+}
+
+#[test]
 fn form_control_type_checked_and_textarea_value_reflect() {
     // `input.type` defaults to "text"; `input.checked` reflects (and writes) the
     // `checked` attribute so it drives rendering; `textarea.value` falls back to
