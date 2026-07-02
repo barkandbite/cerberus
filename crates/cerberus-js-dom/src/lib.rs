@@ -2871,6 +2871,44 @@ pub const DOM_MODEL_PRELUDE: &str = r##"
       return api;
     };
 
+    // btoa/atob: base64 of a binary (Latin-1) string and back. Common for data
+    // URIs, Basic-auth headers, and token blobs. Pure JS since QuickJS ships no
+    // base64 global; btoa throws on codepoints > 255 (like a real browser).
+    var B64 = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    g.btoa = function (input) {
+      var s = String(input), out = "", i = 0;
+      while (i < s.length) {
+        var b1 = s.charCodeAt(i++);
+        var b2 = i < s.length ? s.charCodeAt(i++) : NaN;
+        var b3 = i < s.length ? s.charCodeAt(i++) : NaN;
+        if (b1 > 255 || (b2 === b2 && b2 > 255) || (b3 === b3 && b3 > 255)) {
+          throw new Error("btoa: string contains characters outside of the Latin1 range");
+        }
+        var e1 = b1 >> 2;
+        var e2 = ((b1 & 3) << 4) | (b2 === b2 ? b2 >> 4 : 0);
+        var e3 = b2 === b2 ? (((b2 & 15) << 2) | (b3 === b3 ? b3 >> 6 : 0)) : 64;
+        var e4 = b3 === b3 ? (b3 & 63) : 64;
+        out += B64.charAt(e1) + B64.charAt(e2)
+             + (e3 === 64 ? "=" : B64.charAt(e3))
+             + (e4 === 64 ? "=" : B64.charAt(e4));
+      }
+      return out;
+    };
+    g.atob = function (input) {
+      var s = String(input).replace(/[ \t\n\f\r]/g, "");
+      if (s.length % 4 === 1) throw new Error("atob: invalid base64 length");
+      s = s.replace(/=+$/, "");
+      var out = "", bits = 0, buffer = 0;
+      for (var i = 0; i < s.length; i++) {
+        var idx = B64.indexOf(s.charAt(i));
+        if (idx === -1) throw new Error("atob: invalid base64 character");
+        buffer = (buffer << 6) | idx;
+        bits += 6;
+        if (bits >= 8) { bits -= 8; out += String.fromCharCode((buffer >> bits) & 0xff); }
+      }
+      return out;
+    };
+
     // ---- normalize an init.headers into [[name,value],...] -------------
     function normalizeHeaders(init) {
       var out = [];
