@@ -1252,7 +1252,8 @@ pub fn run_page_scripts_with_fetch(
 ///   attribute the renderer reads), `children`/`childNodes`,
 ///   `parentNode`/`parentElement`, `firstChild`/`lastChild`/`nextSibling`/
 ///   `previousSibling`, `appendChild`/`removeChild`/`insertBefore`/`remove`, a
-///   `dataset` (live `data-*` <-> camelCase map), store-only `style`,
+///   `dataset` (live `data-*` <-> camelCase map), `href`/`src` (resolved to an
+///   absolute URL against the document location), store-only `style`,
 ///   `getBoundingClientRect` (all-zero), scoped
 ///   `querySelector`/`querySelectorAll`/`matches`/`closest`,
 ///   `addEventListener`/`removeEventListener`/`dispatchEvent` and the
@@ -1890,6 +1891,59 @@ pub const DOM_MODEL_PRELUDE: &str = r##"
       });
       return this.__dataset;
     });
+    // Resolve a possibly-relative URL against the document location, so
+    // `a.href` / `img.src` return the *absolute* URL the spec requires (pages
+    // routinely compare or log these). Reads `g.location` at call time (set
+    // later in this prelude). Handles absolute, protocol-relative, absolute-
+    // path, query-only, fragment-only and dot-segment relative references.
+    function resolveUrl(rel) {
+      rel = (rel == null) ? "" : String(rel);
+      var loc = g.location || {};
+      var baseHref = loc.href || "";
+      if (rel === "") return baseHref;
+      if (/^[a-zA-Z][a-zA-Z0-9+.\-]*:/.test(rel)) return rel; // already absolute
+      var protocol = loc.protocol || "https:";
+      var origin = loc.origin || (protocol + "//" + (loc.host || ""));
+      if (rel.indexOf("//") === 0) return protocol + rel;      // protocol-relative
+      if (rel.charAt(0) === "#") return baseHref.split("#")[0] + rel;
+      if (rel.charAt(0) === "?") return baseHref.split("#")[0].split("?")[0] + rel;
+      var tail = "";
+      var hi = rel.search(/[?#]/);
+      if (hi >= 0) { tail = rel.slice(hi); rel = rel.slice(0, hi); }
+      var path;
+      if (rel.charAt(0) === "/") {
+        path = rel;
+      } else {
+        var basePath = loc.pathname || "/";
+        var dir = basePath.slice(0, basePath.lastIndexOf("/") + 1) || "/";
+        path = dir + rel;
+      }
+      var parts = path.split("/"), stack = [];
+      for (var i = 0; i < parts.length; i++) {
+        if (parts[i] === "..") { stack.pop(); }
+        else if (parts[i] !== ".") { stack.push(parts[i]); }
+      }
+      var norm = stack.join("/");
+      if (norm.charAt(0) !== "/") norm = "/" + norm;
+      return origin + norm + tail;
+    }
+    var HREF_TAGS = { a: 1, area: 1, link: 1, base: 1 };
+    var SRC_TAGS = { img: 1, script: 1, iframe: 1, source: 1, audio: 1, video: 1, track: 1, embed: 1, frame: 1 };
+    // `.href` / `.src` reflect their attribute resolved to an absolute URL (or
+    // "" when the element type carries the attribute but it is unset); other
+    // element types have no such property (undefined), per the DOM.
+    defAccessor(ELEMENT_PROTO, "href",
+      function () {
+        if (!HREF_TAGS[this.__tag]) return undefined;
+        var v = getAttr(this, "href"); return v === null ? "" : resolveUrl(v);
+      },
+      function (v) { setAttr(this, "href", String(v)); });
+    defAccessor(ELEMENT_PROTO, "src",
+      function () {
+        if (!SRC_TAGS[this.__tag]) return undefined;
+        var v = getAttr(this, "src"); return v === null ? "" : resolveUrl(v);
+      },
+      function (v) { setAttr(this, "src", String(v)); });
     defAccessor(ELEMENT_PROTO, "innerText",
       function () { var acc = []; collectText(this, acc); return acc.join(""); },
       function (v) { this.textContent = v; });
