@@ -1846,12 +1846,51 @@ pub const DOM_MODEL_PRELUDE: &str = r##"
     defAccessor(ELEMENT_PROTO, "checked",
       function () { return getAttr(this, "checked") !== null; },
       function (v) { if (v) { setAttr(this, "checked", ""); } else { removeAttr(this, "checked"); } });
+    // `form.elements`: the form's listed controls as an HTMLFormControlsCollection
+    // — an array (so `.length`, indexing and iteration work) that also exposes each
+    // control by its `name`/`id` (`form.elements.user`) and a `namedItem(name)`
+    // method, matching the two idioms real pages use to read a form. Only listed
+    // control tags participate (input/select/textarea/button/fieldset/output/object),
+    // in tree order. Non-form elements return an empty collection.
+    var LISTED_CONTROLS = {
+      input: 1, select: 1, textarea: 1, button: 1, fieldset: 1, output: 1, object: 1,
+    };
+    defAccessor(ELEMENT_PROTO, "elements", function () {
+      var out = [];
+      if (this.__tag !== "form") return out;
+      walkElements(this, function (el) {
+        if (LISTED_CONTROLS[el.__tag]) out.push(el);
+      });
+      // Named access mirrors the spec: id and name both index the collection,
+      // and `namedItem` looks up by either. Defined non-enumerable so they don't
+      // perturb `.length`/index iteration.
+      var named = {};
+      for (var i = 0; i < out.length; i++) {
+        var key = getAttr(out[i], "name");
+        if (key === null) key = getAttr(out[i], "id");
+        if (key !== null && key !== "" && !(key in named)) named[key] = out[i];
+      }
+      for (var k in named) {
+        Object.defineProperty(out, k, { value: named[k], enumerable: false, configurable: true });
+      }
+      Object.defineProperty(out, "namedItem", {
+        value: function (n) { return named[n] || null; },
+        enumerable: false, configurable: true,
+      });
+      return out;
+    });
     // `el.hidden` reflects the `hidden` boolean attribute, so `el.hidden = true`
     // hides the element via the UA `[hidden] { display: none }` rule (and reads
     // back the initial `<x hidden>` state).
     defAccessor(ELEMENT_PROTO, "hidden",
       function () { return getAttr(this, "hidden") !== null; },
       function (v) { if (v) { setAttr(this, "hidden", ""); } else { removeAttr(this, "hidden"); } });
+    // `el.name` reflects the `name` attribute (form controls, `<form>`, `<img>`,
+    // …). Pages iterate `form.elements` and read `.name` to build submissions, so
+    // an unreflected name read back undefined and lost the field.
+    defAccessor(ELEMENT_PROTO, "name",
+      function () { return getAttr(this, "name") || ""; },
+      function (v) { setAttr(this, "name", String(v)); });
     defAccessor(ELEMENT_PROTO, "className",
       function () { return getAttr(this, "class") || ""; },
       function (v) { setAttr(this, "class", v); });
