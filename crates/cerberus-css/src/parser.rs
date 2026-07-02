@@ -259,7 +259,7 @@ fn feature_matches(f: MediaFeature, ctx: MediaContext) -> bool {
 #[derive(Clone, Debug)]
 pub struct Rule {
     pub selectors: Vec<Selector>,
-    pub declarations: Vec<(String, String)>,
+    pub declarations: Vec<(String, String, bool)>,
     pub media: Option<MediaQuery>,
 }
 
@@ -354,7 +354,12 @@ fn parse_rules_into(text: &str, media: Option<&MediaQuery>, out: &mut Vec<Rule>)
 }
 
 /// Parse a `prop: value; …` block (also used for inline `style=` attributes).
-pub fn parse_declaration_block(text: &str) -> Vec<(String, String)> {
+///
+/// Each declaration carries an `important` flag: a trailing `!important` is
+/// stripped from the value *and recorded*, so the cascade can let it override
+/// normal declarations (previously the flag was parsed then dropped, so
+/// `color: red !important` competed at normal priority — a cascade bug).
+pub fn parse_declaration_block(text: &str) -> Vec<(String, String, bool)> {
     let mut decls = Vec::new();
     for chunk in text.split(';') {
         let chunk = chunk.trim();
@@ -365,12 +370,16 @@ pub fn parse_declaration_block(text: &str) -> Vec<(String, String)> {
             let prop = prop.trim().to_ascii_lowercase();
             let mut value = value.trim().to_string();
             let low = value.to_ascii_lowercase();
-            if let Some(pos) = low.rfind("!important") {
-                value.truncate(pos);
-                value = value.trim().to_string();
-            }
+            let important = match low.rfind("!important") {
+                Some(pos) => {
+                    value.truncate(pos);
+                    value = value.trim().to_string();
+                    true
+                }
+                None => false,
+            };
             if !prop.is_empty() {
-                decls.push((prop, value));
+                decls.push((prop, value, important));
             }
         }
     }
