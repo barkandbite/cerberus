@@ -66,6 +66,40 @@ fn doc_with_div_x() -> Document {
 }
 
 #[test]
+fn btoa_and_atob_round_trip_base64() {
+    // Base64 encode/decode with correct padding, round-trip, and the Latin1
+    // guard on btoa.
+    let (mut engine, realm) = engine_and_realm();
+    let doc = doc_with_div_x();
+    let scripts = vec!["var x = document.getElementById('x'); \
+         x.setAttribute('enc', btoa('Man')); \
+         x.setAttribute('pad', btoa('M')); \
+         x.setAttribute('dec', atob('TWFu')); \
+         x.setAttribute('round', atob(btoa('Hello, World!'))); \
+         x.setAttribute('auth', btoa('user:pass')); \
+         var threw = false; try { btoa('\\u2603'); } catch (e) { threw = true; } \
+         x.setAttribute('latin1', String(threw));"
+        .to_string()];
+
+    let out = run_page_scripts(engine.as_mut(), realm, &doc, &scripts, &env()).expect("run");
+    let x = find_id(out.root(), "x").expect("#x present");
+    assert_eq!(x.attr("enc"), Some("TWFu"), "btoa encodes");
+    assert_eq!(x.attr("pad"), Some("TQ=="), "btoa pads a 1-byte input");
+    assert_eq!(x.attr("dec"), Some("Man"), "atob decodes");
+    assert_eq!(
+        x.attr("round"),
+        Some("Hello, World!"),
+        "btoa/atob round-trip"
+    );
+    assert_eq!(x.attr("auth"), Some("dXNlcjpwYXNz"), "basic-auth blob");
+    assert_eq!(
+        x.attr("latin1"),
+        Some("true"),
+        "btoa rejects codepoints > 255"
+    );
+}
+
+#[test]
 fn url_search_params_parses_mutates_and_serializes() {
     // A page-side URLSearchParams round-trip: parse (with `?`, `+`, `%`), the
     // multi-value accessors, set/append/delete, and encoded `toString`.
