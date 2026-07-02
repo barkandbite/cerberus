@@ -883,7 +883,9 @@ impl<'a> Ctx<'a> {
         let gap = if self.x == self.left {
             0
         } else {
-            space_width(self.shaper, px) as i32
+            // `word-spacing` adds to (or, if negative, trims) the normal space
+            // advance between words; clamp so a large negative can't reverse it.
+            (space_width(self.shaper, px) as i32 + style.word_spacing).max(0)
         };
         if self.x != self.left && self.x + gap + w as i32 > self.right {
             self.newline();
@@ -3890,6 +3892,26 @@ mod tests {
         );
         let (nw, sw) = (fill_rects(&normal)[0].w, fill_rects(&spaced)[0].w);
         assert!(sw > nw + 20, "letter-spacing widens the run: {sw} vs {nw}");
+    }
+
+    #[test]
+    fn word_spacing_widens_inter_word_gaps() {
+        // Four words → three inter-word gaps; word-spacing:30px adds 30 to each,
+        // so the shrink-to-fit run grows by ~90px. Single-word runs are unaffected
+        // by word-spacing (no gaps), unlike letter-spacing.
+        let normal = lay(
+            "<div style='display:flex'><div style='background:#ff0000'>a b c d</div></div>",
+            800,
+        );
+        let spaced = lay(
+            "<div style='display:flex'><div style='background:#ff0000;word-spacing:30px'>a b c d</div></div>",
+            800,
+        );
+        let (nw, sw) = (fill_rects(&normal)[0].w, fill_rects(&spaced)[0].w);
+        assert!(
+            sw > nw + 60,
+            "word-spacing widens the inter-word gaps: {sw} vs {nw}"
+        );
     }
 
     #[test]
