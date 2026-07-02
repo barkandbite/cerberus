@@ -1170,7 +1170,7 @@ pub fn render(config: &RenderConfig) -> Result<RenderOutcome, AppError> {
         images_decoded,
         third_party_decision,
         subresources_blocked,
-        page_text: config.dump_text.then(|| visible_text(document.root())),
+        page_text: config.dump_text.then(|| visible_text(&styled.root)),
         timings: if config.timers {
             timings.as_pairs()
         } else {
@@ -1722,22 +1722,27 @@ fn resolve_subresource(base: Option<&Url>, src: &str) -> String {
     }
 }
 
-/// The page's user-visible text: like `text_content`, but `<script>`/`<style>`
-/// payloads are skipped (they are code, not page text — for `--dump-text`).
-fn visible_text(node: NodeRef<'_>) -> String {
-    fn walk(node: NodeRef<'_>, out: &mut String) {
-        if matches!(node.tag(), "script" | "style") {
+/// The page's user-visible text (for `--dump-text`): walks the **styled** tree
+/// so it honors computed `display` — a `display: none` / `[hidden]` subtree
+/// contributes no text, matching what is actually painted. `<script>`/`<style>`
+/// payloads are code, not page text, and are skipped too. (Walking the raw DOM
+/// would leak text from hidden elements.)
+fn visible_text(root: &StyledNode) -> String {
+    fn walk(node: &StyledNode, out: &mut String) {
+        if node.style.display == cerberus_style::Display::None
+            || matches!(node.tag.as_str(), "script" | "style")
+        {
             return;
         }
-        if let Some(text) = node.text() {
-            out.push_str(text);
-        }
-        for child in node.children() {
-            walk(child, out);
+        for child in &node.children {
+            match child {
+                StyledChild::Text(t) => out.push_str(t),
+                StyledChild::Element(e) => walk(e, out),
+            }
         }
     }
     let mut out = String::new();
-    walk(node, &mut out);
+    walk(root, &mut out);
     out
 }
 
@@ -5334,6 +5339,25 @@ mod tests {
         assert_eq!(outcome.third_party_decision, Decision::Deny);
         // A frame was produced at the requested size.
         assert_eq!(outcome.framebuffer.size, RenderConfig::default().viewport);
+    }
+
+    #[test]
+    fn visible_text_skips_hidden_and_display_none() {
+        // `--dump-text` must reflect what is painted: a `[hidden]` element (UA
+        // `display:none`), an inline `display:none`, and everything nested under
+        // a `display:none` subtree contribute no text; `<script>`/`<style>`
+        // payloads are code, not page text.
+        let doc = parse_html(
+            "<p>A</p>\
+             <p hidden>H</p>\
+             <p style='display:none'>N</p>\
+             <div style='display:none'><span>NESTED</span></div>\
+             <script>var s = 1;</script>\
+             <style>.x { color: red }</style>\
+             <p>B</p>",
+        );
+        let styled = CssEngine::new().style(&doc);
+        assert_eq!(visible_text(&styled.root), "AB");
     }
 
     #[test]
