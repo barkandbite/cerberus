@@ -337,6 +337,42 @@ fn resolve_value(value: &str, vars: &Vars, em: f32) -> String {
     }
 }
 
+/// Replace the `currentColor` keyword (case-insensitive) with `color` rendered
+/// as `rgba(...)`, which every color parser here already understands. CSS
+/// resolves `currentColor` to the element's own computed `color`; we use the
+/// value cascaded so far — the inherited color unless an earlier declaration in
+/// this element set it. Most values never mention it (fast path returns as-is).
+fn substitute_current_color(value: &str, color: cerberus_types::Color) -> String {
+    const KW: &str = "currentcolor";
+    let lower = value.to_ascii_lowercase();
+    if !lower.contains(KW) {
+        return value.to_string();
+    }
+    // No spaces inside the function: some property parsers grab the first
+    // whitespace-delimited token (e.g. `border-color`), so a spaced `rgba(…)`
+    // would be split apart.
+    let repl = format!(
+        "rgba({},{},{},{})",
+        color.r,
+        color.g,
+        color.b,
+        color.a as f32 / 255.0
+    );
+    // Splice from the ORIGINAL string (not the lowercased copy) so any
+    // case-sensitive neighbours — e.g. a `url(Path.png)` in a `background`
+    // shorthand — keep their casing.
+    let mut out = String::with_capacity(value.len());
+    let mut i = 0;
+    while let Some(rel) = lower[i..].find(KW) {
+        let start = i + rel;
+        out.push_str(&value[i..start]);
+        out.push_str(&repl);
+        i = start + KW.len();
+    }
+    out.push_str(&value[i..]);
+    out
+}
+
 /// Replace every `var(--name[, fallback])` in `input` with the custom property's
 /// value (resolved recursively, since a custom property may itself reference
 /// others), falling back to the comma fallback or empty. Guarded against cycles
@@ -617,6 +653,10 @@ fn apply_declarations(
         // Resolve `var()` references and `calc()` math before parsing the value.
         // `em` for `calc()` uses the element's current font size.
         let resolved = resolve_value(value, vars, style.font_size as f32);
+        // Then resolve the `currentColor` keyword against the color cascaded so
+        // far, so it works anywhere a color appears (borders, backgrounds,
+        // shadows, gradients) — not just as an unresolved literal.
+        let resolved = substitute_current_color(&resolved, style.color);
         let v = resolved.trim();
         match prop.as_str() {
             "color" => {
@@ -2124,6 +2164,40 @@ mod tests {
             first(&dom.root, "p").unwrap().style.color,
             Color::rgb(0, 0xff, 0),
             "higher-specificity !important wins among important declarations"
+        );
+    }
+
+    #[test]
+    fn current_color_resolves_to_the_elements_color() {
+        // `currentColor` in a non-`color` slot resolves to the element's own
+        // cascaded `color` (here set red earlier in the same rule).
+        let html = "<html><head><style>\
+            p { color: #ff0000; border-color: currentColor }\
+            </style></head><body><p>x</p></body></html>";
+        let dom = CssEngine::new().style(&parse_html(html));
+        let p = first(&dom.root, "p").unwrap();
+        assert_eq!(p.style.color, Color::rgb(0xff, 0, 0));
+        assert_eq!(
+            p.style.border_color,
+            Color::rgb(0xff, 0, 0),
+            "border-color: currentColor picks up the element color"
+        );
+    }
+
+    #[test]
+    fn current_color_uses_inherited_color() {
+        // With no `color` on the element, `currentColor` resolves to the
+        // inherited color from the parent.
+        let html = "<html><head><style>\
+            div { color: #00ff00 }\
+            span { border-color: currentColor }\
+            </style></head><body><div><span>x</span></div></body></html>";
+        let dom = CssEngine::new().style(&parse_html(html));
+        let span = first(&dom.root, "span").unwrap();
+        assert_eq!(
+            span.style.border_color,
+            Color::rgb(0, 0xff, 0),
+            "currentColor inherits the parent's color"
         );
     }
 
