@@ -602,20 +602,25 @@ fn apply_declarations(
                 }
             }
             "background" | "background-color" => {
-                if let Some(c) = parse_bg_color(v) {
-                    style.background = (c.a != 0).then_some(c);
-                }
-                // The `background` shorthand may also carry an image/gradient and,
-                // crucially for real sites, a `<position> / <size>` group such as
-                // `center / cover` (ADR-0044/0045).
                 if prop == "background" {
+                    // The shorthand resets *every* longhand it can set to its
+                    // initial value, then applies what the value specifies — so
+                    // `background: url(x)` / `background: none` (neither parses
+                    // as a color) clears a previously-cascaded color to
+                    // transparent (`None`), not just the image/gradient. Color,
+                    // image, gradient, position, and size are all recomputed
+                    // from the value here (ADR-0044/0045).
+                    style.background = parse_bg_color(v).filter(|c| c.a != 0);
                     style.background_image = parse_url_value(v);
                     style.background_gradient = parse_gradient(v).map(Box::new);
-                    // The shorthand resets every longhand it can set, including
-                    // position/size, before applying whatever the value specifies.
                     style.background_position = ImagePos::TOP_LEFT;
                     style.background_size = ImageFit::Fill;
                     apply_background_shorthand_geometry(style, v);
+                } else if let Some(c) = parse_bg_color(v) {
+                    // Standalone `background-color` longhand: additive — only
+                    // overwrite when the value parses, so an unparseable value
+                    // leaves a prior color intact.
+                    style.background = (c.a != 0).then_some(c);
                 }
             }
             "background-image" => {
@@ -2195,6 +2200,36 @@ mod tests {
             s("background-position: right; background-size: cover; background-color: red");
         assert_eq!(color_only.background_position, ImagePos { x: 1.0, y: 0.5 });
         assert_eq!(color_only.background_size, ImageFit::Cover);
+    }
+
+    #[test]
+    fn background_shorthand_resets_a_prior_color() {
+        let s = |css: &str| {
+            let dom = CssEngine::new().style(&parse_html(&format!("<div style='{css}'>x</div>")));
+            first(&dom.root, "div").unwrap().style.clone()
+        };
+        // A shorthand with no color component clears a previously-set color to
+        // transparent (issue #78) — it must not leak behind the image.
+        assert_eq!(
+            s("background: red; background: url(x)").background,
+            None,
+            "a later `background: url(x)` resets the color to transparent"
+        );
+        // `background: none` clears both the image and any prior color.
+        assert_eq!(s("background: red; background: none").background, None);
+        // Positive case: a color in the shorthand is still applied.
+        assert_eq!(
+            s("background: #fff url(x)").background,
+            Some(Color::rgb(255, 255, 255)),
+            "a color present in the shorthand is kept"
+        );
+        // The standalone `background-color` longhand stays additive: an
+        // unparseable value does not wipe a prior color.
+        assert_eq!(
+            s("background-color: red; background-color: nonsense").background,
+            Some(Color::rgb(255, 0, 0)),
+            "a bad background-color longhand leaves the prior color intact"
+        );
     }
 
     #[test]
