@@ -112,6 +112,69 @@ fn script_sets_attribute_and_class() {
 }
 
 #[test]
+fn form_control_type_checked_and_textarea_value_reflect() {
+    // `input.type` defaults to "text"; `input.checked` reflects (and writes) the
+    // `checked` attribute so it drives rendering; `textarea.value` falls back to
+    // the element's text content when there is no value attribute.
+    let mut b = DocumentBuilder::new();
+    let cbtext = b.text("area");
+    let input = b.element_attrs(
+        "input",
+        vec![
+            ("id".into(), "cb".into()),
+            ("type".into(), "checkbox".into()),
+        ],
+        [],
+    );
+    let ta = b.element_attrs("textarea", vec![("id".into(), "ta".into())], [cbtext]);
+    let probe = b.element_attrs("div", vec![("id".into(), "p".into())], []);
+    let body = b.element("body", [input, ta, probe]);
+    let html = b.element("html", [body]);
+    let doc = b.finish(html);
+
+    let (mut engine, realm) = engine_and_realm();
+    let scripts = vec!["var cb = document.getElementById('cb'); \
+         var ta = document.getElementById('ta'); \
+         var p = document.getElementById('p'); \
+         p.setAttribute('data-type', cb.type); \
+         p.setAttribute('data-checked0', String(cb.checked)); \
+         cb.checked = true; \
+         p.setAttribute('data-checked1', String(cb.checked)); \
+         p.setAttribute('data-ta', ta.value);"
+        .to_string()];
+
+    let out = run_page_scripts(engine.as_mut(), realm, &doc, &scripts, &env()).expect("run");
+    let p = find_id(out.root(), "p").expect("#p present");
+    assert_eq!(
+        p.attr("data-type"),
+        Some("checkbox"),
+        "input.type reflects attr"
+    );
+    assert_eq!(
+        p.attr("data-checked0"),
+        Some("false"),
+        "unchecked initially"
+    );
+    assert_eq!(
+        p.attr("data-checked1"),
+        Some("true"),
+        "el.checked=true reflects"
+    );
+    assert_eq!(
+        p.attr("data-ta"),
+        Some("area"),
+        "textarea.value is its text"
+    );
+
+    // The scripted `checked = true` must reflect onto the input for rendering.
+    let cb = find_id(out.root(), "cb").expect("#cb present");
+    assert!(
+        cb.attr("checked").is_some(),
+        "checked attribute set for layout"
+    );
+}
+
+#[test]
 fn programmatic_click_fires_listeners_and_bubbles() {
     // `element.click()` must dispatch a click event to the element's own
     // listeners and bubble to ancestors — a page toggling a menu via

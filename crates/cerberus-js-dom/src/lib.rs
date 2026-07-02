@@ -1245,7 +1245,9 @@ pub fn run_page_scripts_with_fetch(
 ///   raw fragment reparsed in Rust — see below), `insertAdjacentHTML`,
 ///   `getAttribute`/`setAttribute`/`removeAttribute`/`hasAttribute`/
 ///   `getAttributeNames`, `id`, `className`, `classList`
-///   (`add`/`remove`/`toggle`/`contains`/`length`), `children`/`childNodes`,
+///   (`add`/`remove`/`toggle`/`contains`/`length`), form-control `value`
+///   (`<textarea>` falls back to its text), `type` (spec defaults), `checked`
+///   (reflects the `checked` attribute), `children`/`childNodes`,
 ///   `parentNode`/`parentElement`, `firstChild`/`lastChild`/`nextSibling`/
 ///   `previousSibling`, `appendChild`/`removeChild`/`insertBefore`/`remove`, a
 ///   store-only `style`, `getBoundingClientRect` (all-zero), scoped
@@ -1749,10 +1751,39 @@ pub const DOM_MODEL_PRELUDE: &str = r##"
       function (v) { setAttr(this, "id", v); });
     // Form-control current value, backed by the `value` attribute so handlers
     // can read/modify `el.value` and the change reflects in serialize/layout
-    // (M12b input events).
+    // (M12b input events). A <textarea> has no value attribute — its value is its
+    // text content — so fall back to that when the attribute is unset.
     defAccessor(ELEMENT_PROTO, "value",
-      function () { var v = getAttr(this, "value"); return v === null ? "" : v; },
+      function () {
+        var v = getAttr(this, "value");
+        if (v !== null) return v;
+        if (this.__tag === "textarea") { var acc = []; collectText(this, acc); return acc.join(""); }
+        return "";
+      },
       function (v) { setAttr(this, "value", String(v)); });
+    // `input.type` (and friends): reflect the `type` attribute, defaulting per
+    // element as the DOM spec does (input→"text", button→"submit", …), so a
+    // page that branches on `el.type` sees a sensible value instead of undefined.
+    defAccessor(ELEMENT_PROTO, "type",
+      function () {
+        var t = getAttr(this, "type");
+        if (t !== null) return this.__tag === "input" ? String(t).toLowerCase() : t;
+        switch (this.__tag) {
+          case "input": return "text";
+          case "button": return "submit";
+          case "textarea": return "textarea";
+          case "select": return getAttr(this, "multiple") !== null ? "select-multiple" : "select-one";
+          default: return "";
+        }
+      },
+      function (v) { setAttr(this, "type", String(v)); });
+    // `checked` for checkbox/radio, backed by the `checked` attribute so both
+    // the initial HTML state (`<input checked>`) reads back true and a scripted
+    // `el.checked = true/false` reflects into serialize/layout (which renders a
+    // checkbox from that attribute — see cerberus-layout).
+    defAccessor(ELEMENT_PROTO, "checked",
+      function () { return getAttr(this, "checked") !== null; },
+      function (v) { if (v) { setAttr(this, "checked", ""); } else { removeAttr(this, "checked"); } });
     defAccessor(ELEMENT_PROTO, "className",
       function () { return getAttr(this, "class") || ""; },
       function (v) { setAttr(this, "class", v); });
