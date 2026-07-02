@@ -330,6 +330,10 @@ impl<'a> Ctx<'a> {
     /// needed). The `field_id` is seeded from the parent so controls inside the
     /// cell continue the document-wide pre-order numbering; the parent reads the
     /// advanced counter back after the cell is flowed.
+    // Folding these into a shared `LayoutEnv` (shaper/images/forms/viewport) is
+    // the cleaner shape, but that belongs with the #20 walker decomposition; for
+    // now the explicit params keep viewport propagation a compile-time obligation.
+    #[allow(clippy::too_many_arguments)]
     fn sub(
         left: i32,
         right: i32,
@@ -338,6 +342,12 @@ impl<'a> Ctx<'a> {
         images: &'a dyn ImageProvider,
         forms: &'a dyn FormState,
         field_id: u32,
+        // The viewport is global to a layout pass; every sub-context must resolve
+        // `vh`/`vw` (and viewport-relative insets) against the *real* viewport, so
+        // it is a required parameter — making omission a compile error rather than
+        // the silent `vw:0/vh:0` collapse that hit flex/grid/table/float children.
+        vw: i32,
+        vh: i32,
     ) -> Self {
         Self {
             shaper,
@@ -360,8 +370,8 @@ impl<'a> Ctx<'a> {
             cur_link_node: None,
             opacity_hidden: false,
             scratch: None,
-            vw: 0,
-            vh: 0,
+            vw,
+            vh,
             positioned: Vec::new(),
             pos_order: 0,
             cb_stack: Vec::new(),
@@ -912,10 +922,10 @@ impl<'a> Ctx<'a> {
             self.images,
             self.forms,
             self.field_id,
+            self.vw,
+            self.vh,
         );
         sub.measuring = self.measuring;
-        sub.vw = self.vw;
-        sub.vh = self.vh;
         sub.as_block_once = true; // lay `e` with the block box model, filling [x, x+w]
         sub.walk(e, in_link);
         sub.flush_line();
@@ -1367,6 +1377,8 @@ impl<'a> Ctx<'a> {
                 self.images,
                 self.forms,
                 field_id,
+                self.vw,
+                self.vh,
             ))
         });
         scratch.reset_for_measure(field_id);
@@ -1395,6 +1407,8 @@ impl<'a> Ctx<'a> {
                 self.images,
                 self.forms,
                 field_id,
+                self.vw,
+                self.vh,
             ))
         });
         scratch.reset_for_measure(field_id);
@@ -1602,6 +1616,8 @@ impl<'a> Ctx<'a> {
             self.images,
             self.forms,
             self.field_id,
+            self.vw,
+            self.vh,
         );
         sub.measuring = self.measuring;
         sub.walk(e, in_link);
@@ -1888,6 +1904,8 @@ impl<'a> Ctx<'a> {
                     self.images,
                     self.forms,
                     self.field_id,
+                    self.vw,
+                    self.vh,
                 );
                 sub.measuring = self.measuring;
                 sub.walk(items[i], None);
@@ -1970,6 +1988,8 @@ impl<'a> Ctx<'a> {
                 self.images,
                 self.forms,
                 self.field_id,
+                self.vw,
+                self.vh,
             );
             sub.measuring = self.measuring;
             sub.walk(it, None);
@@ -2080,6 +2100,8 @@ impl<'a> Ctx<'a> {
                 self.images,
                 self.forms,
                 self.field_id,
+                self.vw,
+                self.vh,
             );
             sub.measuring = self.measuring;
             sub.walk(it, None);
@@ -2282,6 +2304,8 @@ impl<'a> Ctx<'a> {
             self.images,
             self.forms,
             self.field_id,
+            self.vw,
+            self.vh,
         );
 
         let is_header = cell.tag == "th";
@@ -3748,6 +3772,41 @@ mod tests {
             "50vh of 2000 ~ 1000: {}",
             fill_rects(&vh)[0].h
         );
+    }
+
+    #[test]
+    fn viewport_units_resolve_inside_nested_contexts() {
+        // Regression for #58: `vh`/`vw` used to collapse to 0 inside every nested
+        // formatting context because `Ctx::sub` seeded vw:0/vh:0. With the real
+        // viewport (2000 tall) propagated, a `height:50vh` element laid inside a
+        // flex item, a grid cell, and a table cell now resolves to ~1000 (half the
+        // viewport) instead of collapsing to its content height.
+        let has_1000_tall = |laid: &LaidOut| {
+            fill_rects(laid)
+                .iter()
+                .any(|r| (r.h as i32 - 1000).abs() <= 8)
+        };
+
+        let flex = lay(
+            "<div style='display:flex'>\
+               <div style='background:#00ff00;height:50vh'>x</div></div>",
+            400,
+        );
+        assert!(has_1000_tall(&flex), "50vh resolves inside a flex item");
+
+        let grid = lay(
+            "<div style='display:grid'>\
+               <div style='background:#00ff00;height:50vh'>x</div></div>",
+            400,
+        );
+        assert!(has_1000_tall(&grid), "50vh resolves inside a grid cell");
+
+        let table = lay(
+            "<table><tr><td>\
+               <div style='background:#00ff00;height:50vh'>x</div></td></tr></table>",
+            400,
+        );
+        assert!(has_1000_tall(&table), "50vh resolves inside a table cell");
     }
 
     #[test]
