@@ -256,6 +256,17 @@ const VOID: &[&str] = &[
     "track", "wbr",
 ];
 
+/// Maximum open-element nesting depth the tree builder will keep. The builder
+/// itself is iterative (depth-safe), but **every** downstream consumer walks the
+/// tree by direct recursion (`CssEngine::build`, `Ctx::walk`, `serialize_node`,
+/// paint), so an arbitrarily deep arena would overflow the stack one stage later
+/// — and with `panic = "abort"` that is an unrecoverable, remotely-triggerable
+/// process kill. Capping here bounds the recursion depth of all of them at once.
+/// 512 is well above any real page (browsers use a comparable fragment limit);
+/// elements nested past it are flattened into the deepest kept ancestor rather
+/// than opening a new frame.
+const MAX_OPEN_DEPTH: usize = 512;
+
 /// Whether `tag`'s content is raw text (not parsed as markup), and if so whether
 /// to keep that text. `<style>`/`<title>`/`<textarea>` keep it (the CSS engine /
 /// page reads it); scripts and embedded frames are dropped.
@@ -333,7 +344,12 @@ fn build_tree(tokens: Vec<Token>, scripts: Vec<String>) -> Document {
             }
             Token::Open(name, attrs) => {
                 close_implied(&mut nodes, &mut stack, &name);
-                if VOID.contains(&name.as_str()) {
+                if VOID.contains(&name.as_str()) || stack.len() >= MAX_OPEN_DEPTH {
+                    // At the depth cap, materialize the element immediately (with
+                    // no children) instead of opening a new frame, so pathological
+                    // nesting can't grow the open-element stack — and therefore the
+                    // recursion depth of every downstream tree walker. Its content
+                    // flattens into the deepest kept ancestor.
                     push_element(&mut nodes, &mut stack, OpenElement::with_attrs(name, attrs));
                 } else {
                     stack.push(OpenElement::with_attrs(name, attrs));
@@ -889,6 +905,29 @@ mod tests {
         let html = doc.root().children().next().expect("html element");
         assert!(html.is_element());
         assert_eq!(html.tag(), "html");
+    }
+
+    #[test]
+    fn deep_nesting_is_capped_so_walkers_cannot_overflow() {
+        // A depth bomb: 100k nested <div> (the kind of input that overflows an
+        // 8 MB stack in the first recursive walker under panic=abort). The builder
+        // must flatten past MAX_OPEN_DEPTH so the resulting arena is shallow.
+        let html = "<div>".repeat(100_000);
+        let doc = parse_html(&html);
+        // Measure the deepest element chain *iteratively* — a recursive measure
+        // would itself overflow if the cap were absent, defeating the test.
+        let mut max_depth = 0usize;
+        let mut stack = vec![(doc.root(), 0usize)];
+        while let Some((node, depth)) = stack.pop() {
+            max_depth = max_depth.max(depth);
+            for child in node.children() {
+                stack.push((child, depth + 1));
+            }
+        }
+        assert!(
+            max_depth <= MAX_OPEN_DEPTH + 2,
+            "nesting capped near {MAX_OPEN_DEPTH}, got depth {max_depth}"
+        );
     }
 
     #[test]
