@@ -1249,7 +1249,10 @@ pub fn run_page_scripts_with_fetch(
 ///   `parentNode`/`parentElement`, `firstChild`/`lastChild`/`nextSibling`/
 ///   `previousSibling`, `appendChild`/`removeChild`/`insertBefore`/`remove`, a
 ///   store-only `style`, `getBoundingClientRect` (all-zero), scoped
-///   `querySelector`/`querySelectorAll`/`matches`/`closest`.
+///   `querySelector`/`querySelectorAll`/`matches`/`closest`,
+///   `addEventListener`/`removeEventListener`/`dispatchEvent` and the
+///   `click`/`focus`/`blur` convenience methods (dispatch through the same
+///   bubbling path as real input; `focus`/`blur` track `document.activeElement`).
 /// * **`window`** = `globalThis`, with `window.document`,
 ///   `addEventListener`/`removeEventListener` (load events fired by fire-load),
 ///   `location`, `navigator`, `screen`, `history`, `localStorage`/
@@ -1858,6 +1861,24 @@ pub const DOM_MODEL_PRELUDE: &str = r##"
       var arr = this.__listeners[ev && ev.type]; if (!arr) return true;
       for (var i = 0; i < arr.slice().length; i++) { try { arr[i].call(this, ev); } catch (e) {} }
       return true;
+    };
+    // Programmatic click()/focus()/blur() route through the same bubbling
+    // dispatcher real pointer/focus interactions use (`__cerberusDispatch`,
+    // defined later — resolved at call time), so a page that toggles a menu via
+    // `el.click()` or fires focus/blur handlers works. `click` bubbles and is
+    // cancelable; `focus`/`blur` do not bubble (per the DOM spec). The Rust-side
+    // default action (navigation, form submit) is driven by real user input, not
+    // a scripted click — this fires the listeners, which is the common case.
+    ELEMENT_PROTO.click = function () {
+      g.__cerberusDispatch(this.__id, "click", { bubbles: true, cancelable: true });
+    };
+    ELEMENT_PROTO.focus = function () {
+      if (g.document) g.document.activeElement = this;
+      g.__cerberusDispatch(this.__id, "focus", { bubbles: false, cancelable: false });
+    };
+    ELEMENT_PROTO.blur = function () {
+      if (g.document && g.document.activeElement === this) g.document.activeElement = null;
+      g.__cerberusDispatch(this.__id, "blur", { bubbles: false, cancelable: false });
     };
 
     // -- text nodes (TEXT_PROTO) --
