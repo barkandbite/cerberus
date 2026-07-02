@@ -14,8 +14,9 @@ pub use color::parse_color;
 use cerberus_dom::{Document, NodeRef};
 use cerberus_style::{
     AlignItems, AlignSelf, BoxShadow, BoxSizing, Clear, ComputedStyle, Display, ExternalSheets,
-    FlexBasis, FlexDirection, Float, Gradient, JustifyContent, Len, Position, StyleEngine,
-    StyledChild, StyledDom, StyledNode, TextAlign, TextTransform, Track, TrackMax, Visibility,
+    FlexBasis, FlexDirection, Float, Gradient, JustifyContent, Len, ListStyleType, Position,
+    StyleEngine, StyledChild, StyledDom, StyledNode, TextAlign, TextTransform, Track, TrackMax,
+    Visibility,
 };
 use cerberus_types::{Color, ImageFit, ImagePos};
 use parser::{
@@ -45,6 +46,7 @@ head, title, meta, link, style, script, base, template { display: none; }
    which is what unpainted SVG already was. */
 svg { display: none; }
 li { display: list-item; }
+ol { list-style-type: decimal; }
 h1 { font-size: 32px; font-weight: bold; margin-top: 16px; margin-bottom: 16px; }
 h2 { font-size: 24px; font-weight: bold; margin-top: 14px; margin-bottom: 14px; }
 h3 { font-size: 20px; font-weight: bold; margin-top: 12px; margin-bottom: 12px; }
@@ -767,6 +769,21 @@ fn apply_declarations(
                     style.word_spacing = px;
                 }
             }
+            "list-style-type" => {
+                if let Some(t) = parse_list_style_type(v) {
+                    style.list_style_type = t;
+                }
+            }
+            "list-style" => {
+                // Shorthand: we model only the `type` component; scan the tokens
+                // for a recognized keyword (ignoring position/image parts).
+                for tok in v.split_whitespace() {
+                    if let Some(t) = parse_list_style_type(tok) {
+                        style.list_style_type = t;
+                        break;
+                    }
+                }
+            }
             "text-decoration" | "text-decoration-line" => {
                 let low = v.to_ascii_lowercase();
                 if low.contains("underline") {
@@ -1074,6 +1091,27 @@ fn parse_display(v: &str) -> Option<Display> {
         "flex" | "inline-flex" => Display::Flex,
         "grid" | "inline-grid" => Display::Grid,
         "block" | "table" | "table-row" | "table-cell" | "flow-root" => Display::Block,
+        _ => return None,
+    })
+}
+
+/// The recognized `list-style-type` keywords. `decimal-leading-zero` and the
+/// alphabetic/roman families collapse to `decimal` (still numbered, just not
+/// styled), so an `<ol>` never falls back to a bullet.
+fn parse_list_style_type(v: &str) -> Option<ListStyleType> {
+    Some(match v.trim().to_ascii_lowercase().as_str() {
+        "disc" => ListStyleType::Disc,
+        "circle" => ListStyleType::Circle,
+        "square" => ListStyleType::Square,
+        "none" => ListStyleType::None,
+        "decimal"
+        | "decimal-leading-zero"
+        | "lower-alpha"
+        | "upper-alpha"
+        | "lower-roman"
+        | "upper-roman"
+        | "lower-latin"
+        | "upper-latin" => ListStyleType::Decimal,
         _ => return None,
     })
 }
@@ -2205,6 +2243,38 @@ mod tests {
             span.style.border_color,
             Color::rgb(0, 0xff, 0),
             "currentColor inherits the parent's color"
+        );
+    }
+
+    #[test]
+    fn list_style_type_from_ua_and_author() {
+        // `<ol>` gets `decimal` from the UA sheet and its `<li>` inherits it;
+        // `<ul>`/`<li>` default to `disc`.
+        let dom = CssEngine::new().style(&parse_html("<ol><li>a</li></ol><ul><li>b</li></ul>"));
+        let oli = first(&dom.root, "ol")
+            .unwrap()
+            .children
+            .iter()
+            .find_map(|c| {
+                if let StyledChild::Element(e) = c {
+                    Some(&**e)
+                } else {
+                    None
+                }
+            });
+        assert_eq!(oli.unwrap().style.list_style_type, ListStyleType::Decimal);
+        // Author override on a list container reaches its items via inheritance.
+        let dom2 = CssEngine::new().style(&parse_html(
+            "<ul style='list-style-type:square'><li>x</li></ul>",
+        ));
+        let uli = first(&dom2.root, "li").unwrap();
+        assert_eq!(uli.style.list_style_type, ListStyleType::Square);
+        // The `list-style` shorthand's type token is honored.
+        let dom3 =
+            CssEngine::new().style(&parse_html("<li style='list-style: none inside'>x</li>"));
+        assert_eq!(
+            first(&dom3.root, "li").unwrap().style.list_style_type,
+            ListStyleType::None
         );
     }
 

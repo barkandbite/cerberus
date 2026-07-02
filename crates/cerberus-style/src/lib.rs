@@ -83,6 +83,19 @@ pub enum TextTransform {
     Capitalize,
 }
 
+/// CSS `list-style-type`: the marker drawn before a `display: list-item`. A
+/// practical subset — the bullet glyphs and decimal numbering that cover almost
+/// all real lists. Inherited (so `<ol>`'s `decimal` reaches its `<li>` children).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub enum ListStyleType {
+    #[default]
+    Disc,
+    Circle,
+    Square,
+    Decimal,
+    None,
+}
+
 /// CSS `box-sizing` — whether `width`/`height` include padding + border
 /// (`border-box`) or just the content (`content-box`, the default) — ADR-0040.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
@@ -245,6 +258,8 @@ pub struct ComputedStyle {
     /// `word-spacing` in px (may be negative): extra space added to each
     /// inter-word gap on top of the normal space advance. Inherited.
     pub word_spacing: i32,
+    /// `list-style-type`: the marker for a `display: list-item`. Inherited.
+    pub list_style_type: ListStyleType,
     pub margin_top: i32,
     pub margin_bottom: i32,
     pub margin_left: i32,
@@ -371,6 +386,7 @@ impl ComputedStyle {
             text_transform: TextTransform::None,
             letter_spacing: 0,
             word_spacing: 0,
+            list_style_type: ListStyleType::Disc,
             margin_top: 0,
             margin_bottom: 0,
             margin_left: 0,
@@ -446,6 +462,7 @@ impl ComputedStyle {
             text_transform: self.text_transform,
             letter_spacing: self.letter_spacing,
             word_spacing: self.word_spacing,
+            list_style_type: self.list_style_type,
             preformatted: self.preformatted,
             visibility: self.visibility,
             // Reset per element:

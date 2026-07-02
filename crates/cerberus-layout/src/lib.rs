@@ -14,8 +14,8 @@
 use cerberus_dom::NodeId;
 use cerberus_paint::{DecodedImage, DisplayItem, DisplayList, GlyphBox, TextShaper};
 use cerberus_style::{
-    AlignItems, ComputedStyle, Display, FlexDirection, JustifyContent, Len, StyledChild, StyledDom,
-    StyledNode, TextAlign, TextTransform, Track, TrackMax,
+    AlignItems, ComputedStyle, Display, FlexDirection, JustifyContent, Len, ListStyleType,
+    StyledChild, StyledDom, StyledNode, TextAlign, TextTransform, Track, TrackMax,
 };
 use cerberus_types::{Color, FontStyle, Point, Rect, Size};
 use std::sync::Arc;
@@ -281,6 +281,10 @@ struct Ctx<'a> {
     /// One-shot: treat the next walked element as a block (the inline-block atom
     /// laid into its own sub gets the full block box model) — ADR-0042.
     as_block_once: bool,
+    /// Ordinal of the `list-item` about to be walked (set by the parent's child
+    /// loop), used to render a `decimal` `<ol>` marker as "N.". Consumed when the
+    /// marker is emitted, before descending, so nested lists number independently.
+    list_ordinal: u32,
 }
 
 impl<'a> Ctx<'a> {
@@ -321,6 +325,7 @@ impl<'a> Ctx<'a> {
             pos_enabled: true,
             measuring: false,
             as_block_once: false,
+            list_ordinal: 0,
         }
     }
 
@@ -378,6 +383,7 @@ impl<'a> Ctx<'a> {
             pos_enabled: false,
             measuring: false,
             as_block_once: false,
+            list_ordinal: 0,
         }
     }
 
@@ -599,8 +605,10 @@ impl<'a> Ctx<'a> {
             self.y += style.border_top + style.padding_top;
             self.x = self.left;
             if visible && style.display == Display::ListItem {
-                self.add_run("\u{2022}", style, None);
-                self.x += space_width(self.shaper, style.font_size.max(1)) as i32;
+                if let Some(m) = list_marker(style.list_style_type, self.list_ordinal) {
+                    self.add_run(&m, style, None);
+                    self.x += space_width(self.shaper, style.font_size.max(1)) as i32;
+                }
             }
         }
 
@@ -610,6 +618,9 @@ impl<'a> Ctx<'a> {
         // wrap (the common column-grid pattern); a non-float child, text, or
         // `clear` drops below the band (ADR-0039). Text wrap-around is not modeled.
         let mut fb = FloatBand::new(self.left, self.right, self.y);
+        // Counts the list-item children of this block so an ordered list numbers
+        // 1, 2, 3…; each `<ol>`/`<ul>` restarts it, so nested lists are independent.
+        let mut item_ordinal = 0u32;
         for child in &node.children {
             match child {
                 StyledChild::Text(t) => {
@@ -629,6 +640,10 @@ impl<'a> Ctx<'a> {
                         self.flush_floats(&mut fb);
                     }
                     self.flush_floats(&mut fb);
+                    if e.style.display == Display::ListItem {
+                        item_ordinal += 1;
+                        self.list_ordinal = item_ordinal;
+                    }
                     self.walk(e, href);
                 }
             }
@@ -2796,6 +2811,20 @@ fn resolve_flex(basis: &[f32], grow: &[f32], shrink: &[f32], mins: &[f32], avail
     size
 }
 
+/// The marker text for a `list-item`, per `list-style-type`: a bullet glyph, or
+/// the `1.`-style decimal ordinal for an `<ol>` (the parent's child loop set the
+/// ordinal). `none` yields no marker (and the caller skips the gap too). Ordinals
+/// floor at 1 so a stray zero can't produce `0.`.
+fn list_marker(kind: ListStyleType, ordinal: u32) -> Option<String> {
+    Some(match kind {
+        ListStyleType::None => return None,
+        ListStyleType::Decimal => format!("{}.", ordinal.max(1)),
+        ListStyleType::Circle => "\u{25E6}".to_string(), // ◦
+        ListStyleType::Square => "\u{25AA}".to_string(), // ▪
+        ListStyleType::Disc => "\u{2022}".to_string(),   // •
+    })
+}
+
 fn space_width(shaper: &dyn TextShaper, px: u32) -> u32 {
     // Delegates to the shaper's `space_advance`, which real shapers implement
     // without the per-call `Vec` allocation `shape(" ", …)` would incur — this
@@ -3911,6 +3940,61 @@ mod tests {
         assert!(
             sw > nw + 60,
             "word-spacing widens the inter-word gaps: {sw} vs {nw}"
+        );
+    }
+
+    #[test]
+    fn list_marker_reflects_type_and_ordinal() {
+        assert_eq!(
+            list_marker(ListStyleType::Disc, 3).as_deref(),
+            Some("\u{2022}")
+        );
+        assert_eq!(
+            list_marker(ListStyleType::Circle, 3).as_deref(),
+            Some("\u{25E6}")
+        );
+        assert_eq!(
+            list_marker(ListStyleType::Square, 3).as_deref(),
+            Some("\u{25AA}")
+        );
+        assert_eq!(list_marker(ListStyleType::None, 3), None);
+        // Ordered items number by ordinal; a 0 floors to 1.
+        assert_eq!(
+            list_marker(ListStyleType::Decimal, 1).as_deref(),
+            Some("1.")
+        );
+        assert_eq!(
+            list_marker(ListStyleType::Decimal, 42).as_deref(),
+            Some("42.")
+        );
+        assert_eq!(
+            list_marker(ListStyleType::Decimal, 0).as_deref(),
+            Some("1.")
+        );
+    }
+
+    #[test]
+    fn ordered_list_numbers_items_distinctly_from_bullets() {
+        // A <ul> emits a single bullet glyph per item; an <ol> emits a decimal
+        // marker ("1." = 2 glyphs, …), so the ordered list produces strictly more
+        // marker glyphs across three items — proof it isn't rendering bullets.
+        let glyph_count = |laid: &LaidOut| {
+            laid.display
+                .items
+                .iter()
+                .filter_map(|i| match i {
+                    DisplayItem::Glyphs { glyphs, .. } => Some(glyphs.len()),
+                    _ => None,
+                })
+                .sum::<usize>()
+        };
+        let ul = lay("<ul><li>a</li><li>a</li><li>a</li></ul>", 800);
+        let ol = lay("<ol><li>a</li><li>a</li><li>a</li></ol>", 800);
+        assert!(
+            glyph_count(&ol) > glyph_count(&ul),
+            "ordered markers (1. 2. 3.) add more glyphs than bullets: ol={} ul={}",
+            glyph_count(&ol),
+            glyph_count(&ul)
         );
     }
 
