@@ -351,6 +351,15 @@ pub trait TextShaper: Send + Sync {
     fn shape_icon(&self, _ch: char, _px: u32) -> Vec<GlyphBox> {
         Vec::new()
     }
+
+    /// The advance width of a single space at `px`, used for inter-word gaps in
+    /// inline layout. This is called once per word on the hottest text path, so
+    /// the default's throwaway one-element `Vec` allocation is worth avoiding —
+    /// real shapers override this to read the space glyph's advance directly.
+    /// Default: shape a single space and sum, so any shaper stays correct.
+    fn space_advance(&self, px: u32) -> u32 {
+        self.shape(" ", px).iter().map(|g| g.advance).sum()
+    }
 }
 
 /// Decodes image bytes. Wraps image decoders (M2) — a historically large CVE

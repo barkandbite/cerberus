@@ -221,6 +221,15 @@ impl TextShaper for TextEngine {
             px,
         }]
     }
+
+    /// Read the space glyph's advance directly — identical to the first (only)
+    /// element of `shape(" ", px)` but with no `Vec` allocation, since inline
+    /// layout calls this once per word.
+    fn space_advance(&self, px: u32) -> u32 {
+        let scale = PxScale::from(px.max(1) as f32);
+        let scaled = self.font.as_scaled(scale);
+        scaled.h_advance(self.font.glyph_id(' ')).round().max(0.0) as u32
+    }
 }
 
 /// Lerp two colors at `t` in `0..=1`.
@@ -665,6 +674,21 @@ mod tests {
         // Real glyphs have non-zero ids and advances.
         assert!(glyphs.iter().all(|g| g.id != 0));
         assert!(glyphs.iter().all(|g| g.advance > 0));
+    }
+
+    #[test]
+    fn space_advance_matches_shaping_a_space() {
+        // The allocation-free override must return exactly what the general
+        // `shape(" ", px)` path would, so inline layout geometry is unchanged.
+        let engine = TextEngine::new();
+        for px in [12u32, 16, 24, 40, 100] {
+            let via_shape: u32 = engine.shape(" ", px).iter().map(|g| g.advance).sum();
+            assert_eq!(
+                engine.space_advance(px),
+                via_shape,
+                "space_advance must equal shape(\" \") at {px}px"
+            );
+        }
     }
 
     #[test]
