@@ -2047,6 +2047,30 @@ mod tests {
     }
 
     #[test]
+    fn nth_last_child_cascades_from_the_end() {
+        // `li:nth-last-child(1)` is the last item; `:nth-last-child(2)` the
+        // second-to-last — counted from the end through the full cascade.
+        let html = "<style>\
+            li:nth-last-child(1) { color: #ff0000 }\
+            li:nth-last-child(2) { color: #00ff00 }\
+            </style>\
+            <ul><li>a</li><li>b</li><li>c</li></ul>";
+        let dom = CssEngine::new().style(&parse_html(html));
+        let lis: Vec<_> = first(&dom.root, "ul")
+            .unwrap()
+            .children
+            .iter()
+            .filter_map(|c| match c {
+                StyledChild::Element(e) if e.tag == "li" => Some(e),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(lis[0].style.color, Color::BLACK, "first li unaffected");
+        assert_eq!(lis[1].style.color, Color::rgb(0, 0xff, 0), "2nd-from-last");
+        assert_eq!(lis[2].style.color, Color::rgb(0xff, 0, 0), "last");
+    }
+
+    #[test]
     fn media_query_respects_viewport() {
         let html = "<style>@media (max-width: 600px) { p { color: #ff0000 } }</style><p>x</p>";
         // Narrow viewport: the rule applies.

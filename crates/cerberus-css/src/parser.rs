@@ -2,9 +2,10 @@
 //!
 //! Supported selectors: universal `*`, type, `.class`, `#id`, attribute
 //! selectors (`[a]`, `[a=v]`, `~= |= ^= $= *=`), structural pseudo-classes
-//! (`:first-child`, `:last-child`, `:only-child`, `:nth-child(an+b)`, the
-//! `*-of-type` family (`:first-of-type`, `:last-of-type`, `:only-of-type`,
-//! `:nth-of-type(an+b)`), `:not(…)`,
+//! (`:first-child`, `:last-child`, `:only-child`, `:nth-child(an+b)`,
+//! `:nth-last-child(an+b)`, the `*-of-type` family (`:first-of-type`,
+//! `:last-of-type`, `:only-of-type`, `:nth-of-type(an+b)`,
+//! `:nth-last-of-type(an+b)`), `:not(…)`,
 //! `:root`), grouping `,`, and the descendant / child (`>`) / adjacent-sibling
 //! (`+`) / general-sibling (`~`) combinators. State pseudo-classes (`:hover`,
 //! `:focus`, `:active`, `:visited`, `:link`) parse but never match in the static
@@ -74,13 +75,15 @@ enum Pseudo {
     FirstChild,
     LastChild,
     OnlyChild,
-    NthChild(i32, i32), // a, b  for an+b (1-based position among all siblings)
+    NthChild(i32, i32),     // a, b  for an+b (1-based position among all siblings)
+    NthLastChild(i32, i32), // an+b counting from the END of the sibling list
     // The `*-of-type` family: same as the `*-child` ones but counting only
     // siblings that share this element's tag (1-based position among them).
     FirstOfType,
     LastOfType,
     OnlyOfType,
     NthOfType(i32, i32),
+    NthLastOfType(i32, i32), // an+b among same-tag siblings, counting from the end
     Root,
     Never, // :hover/:focus/:active/:visited/:link — no static match
 }
@@ -192,10 +195,12 @@ fn pseudo_matches(
         Pseudo::LastChild => index + 1 == total,
         Pseudo::OnlyChild => total == 1,
         Pseudo::NthChild(a, b) => nth_matches(*a, *b, pos),
+        Pseudo::NthLastChild(a, b) => nth_matches(*a, *b, total as i32 - index as i32),
         Pseudo::FirstOfType => type_pos() == 1,
         Pseudo::LastOfType => type_pos() as usize == type_total(),
         Pseudo::OnlyOfType => type_total() == 1,
         Pseudo::NthOfType(a, b) => nth_matches(*a, *b, type_pos()),
+        Pseudo::NthLastOfType(a, b) => nth_matches(*a, *b, type_total() as i32 - type_pos() + 1),
         Pseudo::Root => el.tag == "html",
         Pseudo::Never => false,
     }
@@ -607,9 +612,19 @@ fn apply_pseudo(c: &mut Compound, name: &str, arg: &str) {
                 c.pseudos.push(Pseudo::NthChild(a, b));
             }
         }
+        "nth-last-child" => {
+            if let Some((a, b)) = parse_an_plus_b(arg) {
+                c.pseudos.push(Pseudo::NthLastChild(a, b));
+            }
+        }
         "nth-of-type" => {
             if let Some((a, b)) = parse_an_plus_b(arg) {
                 c.pseudos.push(Pseudo::NthOfType(a, b));
+            }
+        }
+        "nth-last-of-type" => {
+            if let Some((a, b)) = parse_an_plus_b(arg) {
+                c.pseudos.push(Pseudo::NthLastOfType(a, b));
             }
         }
         "not" => {
@@ -880,6 +895,14 @@ mod tests {
         // The lone span is :only-of-type.
         assert!(matches("span:only-of-type { a: b }", &at(3)));
         assert!(!matches("p:only-of-type { a: b }", &at(1)));
+        // Counting from the end: the last p (index 4) is nth-last-of-type(1),
+        // and the 2nd p (index 2) is nth-last-of-type(2). Among all siblings the
+        // last element (index 4) is nth-last-child(1).
+        assert!(matches("p:nth-last-of-type(1) { a: b }", &at(4)));
+        assert!(matches("p:nth-last-of-type(2) { a: b }", &at(2)));
+        assert!(!matches("p:nth-last-of-type(1) { a: b }", &at(1)));
+        assert!(matches("p:nth-last-child(1) { a: b }", &at(4)));
+        assert!(!matches("p:nth-last-child(1) { a: b }", &at(2)));
     }
 
     #[test]
