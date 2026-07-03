@@ -39,7 +39,8 @@ type MatchedRule<'a> = (u8, Specificity, usize, &'a Vec<(String, String, bool)>)
 const UA_CSS: &str = r#"
 html, body, div, p, h1, h2, h3, h4, h5, h6, ul, ol, li, section, article,
 header, footer, nav, main, aside, blockquote, pre, figure, figcaption, form,
-table, tr, hr, dl, dt, dd, fieldset, address, center { display: block; }
+table, tr, hr, dl, dt, dd, fieldset, address, center,
+details, summary { display: block; }
 /* Legacy presentational elements still seen on older pages. */
 center { text-align: center; }
 nobr { white-space: nowrap; }
@@ -1993,6 +1994,20 @@ mod tests {
         let a = first(&dom.root, "a").unwrap();
         assert!(a.style.underline);
         assert_eq!(a.style.color, Color::rgb(0x15, 0x4f, 0xd2));
+    }
+
+    #[test]
+    fn ua_styles_details_summary_block() {
+        let dom =
+            CssEngine::new().style(&parse_html("<details><summary>s</summary>body</details>"));
+        assert_eq!(
+            first(&dom.root, "details").unwrap().style.display,
+            Display::Block
+        );
+        assert_eq!(
+            first(&dom.root, "summary").unwrap().style.display,
+            Display::Block
+        );
     }
 
     #[test]
