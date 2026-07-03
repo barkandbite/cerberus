@@ -66,6 +66,86 @@ fn doc_with_div_x() -> Document {
 }
 
 #[test]
+fn form_data_scrapes_successful_controls() {
+    // new FormData(form) collects named, non-disabled controls; an unchecked
+    // checkbox, a disabled input, and a <button> are all excluded.
+    let mut b = DocumentBuilder::new();
+    let user = b.element_attrs(
+        "input",
+        vec![
+            ("name".into(), "user".into()),
+            ("value".into(), "alice".into()),
+        ],
+        [],
+    );
+    let agree = b.element_attrs(
+        "input",
+        vec![
+            ("name".into(), "agree".into()),
+            ("type".into(), "checkbox".into()),
+            ("checked".into(), "".into()),
+        ],
+        [],
+    );
+    let news = b.element_attrs(
+        "input",
+        vec![
+            ("name".into(), "news".into()),
+            ("type".into(), "checkbox".into()),
+        ],
+        [],
+    );
+    let skip = b.element_attrs(
+        "input",
+        vec![
+            ("name".into(), "skip".into()),
+            ("value".into(), "x".into()),
+            ("disabled".into(), "".into()),
+        ],
+        [],
+    );
+    let btn = b.element_attrs(
+        "button",
+        vec![("name".into(), "btn".into()), ("value".into(), "go".into())],
+        [],
+    );
+    let form = b.element_attrs(
+        "form",
+        vec![("id".into(), "f".into())],
+        [user, agree, news, skip, btn],
+    );
+    let probe = b.element_attrs("p", vec![("id".into(), "p".into())], []);
+    let body = b.element("body", [form, probe]);
+    let html = b.element("html", [body]);
+    let doc = b.finish(html);
+
+    let (mut engine, realm) = engine_and_realm();
+    let scripts = vec!["var p = document.getElementById('p'); \
+         var fd = new FormData(document.getElementById('f')); \
+         p.setAttribute('user', fd.get('user')); \
+         p.setAttribute('agree', fd.get('agree')); \
+         p.setAttribute('news', String(fd.has('news'))); \
+         p.setAttribute('skip', String(fd.has('skip'))); \
+         p.setAttribute('btn', String(fd.has('btn'))); \
+         fd.append('extra', '1'); fd.append('extra', '2'); \
+         p.setAttribute('extra', fd.getAll('extra').join(','));"
+        .to_string()];
+
+    let out = run_page_scripts(engine.as_mut(), realm, &doc, &scripts, &env()).expect("run");
+    let p = find_id(out.root(), "p").expect("#p present");
+    assert_eq!(p.attr("user"), Some("alice"), "text control included");
+    assert_eq!(p.attr("agree"), Some("on"), "checked checkbox → on");
+    assert_eq!(p.attr("news"), Some("false"), "unchecked checkbox excluded");
+    assert_eq!(p.attr("skip"), Some("false"), "disabled control excluded");
+    assert_eq!(
+        p.attr("btn"),
+        Some("false"),
+        "<button> excluded (no submitter)"
+    );
+    assert_eq!(p.attr("extra"), Some("1,2"), "programmatic append works");
+}
+
+#[test]
 fn btoa_and_atob_round_trip_base64() {
     // Base64 encode/decode with correct padding, round-trip, and the Latin1
     // guard on btoa.
