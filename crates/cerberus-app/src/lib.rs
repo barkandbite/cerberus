@@ -3063,10 +3063,6 @@ impl BrowserApp {
         let Some(nav) = navs.into_iter().next_back() else {
             return;
         };
-        if self.script_nav_budget == 0 {
-            return;
-        }
-        self.script_nav_budget -= 1;
         // Resolve against the current document URL — the target may be relative
         // (`location.href = '/home'`). Fall back to the raw string if there is no
         // base or it doesn't parse (begin_load re-parses and reports errors).
@@ -3076,6 +3072,30 @@ impl BrowserApp {
             .and_then(|base| join_url(base, &nav.url).ok())
             .map(|u| u.to_string())
             .unwrap_or(nav.url);
+        // Only follow navigable top-level schemes (http/https/cerberus). A
+        // javascript:/data:/blob:/mailto: target is ignored — never fetched or
+        // executed — matching a browser that doesn't treat those as a document
+        // navigation, and denying a hostile page a way to make the host fetch an
+        // arbitrary non-http scheme. Ignored before spending budget.
+        if !is_navigable_scheme(&target) {
+            return;
+        }
+        if self.script_nav_budget == 0 {
+            return;
+        }
+        self.script_nav_budget -= 1;
+        // Record history like a browser: a non-replacing navigation (assign,
+        // location.href =) pushes a new entry; replace()/reload() overwrite the
+        // current one (so Back doesn't return to a challenge interstitial).
+        if nav.replace {
+            if let Some(slot) = self.history.get_mut(self.index) {
+                *slot = target.clone();
+            }
+        } else {
+            self.history.truncate(self.index + 1);
+            self.history.push(target.clone());
+            self.index = self.history.len() - 1;
+        }
         self.begin_load(&target, None, false);
     }
 
@@ -4564,6 +4584,17 @@ fn empty_document() -> Document {
     let mut b = DocumentBuilder::new();
     let root = b.element("#root", []);
     b.finish(root)
+}
+
+/// Whether `url` is a scheme the browser navigates to as a top-level document:
+/// `http(s)` or our built-in `cerberus:` pages. A script navigation to anything
+/// else (`javascript:`, `data:`, `blob:`, `mailto:`, …) is ignored rather than
+/// fetched — those are never a document navigation in a real browser, and
+/// letting a page trigger a fetch of an arbitrary scheme is needless surface.
+fn is_navigable_scheme(url: &str) -> bool {
+    let s = url.trim_start();
+    let has = |p: &str| s.get(..p.len()).is_some_and(|h| h.eq_ignore_ascii_case(p));
+    has("http://") || has("https://") || has("cerberus:")
 }
 
 fn first_party_of(url: &cerberus_url::Url) -> Option<Origin> {
@@ -6417,6 +6448,35 @@ mod tests {
         }
         // One user-initiated request + SCRIPT_NAV_CAP script reloads, then capped.
         assert_eq!(seen.locked().len(), 1 + SCRIPT_NAV_CAP as usize);
+    }
+
+    #[test]
+    fn script_navigation_ignores_non_navigable_schemes() {
+        // location.href = 'javascript:…' / location.assign('data:…') must be
+        // ignored (never fetched or shown as an error page), matching a browser
+        // that doesn't navigate to those schemes.
+        let loader = FakeLoader::new(vec![(
+            "https://site.test/",
+            Ok(page(
+                "https://site.test/",
+                200,
+                None,
+                "<script>location.href = 'javascript:void(0)'; \
+                 location.assign('data:text/html,x');</script>",
+            )),
+        )]);
+        let seen = loader.seen_requests.clone();
+        let mut b = BrowserApp::with_loader(Box::new(loader));
+        b.navigate("https://site.test/");
+        let mut guard = 0;
+        while b.poll() {
+            guard += 1;
+            assert!(guard < 10, "did not converge");
+        }
+        // Only the initial user navigation was fetched; the script schemes were
+        // dropped, so we stay on site.test with no error page.
+        assert_eq!(seen.locked().len(), 1, "no navigation to js:/data: schemes");
+        assert_eq!(b.toolbar.url_text, "https://site.test/");
     }
 
     #[test]
