@@ -16,7 +16,7 @@ use cerberus_style::{
     AlignItems, AlignSelf, BoxShadow, BoxSizing, Clear, ComputedStyle, Display, ExternalSheets,
     FlexBasis, FlexDirection, Float, Gradient, JustifyContent, Len, ListStyleType, Position,
     StyleEngine, StyledChild, StyledDom, StyledNode, TextAlign, TextTransform, Track, TrackMax,
-    VerticalAlign, Visibility,
+    VerticalAlign, Visibility, WhiteSpace,
 };
 use cerberus_types::{Color, ImageFit, ImagePos};
 use parser::{
@@ -936,12 +936,13 @@ fn apply_declarations(
             "border-bottom-width" => set_len(&mut style.border_bottom, v, style.font_size as f32),
             "border-left-width" => set_len(&mut style.border_left, v, style.font_size as f32),
             "white-space" => {
-                let low = v.trim().to_ascii_lowercase();
-                // `pre*` preserves whitespace/newlines; `nowrap` collapses like
-                // `normal` but never wraps. (`pre-wrap`/`pre-line` are treated as
-                // `pre` for now.)
-                style.preformatted = low.starts_with("pre");
-                style.nowrap = low == "nowrap";
+                style.white_space = match v.trim().to_ascii_lowercase().as_str() {
+                    "pre" => WhiteSpace::Pre,
+                    "pre-wrap" => WhiteSpace::PreWrap,
+                    "pre-line" => WhiteSpace::PreLine,
+                    "nowrap" => WhiteSpace::Nowrap,
+                    _ => WhiteSpace::Normal,
+                };
             }
             "visibility" => {
                 style.visibility = match v.to_ascii_lowercase().as_str() {
@@ -2428,14 +2429,34 @@ mod tests {
     }
 
     #[test]
-    fn white_space_nowrap_and_pre_parse() {
-        let nw = CssEngine::new().style(&parse_html("<p style='white-space:nowrap'>x</p>"));
-        let p = first(&nw.root, "p").unwrap();
-        assert!(p.style.nowrap && !p.style.preformatted);
-        // `pre` sets preformatted, not nowrap; `<pre>` gets it from the UA sheet.
+    fn white_space_keywords_parse() {
+        use cerberus_style::WhiteSpace;
+        let cases = [
+            ("nowrap", WhiteSpace::Nowrap),
+            ("pre-wrap", WhiteSpace::PreWrap),
+            ("pre-line", WhiteSpace::PreLine),
+            ("normal", WhiteSpace::Normal),
+        ];
+        for (kw, want) in cases {
+            let dom =
+                CssEngine::new().style(&parse_html(&format!("<p style='white-space:{kw}'>x</p>")));
+            assert_eq!(
+                first(&dom.root, "p").unwrap().style.white_space,
+                want,
+                "{kw}"
+            );
+        }
+        // `<pre>` gets `pre` from the UA sheet; it wraps neither spaces nor lines.
         let pre = CssEngine::new().style(&parse_html("<pre>x</pre>"));
         let el = first(&pre.root, "pre").unwrap();
-        assert!(el.style.preformatted && !el.style.nowrap);
+        assert_eq!(el.style.white_space, WhiteSpace::Pre);
+        assert!(el.style.white_space.preserves_spaces() && !el.style.white_space.wraps());
+        // `pre-wrap` preserves spaces but still wraps; `pre-line` collapses spaces
+        // yet preserves newlines.
+        assert!(WhiteSpace::PreWrap.preserves_spaces() && WhiteSpace::PreWrap.wraps());
+        assert!(
+            !WhiteSpace::PreLine.preserves_spaces() && WhiteSpace::PreLine.preserves_newlines()
+        );
     }
 
     #[test]

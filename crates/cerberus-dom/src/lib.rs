@@ -325,21 +325,30 @@ fn build_tree(tokens: Vec<Token>, scripts: Vec<String>) -> Document {
     for token in tokens {
         match token {
             Token::Text(text) => {
-                let top = stack.last_mut().expect("root frame is always present");
-                if top.tag == "style" {
+                let is_style = stack.last().is_some_and(|f| f.tag == "style");
+                // `<pre>` establishes a whitespace-preserving context: its spaces
+                // and newlines are significant (the layout `white-space: pre` path
+                // splits on `\n`), so collapsing them here would erase the very
+                // formatting `<pre>` exists to keep. We preserve raw text anywhere
+                // under a `<pre>` ancestor; entities are still decoded.
+                let is_pre = stack.iter().any(|f| f.tag == "pre");
+                let node = if is_style {
                     // Keep CSS verbatim for the style engine.
-                    let id = alloc(&mut nodes, NodeData::Text(text));
-                    top.children.push(id);
+                    Some(text)
+                } else if is_pre {
+                    let decoded = decode_entities(&text);
+                    (!decoded.is_empty()).then_some(decoded)
                 } else {
                     let cleaned = clean_text(&text);
-                    if !cleaned.is_empty() {
-                        let id = alloc(&mut nodes, NodeData::Text(cleaned));
-                        stack
-                            .last_mut()
-                            .expect("root frame is always present")
-                            .children
-                            .push(id);
-                    }
+                    (!cleaned.is_empty()).then_some(cleaned)
+                };
+                if let Some(s) = node {
+                    let id = alloc(&mut nodes, NodeData::Text(s));
+                    stack
+                        .last_mut()
+                        .expect("root frame is always present")
+                        .children
+                        .push(id);
                 }
             }
             Token::Open(name, attrs) => {

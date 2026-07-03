@@ -93,6 +93,47 @@ pub enum VerticalAlign {
     Super,
 }
 
+/// CSS `white-space`: how whitespace and newlines in inline content collapse,
+/// and whether lines soft-wrap. Inherited. The three behaviors — preserving
+/// space runs, preserving explicit `\n`, and wrapping on overflow — vary
+/// independently across the keywords, so they're exposed as predicate methods
+/// rather than encoded positionally.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub enum WhiteSpace {
+    /// Collapse whitespace runs to a single space; wrap on overflow.
+    #[default]
+    Normal,
+    /// Preserve spaces and newlines; never wrap (`<pre>`).
+    Pre,
+    /// Preserve spaces and newlines; still wrap on overflow.
+    PreWrap,
+    /// Collapse space runs but keep explicit newlines; wrap on overflow.
+    PreLine,
+    /// Collapse whitespace like `normal`, but never wrap.
+    Nowrap,
+}
+
+impl WhiteSpace {
+    /// Whether runs of spaces/tabs are kept verbatim rather than collapsed.
+    pub fn preserves_spaces(self) -> bool {
+        matches!(self, WhiteSpace::Pre | WhiteSpace::PreWrap)
+    }
+    /// Whether an explicit `\n` in the source forces a hard line break.
+    pub fn preserves_newlines(self) -> bool {
+        matches!(
+            self,
+            WhiteSpace::Pre | WhiteSpace::PreWrap | WhiteSpace::PreLine
+        )
+    }
+    /// Whether long lines soft-wrap at word boundaries when they overflow.
+    pub fn wraps(self) -> bool {
+        matches!(
+            self,
+            WhiteSpace::Normal | WhiteSpace::PreWrap | WhiteSpace::PreLine
+        )
+    }
+}
+
 /// CSS `list-style-type`: the marker drawn before a `display: list-item`. A
 /// practical subset — the bullet glyphs and decimal numbering that cover almost
 /// all real lists. Inherited (so `<ol>`'s `decimal` reaches its `<li>` children).
@@ -336,11 +377,9 @@ pub struct ComputedStyle {
     /// (ADR-0045). Plain values (8 bytes each), not inherited.
     pub object_position: ImagePos,
     pub background_position: ImagePos,
-    /// Preserve whitespace/newlines (`<pre>`); otherwise collapse + wrap.
-    pub preformatted: bool,
-    /// `white-space: nowrap` — collapse whitespace but never wrap to a new line.
+    /// `white-space`: whitespace collapsing, newline preservation, and wrapping.
     /// Inherited.
-    pub nowrap: bool,
+    pub white_space: WhiteSpace,
     /// `visibility: hidden` — laid out but not painted. Inherited.
     pub visibility: Visibility,
     /// `opacity` in `[0.0, 1.0]`, composited in paint. Not inherited.
@@ -443,8 +482,7 @@ impl ComputedStyle {
             background_size: ImageFit::Fill,
             object_position: ImagePos::CENTER,
             background_position: ImagePos::TOP_LEFT,
-            preformatted: false,
-            nowrap: false,
+            white_space: WhiteSpace::Normal,
             visibility: Visibility::Visible,
             opacity: 1.0,
             flex_direction: FlexDirection::Row,
@@ -492,8 +530,7 @@ impl ComputedStyle {
             list_style_type: self.list_style_type,
             vertical_align: VerticalAlign::Baseline,
             text_indent: self.text_indent,
-            preformatted: self.preformatted,
-            nowrap: self.nowrap,
+            white_space: self.white_space,
             visibility: self.visibility,
             // Reset per element:
             display: Display::Inline,

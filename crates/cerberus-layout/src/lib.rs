@@ -886,18 +886,38 @@ impl<'a> Ctx<'a> {
                 transformed.as_str()
             }
         };
-        if style.preformatted {
+        let ws = style.white_space;
+        if ws.preserves_newlines() {
+            // `pre`/`pre-wrap`/`pre-line`: an explicit `\n` is a hard break. Each
+            // resulting line then either preserves its spaces (and maybe wraps) or
+            // collapses them, per the keyword.
             let mut first = true;
             for line in text.split('\n') {
                 if !first {
                     self.line_break(style.font_size.max(1));
                 }
                 first = false;
-                if !line.is_empty() {
-                    self.add_run(line, style, href);
+                if line.is_empty() {
+                    continue;
+                }
+                if ws.preserves_spaces() {
+                    if ws.wraps() {
+                        // `pre-wrap`: keep the exact spaces but break between words
+                        // when the line overflows.
+                        self.add_pre_wrap_line(line, style, href);
+                    } else {
+                        // `pre`: one atomic run, spaces intact, never wrapping.
+                        self.add_run(line, style, href);
+                    }
+                } else {
+                    // `pre-line`: spaces collapse, but the surrounding `\n`s (above)
+                    // are preserved and the collapsed words still wrap.
+                    for word in line.split_whitespace() {
+                        self.add_word(word, style, href);
+                    }
                 }
             }
-        } else if style.nowrap {
+        } else if !ws.wraps() {
             // `white-space: nowrap`: collapse runs of whitespace to single spaces
             // like normal text, but place the whole thing as one atomic run so it
             // never wraps (it may overflow the container, per spec).
@@ -909,6 +929,51 @@ impl<'a> Ctx<'a> {
             for word in text.split_whitespace() {
                 self.add_word(word, style, href);
             }
+        }
+    }
+
+    /// Lay one `white-space: pre-wrap` line: preserve every space run as literal
+    /// advance (spaces draw no glyph, so width is `count × space_advance`) while
+    /// still allowing a soft break between words on overflow. A break consumes the
+    /// space run that would have preceded the wrapped word (it hangs at the old
+    /// line's end); leading spaces on a line are kept as indentation. Tabs are
+    /// counted as one space each — a small simplification, noted here.
+    fn add_pre_wrap_line(&mut self, line: &str, style: &ComputedStyle, href: Option<&str>) {
+        let px = style.font_size.max(1);
+        let sw = space_width(self.shaper, px) as i32;
+        // Accumulated leading-whitespace width for the next word.
+        let mut lead = 0i32;
+        let mut chars = line.chars().peekable();
+        while let Some(&c) = chars.peek() {
+            if c.is_whitespace() {
+                lead += sw;
+                chars.next();
+                continue;
+            }
+            // Gather the next word (run of non-whitespace).
+            let mut word = String::new();
+            while let Some(&c) = chars.peek() {
+                if c.is_whitespace() {
+                    break;
+                }
+                word.push(c);
+                chars.next();
+            }
+            let (glyphs, w) = self.shape_run(&word, px, style);
+            let at_line_start = self.x == self.left;
+            if !at_line_start && self.x + lead + w as i32 > self.right {
+                // Wrap: the pending space run hangs at the end of the old line.
+                self.newline();
+            } else {
+                self.x += lead;
+            }
+            lead = 0;
+            self.push_piece(px, w, glyphs, style, href);
+        }
+        // Trailing spaces hang past the last word (kept for width fidelity).
+        if lead > 0 {
+            self.x += lead;
+            self.max_x = self.max_x.max(self.x);
         }
     }
 
@@ -4555,6 +4620,65 @@ mod tests {
             distinct(&glyph_ys(&nowrap)),
             1,
             "nowrap text stays on one line"
+        );
+    }
+
+    #[test]
+    fn pre_wrap_and_pre_line_wrap_but_pre_does_not() {
+        // Long text in a narrow box: `pre` (from <pre>) never wraps, so it stays
+        // on one line; `pre-wrap` and `pre-line` both wrap on overflow.
+        let text = "aaaa bbbb cccc dddd eeee ffff";
+        let pre = lay(&format!("<pre>{text}</pre>"), 60);
+        assert_eq!(
+            distinct(&glyph_ys(&pre)),
+            1,
+            "pre never wraps: {:?}",
+            glyph_ys(&pre)
+        );
+        let pre_wrap = lay(&format!("<p style='white-space:pre-wrap'>{text}</p>"), 60);
+        assert!(
+            distinct(&glyph_ys(&pre_wrap)) > 1,
+            "pre-wrap wraps on overflow: {:?}",
+            glyph_ys(&pre_wrap)
+        );
+        let pre_line = lay(&format!("<p style='white-space:pre-line'>{text}</p>"), 60);
+        assert!(
+            distinct(&glyph_ys(&pre_line)) > 1,
+            "pre-line wraps on overflow: {:?}",
+            glyph_ys(&pre_line)
+        );
+    }
+
+    #[test]
+    fn pre_preserves_newlines_and_spaces() {
+        // `<pre>` is a whitespace-preserving context (parser keeps its raw text),
+        // so explicit newlines become hard breaks — unlike `normal`, which
+        // collapses them onto one row.
+        let pre = lay("<pre>ab\n    cd</pre>", 400);
+        assert_eq!(
+            distinct(&glyph_ys(&pre)),
+            2,
+            "newline makes two rows: {:?}",
+            glyph_ys(&pre)
+        );
+        let norm = lay("<p>ab\n    cd</p>", 400);
+        assert_eq!(
+            distinct(&glyph_ys(&norm)),
+            1,
+            "normal collapses to one line"
+        );
+
+        // Space runs survive verbatim in `<pre>` (each space is a laid glyph in
+        // the atomic run), where `normal` collapses the run and renders the single
+        // inter-word space as an advance, not a glyph: "a    b" → 6 glyphs (a, four
+        // spaces, b) under `pre` vs just 2 (a, b) under `normal`.
+        let pre_sp = lay("<pre>a    b</pre>", 400);
+        let norm_sp = lay("<p>a    b</p>", 400);
+        assert_eq!(total_glyphs(&pre_sp), 6, "pre keeps the four spaces");
+        assert_eq!(
+            total_glyphs(&norm_sp),
+            2,
+            "normal collapses inter-word space"
         );
     }
 
