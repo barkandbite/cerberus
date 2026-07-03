@@ -66,6 +66,7 @@ h6 { font-size: 13px; font-weight: bold; margin-top: 10px; margin-bottom: 10px; 
 p { margin-top: 8px; margin-bottom: 8px; }
 ul, ol { margin-top: 8px; margin-bottom: 8px; margin-left: 24px; }
 blockquote { margin-left: 24px; margin-top: 8px; margin-bottom: 8px; }
+figure { margin-top: 16px; margin-bottom: 16px; margin-left: 40px; margin-right: 40px; }
 pre { white-space: pre; margin-top: 8px; margin-bottom: 8px; }
 code, kbd, samp { white-space: pre; }
 /* Only anchors with an href are links (`:any-link`); a bare `<a name=…>`
@@ -1994,6 +1995,15 @@ mod tests {
         let a = first(&dom.root, "a").unwrap();
         assert!(a.style.underline);
         assert_eq!(a.style.color, Color::rgb(0x15, 0x4f, 0xd2));
+    }
+
+    #[test]
+    fn ua_gives_figure_default_margins() {
+        let dom = CssEngine::new().style(&parse_html("<figure>f</figure>"));
+        let f = first(&dom.root, "figure").unwrap();
+        assert_eq!(f.style.margin_left, 40);
+        assert_eq!(f.style.margin_right, 40);
+        assert_eq!(f.style.margin_top, 16);
     }
 
     #[test]
