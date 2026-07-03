@@ -2672,12 +2672,24 @@ pub const DOM_MODEL_PRELUDE: &str = r##"
     };
 
     // ---- matchMedia (honors width/height/orientation vs the viewport) ---
+    // Resolve a media-query length to px against the viewport, honoring units —
+    // `parseInt` alone silently read `30em`/`50vw` as bare pixel counts. `em`/
+    // `rem` use the 16px root default (matchMedia has no element context), and
+    // `vw`/`vh` are viewport-relative.
+    function __cerberusMediaPx(val, w, h) {
+      var num = parseFloat(val);
+      if (isNaN(num)) return 0;
+      if (/vw$/i.test(val)) return num * w / 100;
+      if (/vh$/i.test(val)) return num * h / 100;
+      if (/r?em$/i.test(val)) return num * 16;
+      return num; // px or unitless
+    }
     function __cerberusEvalMedia(query, w, h) {
       return String(query).split(",").some(function (branch) {
         var re = /\(([a-z-]+)\s*:\s*([^)]+)\)/g, m, ok = true, any = false;
         while ((m = re.exec(branch)) !== null) {
           any = true;
-          var name = m[1], val = m[2].trim(), px = parseInt(val, 10) || 0;
+          var name = m[1], val = m[2].trim(), px = __cerberusMediaPx(val, w, h);
           if (name === "min-width") ok = ok && w >= px;
           else if (name === "max-width") ok = ok && w <= px;
           else if (name === "min-height") ok = ok && h >= px;

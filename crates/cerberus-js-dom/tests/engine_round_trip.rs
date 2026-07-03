@@ -66,6 +66,27 @@ fn doc_with_div_x() -> Document {
 }
 
 #[test]
+fn match_media_resolves_length_units() {
+    // The test viewport is 1280×800. matchMedia must resolve em/vw units, not
+    // read them as bare pixels (`parseInt('100em')` → 100 would be wrong).
+    let (mut engine, realm) = engine_and_realm();
+    let doc = doc_with_div_x();
+    let scripts = vec!["var x = document.getElementById('x'); \
+         x.setAttribute('em', String(matchMedia('(max-width: 100em)').matches)); \
+         x.setAttribute('vw', String(matchMedia('(min-width: 200vw)').matches)); \
+         x.setAttribute('px', String(matchMedia('(min-width: 600px)').matches));"
+        .to_string()];
+
+    let out = run_page_scripts(engine.as_mut(), realm, &doc, &scripts, &env()).expect("run");
+    let x = find_id(out.root(), "x").expect("#x present");
+    // 100em = 1600px; 1280 <= 1600 → true (a bare-100 misread would be false).
+    assert_eq!(x.attr("em"), Some("true"), "em resolved to 1600px");
+    // 200vw = 2560px; 1280 >= 2560 → false (a bare-200 misread would be true).
+    assert_eq!(x.attr("vw"), Some("false"), "vw resolved to 2560px");
+    assert_eq!(x.attr("px"), Some("true"), "plain px unaffected");
+}
+
+#[test]
 fn document_collections_and_get_elements_by_name() {
     // document.forms (with named access), .images, .links (href-only), and
     // getElementsByName.
