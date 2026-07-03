@@ -769,6 +769,11 @@ fn apply_declarations(
                     style.word_spacing = px;
                 }
             }
+            "text-indent" => {
+                if let Some(px) = parse_len(v, style.font_size as f32) {
+                    style.text_indent = px;
+                }
+            }
             "list-style-type" => {
                 if let Some(t) = parse_list_style_type(v) {
                     style.list_style_type = t;
@@ -2307,6 +2312,15 @@ mod tests {
             first(&dom3.root, "li").unwrap().style.list_style_type,
             ListStyleType::None
         );
+    }
+
+    #[test]
+    fn text_indent_parses_and_inherits() {
+        let dom =
+            CssEngine::new().style(&parse_html("<div style='text-indent:2em'><p>x</p></div>"));
+        // 2em at the default 16px font = 32px; inherited by the child.
+        assert_eq!(first(&dom.root, "div").unwrap().style.text_indent, 32);
+        assert_eq!(first(&dom.root, "p").unwrap().style.text_indent, 32);
     }
 
     #[test]

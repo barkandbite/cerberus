@@ -285,6 +285,9 @@ struct Ctx<'a> {
     /// loop), used to render a `decimal` `<ol>` marker as "N.". Consumed when the
     /// marker is emitted, before descending, so nested lists number independently.
     list_ordinal: u32,
+    /// Pending `text-indent` (px) for the current block's first line, consumed as
+    /// the leading offset of the first word placed and then zeroed.
+    pending_indent: i32,
 }
 
 impl<'a> Ctx<'a> {
@@ -326,6 +329,7 @@ impl<'a> Ctx<'a> {
             measuring: false,
             as_block_once: false,
             list_ordinal: 0,
+            pending_indent: 0,
         }
     }
 
@@ -384,6 +388,7 @@ impl<'a> Ctx<'a> {
             measuring: false,
             as_block_once: false,
             list_ordinal: 0,
+            pending_indent: 0,
         }
     }
 
@@ -610,6 +615,12 @@ impl<'a> Ctx<'a> {
                     self.x += space_width(self.shaper, style.font_size.max(1)) as i32;
                 }
             }
+            // Arm `text-indent` for this block's first line: it is consumed as the
+            // leading offset of the first word (so `add_word`'s "first word of
+            // line" test `x == left` still holds and no phantom space is inserted),
+            // then cleared — only the first line is indented. Nested blocks re-arm
+            // it from the inherited value when their own content starts.
+            self.pending_indent = style.text_indent;
         }
 
         let saved_opacity_hidden = self.opacity_hidden;
@@ -895,14 +906,17 @@ impl<'a> Ctx<'a> {
     fn add_word(&mut self, word: &str, style: &ComputedStyle, href: Option<&str>) {
         let px = style.font_size.max(1);
         let (glyphs, w) = self.shape_run(word, px, style);
-        let gap = if self.x == self.left {
-            0
+        let at_line_start = self.x == self.left;
+        // The leading offset before this word: at the start of a line it is the
+        // one-shot `text-indent` (usually 0), otherwise the inter-word space
+        // (widened/trimmed by `word-spacing`, clamped so a large negative can't
+        // reverse the cursor).
+        let gap = if at_line_start {
+            std::mem::take(&mut self.pending_indent).max(0)
         } else {
-            // `word-spacing` adds to (or, if negative, trims) the normal space
-            // advance between words; clamp so a large negative can't reverse it.
             (space_width(self.shaper, px) as i32 + style.word_spacing).max(0)
         };
-        if self.x != self.left && self.x + gap + w as i32 > self.right {
+        if !at_line_start && self.x + gap + w as i32 > self.right {
             self.newline();
         } else {
             self.x += gap;
@@ -1297,6 +1311,9 @@ impl<'a> Ctx<'a> {
         self.y += self.line_h.max(1);
         self.x = self.left;
         self.line_h = 0;
+        // text-indent is a first-line-only effect; once we wrap it no longer
+        // applies (it is normally already consumed by the first word).
+        self.pending_indent = 0;
     }
 
     /// Apply text-align to the buffered line, then emit it.
@@ -4662,6 +4679,46 @@ mod tests {
                 _ => None,
             })
             .collect()
+    }
+
+    #[test]
+    fn text_indent_offsets_only_the_first_line() {
+        let min_x = |laid: &LaidOut| glyph_xy(laid).iter().map(|(x, _)| *x).min().unwrap();
+
+        // Single line: the indented run starts exactly 40px further right.
+        let plain = lay("<p>hello world</p>", 400);
+        let indented = lay("<p style='text-indent:40px'>hello world</p>", 400);
+        assert_eq!(
+            min_x(&indented) - min_x(&plain),
+            40,
+            "the first line is indented by text-indent"
+        );
+
+        // Force a wrap: the first line (smallest y) is indented, later lines
+        // reset to the left edge — text-indent is a first-line-only effect.
+        let wrapped = lay(
+            "<p style='text-indent:40px'>aaaa bbbb cccc dddd eeee ffff</p>",
+            80,
+        );
+        let xy = glyph_xy(&wrapped);
+        let first_y = xy.iter().map(|(_, y)| *y).min().unwrap();
+        let first_line_x = xy
+            .iter()
+            .filter(|(_, y)| *y == first_y)
+            .map(|(x, _)| *x)
+            .min()
+            .unwrap();
+        let later_x = xy
+            .iter()
+            .filter(|(_, y)| *y != first_y)
+            .map(|(x, _)| *x)
+            .min()
+            .expect("content wrapped to a second line");
+        assert_eq!(
+            first_line_x - later_x,
+            40,
+            "only the first line is indented; wrapped lines reset to the left"
+        );
     }
 
     #[test]

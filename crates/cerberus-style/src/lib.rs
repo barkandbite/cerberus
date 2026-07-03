@@ -260,6 +260,9 @@ pub struct ComputedStyle {
     pub word_spacing: i32,
     /// `list-style-type`: the marker for a `display: list-item`. Inherited.
     pub list_style_type: ListStyleType,
+    /// `text-indent` in px: the first-line indent of a block's inline content.
+    /// Inherited.
+    pub text_indent: i32,
     pub margin_top: i32,
     pub margin_bottom: i32,
     pub margin_left: i32,
@@ -387,6 +390,7 @@ impl ComputedStyle {
             letter_spacing: 0,
             word_spacing: 0,
             list_style_type: ListStyleType::Disc,
+            text_indent: 0,
             margin_top: 0,
             margin_bottom: 0,
             margin_left: 0,
@@ -463,6 +467,7 @@ impl ComputedStyle {
             letter_spacing: self.letter_spacing,
             word_spacing: self.word_spacing,
             list_style_type: self.list_style_type,
+            text_indent: self.text_indent,
             preformatted: self.preformatted,
             visibility: self.visibility,
             // Reset per element:
