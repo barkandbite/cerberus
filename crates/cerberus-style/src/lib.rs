@@ -325,6 +325,9 @@ pub struct ComputedStyle {
     pub background_position: ImagePos,
     /// Preserve whitespace/newlines (`<pre>`); otherwise collapse + wrap.
     pub preformatted: bool,
+    /// `white-space: nowrap` — collapse whitespace but never wrap to a new line.
+    /// Inherited.
+    pub nowrap: bool,
     /// `visibility: hidden` — laid out but not painted. Inherited.
     pub visibility: Visibility,
     /// `opacity` in `[0.0, 1.0]`, composited in paint. Not inherited.
@@ -427,6 +430,7 @@ impl ComputedStyle {
             object_position: ImagePos::CENTER,
             background_position: ImagePos::TOP_LEFT,
             preformatted: false,
+            nowrap: false,
             visibility: Visibility::Visible,
             opacity: 1.0,
             flex_direction: FlexDirection::Row,
@@ -474,6 +478,7 @@ impl ComputedStyle {
             list_style_type: self.list_style_type,
             text_indent: self.text_indent,
             preformatted: self.preformatted,
+            nowrap: self.nowrap,
             visibility: self.visibility,
             // Reset per element:
             display: Display::Inline,

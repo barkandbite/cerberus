@@ -925,7 +925,14 @@ fn apply_declarations(
             "border-right-width" => set_len(&mut style.border_right, v, style.font_size as f32),
             "border-bottom-width" => set_len(&mut style.border_bottom, v, style.font_size as f32),
             "border-left-width" => set_len(&mut style.border_left, v, style.font_size as f32),
-            "white-space" => style.preformatted = v.to_ascii_lowercase().starts_with("pre"),
+            "white-space" => {
+                let low = v.trim().to_ascii_lowercase();
+                // `pre*` preserves whitespace/newlines; `nowrap` collapses like
+                // `normal` but never wraps. (`pre-wrap`/`pre-line` are treated as
+                // `pre` for now.)
+                style.preformatted = low.starts_with("pre");
+                style.nowrap = low == "nowrap";
+            }
             "visibility" => {
                 style.visibility = match v.to_ascii_lowercase().as_str() {
                     "hidden" | "collapse" => Visibility::Hidden,
@@ -2374,6 +2381,17 @@ mod tests {
         // 2em at the default 16px font = 32px; inherited by the child.
         assert_eq!(first(&dom.root, "div").unwrap().style.text_indent, 32);
         assert_eq!(first(&dom.root, "p").unwrap().style.text_indent, 32);
+    }
+
+    #[test]
+    fn white_space_nowrap_and_pre_parse() {
+        let nw = CssEngine::new().style(&parse_html("<p style='white-space:nowrap'>x</p>"));
+        let p = first(&nw.root, "p").unwrap();
+        assert!(p.style.nowrap && !p.style.preformatted);
+        // `pre` sets preformatted, not nowrap; `<pre>` gets it from the UA sheet.
+        let pre = CssEngine::new().style(&parse_html("<pre>x</pre>"));
+        let el = first(&pre.root, "pre").unwrap();
+        assert!(el.style.preformatted && !el.style.nowrap);
     }
 
     #[test]

@@ -897,6 +897,14 @@ impl<'a> Ctx<'a> {
                     self.add_run(line, style, href);
                 }
             }
+        } else if style.nowrap {
+            // `white-space: nowrap`: collapse runs of whitespace to single spaces
+            // like normal text, but place the whole thing as one atomic run so it
+            // never wraps (it may overflow the container, per spec).
+            let collapsed = text.split_whitespace().collect::<Vec<_>>().join(" ");
+            if !collapsed.is_empty() {
+                self.add_run(&collapsed, style, href);
+            }
         } else {
             for word in text.split_whitespace() {
                 self.add_word(word, style, href);
@@ -4518,6 +4526,26 @@ mod tests {
         let laid = lay("<input type='submit' value='Send'>", 400);
         assert!(has_rect_color(&laid, BUTTON_BG));
         assert_eq!(total_glyphs(&laid), 4, "'Send' label");
+    }
+
+    #[test]
+    fn white_space_nowrap_stays_on_one_line() {
+        // In a narrow container, normal text wraps to several lines; the same text
+        // with `white-space: nowrap` stays on a single line.
+        let wrapped = lay("<p>aaaa bbbb cccc dddd eeee</p>", 60);
+        let nowrap = lay(
+            "<p style='white-space:nowrap'>aaaa bbbb cccc dddd eeee</p>",
+            60,
+        );
+        assert!(
+            distinct(&glyph_ys(&wrapped)) > 1,
+            "normal text wraps to multiple lines"
+        );
+        assert_eq!(
+            distinct(&glyph_ys(&nowrap)),
+            1,
+            "nowrap text stays on one line"
+        );
     }
 
     #[test]
