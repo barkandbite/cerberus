@@ -2426,6 +2426,45 @@ pub const DOM_MODEL_PRELUDE: &str = r##"
     document.getElementsByClassName = function (c) { return this.documentElement ? queryAll(this.documentElement, "." + String(c)) : []; };
     document.querySelector = function (s) { return this.documentElement ? queryOne(this.documentElement, s) : null; };
     document.querySelectorAll = function (s) { return this.documentElement ? queryAll(this.documentElement, s) : []; };
+    // Document collections: `document.forms` (with named access by id/name, as
+    // pages do `document.forms.login`), `document.images`, and `document.links`
+    // (anchors/areas that actually have an href). Live-ish: recomputed per read.
+    Object.defineProperty(document, "forms", {
+      get: function () {
+        var list = this.documentElement ? queryAll(this.documentElement, "form") : [];
+        for (var i = 0; i < list.length; i++) {
+          var key = getAttr(list[i], "id") || getAttr(list[i], "name");
+          if (key && !(key in list)) {
+            Object.defineProperty(list, key, { value: list[i], enumerable: false, configurable: true });
+          }
+        }
+        return list;
+      },
+      enumerable: true, configurable: true,
+    });
+    Object.defineProperty(document, "images", {
+      get: function () { return this.documentElement ? queryAll(this.documentElement, "img") : []; },
+      enumerable: true, configurable: true,
+    });
+    Object.defineProperty(document, "links", {
+      get: function () {
+        if (!this.documentElement) return [];
+        var out = [];
+        walkElements(this.documentElement, function (el) {
+          if ((el.__tag === "a" || el.__tag === "area") && getAttr(el, "href") !== null) out.push(el);
+        });
+        return out;
+      },
+      enumerable: true, configurable: true,
+    });
+    document.getElementsByName = function (n) {
+      n = String(n);
+      var out = [];
+      if (this.documentElement) {
+        walkElements(this.documentElement, function (el) { if (getAttr(el, "name") === n) out.push(el); });
+      }
+      return out;
+    };
     document.createElement = function (tag) { return makeElement(tag); };
     document.createTextNode = function (text) { return makeText(text); };
     document.createDocumentFragment = function () {
