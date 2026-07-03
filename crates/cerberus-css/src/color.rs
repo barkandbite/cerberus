@@ -10,14 +10,16 @@ pub fn parse_color(input: &str) -> Option<Color> {
         return parse_hex(hex);
     }
     let lower = s.to_ascii_lowercase();
+    // `rgb()` and `rgba()` are synonyms (CSS Color 4); both accept an optional
+    // alpha in either legacy or modern syntax.
     if let Some(inner) = lower.strip_prefix("rgb(").and_then(|x| x.strip_suffix(')')) {
-        return parse_rgb(inner, false);
+        return parse_rgb(inner);
     }
     if let Some(inner) = lower
         .strip_prefix("rgba(")
         .and_then(|x| x.strip_suffix(')'))
     {
-        return parse_rgb(inner, true);
+        return parse_rgb(inner);
     }
     if let Some(inner) = lower.strip_prefix("hsl(").and_then(|x| x.strip_suffix(')')) {
         return parse_hsl(inner);
@@ -124,21 +126,50 @@ fn hsl_to_rgb(h: f32, s: f32, l: f32) -> (u8, u8, u8) {
     (hue(h + 1.0 / 3.0), hue(h), hue(h - 1.0 / 3.0))
 }
 
-fn parse_rgb(inner: &str, with_alpha: bool) -> Option<Color> {
-    let parts: Vec<&str> = inner.split(',').map(str::trim).collect();
-    if parts.len() < 3 {
-        return None;
-    }
-    let r = channel(parts[0])?;
-    let g = channel(parts[1])?;
-    let b = channel(parts[2])?;
-    let a = if with_alpha && parts.len() >= 4 {
-        let alpha: f32 = parts[3].parse().ok()?;
-        (alpha.clamp(0.0, 1.0) * 255.0).round() as u8
+/// Parse the inside of `rgb(...)`/`rgba(...)` in either syntax:
+/// - legacy comma:  `r, g, b` / `r, g, b, a`
+/// - modern space:  `r g b`   / `r g b / a`   (CSS Color 4)
+///
+/// Channels are 0–255 integers or percentages; alpha is a 0–1 number or a
+/// percentage. The two forms are told apart by the presence of a comma.
+fn parse_rgb(inner: &str) -> Option<Color> {
+    let (rgb, alpha) = if inner.contains(',') {
+        let parts: Vec<&str> = inner.split(',').map(str::trim).collect();
+        if parts.len() < 3 {
+            return None;
+        }
+        ([parts[0], parts[1], parts[2]], parts.get(3).copied())
     } else {
-        255
+        // Modern syntax: optional `/ alpha` after the three channels.
+        let (chans, alpha) = match inner.split_once('/') {
+            Some((c, a)) => (c, Some(a)),
+            None => (inner, None),
+        };
+        let nums: Vec<&str> = chans.split_whitespace().collect();
+        if nums.len() < 3 {
+            return None;
+        }
+        ([nums[0], nums[1], nums[2]], alpha)
+    };
+    let r = channel(rgb[0].trim())?;
+    let g = channel(rgb[1].trim())?;
+    let b = channel(rgb[2].trim())?;
+    let a = match alpha.map(str::trim).filter(|s| !s.is_empty()) {
+        Some(a) => parse_alpha(a)?,
+        None => 255,
     };
     Some(Color::rgba(r, g, b, a))
+}
+
+/// Parse an alpha value: a `0..=1` number or a percentage. Clamped to `[0, 1]`
+/// and scaled to a 0–255 byte.
+fn parse_alpha(s: &str) -> Option<u8> {
+    let frac = if let Some(p) = s.strip_suffix('%') {
+        p.trim().parse::<f32>().ok()? / 100.0
+    } else {
+        s.parse::<f32>().ok()?
+    };
+    Some((frac.clamp(0.0, 1.0) * 255.0).round() as u8)
 }
 
 fn channel(s: &str) -> Option<u8> {
@@ -316,6 +347,41 @@ mod tests {
         assert_eq!(parse_color("RoyalBlue"), Some(Color::rgb(65, 105, 225)));
         assert_eq!(parse_color("transparent").unwrap().a, 0);
         assert_eq!(parse_color("not-a-color"), None);
+    }
+
+    #[test]
+    fn parses_modern_and_legacy_rgb_syntax() {
+        // Legacy comma and modern space forms are equivalent; rgb()/rgba() are
+        // synonyms and both accept an optional alpha.
+        assert_eq!(
+            parse_color("rgb(255 0 0)"),
+            Some(Color::rgba(255, 0, 0, 255))
+        );
+        assert_eq!(
+            parse_color("rgb(10, 20, 30)"),
+            parse_color("rgb(10 20 30)"),
+            "comma and space forms agree"
+        );
+        // Modern slash alpha, as a number and as a percentage.
+        assert_eq!(
+            parse_color("rgb(0 128 255 / 0.5)"),
+            Some(Color::rgba(0, 128, 255, 128))
+        );
+        assert_eq!(
+            parse_color("rgb(0 0 0 / 50%)").unwrap().a,
+            128,
+            "percent alpha"
+        );
+        // `rgb(...)` (not just rgba) honors alpha; legacy 4-value form still works.
+        assert_eq!(parse_color("rgba(255, 0, 0, 0)").unwrap().a, 0);
+        assert_eq!(parse_color("rgb(1 2 3 / 100%)").unwrap().a, 255);
+        // Percentage channels resolve in both forms.
+        assert_eq!(
+            parse_color("rgb(100% 0% 0%)"),
+            Some(Color::rgba(255, 0, 0, 255))
+        );
+        // Too few channels → no color.
+        assert_eq!(parse_color("rgb(1 2)"), None);
     }
 
     #[test]
