@@ -1846,6 +1846,24 @@ fn link_is_stylesheet(node: NodeRef<'_>) -> bool {
     })
 }
 
+/// Collect every `<script src="…">` value in document order (external scripts —
+/// inline `<script>` bodies are handled separately via [`Document::scripts`]).
+/// The raw `src` is returned; the caller resolves it against the page URL.
+fn collect_external_scripts(node: NodeRef<'_>, out: &mut Vec<String>) {
+    if node.tag() == "script" {
+        if let Some(src) = node.attr("src") {
+            if !src.trim().is_empty() {
+                out.push(src.to_string());
+            }
+        }
+    }
+    for child in node.children() {
+        if child.is_element() {
+            collect_external_scripts(child, out);
+        }
+    }
+}
+
 /// Synchronously fetch every `<link rel="stylesheet">` body, keyed by the link's
 /// raw `href` (what the cascade looks up). Used by the one-shot [`render`] (the
 /// interactive browser fetches them on its worker). Third-party sheets are
@@ -2190,6 +2208,10 @@ pub struct BrowserApp {
     /// `Done::Sub` response can be routed to CSS (vs. an image) and stored under
     /// the href the cascade keys on.
     pending_sheets: HashMap<String, String>,
+    /// In-flight external `<script src>` fetches (resolved absolute URLs), so a
+    /// `Done::Sub` response can be routed to the JS engine and executed against
+    /// the page realm rather than decoded as an image.
+    pending_scripts: std::collections::HashSet<String>,
     history: Vec<String>,
     index: usize,
     document: Document,
@@ -2407,6 +2429,7 @@ impl BrowserApp {
             images: HashMap::new(),
             sheets: ExternalSheets::new(),
             pending_sheets: HashMap::new(),
+            pending_scripts: std::collections::HashSet::new(),
             history: Vec::new(),
             index: 0,
             document: empty_document(),
@@ -2606,6 +2629,8 @@ impl BrowserApp {
         // worker and re-style as they arrive (ADR-0037).
         self.sheets.clear();
         self.pending_sheets.clear();
+        // New page: abandon any external scripts still in flight from the last one.
+        self.pending_scripts.clear();
         let t = Instant::now();
         self.styled = self.style_engine.style(&doc);
         self.timings.record("style", t.elapsed());
@@ -2632,10 +2657,15 @@ impl BrowserApp {
     /// unscripted DOM so the page still renders.
     fn run_scripts(&mut self, doc: Document) -> Document {
         // Each navigation rebuilds the realm's model, so the previous node↔JS
-        // correlation is stale. A script-less page has no realm and no dispatch
-        // targets: keep the map empty and return the DOM untouched.
+        // correlation is stale. A truly script-less page (no inline AND no
+        // external scripts) has no realm and no dispatch targets: keep the map
+        // empty and return the DOM untouched. A page with only external scripts
+        // still installs the realm here (running zero inline scripts), so the
+        // fetched external bodies have a live document model to execute against.
         self.node_to_js.clear();
-        if doc.scripts().is_empty() {
+        let mut external = Vec::new();
+        collect_external_scripts(doc.root(), &mut external);
+        if doc.scripts().is_empty() && external.is_empty() {
             return doc;
         }
         let realm = RealmId(self.heads.active().id.0);
@@ -2729,6 +2759,9 @@ impl BrowserApp {
 
         self.request_page_images();
         self.request_page_stylesheets();
+        // Fetch external `<script src>` (e.g. a bot-challenge sensor) to run on
+        // the worker; each executes against the page realm as it resolves.
+        self.request_page_scripts();
         self.update_nav();
         // Page-load total covers fetch → parse → scripts → style (M11);
         // layout+paint is timed per frame in render_frame.
@@ -2869,6 +2902,9 @@ impl BrowserApp {
         self.timings.add("subresources", elapsed);
         if self.pending_sheets.contains_key(&url) {
             return self.handle_stylesheet(url, bytes);
+        }
+        if self.pending_scripts.contains(&url) {
+            return self.handle_script(url, bytes);
         }
         let state =
             match bytes.and_then(|b| self.image_codec.decode(&b).map_err(|e| format!("{e:?}"))) {
@@ -3192,6 +3228,80 @@ impl BrowserApp {
                 },
             );
         }
+    }
+
+    /// Scan the current document for `<script src>` and queue a background fetch
+    /// for each new http(s) script, consent-gated like any subresource. Responses
+    /// route to the JS engine in `handle_script`, which executes the fetched body
+    /// against the page realm (so an external sensor script actually runs). Async
+    /// by nature: a script runs whenever its fetch resolves.
+    fn request_page_scripts(&mut self) {
+        // No realm to run against (a truly script-less page never installed one).
+        if self.node_to_js.is_empty() {
+            return;
+        }
+        let first_party = self.current_url.as_ref().and_then(first_party_of);
+        let instance = self.heads.active().instance;
+        let mut srcs = Vec::new();
+        collect_external_scripts(self.document.root(), &mut srcs);
+        for src in srcs {
+            let abs = resolve_subresource(self.current_url.as_ref(), &src);
+            if !(abs.starts_with("http://") || abs.starts_with("https://")) {
+                continue;
+            }
+            // One fetch per distinct URL per page (already fetched or in flight).
+            if self.pending_scripts.contains(&abs) {
+                continue;
+            }
+            let Some(first_party) = first_party.clone() else {
+                continue;
+            };
+            // Consent gate: a third-party script needs an Allow rule (a first-party
+            // script — same site as the page — is allowed).
+            if self.gate_subresource(&abs, &first_party) != Decision::Allow {
+                continue;
+            }
+            self.pending_scripts.insert(abs.clone());
+            self.loader.request_subresource(
+                abs,
+                FetchContext {
+                    instance,
+                    kind: FetchKind::Subresource { first_party },
+                },
+            );
+        }
+    }
+
+    /// Execute a fetched external script body against the page realm, then
+    /// reconcile the DOM and dispatch any fetch/navigation it triggered (an
+    /// external sensor typically XHRs a payload and later reloads). A failed fetch
+    /// or bridge error simply runs nothing — the page still stands.
+    fn handle_script(&mut self, url: String, bytes: Result<Vec<u8>, String>) -> bool {
+        if !self.pending_scripts.remove(&url) {
+            return false;
+        }
+        let Ok(bytes) = bytes else {
+            return false;
+        };
+        let body = String::from_utf8_lossy(&bytes).into_owned();
+        let realm = RealmId(self.heads.active().id.0);
+        {
+            let Ok(engine) = self.heads.engine() else {
+                return false;
+            };
+            // Run against the already-installed realm; swallow a script throw the
+            // same way inline execution does (the page must survive a bad script).
+            let _ = cerberus_js_dom::run_scripts(engine, realm, &[body]);
+            let _ = run_event_loop(engine, realm, EventLoopBudget::default());
+        }
+        // The script may have set document.cookie, mutated the DOM, or queued a
+        // fetch/navigation — persist, re-read, and pump, exactly like a settled
+        // fetch handler.
+        self.capture_cookie_writes();
+        self.reconcile_realm();
+        self.pump_fetches();
+        self.pump_navigations();
+        true
     }
 
     // ---- Cookie inspector (M10) ----
@@ -4586,15 +4696,17 @@ fn empty_document() -> Document {
     b.finish(root)
 }
 
-/// Whether `url` is a scheme the browser navigates to as a top-level document:
-/// `http(s)` or our built-in `cerberus:` pages. A script navigation to anything
-/// else (`javascript:`, `data:`, `blob:`, `mailto:`, …) is ignored rather than
-/// fetched — those are never a document navigation in a real browser, and
-/// letting a page trigger a fetch of an arbitrary scheme is needless surface.
+/// Whether a **script-initiated** navigation may target `url`. Only web schemes
+/// (`http(s)`) are allowed: a page's script must not drive the head to
+/// `javascript:`/`data:`/`blob:`/`mailto:` (ignored, never fetched) nor to our
+/// internal `cerberus:` pages — web content navigating to the browser's own
+/// privileged scheme is something a real browser forbids (like `chrome://`).
+/// User gestures (toolbar, links) reach `cerberus:` through `begin_load`
+/// directly; this guard governs only the script path.
 fn is_navigable_scheme(url: &str) -> bool {
     let s = url.trim_start();
     let has = |p: &str| s.get(..p.len()).is_some_and(|h| h.eq_ignore_ascii_case(p));
-    has("http://") || has("https://") || has("cerberus:")
+    has("http://") || has("https://")
 }
 
 fn first_party_of(url: &cerberus_url::Url) -> Option<Origin> {
@@ -6448,6 +6560,38 @@ mod tests {
         }
         // One user-initiated request + SCRIPT_NAV_CAP script reloads, then capped.
         assert_eq!(seen.locked().len(), 1 + SCRIPT_NAV_CAP as usize);
+    }
+
+    #[test]
+    fn external_script_is_fetched_and_executed() {
+        // A page whose ONLY script is external `<script src>` still installs a
+        // realm; the fetched body runs against it and its DOM mutation shows up.
+        let mut b = fake_app_img(
+            vec![(
+                "https://site.test/",
+                Ok(page(
+                    "https://site.test/",
+                    200,
+                    None,
+                    "<div id=\"x\">old</div><script src=\"/sensor.js\"></script>",
+                )),
+            )],
+            vec![(
+                "https://site.test/sensor.js",
+                Ok(b"document.getElementById('x').textContent = 'from-external';".to_vec()),
+            )],
+        );
+        b.navigate("https://site.test/");
+        let mut guard = 0;
+        while b.poll() {
+            guard += 1;
+            assert!(guard < 20, "did not converge");
+        }
+        assert!(
+            b.document.root().text_content().contains("from-external"),
+            "external script should have run and mutated the DOM; got {:?}",
+            b.document.root().text_content()
+        );
     }
 
     #[test]
