@@ -581,8 +581,13 @@ impl<'a> Ctx<'a> {
                         (self.left + off, bw)
                     }
                     None => {
+                        // Auto width fills the space left after both margins: a
+                        // non-auto `margin-right` shrinks the box from the right
+                        // (an `auto` right margin computes to 0 here, and its value
+                        // is 0, so this is a no-op for centering).
                         let l = self.left + style.margin_left;
-                        (l, (self.right - l).max(1))
+                        let r = (self.right - style.margin_right).max(l + 1);
+                        (l, (r - l).max(1))
                     }
                 };
             bbox = Some(BorderBox {
@@ -4704,6 +4709,25 @@ mod tests {
             1,
             "nbsp keeps both words on one line: {:?}",
             glyph_ys(&nbsp)
+        );
+    }
+
+    #[test]
+    fn margin_right_shrinks_the_auto_width_box() {
+        // A non-auto `margin-right` narrows an auto-width block, so the same text
+        // wraps into more rows than with no right margin. Both share the same left
+        // edge, so this isolates the right-margin effect.
+        let text = "aa bb cc dd ee ff gg hh";
+        let plain = lay(&format!("<div>{text}</div>"), 200);
+        let margined = lay(
+            &format!("<div style='margin-right:140px'>{text}</div>"),
+            200,
+        );
+        assert!(
+            distinct(&glyph_ys(&margined)) > distinct(&glyph_ys(&plain)),
+            "margin-right narrows the box so text wraps more: plain {:?} vs margined {:?}",
+            glyph_ys(&plain),
+            glyph_ys(&margined)
         );
     }
 
