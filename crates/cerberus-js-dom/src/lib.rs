@@ -1477,8 +1477,8 @@ pub const DOM_MODEL_PRELUDE: &str = r##"
     // pseudo — dynamic state like `:hover`, or a `::pseudo-element` — never matches
     // statically (as in the cascade engine). Unsupported (by design, speed-first):
     // sibling combinators `~`/`+`, `:nth-child()`/`:not()`, leading `>`,
-    // namespaces. Attribute selectors are limited to `[name]` and `[name="value"]`
-    // / `[name='value']` (presence and exact-match; no `~=`, `^=`, `*=`, …).
+    // namespaces. Attribute selectors support presence (`[name]`), exact match
+    // (`[name="value"]`), and the `^= $= *= ~= |=` operators.
     function parseCompound(text) {
       // text is one compound run with no whitespace/combinators, e.g.
       // `div.foo#bar[data-x="1"]`. Returns null if it is empty/garbage.
@@ -1516,12 +1516,19 @@ pub const DOM_MODEL_PRELUDE: &str = r##"
           i = end + 1;
           var eq = body.indexOf("=");
           if (eq === -1) {
-            if (body) { compound.attrs.push({ name: body, value: null }); sawAny = true; }
+            if (body) { compound.attrs.push({ name: body, value: null, op: null }); sawAny = true; }
           } else {
-            var an = body.slice(0, eq).trim();
+            // An operator may prefix the `=`: ^= $= *= ~= |= (else exact `=`).
+            var op = "=";
+            var nameEnd = eq;
+            if (eq > 0 && "^$*~|".includes(body.charAt(eq - 1))) {
+              op = body.charAt(eq - 1) + "=";
+              nameEnd = eq - 1;
+            }
+            var an = body.slice(0, nameEnd).trim();
             var av = body.slice(eq + 1).trim();
             if (av.length >= 2 && (av.charAt(0) === '"' || av.charAt(0) === "'")) av = av.slice(1, -1);
-            if (an) { compound.attrs.push({ name: an, value: av }); sawAny = true; }
+            if (an) { compound.attrs.push({ name: an, value: av, op: op }); sawAny = true; }
           }
         } else {
           // A type (tag) selector or universal `*`; runs until the next part.
@@ -1584,8 +1591,16 @@ pub const DOM_MODEL_PRELUDE: &str = r##"
       for (var j = 0; j < compound.attrs.length; j++) {
         var a = compound.attrs[j];
         var v = getAttr(el, a.name);
-        if (v === null) return false;
-        if (a.value !== null && v !== a.value) return false;
+        if (v === null) return false;           // attribute must be present
+        if (a.value === null) continue;         // `[name]` presence-only
+        switch (a.op) {
+          case "^=": if (!a.value || v.indexOf(a.value) !== 0) return false; break;
+          case "$=": if (!a.value || v.slice(-a.value.length) !== a.value || v.length < a.value.length) return false; break;
+          case "*=": if (!a.value || v.indexOf(a.value) === -1) return false; break;
+          case "~=": if (v.split(/\s+/).indexOf(a.value) === -1) return false; break;
+          case "|=": if (v !== a.value && v.indexOf(a.value + "-") !== 0) return false; break;
+          default:   if (v !== a.value) return false; // `=` exact
+        }
       }
       if (compound.pseudos) {
         for (var q = 0; q < compound.pseudos.length; q++) {
