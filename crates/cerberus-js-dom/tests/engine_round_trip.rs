@@ -66,6 +66,57 @@ fn doc_with_div_x() -> Document {
 }
 
 #[test]
+fn query_selector_sibling_combinators() {
+    // `+` (adjacent) and `~` (general) sibling combinators in querySelector.
+    let mut b = DocumentBuilder::new();
+    let h = b.element_attrs("h2", vec![("id".into(), "h".into())], []);
+    let p1 = b.element_attrs("p", vec![("id".into(), "p1".into())], []);
+    let p2 = b.element_attrs("p", vec![("id".into(), "p2".into())], []);
+    let sp = b.element_attrs("span", vec![("id".into(), "s".into())], []);
+    let p3 = b.element_attrs("p", vec![("id".into(), "p3".into())], []);
+    let probe = b.element_attrs("div", vec![("id".into(), "d".into())], []);
+    let body = b.element("body", [h, p1, p2, sp, p3, probe]);
+    let html = b.element("html", [body]);
+    let doc = b.finish(html);
+
+    let (mut engine, realm) = engine_and_realm();
+    let scripts = vec!["var d = document.getElementById('d'); \
+         d.setAttribute('adj', document.querySelector('h2 + p').id); \
+         d.setAttribute('adj-none', String(document.querySelectorAll('h2 + span').length)); \
+         var g = document.querySelectorAll('h2 ~ p'); \
+         d.setAttribute('gen', Array.prototype.map.call(g, function (x) { return x.id; }).join(',')); \
+         d.setAttribute('gen-span', document.querySelector('h2 ~ span').id); \
+         d.setAttribute('m1', String(document.getElementById('p1').matches('h2 + p'))); \
+         d.setAttribute('m2', String(document.getElementById('p2').matches('h2 + p')));"
+        .to_string()];
+
+    let out = run_page_scripts(engine.as_mut(), realm, &doc, &scripts, &env()).expect("run");
+    let d = find_id(out.root(), "d").expect("#d present");
+    assert_eq!(
+        d.attr("adj"),
+        Some("p1"),
+        "+ matches the immediately-next sibling"
+    );
+    assert_eq!(d.attr("adj-none"), Some("0"), "+ requires adjacency");
+    assert_eq!(
+        d.attr("gen"),
+        Some("p1,p2,p3"),
+        "~ matches all following siblings"
+    );
+    assert_eq!(
+        d.attr("gen-span"),
+        Some("s"),
+        "~ works across element types"
+    );
+    assert_eq!(
+        d.attr("m1"),
+        Some("true"),
+        "matches('h2 + p') on the adjacent p"
+    );
+    assert_eq!(d.attr("m2"), Some("false"), "not adjacent → no match");
+}
+
+#[test]
 fn query_selector_attribute_operators() {
     // The substring/word/dash attribute operators (^= $= *= ~= |=) now work in
     // querySelector, not just presence and exact match.

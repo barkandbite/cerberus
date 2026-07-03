@@ -1476,9 +1476,10 @@ pub const DOM_MODEL_PRELUDE: &str = r##"
     // (`:first-child`, `:last-child`, `:only-child`, `:empty`, `:root`). Any other
     // pseudo — dynamic state like `:hover`, or a `::pseudo-element` — never matches
     // statically (as in the cascade engine). Unsupported (by design, speed-first):
-    // sibling combinators `~`/`+`, `:nth-child()`/`:not()`, leading `>`,
-    // namespaces. Attribute selectors support presence (`[name]`), exact match
-    // (`[name="value"]`), and the `^= $= *= ~= |=` operators.
+    // `:nth-child()`/`:not()`, namespaces. Combinators: descendant, child (`>`),
+    // adjacent-sibling (`+`), general-sibling (`~`). Attribute selectors support
+    // presence (`[name]`), exact match (`[name="value"]`), and the
+    // `^= $= *= ~= |=` operators.
     function parseCompound(text) {
       // text is one compound run with no whitespace/combinators, e.g.
       // `div.foo#bar[data-x="1"]`. Returns null if it is empty/garbage.
@@ -1551,16 +1552,17 @@ pub const DOM_MODEL_PRELUDE: &str = r##"
         var sawSpace = false;
         while (i < n && /\s/.test(text.charAt(i))) { i++; sawSpace = true; }
         if (i >= n) break;
-        if (text.charAt(i) === ">") {
-          pendingCombinator = ">"; i++;
-          // Skip whitespace after `>`.
+        var cc = text.charAt(i);
+        if (cc === ">" || cc === "+" || cc === "~") {
+          // `>` child, `+` adjacent-sibling, `~` general-sibling.
+          pendingCombinator = cc; i++;
           while (i < n && /\s/.test(text.charAt(i))) i++;
         } else if (sawSpace && steps.length > 0) {
           pendingCombinator = " ";
         }
         // Read the compound run up to the next combinator/whitespace.
         var s = i;
-        while (i < n && !/\s/.test(text.charAt(i)) && text.charAt(i) !== ">") {
+        while (i < n && !/\s/.test(text.charAt(i)) && !">+~".includes(text.charAt(i))) {
           if (text.charAt(i) === "[") { var e = text.indexOf("]", i); i = (e === -1) ? n : e + 1; }
           else i++;
         }
@@ -1655,6 +1657,18 @@ pub const DOM_MODEL_PRELUDE: &str = r##"
         if (rel === ">") {
           node = node.__parent;
           if (!matchesCompound(node, want)) return false;
+        } else if (rel === "+") {
+          // Adjacent sibling: the element immediately before `node`.
+          var asibs = elementSiblingsOf(node), ai = asibs.indexOf(node);
+          if (ai <= 0 || !matchesCompound(asibs[ai - 1], want)) return false;
+          node = asibs[ai - 1];
+        } else if (rel === "~") {
+          // General sibling: SOME preceding element sibling matching `want`.
+          var gsibs = elementSiblingsOf(node), gi = gsibs.indexOf(node), gok = false;
+          for (var gs = gi - 1; gs >= 0; gs--) {
+            if (matchesCompound(gsibs[gs], want)) { gok = true; node = gsibs[gs]; break; }
+          }
+          if (!gok) return false;
         } else {
           // Descendant: find SOME ancestor matching `want`.
           var anc = node.__parent, ok = false;
