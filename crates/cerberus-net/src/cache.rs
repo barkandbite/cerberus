@@ -33,7 +33,12 @@ struct Entry {
 /// (On-disk caching is later work.)
 #[derive(Default)]
 pub struct HttpCache {
-    entries: HashMap<(InstanceId, String), Entry>,
+    /// Two-level so a lookup borrows the URL: keying a flat map on
+    /// `(InstanceId, String)` forced a `url.to_string()` on every `get`, but a
+    /// `HashMap<String, _>` can be probed with `&str` (via `Borrow`). Reads are
+    /// the hot path (every subresource fetch checks the cache), so this drops one
+    /// URL-length allocation per probe (issue #24).
+    entries: HashMap<InstanceId, HashMap<String, Entry>>,
     /// Content-addressed body pool: `content-hash -> live body allocations`.
     /// Weak, so a body frees when its last [`Entry`] drops; dead weaks are pruned
     /// lazily on the next intern of the same hash (ADR-0016).
@@ -48,7 +53,7 @@ impl HttpCache {
 
     /// Return a fresh cached response for `(instance, url)`, if any.
     pub fn get(&self, instance: InstanceId, url: &str) -> Option<HttpResponse> {
-        let entry = self.entries.get(&(instance, url.to_string()))?;
+        let entry = self.entries.get(&instance)?.get(url)?;
         if Instant::now() >= entry.expires {
             None
         } else {
@@ -89,8 +94,8 @@ impl HttpCache {
             .cloned()
             .collect();
         let body = self.intern_body(&response.body);
-        self.entries.insert(
-            (instance, url.to_string()),
+        self.entries.entry(instance).or_default().insert(
+            url.to_string(),
             Entry {
                 status: response.status,
                 headers,
@@ -126,17 +131,19 @@ impl HttpCache {
     /// Drop all entries for an instance (e.g. on identity reset). Interned bodies
     /// they held free here if no other instance still references them.
     pub fn clear_instance(&mut self, instance: InstanceId) {
-        self.entries.retain(|(i, _), _| *i != instance);
+        self.entries.remove(&instance);
     }
 
-    /// Number of cached entries.
+    /// Number of cached entries across all instances.
     pub fn len(&self) -> usize {
-        self.entries.len()
+        self.entries.values().map(HashMap::len).sum()
     }
 
-    /// Whether the cache is empty.
+    /// Whether the cache holds no entries. An instance whose entries were all
+    /// removed may leave an empty inner map, so check the entry counts rather
+    /// than the outer map's emptiness.
     pub fn is_empty(&self) -> bool {
-        self.entries.is_empty()
+        self.entries.values().all(HashMap::is_empty)
     }
 
     /// Number of distinct body allocations currently live — the dedup invariant
@@ -235,6 +242,24 @@ mod tests {
         // A different body is a distinct allocation.
         c.store(a(), "https://y/", &resp_body("max-age=60", b"other-bytes"));
         assert_eq!(c.distinct_bodies(), 2);
+    }
+
+    #[test]
+    fn len_and_is_empty_track_entries_not_the_instance_map() {
+        // With the two-level map, clearing an instance can leave an empty inner
+        // map behind; `len`/`is_empty` must count entries, not instance buckets.
+        let mut c = HttpCache::new();
+        assert!(c.is_empty());
+        assert_eq!(c.len(), 0);
+        c.store(a(), "https://x/", &resp("max-age=60"));
+        c.store(a(), "https://y/", &resp("max-age=60"));
+        c.store(b(), "https://x/", &resp("max-age=60"));
+        assert_eq!(c.len(), 3);
+        c.clear_instance(a());
+        assert_eq!(c.len(), 1, "only b's entry remains");
+        c.clear_instance(b());
+        assert!(c.is_empty(), "no entries left even if a bucket lingers");
+        assert_eq!(c.len(), 0);
     }
 
     #[test]
