@@ -171,6 +171,14 @@ pub enum ListStyleType {
     Circle,
     Square,
     Decimal,
+    /// `a, b, … z, aa, …` (bijective base-26); `LowerAlpha`/`UpperAlpha` differ
+    /// only in case.
+    LowerAlpha,
+    UpperAlpha,
+    /// `i, ii, iii, iv, …` roman numerals; `LowerRoman`/`UpperRoman` differ only
+    /// in case.
+    LowerRoman,
+    UpperRoman,
     None,
 }
 

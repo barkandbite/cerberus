@@ -47,6 +47,12 @@ head, title, meta, link, style, script, base, template { display: none; }
 svg { display: none; }
 li { display: list-item; }
 ol { list-style-type: decimal; }
+/* The `type` attribute selects the ordered-list marker (HTML UA stylesheet). */
+ol[type="a"] { list-style-type: lower-alpha; }
+ol[type="A"] { list-style-type: upper-alpha; }
+ol[type="i"] { list-style-type: lower-roman; }
+ol[type="I"] { list-style-type: upper-roman; }
+ol[type="1"] { list-style-type: decimal; }
 h1 { font-size: 32px; font-weight: bold; margin-top: 16px; margin-bottom: 16px; }
 h2 { font-size: 24px; font-weight: bold; margin-top: 14px; margin-bottom: 14px; }
 h3 { font-size: 20px; font-weight: bold; margin-top: 12px; margin-bottom: 12px; }
@@ -1141,14 +1147,12 @@ fn parse_list_style_type(v: &str) -> Option<ListStyleType> {
         "circle" => ListStyleType::Circle,
         "square" => ListStyleType::Square,
         "none" => ListStyleType::None,
-        "decimal"
-        | "decimal-leading-zero"
-        | "lower-alpha"
-        | "upper-alpha"
-        | "lower-roman"
-        | "upper-roman"
-        | "lower-latin"
-        | "upper-latin" => ListStyleType::Decimal,
+        "decimal" | "decimal-leading-zero" => ListStyleType::Decimal,
+        // `latin` is a synonym for `alpha`.
+        "lower-alpha" | "lower-latin" => ListStyleType::LowerAlpha,
+        "upper-alpha" | "upper-latin" => ListStyleType::UpperAlpha,
+        "lower-roman" => ListStyleType::LowerRoman,
+        "upper-roman" => ListStyleType::UpperRoman,
         _ => return None,
     })
 }
@@ -2450,6 +2454,39 @@ mod tests {
         assert_eq!(
             first(&dom3.root, "li").unwrap().style.list_style_type,
             ListStyleType::None
+        );
+    }
+
+    #[test]
+    fn alpha_and_roman_list_types_parse_and_map_from_ol_type_attr() {
+        // The `lower-alpha`/`upper-roman`/… keywords now map to their own types
+        // (previously all collapsed to decimal); `latin` is a synonym for `alpha`.
+        let author = CssEngine::new().style(&parse_html(
+            "<ol style='list-style-type:lower-roman'><li>x</li></ol>",
+        ));
+        assert_eq!(
+            first(&author.root, "ol").unwrap().style.list_style_type,
+            ListStyleType::LowerRoman
+        );
+        let latin = CssEngine::new().style(&parse_html(
+            "<ol style='list-style-type:upper-latin'><li>x</li></ol>",
+        ));
+        assert_eq!(
+            first(&latin.root, "ol").unwrap().style.list_style_type,
+            ListStyleType::UpperAlpha
+        );
+
+        // The HTML `type` attribute selects the marker via UA rules, and the value
+        // match is case-sensitive: `a` → lower-alpha, `A` → upper-alpha.
+        let lower = CssEngine::new().style(&parse_html("<ol type='a'><li>x</li></ol>"));
+        assert_eq!(
+            first(&lower.root, "ol").unwrap().style.list_style_type,
+            ListStyleType::LowerAlpha
+        );
+        let upper = CssEngine::new().style(&parse_html("<ol type='I'><li>x</li></ol>"));
+        assert_eq!(
+            first(&upper.root, "ol").unwrap().style.list_style_type,
+            ListStyleType::UpperRoman
         );
     }
 
