@@ -37,8 +37,8 @@ use cerberus_js::JsEngineFactory;
 use cerberus_js_dom::{
     dispatch_event, fire_load, install_page, reject_fetch, resolve_fetch, run_event_loop,
     run_page_scripts, run_page_scripts_with_fetch, serialize_dom, set_node_value,
-    take_cookie_writes, take_fetches, EventLoopBudget, FetchClient, FetchRequest, FetchResponse,
-    PageEnv, RebuiltDom,
+    take_cookie_writes, take_fetches, take_navigations, EventLoopBudget, FetchClient, FetchRequest,
+    FetchResponse, PageEnv, RebuiltDom,
 };
 use cerberus_js_quickjs::QuickJsEngineFactory;
 use cerberus_layout::{
@@ -2267,7 +2267,18 @@ pub struct BrowserApp {
     /// A transient status line shown under the MIRC control bar (e.g. the result
     /// of a bulk action), cleared on the next panel interaction.
     mirc_status: Option<String>,
+    /// Remaining script-initiated navigations before further ones are ignored.
+    /// A user gesture refills it to [`SCRIPT_NAV_CAP`]; each `location.*`/
+    /// `location.href =` reload spends one. Caps a page that reloads on every
+    /// load (a bot challenge that never resolves) without blocking the one or two
+    /// reloads a real cookie-gated handshake needs.
+    script_nav_budget: u32,
 }
+
+/// How many chained script-initiated navigations are allowed between user
+/// gestures. A cookie-gated reload needs one; a couple covers redirect chains.
+/// Beyond this we stop following script reloads to avoid a spin loop.
+const SCRIPT_NAV_CAP: u32 = 4;
 
 impl BrowserApp {
     /// Create a browser on the default heads, showing `cerberus:home`.
@@ -2435,6 +2446,7 @@ impl BrowserApp {
             mirc_open: false,
             mirc_scroll: 0,
             mirc_status: None,
+            script_nav_budget: SCRIPT_NAV_CAP,
         };
         // The SYNC button shows how many identities/sessions it can drive.
         app.toolbar.sync_count = app.heads.heads().len();
@@ -2486,13 +2498,18 @@ impl BrowserApp {
     /// Begin loading `url` (a GET): built-in pages synchronously; http(s) on the
     /// worker, upgrading `http`→`https` first.
     fn start_load(&mut self, url: &str) {
-        self.begin_load(url, None);
+        self.begin_load(url, None, true);
     }
 
     /// Begin loading `url` with an optional form `post` body. With `Some`, the
     /// load is a POST (the body is sent instead of a URL query); with `None`, a
-    /// normal GET. Shared prelude for both navigation kinds.
-    fn begin_load(&mut self, url: &str, post: Option<PostBody>) {
+    /// normal GET. Shared prelude for both navigation kinds. `user_initiated`
+    /// marks a genuine user gesture (toolbar, link, form, history) as opposed to
+    /// a script `location.*` reload, and refills the script-navigation budget.
+    fn begin_load(&mut self, url: &str, post: Option<PostBody>, user_initiated: bool) {
+        if user_initiated {
+            self.script_nav_budget = SCRIPT_NAV_CAP;
+        }
         self.insecure_prompt = None;
         self.insecure_post = None;
         self.insecure_button = None;
@@ -2595,6 +2612,8 @@ impl BrowserApp {
         self.document = doc;
         // Dispatch any fetches the page scheduled at load to the worker (async).
         self.pump_fetches();
+        // An inline script may have set location.* at load — follow it.
+        self.pump_navigations();
     }
 
     /// Re-run the cascade with the external stylesheets fetched so far, splicing
@@ -2972,6 +2991,10 @@ impl BrowserApp {
         }
         self.reconcile_realm();
         self.pump_fetches();
+        // A settled fetch's handler (e.g. a bot-challenge sensor's XHR onload that
+        // set the token cookie) may have called location.reload()/assign — follow
+        // it now so the cookie-gated re-fetch happens.
+        self.pump_navigations();
         true
     }
 
@@ -3012,6 +3035,48 @@ impl BrowserApp {
         for value in writes {
             jar.set_cookie(instance, &url, &first_party, &value);
         }
+    }
+
+    /// Perform a navigation the page's scripts requested (`location.assign`/
+    /// `replace`/`reload`, `location.href =`, `window.location =`). The LAST
+    /// request wins — a script that sets `location` repeatedly ends at its final
+    /// target. This is the reload half of a cookie-gated handshake: after a bot
+    /// challenge sets its token (captured into the jar) and calls `reload()`, the
+    /// re-fetch carries the cookie and returns the real page. Guarded by
+    /// `script_nav_budget` so a page that reloads on every load can't spin.
+    fn pump_navigations(&mut self) {
+        if self.node_to_js.is_empty() {
+            return;
+        }
+        let realm = RealmId(self.heads.active().id.0);
+        let navs = {
+            let Ok(engine) = self.heads.engine() else {
+                return;
+            };
+            match take_navigations(engine, realm) {
+                Ok(n) if !n.is_empty() => n,
+                _ => return,
+            }
+        };
+        // Later synchronous assignments supersede earlier ones (a real browser
+        // only performs the last one); drop the rest.
+        let Some(nav) = navs.into_iter().next_back() else {
+            return;
+        };
+        if self.script_nav_budget == 0 {
+            return;
+        }
+        self.script_nav_budget -= 1;
+        // Resolve against the current document URL — the target may be relative
+        // (`location.href = '/home'`). Fall back to the raw string if there is no
+        // base or it doesn't parse (begin_load re-parses and reports errors).
+        let target = self
+            .current_url
+            .as_ref()
+            .and_then(|base| join_url(base, &nav.url).ok())
+            .map(|u| u.to_string())
+            .unwrap_or(nav.url);
+        self.begin_load(&target, None, false);
     }
 
     /// Re-read the live realm into the rendered document + restyle, after async
@@ -3450,6 +3515,9 @@ impl BrowserApp {
         self.reconcile_dispatched(dispatched.dom);
         // A handler may have called fetch(); dispatch it to the worker (async).
         self.pump_fetches();
+        // A handler may have navigated (e.g. a JS link or button that sets
+        // location) — follow the last requested location change.
+        self.pump_navigations();
         Some(prevented)
     }
 
@@ -3559,7 +3627,7 @@ impl BrowserApp {
             // POST a multipart body — the only encoding that carries file uploads.
             let target = self.resolve_action_base(action);
             let (content_type, body) = build_multipart(&controls, form_el, &self.forms);
-            self.begin_load(&target, Some(PostBody { content_type, body }));
+            self.begin_load(&target, Some(PostBody { content_type, body }), true);
             return;
         }
         // Otherwise the controls serialize as application/x-www-form-urlencoded —
@@ -3573,6 +3641,7 @@ impl BrowserApp {
                     content_type: "application/x-www-form-urlencoded".to_string(),
                     body: encoded.into_bytes(),
                 }),
+                true,
             );
         } else {
             let target = self.resolve_action(action, &encoded);
@@ -6283,6 +6352,71 @@ mod tests {
             !text.contains("old"),
             "original text should be replaced; got {text:?}"
         );
+    }
+
+    #[test]
+    fn script_location_navigates_to_the_new_url() {
+        // A page whose inline script assigns location.href triggers a fresh load
+        // of the target — the mechanism a cookie-gated reload rides.
+        let mut b = fake_app(vec![
+            (
+                "https://site.test/",
+                Ok(page(
+                    "https://site.test/",
+                    200,
+                    None,
+                    "<script>location.href = 'https://site.test/next'</script>",
+                )),
+            ),
+            (
+                "https://site.test/next",
+                Ok(page(
+                    "https://site.test/next",
+                    200,
+                    None,
+                    "<h1>Arrived</h1>",
+                )),
+            ),
+        ]);
+        b.navigate("https://site.test/");
+        // Drain the interstitial load and the navigation it triggers.
+        let mut guard = 0;
+        while b.poll() {
+            guard += 1;
+            assert!(guard < 20, "did not converge");
+        }
+        assert!(
+            b.document.root().text_content().contains("Arrived"),
+            "script navigation should have loaded /next; got {:?}",
+            b.document.root().text_content()
+        );
+        assert_eq!(b.toolbar.url_text, "https://site.test/next");
+    }
+
+    #[test]
+    fn script_reload_budget_caps_a_spin_loop() {
+        // A page that reloads itself on every load must not spin forever: after the
+        // user gesture refills the budget, only SCRIPT_NAV_CAP script reloads are
+        // followed, then further ones are ignored.
+        let loader = FakeLoader::new(vec![(
+            "https://spin.test/",
+            Ok(page(
+                "https://spin.test/",
+                200,
+                None,
+                "<script>location.reload()</script>",
+            )),
+        )]);
+        let seen = loader.seen_requests.clone();
+        let mut b = BrowserApp::with_loader(Box::new(loader));
+        b.navigate("https://spin.test/");
+        let mut guard = 0;
+        while b.poll() {
+            guard += 1;
+            assert!(guard < 50, "reload loop did not converge");
+        }
+        // One user-initiated request + SCRIPT_NAV_CAP script reloads, then capped.
+        assert_eq!(seen.locked().len(), 1 + SCRIPT_NAV_CAP as usize);
     }
 
     #[test]

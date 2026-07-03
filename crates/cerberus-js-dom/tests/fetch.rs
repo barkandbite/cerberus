@@ -11,8 +11,8 @@ use cerberus_dom::{Document, DocumentBuilder, NodeRef};
 use cerberus_js::{JsEngine, JsEngineFactory};
 use cerberus_js_dom::{
     drive_fetches, fire_load, install_page, run_page_scripts_with_fetch, run_scripts,
-    serialize_dom, take_cookie_writes, EventLoopBudget, FetchBudget, FetchClient, FetchRequest,
-    FetchResponse, PageEnv,
+    serialize_dom, take_cookie_writes, take_navigations, EventLoopBudget, FetchBudget, FetchClient,
+    FetchRequest, FetchResponse, Navigation, PageEnv,
 };
 use cerberus_js_quickjs::QuickJsEngineFactory;
 use cerberus_types::RealmId;
@@ -441,4 +441,57 @@ fn document_cookie_view_honors_deletion() {
     // The deletion is still surfaced to the host so the jar expires it too.
     let writes = take_cookie_writes(engine.as_mut(), realm).expect("take writes");
     assert_eq!(writes, vec!["a=; Max-Age=0".to_string()]);
+}
+
+// ---- script navigation capture (Phase D) --------------------------------
+
+#[test]
+fn location_navigations_are_captured_for_the_host() {
+    // location.assign/replace, window.location = "...", and location.reload() each
+    // record a navigation intent for the host to perform (resolve + fetch). This is
+    // the mechanism a cookie-gated reload (e.g. a solved bot challenge) rides.
+    let (mut engine, realm) = engine_and_realm();
+    let doc = doc_with_div_x();
+    let e = env(); // https://example.test/
+    install_page(engine.as_mut(), realm, &doc, &e).expect("install");
+    run_scripts(
+        engine.as_mut(),
+        realm,
+        &[
+            "location.assign('/a');".to_string(),
+            "location.replace('/b');".to_string(),
+            "window.location = 'https://c.test/';".to_string(),
+            "location.reload();".to_string(),
+        ],
+    )
+    .expect("scripts");
+
+    let navs = take_navigations(engine.as_mut(), realm).expect("navs");
+    assert_eq!(
+        navs,
+        vec![
+            Navigation {
+                url: "/a".into(),
+                replace: false
+            },
+            Navigation {
+                url: "/b".into(),
+                replace: true
+            },
+            Navigation {
+                url: "https://c.test/".into(),
+                replace: false
+            },
+            // reload() targets the now-current href (updated by the window.location
+            // assignment above), replacing history.
+            Navigation {
+                url: "https://c.test/".into(),
+                replace: true
+            },
+        ]
+    );
+    // Draining again yields nothing (the queue was cleared).
+    assert!(take_navigations(engine.as_mut(), realm)
+        .expect("again")
+        .is_empty());
 }
