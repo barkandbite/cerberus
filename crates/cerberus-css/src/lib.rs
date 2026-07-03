@@ -39,7 +39,10 @@ type MatchedRule<'a> = (u8, Specificity, usize, &'a Vec<(String, String, bool)>)
 const UA_CSS: &str = r#"
 html, body, div, p, h1, h2, h3, h4, h5, h6, ul, ol, li, section, article,
 header, footer, nav, main, aside, blockquote, pre, figure, figcaption, form,
-table, tr, hr, dl, dt, dd, fieldset, address { display: block; }
+table, tr, hr, dl, dt, dd, fieldset, address, center { display: block; }
+/* Legacy presentational elements still seen on older pages. */
+center { text-align: center; }
+nobr { white-space: nowrap; }
 head, title, meta, link, style, script, base, template { display: none; }
 /* We don't paint SVG graphics; hiding it avoids flowing its <text>/markup as
    stray page text (e.g. decorative symbol grids). Icons render as nothing,
@@ -1990,6 +1993,19 @@ mod tests {
         let a = first(&dom.root, "a").unwrap();
         assert!(a.style.underline);
         assert_eq!(a.style.color, Color::rgb(0x15, 0x4f, 0xd2));
+    }
+
+    #[test]
+    fn ua_styles_legacy_center_and_nobr() {
+        // `<center>` is a centered block; `<nobr>` prevents wrapping.
+        let dom = CssEngine::new().style(&parse_html("<center>c</center><nobr>n</nobr>"));
+        let c = first(&dom.root, "center").unwrap();
+        assert_eq!(c.style.display, Display::Block);
+        assert_eq!(c.style.text_align, TextAlign::Center);
+        assert_eq!(
+            first(&dom.root, "nobr").unwrap().style.white_space,
+            cerberus_style::WhiteSpace::Nowrap
+        );
     }
 
     #[test]
