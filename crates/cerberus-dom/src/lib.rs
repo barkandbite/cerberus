@@ -702,9 +702,33 @@ fn is_name_byte(c: u8) -> bool {
     c.is_ascii_alphanumeric() || c == b'-' || c == b':' || c == b'_'
 }
 
-/// Case-insensitive byte-offset search (ASCII-fold). `needle` must be lowercase.
+/// Case-insensitive ASCII substring search returning the first match's byte
+/// offset. `needle` must be ASCII-lowercase; only ASCII case is folded, which is
+/// all HTML tag names need.
+///
+/// This scans `haystack` in place. The previous implementation allocated a fully
+/// lowercased copy of the haystack on every call — and the one caller
+/// ([`read_rawtext`]) passes the *entire rest of the document* as the haystack for
+/// each `<script>`/`<style>`/… element, so a page with many rawtext elements paid
+/// O(n²) time and a full-document allocation per element (issue #23).
 fn find_ci(haystack: &str, needle: &str) -> Option<usize> {
-    haystack.to_ascii_lowercase().find(needle)
+    let (hay, ndl) = (haystack.as_bytes(), needle.as_bytes());
+    let Some((&first, rest)) = ndl.split_first() else {
+        return Some(0); // empty needle matches at the start
+    };
+    if hay.len() < ndl.len() {
+        return None;
+    }
+    // Fast-path on the first byte, then fold-compare the remainder. `needle`'s
+    // first byte here is always `<` (ASCII), so a match offset lands on a UTF-8
+    // char boundary and is safe to slice at.
+    (0..=hay.len() - ndl.len()).find(|&start| {
+        hay[start].eq_ignore_ascii_case(&first)
+            && hay[start + 1..start + ndl.len()]
+                .iter()
+                .zip(rest)
+                .all(|(h, n)| h.eq_ignore_ascii_case(n))
+    })
 }
 
 /// Decode HTML entities, collapse runs of *collapsible* whitespace to single
@@ -976,6 +1000,41 @@ mod tests {
         assert!(text.contains("done"));
         // The inline script body is captured separately, rawtext (undecoded).
         assert_eq!(doc.scripts(), &["if (x<1){ y }".to_string()]);
+    }
+
+    #[test]
+    fn rawtext_close_tag_is_case_insensitive() {
+        // The end tag matches regardless of case (`</SCRIPT>`, `</Style>`), and a
+        // `<` inside the body that isn't the close tag does not end it early.
+        let doc = parse_html(
+            "<style>p{color:red}</STYLE>\
+             <script>var a = b < c && d > e;</Script><p>after</p>",
+        );
+        assert_eq!(doc.scripts(), &["var a = b < c && d > e;".to_string()]);
+        let text = doc.root().text_content();
+        assert!(text.contains("color:red"), "style body kept: {text:?}");
+        assert!(
+            text.contains("after"),
+            "parsing resumes after the close tag"
+        );
+        assert!(
+            !text.contains("var a"),
+            "script body not rendered: {text:?}"
+        );
+    }
+
+    #[test]
+    fn find_ci_matches_in_place() {
+        // Case-insensitive, first-match, and correct offsets — without allocating
+        // a lowercased copy of the haystack (issue #23).
+        assert_eq!(find_ci("aXcabc", "abc"), Some(3));
+        assert_eq!(find_ci("hello </SCRIPT> tail", "</script"), Some(6));
+        assert_eq!(find_ci("no closer here", "</script"), None);
+        assert_eq!(find_ci("abc", ""), Some(0));
+        // A needle longer than the haystack cannot match.
+        assert_eq!(find_ci("ab", "abc"), None);
+        // Non-ASCII bytes in the haystack are compared verbatim (never folded).
+        assert_eq!(find_ci("café</b>", "</b"), Some(5));
     }
 
     #[test]
