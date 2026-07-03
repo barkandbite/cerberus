@@ -16,7 +16,7 @@ use cerberus_style::{
     AlignItems, AlignSelf, BoxShadow, BoxSizing, Clear, ComputedStyle, Display, ExternalSheets,
     FlexBasis, FlexDirection, Float, Gradient, JustifyContent, Len, ListStyleType, Position,
     StyleEngine, StyledChild, StyledDom, StyledNode, TextAlign, TextTransform, Track, TrackMax,
-    Visibility,
+    VerticalAlign, Visibility,
 };
 use cerberus_types::{Color, ImageFit, ImagePos};
 use parser::{
@@ -61,6 +61,9 @@ code, kbd, samp { white-space: pre; }
 a { color: #154fd2; text-decoration: underline; }
 b, strong { font-weight: bold; }
 i, em, cite, var { font-style: italic; }
+small { font-size: smaller; }
+sub { vertical-align: sub; font-size: smaller; }
+sup { vertical-align: super; font-size: smaller; }
 /* The `hidden` boolean attribute hides the element (HTML UA stylesheet). Low
    specificity (one attribute selector), so an author `display` still wins. */
 [hidden] { display: none; }
@@ -773,6 +776,13 @@ fn apply_declarations(
                 if let Some(px) = parse_len(v, style.font_size as f32) {
                     style.text_indent = px;
                 }
+            }
+            "vertical-align" => {
+                style.vertical_align = match v.trim().to_ascii_lowercase().as_str() {
+                    "sub" => VerticalAlign::Sub,
+                    "super" => VerticalAlign::Super,
+                    _ => VerticalAlign::Baseline,
+                };
             }
             "list-style-type" => {
                 if let Some(t) = parse_list_style_type(v) {
@@ -2381,6 +2391,40 @@ mod tests {
         // 2em at the default 16px font = 32px; inherited by the child.
         assert_eq!(first(&dom.root, "div").unwrap().style.text_indent, 32);
         assert_eq!(first(&dom.root, "p").unwrap().style.text_indent, 32);
+    }
+
+    #[test]
+    fn vertical_align_sub_sup_from_ua_and_not_inherited() {
+        use cerberus_style::VerticalAlign;
+        // `<sub>`/`<sup>` pick up their alignment (and a smaller size) from the UA
+        // sheet; the surrounding text stays on the baseline.
+        let dom = CssEngine::new().style(&parse_html("<p>x<sub>1</sub><sup>2</sup></p>"));
+        assert_eq!(
+            first(&dom.root, "sub").unwrap().style.vertical_align,
+            VerticalAlign::Sub
+        );
+        assert_eq!(
+            first(&dom.root, "sup").unwrap().style.vertical_align,
+            VerticalAlign::Super
+        );
+        assert_eq!(
+            first(&dom.root, "p").unwrap().style.vertical_align,
+            VerticalAlign::Baseline
+        );
+        // `smaller` shrinks the sub/sup font below the 16px default.
+        assert!(first(&dom.root, "sup").unwrap().style.font_size < 16);
+        // Not inherited: a value on a parent does not reach the child.
+        let dom2 = CssEngine::new().style(&parse_html(
+            "<div style='vertical-align:super'><span>y</span></div>",
+        ));
+        assert_eq!(
+            first(&dom2.root, "div").unwrap().style.vertical_align,
+            VerticalAlign::Super
+        );
+        assert_eq!(
+            first(&dom2.root, "span").unwrap().style.vertical_align,
+            VerticalAlign::Baseline
+        );
     }
 
     #[test]

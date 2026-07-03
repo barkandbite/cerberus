@@ -83,6 +83,16 @@ pub enum TextTransform {
     Capitalize,
 }
 
+/// CSS `vertical-align` for inline content — the subset that shifts the baseline
+/// (`sub`/`super`, as used by `<sub>`/`<sup>`). Not inherited.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub enum VerticalAlign {
+    #[default]
+    Baseline,
+    Sub,
+    Super,
+}
+
 /// CSS `list-style-type`: the marker drawn before a `display: list-item`. A
 /// practical subset — the bullet glyphs and decimal numbering that cover almost
 /// all real lists. Inherited (so `<ol>`'s `decimal` reaches its `<li>` children).
@@ -263,6 +273,9 @@ pub struct ComputedStyle {
     pub word_spacing: i32,
     /// `list-style-type`: the marker for a `display: list-item`. Inherited.
     pub list_style_type: ListStyleType,
+    /// `vertical-align` (`sub`/`super`) — shifts inline content off the baseline.
+    /// Not inherited.
+    pub vertical_align: VerticalAlign,
     /// `text-indent` in px: the first-line indent of a block's inline content.
     /// Inherited.
     pub text_indent: i32,
@@ -397,6 +410,7 @@ impl ComputedStyle {
             letter_spacing: 0,
             word_spacing: 0,
             list_style_type: ListStyleType::Disc,
+            vertical_align: VerticalAlign::Baseline,
             text_indent: 0,
             margin_top: 0,
             margin_bottom: 0,
@@ -476,6 +490,7 @@ impl ComputedStyle {
             letter_spacing: self.letter_spacing,
             word_spacing: self.word_spacing,
             list_style_type: self.list_style_type,
+            vertical_align: VerticalAlign::Baseline,
             text_indent: self.text_indent,
             preformatted: self.preformatted,
             nowrap: self.nowrap,
