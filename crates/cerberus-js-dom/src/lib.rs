@@ -1051,6 +1051,50 @@ pub fn take_cookie_writes(
         .collect())
 }
 
+/// A navigation a page's script requested: `location.assign`/`replace`/`reload`,
+/// `location.href = …`, or `window.location = "…"`. `url` is exactly what the
+/// script supplied (possibly relative — the host resolves it against the current
+/// document); `replace` is set for history-replacing navigations (`replace()`,
+/// `reload()`), which the host may use to decide history semantics.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Navigation {
+    /// The target URL as the script supplied it (may be relative).
+    pub url: String,
+    /// Whether this replaces the current history entry rather than pushing one.
+    pub replace: bool,
+}
+
+/// Drain the realm's queued script navigations (in request order) and clear the
+/// queue. Each entry is a [`Navigation`]; the host resolves the URL and performs
+/// the load (a cookie-gated reload after a bot challenge sets its token rides
+/// this path). An empty queue yields an empty `Vec`; malformed entries are
+/// skipped, never fatal.
+pub fn take_navigations(
+    engine: &mut dyn JsEngine,
+    realm: RealmId,
+) -> Result<Vec<Navigation>, BridgeError> {
+    let json = match engine.eval(realm, "__cerberusTakeNavigations()")? {
+        JsValue::Str(s) => s,
+        other => {
+            return Err(BridgeError::Structure(format!(
+                "__cerberusTakeNavigations did not return a string: {other:?}"
+            )))
+        }
+    };
+    let value = json::parse(&json).map_err(BridgeError::Json)?;
+    let items = value.as_array().ok_or_else(|| {
+        BridgeError::Structure("__cerberusTakeNavigations did not return an array".to_string())
+    })?;
+    Ok(items
+        .iter()
+        .filter_map(|item| {
+            let url = item.get("url").and_then(Json::as_str)?.to_string();
+            let replace = item.get("replace").and_then(Json::as_u64).unwrap_or(0) != 0;
+            Some(Navigation { url, replace })
+        })
+        .collect())
+}
+
 /// Decode a wire `headers` value (`[[name, value], …]`) into a `(name, value)`
 /// list. A missing/garbage *pair* is skipped (a `None` field yields an empty
 /// list); a pair whose name or value contains a CR, LF, or NUL byte fails the
@@ -2619,13 +2663,44 @@ pub const DOM_MODEL_PRELUDE: &str = r##"
       return loc;
     }
     var locationObj = parseLocation(envUrl);
-    locationObj.assign = function () {};
-    locationObj.replace = function () {};
-    locationObj.reload = function () {};
+    var __locHref = locationObj.href;
+    // Navigation is the host's job (resolve + fetch + re-render), so the page's
+    // location methods and `location.href =` RECORD the intent for the host to
+    // drain (__cerberusTakeNavigations). A cookie-gated reload — e.g. a bot
+    // challenge that sets its token then reloads to fetch the real page —
+    // depends on this. `replace` distinguishes history-replacing navigations.
+    function recordNav(u, replace) {
+      u = String(u);
+      if (!u) return;
+      // `replace` as 1/0, not a JS boolean: the host's JSON layer carries only
+      // strings/ints/arrays/objects (booleans are intentionally unsupported).
+      if (Array.isArray(g.__cerberusNavigations)) {
+        g.__cerberusNavigations.push({ url: u, replace: replace ? 1 : 0 });
+      }
+    }
+    locationObj.assign = function (u) { recordNav(u, false); };
+    locationObj.replace = function (u) { recordNav(u, true); };
+    locationObj.reload = function () { recordNav(__locHref, true); };
     locationObj.toString = function () { return this.href; };
-    g.location = locationObj;
-    window.location = locationObj;
-    document.location = locationObj;
+    // `location.href = "..."` navigates (like assign); keep the readable value in
+    // sync so a same-turn re-read reflects the assignment.
+    Object.defineProperty(locationObj, "href", {
+      get: function () { return __locHref; },
+      set: function (u) { __locHref = String(u); recordNav(__locHref, false); },
+      enumerable: true, configurable: true,
+    });
+    // `window.location = "url"` / `document.location = "url"` are navigations too
+    // (string assignment); reading still returns the location object. window and
+    // self alias globalThis (g), so defining on g covers both.
+    function defineLocation(obj) {
+      Object.defineProperty(obj, "location", {
+        get: function () { return locationObj; },
+        set: function (u) { if (typeof u === "string") locationObj.href = u; },
+        enumerable: true, configurable: true,
+      });
+    }
+    defineLocation(g);
+    defineLocation(document);
     Object.defineProperty(document, "URL", { get: function () { return locationObj.href; }, enumerable: true, configurable: true });
     Object.defineProperty(document, "documentURI", { get: function () { return locationObj.href; }, enumerable: true, configurable: true });
 
@@ -2986,6 +3061,11 @@ pub const DOM_MODEL_PRELUDE: &str = r##"
     // left node_to_js empty) is DISCARDED here rather than drained later and
     // misattributed to this new origin's first party. First-party-only, enforced.
     g.__cerberusCookieWrites = [];
+    // Script-requested navigations (location.assign/replace/reload, location.href=,
+    // window.location=). RESET per install for the same reason as the cookie queue:
+    // a navigation the previous page asked for but the host didn't act on must not
+    // fire against this new page. The host drains via __cerberusTakeNavigations.
+    g.__cerberusNavigations = [];
 
     // ---- Headers (case-insensitive, minimal) ---------------------------
     // Backed by an ordered array of [originalName, value]; lookups fold case.
@@ -3288,6 +3368,19 @@ pub const DOM_MODEL_PRELUDE: &str = r##"
         var q = g.__cerberusCookieWrites;
         if (!Array.isArray(q) || q.length === 0) return "[]";
         g.__cerberusCookieWrites = [];
+        return JSON.stringify(q);
+      } catch (e) {
+        return "[]";
+      }
+    };
+
+    // Drain the queued navigations as a JSON array of {url, replace}, then CLEAR
+    // it. The host resolves each URL against the document and performs the load.
+    g.__cerberusTakeNavigations = function () {
+      try {
+        var q = g.__cerberusNavigations;
+        if (!Array.isArray(q) || q.length === 0) return "[]";
+        g.__cerberusNavigations = [];
         return JSON.stringify(q);
       } catch (e) {
         return "[]";
