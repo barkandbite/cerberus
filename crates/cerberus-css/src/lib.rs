@@ -840,6 +840,9 @@ fn apply_declarations(
             }
             "margin-right" => {
                 style.margin_right_auto = v.trim().eq_ignore_ascii_case("auto");
+                if let Some(m) = parse_len(v, style.font_size as f32) {
+                    style.margin_right = m;
+                }
             }
             "width" => style.width = parse_inset(v, style.font_size as f32).unwrap_or(Len::Auto),
             "max-width" => {
@@ -1598,21 +1601,39 @@ fn apply_margin_shorthand(style: &mut ComputedStyle, v: &str, em_base: f32) {
     // Track which sides are `auto` (for centering): horizontal sides are index 1
     // (right) and 3 (left) in the 4-value form, or index 1 in the 2/3-value form.
     let is_auto = |i: usize| toks.get(i).is_some_and(|t| t.eq_ignore_ascii_case("auto"));
-    let (top, bottom, left, l_auto, r_auto) = match parts.len() {
-        1 => (parts[0], parts[0], parts[0], is_auto(0), is_auto(0)),
+    // Horizontal sides: in the 1-value form both are index 0; in the 2/3-value
+    // form both are index 1; in the 4-value form right is index 1, left index 3.
+    let (top, bottom, left, right, l_auto, r_auto) = match parts.len() {
+        1 => (
+            parts[0],
+            parts[0],
+            parts[0],
+            parts[0],
+            is_auto(0),
+            is_auto(0),
+        ),
         2 | 3 => (
             parts[0],
             if parts.len() == 3 { parts[2] } else { parts[0] },
             parts[1],
+            parts[1],
             is_auto(1),
             is_auto(1),
         ),
-        n if n >= 4 => (parts[0], parts[2], parts[3], is_auto(3), is_auto(1)),
+        n if n >= 4 => (
+            parts[0],
+            parts[2],
+            parts[3],
+            parts[1],
+            is_auto(3),
+            is_auto(1),
+        ),
         _ => return,
     };
     style.margin_top = top;
     style.margin_bottom = bottom;
     style.margin_left = left;
+    style.margin_right = right;
     style.margin_left_auto = l_auto;
     style.margin_right_auto = r_auto;
 }
@@ -2183,6 +2204,22 @@ mod tests {
             first(&dom.root, "p").unwrap().style.color,
             Color::rgb(0xab, 0xcd, 0xef)
         );
+    }
+
+    #[test]
+    fn margin_right_from_longhand_and_shorthand() {
+        // The `margin-right` longhand is honored (previously only its `auto` flag
+        // was), and each shorthand arity fills the right side correctly.
+        let one = CssEngine::new().style(&parse_html("<p style='margin:5px'>x</p>"));
+        assert_eq!(first(&one.root, "p").unwrap().style.margin_right, 5);
+        let two = CssEngine::new().style(&parse_html("<p style='margin:5px 10px'>x</p>"));
+        assert_eq!(first(&two.root, "p").unwrap().style.margin_right, 10);
+        let four = CssEngine::new().style(&parse_html("<p style='margin:1px 2px 3px 4px'>x</p>"));
+        let p = first(&four.root, "p").unwrap();
+        assert_eq!(p.style.margin_right, 2, "right is the 2nd of four values");
+        assert_eq!(p.style.margin_left, 4, "left is the 4th");
+        let long = CssEngine::new().style(&parse_html("<p style='margin-right:12px'>x</p>"));
+        assert_eq!(first(&long.root, "p").unwrap().style.margin_right, 12);
     }
 
     #[test]

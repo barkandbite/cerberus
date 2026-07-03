@@ -323,6 +323,10 @@ pub struct ComputedStyle {
     pub margin_top: i32,
     pub margin_bottom: i32,
     pub margin_left: i32,
+    /// `margin-right` in px. Shrinks an auto-width block's box from the right
+    /// (its `auto` value, for centering, is tracked by `margin_right_auto`
+    /// instead). Not inherited.
+    pub margin_right: i32,
     /// `margin-left`/`-right: auto` — used to center a width-constrained block
     /// (ADR-0039). Not inherited.
     pub margin_left_auto: bool,
@@ -454,6 +458,7 @@ impl ComputedStyle {
             margin_top: 0,
             margin_bottom: 0,
             margin_left: 0,
+            margin_right: 0,
             margin_left_auto: false,
             margin_right_auto: false,
             width: Len::Auto,
@@ -540,6 +545,7 @@ impl ComputedStyle {
             margin_top: 0,
             margin_bottom: 0,
             margin_left: 0,
+            margin_right: 0,
             margin_left_auto: false,
             margin_right_auto: false,
             width: Len::Auto,
