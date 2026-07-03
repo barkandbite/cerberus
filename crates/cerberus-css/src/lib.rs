@@ -67,6 +67,7 @@ p { margin-top: 8px; margin-bottom: 8px; }
 ul, ol { margin-top: 8px; margin-bottom: 8px; margin-left: 24px; }
 blockquote { margin-left: 24px; margin-top: 8px; margin-bottom: 8px; }
 figure { margin-top: 16px; margin-bottom: 16px; margin-left: 40px; margin-right: 40px; }
+dd { margin-left: 40px; }
 pre { white-space: pre; margin-top: 8px; margin-bottom: 8px; }
 code, kbd, samp { white-space: pre; }
 /* Only anchors with an href are links (`:any-link`); a bare `<a name=…>`
@@ -1995,6 +1996,13 @@ mod tests {
         let a = first(&dom.root, "a").unwrap();
         assert!(a.style.underline);
         assert_eq!(a.style.color, Color::rgb(0x15, 0x4f, 0xd2));
+    }
+
+    #[test]
+    fn ua_indents_dd() {
+        // A description-list definition is indented 40px by the UA stylesheet.
+        let dom = CssEngine::new().style(&parse_html("<dl><dt>t</dt><dd>d</dd></dl>"));
+        assert_eq!(first(&dom.root, "dd").unwrap().style.margin_left, 40);
     }
 
     #[test]
