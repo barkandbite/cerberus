@@ -2011,6 +2011,37 @@ mod tests {
     }
 
     #[test]
+    fn nth_of_type_cascades_over_mixed_siblings() {
+        // Among a mix of tags, `p:first-of-type` targets the first <p> even though
+        // it isn't the first child, and `:nth-of-type(2)` the second <p>.
+        let html = "<style>\
+            p:first-of-type { color: #ff0000 }\
+            p:nth-of-type(2) { color: #00ff00 }\
+            </style>\
+            <div><h2>t</h2><p>a</p><span>s</span><p>b</p></div>";
+        let dom = CssEngine::new().style(&parse_html(html));
+        let div = first(&dom.root, "div").unwrap();
+        let ps: Vec<_> = div
+            .children
+            .iter()
+            .filter_map(|c| match c {
+                StyledChild::Element(e) if e.tag == "p" => Some(e),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            ps[0].style.color,
+            Color::rgb(0xff, 0, 0),
+            "first-of-type <p>"
+        );
+        assert_eq!(
+            ps[1].style.color,
+            Color::rgb(0, 0xff, 0),
+            "nth-of-type(2) <p>"
+        );
+    }
+
+    #[test]
     fn media_query_respects_viewport() {
         let html = "<style>@media (max-width: 600px) { p { color: #ff0000 } }</style><p>x</p>";
         // Narrow viewport: the rule applies.
