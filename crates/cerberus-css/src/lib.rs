@@ -71,7 +71,7 @@ code, kbd, samp { white-space: pre; }
    placeholder is not styled blue/underlined. */
 a[href] { color: #154fd2; text-decoration: underline; }
 b, strong { font-weight: bold; }
-i, em, cite, var { font-style: italic; }
+i, em, cite, var, dfn, address { font-style: italic; }
 del, s, strike { text-decoration: line-through; }
 ins, u { text-decoration: underline; }
 mark { background-color: yellow; color: black; }
@@ -1993,6 +1993,15 @@ mod tests {
         let a = first(&dom.root, "a").unwrap();
         assert!(a.style.underline);
         assert_eq!(a.style.color, Color::rgb(0x15, 0x4f, 0xd2));
+    }
+
+    #[test]
+    fn ua_styles_dfn_and_address_italic() {
+        let dom = CssEngine::new().style(&parse_html("<dfn>d</dfn><address>a</address>"));
+        assert!(first(&dom.root, "dfn").unwrap().style.font.italic);
+        let addr = first(&dom.root, "address").unwrap();
+        assert!(addr.style.font.italic);
+        assert_eq!(addr.style.display, Display::Block, "<address> is a block");
     }
 
     #[test]
