@@ -1956,6 +1956,11 @@ pub const DOM_MODEL_PRELUDE: &str = r##"
     defAccessor(ELEMENT_PROTO, "hidden",
       function () { return getAttr(this, "hidden") !== null; },
       function (v) { if (v) { setAttr(this, "hidden", ""); } else { removeAttr(this, "hidden"); } });
+    // `el.disabled` reflects the `disabled` boolean attribute — read by form
+    // handling (e.g. FormData skips disabled controls) and toggled by scripts.
+    defAccessor(ELEMENT_PROTO, "disabled",
+      function () { return getAttr(this, "disabled") !== null; },
+      function (v) { if (v) { setAttr(this, "disabled", ""); } else { removeAttr(this, "disabled"); } });
     // `el.name` reflects the `name` attribute (form controls, `<form>`, `<img>`,
     // …). Pages iterate `form.elements` and read `.name` to build submissions, so
     // an unreflected name read back undefined and lost the field.
@@ -2907,6 +2912,58 @@ pub const DOM_MODEL_PRELUDE: &str = r##"
         if (bits >= 8) { bits -= 8; out += String.fromCharCode((buffer >> bits) & 0xff); }
       }
       return out;
+    };
+
+    // FormData: collect a form's control values, the standard companion to
+    // `fetch(url, { method: 'POST', body: new FormData(form) })`. `new
+    // FormData(form)` scrapes the form's *successful* controls — named,
+    // non-disabled; checkboxes/radios only when checked (defaulting to "on");
+    // buttons and file inputs are skipped — mirroring what a real submission
+    // sends. Also usable programmatically (append/set/etc.), like URLSearchParams.
+    g.FormData = function (form) {
+      var pairs = [];
+      if (form && form.__tag === "form") {
+        var els = form.elements;
+        for (var i = 0; i < els.length; i++) {
+          var el = els[i];
+          var name = getAttr(el, "name");
+          if (name === null || name === "") continue;
+          if (getAttr(el, "disabled") !== null) continue;
+          var tag = el.__tag, type = String(el.type || "").toLowerCase();
+          if (tag === "button") {
+            continue; // a <button> only submits when it is the submitter
+          } else if (tag === "input" && (type === "checkbox" || type === "radio")) {
+            if (getAttr(el, "checked") === null) continue;
+            pairs.push([name, getAttr(el, "value") !== null ? el.value : "on"]);
+          } else if (tag === "input"
+              && (type === "submit" || type === "reset" || type === "button"
+                  || type === "image" || type === "file")) {
+            continue; // not a successful control here (no submitter / no File)
+          } else {
+            pairs.push([name, el.value != null ? String(el.value) : ""]);
+          }
+        }
+      }
+      var api = {
+        get: function (n) { n = String(n); for (var i = 0; i < pairs.length; i++) if (pairs[i][0] === n) return pairs[i][1]; return null; },
+        getAll: function (n) { n = String(n); var out = []; for (var i = 0; i < pairs.length; i++) if (pairs[i][0] === n) out.push(pairs[i][1]); return out; },
+        has: function (n) { n = String(n); for (var i = 0; i < pairs.length; i++) if (pairs[i][0] === n) return true; return false; },
+        append: function (n, v) { pairs.push([String(n), String(v)]); },
+        set: function (n, v) {
+          n = String(n); v = String(v);
+          var first = -1;
+          for (var i = 0; i < pairs.length; i++) { if (pairs[i][0] === n) { first = i; break; } }
+          if (first === -1) { pairs.push([n, v]); return; }
+          pairs[first][1] = v;
+          for (var j = pairs.length - 1; j > first; j--) { if (pairs[j][0] === n) pairs.splice(j, 1); }
+        },
+        "delete": function (n) { n = String(n); for (var i = pairs.length - 1; i >= 0; i--) if (pairs[i][0] === n) pairs.splice(i, 1); },
+        forEach: function (fn, thisArg) { for (var i = 0; i < pairs.length; i++) fn.call(thisArg, pairs[i][1], pairs[i][0], api); },
+        keys: function () { return pairs.map(function (p) { return p[0]; }); },
+        values: function () { return pairs.map(function (p) { return p[1]; }); },
+        entries: function () { return pairs.map(function (p) { return [p[0], p[1]]; }); },
+      };
+      return api;
     };
 
     // ---- normalize an init.headers into [[name,value],...] -------------
