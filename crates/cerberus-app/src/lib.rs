@@ -45,8 +45,9 @@ use cerberus_layout::{
     LayoutEngine, LinkBox, NoForms, NoImages,
 };
 use cerberus_net::{
-    parse_proxy, BuiltinHttpClient, CookieJar, FallbackResolver, FetchContext, FetchKind,
-    HttpCache, HttpClient, HttpResponse, ProxyConfig, Router, SystemResolver, DEFAULT_USER_AGENT,
+    parse_proxy, BuiltinHttpClient, CachingResolver, CookieJar, FallbackResolver, FetchContext,
+    FetchKind, HttpCache, HttpClient, HttpResponse, ProxyConfig, Router, SystemResolver,
+    DEFAULT_USER_AGENT,
 };
 use cerberus_paint::{
     DecodedImage, DisplayItem, DisplayList, Framebuffer, ImageDecoder, Rasterizer, TextShaper,
@@ -769,6 +770,11 @@ pub fn network_client_with_proxies(
         Box::new(DohResolver::google(Box::new(provider()))),
         Box::new(SystemResolver),
     ]);
+    // Cache positive resolutions briefly so a page's burst of same-host lookups
+    // (document + every subresource + redirect hop) costs one DoH round-trip, not
+    // one per connection (#39). The proxied path never resolves locally, so this
+    // does not weaken that guarantee.
+    let dns = CachingResolver::new(Box::new(dns));
     Router::with_proxies(Box::new(provider()), Box::new(dns), jar, proxy, proxies)
 }
 
