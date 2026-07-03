@@ -29,6 +29,7 @@ fn main() -> ExitCode {
     match command {
         "run" => cmd_run(rest),
         "render" => cmd_render(rest),
+        "probe" => cmd_probe(rest),
         "mem-gate" => cmd_mem_gate(rest),
         "bench" => cmd_bench(rest),
         "mirror-bench" => cmd_mirror_bench(rest),
@@ -170,6 +171,53 @@ fn cmd_render(args: &[String]) -> ExitCode {
         println!("--- page text ---");
         println!("{text}");
     }
+    ExitCode::SUCCESS
+}
+
+/// Headless interactive probe: drive the real worker loop against a live URL and
+/// print the settled result. Unlike `render` (one-shot, synchronous), this runs
+/// the async pipeline — external `<script src>` (e.g. a bot-challenge sensor)
+/// fetch + execute, XHR/fetch, cookie capture, and any script-driven reload — so
+/// it reflects what the interactive browser actually does. `--url` is required;
+/// `--proxy`/`--system-roots`/`--data-dir` and `--timeout <secs>` are optional.
+fn cmd_probe(args: &[String]) -> ExitCode {
+    let Some(url) = flag(args, "--url") else {
+        eprintln!("probe: --url <url> is required");
+        return ExitCode::FAILURE;
+    };
+    let opts = cerberus_app::AppOptions {
+        system_roots: has_flag(args, "--system-roots"),
+        data_dir: flag(args, "--data-dir").map(std::path::PathBuf::from),
+        proxy: flag(args, "--proxy"),
+    };
+    let timeout_s: u64 = flag(args, "--timeout")
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(30);
+    let mut app = cerberus_app::BrowserApp::with_config(opts);
+    app.open(&url);
+    // Busy-poll the worker results until the page settles, then a short quiet
+    // period (async JS may schedule a reload just after the response commits).
+    let start = std::time::Instant::now();
+    let mut quiet = 0u32;
+    while start.elapsed() < std::time::Duration::from_secs(timeout_s) {
+        app.drive();
+        if app.is_settled() {
+            quiet += 1;
+            if quiet >= 40 {
+                break; // ~2s of no new network work after settling
+            }
+        } else {
+            quiet = 0;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+    let text = app.page_text();
+    let one_line: String = text.split_whitespace().collect::<Vec<_>>().join(" ");
+    println!("probe {url}");
+    println!("  http status : {}", app.status());
+    println!("  settled     : {}", app.is_settled());
+    println!("  text ({} chars):", one_line.chars().count());
+    println!("{}", one_line.chars().take(3000).collect::<String>());
     ExitCode::SUCCESS
 }
 
