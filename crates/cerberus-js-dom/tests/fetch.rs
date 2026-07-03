@@ -412,3 +412,33 @@ fn document_cookie_seeds_from_env_and_captures_writes() {
         .expect("take again")
         .is_empty());
 }
+
+#[test]
+fn document_cookie_view_honors_deletion() {
+    // A script deleting a cookie (Max-Age<=0) must see it leave the document.cookie
+    // read view within the same turn, matching the sealed jar (which expires it).
+    // The raw deletion string is still queued for the host to honor in the jar.
+    let (mut engine, realm) = engine_and_realm();
+    let doc = doc_with_div_x();
+    let mut e = env();
+    e.cookie = "a=1; b=2".into();
+    install_page(engine.as_mut(), realm, &doc, &e).expect("install");
+    run_scripts(
+        engine.as_mut(),
+        realm,
+        &[
+            "document.cookie = 'a=; Max-Age=0';".to_string(),
+            "document.getElementById('x').setAttribute('data-after', document.cookie);".to_string(),
+        ],
+    )
+    .expect("scripts");
+
+    let dom = serialize_dom(engine.as_mut(), realm).expect("serialize");
+    let x = find_id(dom.document.root(), "x").expect("#x present");
+    // `a` is dropped from the view; `b` remains.
+    assert_eq!(x.attr("data-after"), Some("b=2"));
+
+    // The deletion is still surfaced to the host so the jar expires it too.
+    let writes = take_cookie_writes(engine.as_mut(), realm).expect("take writes");
+    assert_eq!(writes, vec!["a=; Max-Age=0".to_string()]);
+}

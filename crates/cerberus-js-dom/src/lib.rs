@@ -2442,12 +2442,33 @@ pub const DOM_MODEL_PRELUDE: &str = r##"
         if (eq === -1) return;
         var name = pair.slice(0, eq).trim();
         var jar = this.__cookie ? this.__cookie.split("; ") : [];
+        // Deletion: a non-positive Max-Age (the modern idiom; it wins over Expires)
+        // or a past Expires drops the cookie from the view, matching the jar (which
+        // expires it) so a same-turn re-read agrees. The raw string was already
+        // queued above for the jar to honor Path/Domain/etc. exactly.
+        var isDelete = false;
+        if (semi !== -1) {
+          var attrs = raw.slice(semi + 1);
+          var ma = /(?:^|;)\s*max-age\s*=\s*(-?\d+)/i.exec(attrs);
+          if (ma) {
+            if (parseInt(ma[1], 10) <= 0) isDelete = true;
+          } else {
+            var ex = /(?:^|;)\s*expires\s*=\s*([^;]+)/i.exec(attrs);
+            if (ex) { try { var t = Date.parse(ex[1]); if (t === t && t <= Date.now()) isDelete = true; } catch (e) {} }
+          }
+        }
+        var out = [];
         var replaced = false;
         for (var i = 0; i < jar.length; i++) {
-          if (jar[i].slice(0, jar[i].indexOf("=")) === name) { jar[i] = pair; replaced = true; break; }
+          if (jar[i].slice(0, jar[i].indexOf("=")) === name) {
+            replaced = true;
+            if (!isDelete) out.push(pair);
+          } else {
+            out.push(jar[i]);
+          }
         }
-        if (!replaced) jar.push(pair);
-        this.__cookie = jar.join("; ");
+        if (!replaced && !isDelete) out.push(pair);
+        this.__cookie = out.join("; ");
       },
       enumerable: true, configurable: true,
     });
@@ -2959,7 +2980,12 @@ pub const DOM_MODEL_PRELUDE: &str = r##"
     if (typeof g.__cerberusFetchId !== "number") g.__cerberusFetchId = 1;
     // Raw `document.cookie =` write strings awaiting persistence into the sealed
     // jar; the host drains them via __cerberusTakeCookieWrites after each turn.
-    if (!Array.isArray(g.__cerberusCookieWrites)) g.__cerberusCookieWrites = [];
+    // RESET unconditionally on install (unlike the fetch queue above): install_page
+    // runs once per navigation, before this page's scripts, so a write the previous
+    // origin's scripts made but whose capture was skipped (e.g. a serialize failure
+    // left node_to_js empty) is DISCARDED here rather than drained later and
+    // misattributed to this new origin's first party. First-party-only, enforced.
+    g.__cerberusCookieWrites = [];
 
     // ---- Headers (case-insensitive, minimal) ---------------------------
     // Backed by an ordered array of [originalName, value]; lookups fold case.

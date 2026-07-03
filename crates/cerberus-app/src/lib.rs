@@ -1056,6 +1056,17 @@ pub fn render(config: &RenderConfig) -> Result<RenderOutcome, AppError> {
             None => run_page_scripts(engine, base_realm, &document, document.scripts(), &env)
                 .map_err(|e| AppError::Js(format!("{e:?}")))?,
         };
+        // Symmetric to the `cookie` seed above: persist any cookies the page's
+        // scripts set via `document.cookie` into the sealed jar, through the same
+        // consent gate and per-cookie disposition a network `Set-Cookie` takes.
+        // First-party only (a top-level page: request origin == first party). With
+        // `--data-dir` this is saved below, so a script-set token (e.g. a bot
+        // challenge's) survives to a later render sharing the profile.
+        if let Ok(writes) = take_cookie_writes(engine, base_realm) {
+            for value in writes {
+                jar.set_cookie(active_instance, &url, &first_party, &value);
+            }
+        }
     }
     let engine_name = engine.name().to_string();
     let realms_live = engine.realm_count();
@@ -4494,10 +4505,13 @@ fn first_party_of(url: &cerberus_url::Url) -> Option<Origin> {
     })
 }
 
-/// The cookies this instance's sealed jar would send to `origin` under
-/// `first_party`, formatted as `"name=value; name=value"` for seeding
-/// `document.cookie`. Read-only: unlike the attach path it does **not** consume
-/// `Allow-once` cookies (those are spent on a real request, not on a script read).
+/// The cookies this instance's sealed jar would expose to `document.cookie` for
+/// `origin` under `first_party`, formatted as `"name=value; name=value"`.
+/// Read-only in two senses: unlike the attach path it does **not** consume
+/// `Allow-once` cookies (those are spent on a real request, not a script read),
+/// and it drops `HttpOnly` cookies — those ride the network `Cookie` header but
+/// must never be visible to page script, exactly as a real browser hides them
+/// from `document.cookie`.
 fn cookie_seed(
     storage: &Mutex<StorageEnvironment>,
     instance: InstanceId,
@@ -4509,6 +4523,7 @@ fn cookie_seed(
         .instance(instance)
         .cookies_for_request(origin, first_party)
         .iter()
+        .filter(|c| !c.http_only)
         .map(|c| format!("{}={}", c.name, c.value))
         .collect::<Vec<_>>()
         .join("; ")
@@ -5736,6 +5751,36 @@ mod tests {
         jar.set_cookie(a, &url, &fp, "sid=only-in-a");
         assert!(jar.cookie_header(a, &url, &fp).is_some());
         assert!(jar.cookie_header(b, &url, &fp).is_none());
+    }
+
+    #[test]
+    fn cookie_seed_hides_httponly_from_document_cookie() {
+        // `document.cookie` (seeded via cookie_seed) must mirror a real browser:
+        // HttpOnly cookies ride the network Cookie header but are invisible to
+        // script. Without the http_only filter, seeding would leak session tokens
+        // to page JS (including a bot-challenge or XSS payload).
+        let (jar, storage, _events, _cookies) = jar_with_env();
+        let instance = InstanceId::from_u64_pair(0, 0x10);
+        let url = parse_url("https://shop.example.com/").unwrap();
+        let fp = url.origin().unwrap();
+
+        jar.set_cookie(instance, &url, &fp, "vis=1; Secure");
+        jar.set_cookie(instance, &url, &fp, "sess=secret; HttpOnly; Secure");
+
+        // The read seed for document.cookie hides the HttpOnly token...
+        let seed = cookie_seed(&storage, instance, &fp, &fp);
+        assert!(seed.contains("vis=1"), "visible cookie is seeded: {seed:?}");
+        assert!(
+            !seed.contains("sess"),
+            "HttpOnly cookie must NOT reach document.cookie: {seed:?}"
+        );
+
+        // ...while the network Cookie header still carries BOTH (unchanged).
+        let header = jar.cookie_header(instance, &url, &fp).unwrap_or_default();
+        assert!(
+            header.contains("sess=secret") && header.contains("vis=1"),
+            "network header keeps HttpOnly: {header:?}"
+        );
     }
 
     #[test]
