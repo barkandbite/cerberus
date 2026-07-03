@@ -2,7 +2,9 @@
 //!
 //! Supported selectors: universal `*`, type, `.class`, `#id`, attribute
 //! selectors (`[a]`, `[a=v]`, `~= |= ^= $= *=`), structural pseudo-classes
-//! (`:first-child`, `:last-child`, `:only-child`, `:nth-child(an+b)`, `:not(…)`,
+//! (`:first-child`, `:last-child`, `:only-child`, `:nth-child(an+b)`, the
+//! `*-of-type` family (`:first-of-type`, `:last-of-type`, `:only-of-type`,
+//! `:nth-of-type(an+b)`), `:not(…)`,
 //! `:root`), grouping `,`, and the descendant / child (`>`) / adjacent-sibling
 //! (`+`) / general-sibling (`~`) combinators. State pseudo-classes (`:hover`,
 //! `:focus`, `:active`, `:visited`, `:link`) parse but never match in the static
@@ -72,7 +74,13 @@ enum Pseudo {
     FirstChild,
     LastChild,
     OnlyChild,
-    NthChild(i32, i32), // a, b  for an+b (1-based position)
+    NthChild(i32, i32), // a, b  for an+b (1-based position among all siblings)
+    // The `*-of-type` family: same as the `*-child` ones but counting only
+    // siblings that share this element's tag (1-based position among them).
+    FirstOfType,
+    LastOfType,
+    OnlyOfType,
+    NthOfType(i32, i32),
     Root,
     Never, // :hover/:focus/:active/:visited/:link — no static match
 }
@@ -104,7 +112,15 @@ impl Compound {
     }
 
     /// Match this compound against `el` at sibling position `index` of `total`.
-    fn matches(&self, el: &SiblingRef, index: usize, total: usize) -> bool {
+    /// `siblings` is the full element-sibling list at this level (for the
+    /// `*-of-type` pseudos, which count only same-tag siblings).
+    fn matches(
+        &self,
+        el: &SiblingRef,
+        index: usize,
+        total: usize,
+        siblings: &[SiblingRef],
+    ) -> bool {
         if let Some(t) = &self.tag {
             if t != &el.tag {
                 return false;
@@ -122,12 +138,16 @@ impl Compound {
             return false;
         }
         for p in &self.pseudos {
-            if !pseudo_matches(p, el, index, total) {
+            if !pseudo_matches(p, el, index, total, siblings) {
                 return false;
             }
         }
         // :not(...) — none of the inner simple compounds may match.
-        if self.not.iter().any(|n| n.matches(el, index, total)) {
+        if self
+            .not
+            .iter()
+            .any(|n| n.matches(el, index, total, siblings))
+        {
             return false;
         }
         true
@@ -149,13 +169,33 @@ fn attr_matches(a: &AttrSel, el: &SiblingRef) -> bool {
     }
 }
 
-fn pseudo_matches(p: &Pseudo, el: &SiblingRef, index: usize, total: usize) -> bool {
-    let pos = index as i32 + 1; // 1-based
+fn pseudo_matches(
+    p: &Pseudo,
+    el: &SiblingRef,
+    index: usize,
+    total: usize,
+    siblings: &[SiblingRef],
+) -> bool {
+    let pos = index as i32 + 1; // 1-based position among all siblings
+
+    // For the `*-of-type` pseudos: this element's 1-based rank among same-tag
+    // siblings, and how many same-tag siblings there are in total.
+    let type_pos = || {
+        siblings[..=index.min(siblings.len().saturating_sub(1))]
+            .iter()
+            .filter(|s| s.tag == el.tag)
+            .count() as i32
+    };
+    let type_total = || siblings.iter().filter(|s| s.tag == el.tag).count();
     match p {
         Pseudo::FirstChild => index == 0,
         Pseudo::LastChild => index + 1 == total,
         Pseudo::OnlyChild => total == 1,
         Pseudo::NthChild(a, b) => nth_matches(*a, *b, pos),
+        Pseudo::FirstOfType => type_pos() == 1,
+        Pseudo::LastOfType => type_pos() as usize == type_total(),
+        Pseudo::OnlyOfType => type_total() == 1,
+        Pseudo::NthOfType(a, b) => nth_matches(*a, *b, type_pos()),
         Pseudo::Root => el.tag == "html",
         Pseudo::Never => false,
     }
@@ -198,7 +238,7 @@ impl Selector {
     fn match_at(&self, ci: usize, path: &[ElemRef], pi: usize, sib: usize) -> bool {
         let level = &path[pi];
         let total = level.siblings.len();
-        if !self.compounds[ci].matches(&level.siblings[sib], sib, total) {
+        if !self.compounds[ci].matches(&level.siblings[sib], sib, total, &level.siblings) {
             return false;
         }
         if ci == 0 {
@@ -558,10 +598,18 @@ fn apply_pseudo(c: &mut Compound, name: &str, arg: &str) {
         "first-child" => c.pseudos.push(Pseudo::FirstChild),
         "last-child" => c.pseudos.push(Pseudo::LastChild),
         "only-child" => c.pseudos.push(Pseudo::OnlyChild),
+        "first-of-type" => c.pseudos.push(Pseudo::FirstOfType),
+        "last-of-type" => c.pseudos.push(Pseudo::LastOfType),
+        "only-of-type" => c.pseudos.push(Pseudo::OnlyOfType),
         "root" => c.pseudos.push(Pseudo::Root),
         "nth-child" => {
             if let Some((a, b)) = parse_an_plus_b(arg) {
                 c.pseudos.push(Pseudo::NthChild(a, b));
+            }
+        }
+        "nth-of-type" => {
+            if let Some((a, b)) = parse_an_plus_b(arg) {
+                c.pseudos.push(Pseudo::NthOfType(a, b));
             }
         }
         "not" => {
@@ -803,6 +851,35 @@ mod tests {
         assert!(!matches("li:nth-child(odd) { a: b }", &at(1)));
         assert!(matches("li:not(.x) { a: b }", &at(0)));
         assert!(!matches("li:not(.x) { a: b }", &at(1)));
+    }
+
+    #[test]
+    fn of_type_pseudos_count_only_same_tag_siblings() {
+        // Level: h2, p, p, span, p  → the `*-of-type` pseudos count only the `p`s.
+        let sibs: Rc<[SiblingRef]> = Rc::from(vec![
+            sref("h2", None, &[], &[]),
+            sref("p", None, &[], &[]), // 1st p
+            sref("p", None, &[], &[]), // 2nd p
+            sref("span", None, &[], &[]),
+            sref("p", None, &[], &[]), // 3rd (last) p
+        ]);
+        let at = |i: usize| {
+            vec![ElemRef {
+                siblings: sibs.clone(),
+                index: i,
+            }]
+        };
+        // The first p is at sibling index 1 but is `:first-of-type` (not :first-child).
+        assert!(matches("p:first-of-type { a: b }", &at(1)));
+        assert!(!matches("p:first-child { a: b }", &at(1)));
+        // The last p is index 4 and `:last-of-type`.
+        assert!(matches("p:last-of-type { a: b }", &at(4)));
+        // nth-of-type counts among p's: the 2nd p is at index 2.
+        assert!(matches("p:nth-of-type(2) { a: b }", &at(2)));
+        assert!(!matches("p:nth-of-type(2) { a: b }", &at(4)));
+        // The lone span is :only-of-type.
+        assert!(matches("span:only-of-type { a: b }", &at(3)));
+        assert!(!matches("p:only-of-type { a: b }", &at(1)));
     }
 
     #[test]
