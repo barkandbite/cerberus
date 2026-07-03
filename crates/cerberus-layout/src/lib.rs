@@ -1085,7 +1085,10 @@ impl<'a> Ctx<'a> {
         });
         self.x += w as i32;
         self.max_x = self.max_x.max(self.x);
-        let lh = style.line_height.unwrap_or_else(|| line_height(px));
+        // Resolve `line-height` against this piece's own font size, so a unitless
+        // factor inherited from an ancestor scales to this element (not the
+        // ancestor's font size). `Normal` falls back to the font's natural leading.
+        let lh = style.line_height.resolve(px, line_height(px));
         self.line_h = self.line_h.max(lh);
     }
 
@@ -4710,6 +4713,29 @@ mod tests {
             "nbsp keeps both words on one line: {:?}",
             glyph_ys(&nbsp)
         );
+    }
+
+    #[test]
+    fn inherited_unitless_line_height_scales_to_child_font() {
+        // A unitless line-height on the ancestor scales to the child's *own* font
+        // size: the child's wrapped rows are spaced factor × child-font-size
+        // apart, not factor × ancestor-font-size.
+        let laid = lay(
+            "<div style='line-height:3;font-size:10px'>\
+             <p style='font-size:20px'>aaaa bbbb cccc</p></div>",
+            100,
+        );
+        let mut rows = glyph_ys(&laid);
+        rows.sort_unstable();
+        rows.dedup();
+        assert!(rows.len() >= 2, "text wraps to multiple rows: {rows:?}");
+        for pair in rows.windows(2) {
+            assert_eq!(
+                pair[1] - pair[0],
+                60,
+                "row spacing is 3 * 20px (the child's font), not 3 * 10px: {rows:?}"
+            );
+        }
     }
 
     #[test]
