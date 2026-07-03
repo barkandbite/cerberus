@@ -66,6 +66,81 @@ fn doc_with_div_x() -> Document {
 }
 
 #[test]
+fn query_selector_supports_state_and_structural_pseudos() {
+    // querySelector/matches now understand the form-state pseudo-classes
+    // (:checked/:disabled/:required) and the structural ones (:first-child,
+    // :last-child, :empty); an unsupported dynamic pseudo (:hover) matches
+    // nothing statically.
+    let mut b = DocumentBuilder::new();
+    let at = b.text("a");
+    let a = b.element("li", [at]);
+    let ct = b.text("c");
+    let c_li = b.element("li", [ct]);
+    let mid = b.text("b");
+    let ul = b.element("ul", [a, mid, c_li]);
+    let chk = b.element_attrs(
+        "input",
+        vec![
+            ("id".into(), "c".into()),
+            ("type".into(), "checkbox".into()),
+            ("checked".into(), "".into()),
+        ],
+        [],
+    );
+    let dis = b.element_attrs(
+        "input",
+        vec![("id".into(), "d".into()), ("disabled".into(), "".into())],
+        [],
+    );
+    let empty = b.element_attrs("div", vec![("id".into(), "e".into())], []);
+    let probe = b.element_attrs("p", vec![("id".into(), "p".into())], []);
+    let body = b.element("body", [ul, chk, dis, empty, probe]);
+    let html = b.element("html", [body]);
+    let doc = b.finish(html);
+
+    let (mut engine, realm) = engine_and_realm();
+    let scripts = vec!["var p = document.getElementById('p'); \
+         p.setAttribute('checked', document.querySelector('input:checked').id); \
+         p.setAttribute('disabled', document.querySelector(':disabled').id); \
+         p.setAttribute('first', document.querySelector('li:first-child').textContent); \
+         p.setAttribute('last', document.querySelector('li:last-child').textContent); \
+         p.setAttribute('empty', document.querySelector('div:empty').id); \
+         p.setAttribute('matches', String(document.getElementById('c').matches(':checked'))); \
+         p.setAttribute('hover', String(document.querySelectorAll('li:hover').length));"
+        .to_string()];
+
+    let out = run_page_scripts(engine.as_mut(), realm, &doc, &scripts, &env()).expect("run");
+    let p = find_id(out.root(), "p").expect("#p present");
+    assert_eq!(
+        p.attr("checked"),
+        Some("c"),
+        ":checked finds the checked input"
+    );
+    assert_eq!(
+        p.attr("disabled"),
+        Some("d"),
+        ":disabled finds the disabled input"
+    );
+    assert_eq!(
+        p.attr("first"),
+        Some("a"),
+        ":first-child skips text siblings"
+    );
+    assert_eq!(p.attr("last"), Some("c"), ":last-child skips text siblings");
+    assert_eq!(
+        p.attr("empty"),
+        Some("e"),
+        ":empty matches the childless div"
+    );
+    assert_eq!(p.attr("matches"), Some("true"), "matches(':checked') works");
+    assert_eq!(
+        p.attr("hover"),
+        Some("0"),
+        ":hover never matches statically"
+    );
+}
+
+#[test]
 fn form_data_scrapes_successful_controls() {
     // new FormData(form) collects named, non-disabled controls; an unchecked
     // checkbox, a disabled input, and a <button> are all excluded.
