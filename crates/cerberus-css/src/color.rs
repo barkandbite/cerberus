@@ -67,26 +67,55 @@ fn dup(nibble: &str) -> Option<u8> {
     Some(v * 16 + v)
 }
 
-/// `hsl(h, s%, l%)` / `hsla(h, s%, l%, a)` (comma syntax). Hue is in degrees
-/// (wrapped mod 360), saturation and lightness are percentages, alpha is 0..1.
-/// Modern sites lean on HSL heavily; without this every such color silently
-/// dropped to the inherited/initial value.
+/// `hsl()`/`hsla()` in either syntax (they are synonyms, CSS Color 4):
+/// - legacy comma: `h, s%, l%` / `h, s%, l%, a`
+/// - modern space: `h s% l%`   / `h s% l% / a`
+///
+/// Hue is in degrees (an optional `deg` unit, wrapped mod 360), saturation and
+/// lightness are percentages, alpha is a 0..1 number or a percentage. Modern
+/// sites lean on HSL heavily; without this every such color silently dropped to
+/// the inherited/initial value.
 fn parse_hsl(inner: &str) -> Option<Color> {
-    let parts: Vec<&str> = inner.split(',').map(str::trim).collect();
-    if parts.len() < 3 {
-        return None;
-    }
+    let (parts, alpha) = if inner.contains(',') {
+        let p: Vec<&str> = inner.split(',').map(str::trim).collect();
+        if p.len() < 3 {
+            return None;
+        }
+        ([p[0], p[1], p[2]], p.get(3).copied())
+    } else {
+        let (hsl, alpha) = match inner.split_once('/') {
+            Some((h, a)) => (h, Some(a)),
+            None => (inner, None),
+        };
+        let n: Vec<&str> = hsl.split_whitespace().collect();
+        if n.len() < 3 {
+            return None;
+        }
+        ([n[0], n[1], n[2]], alpha)
+    };
     let h = parts[0]
+        .trim()
         .trim_end_matches("deg")
         .trim()
         .parse::<f32>()
         .ok()?;
-    let s = parts[1].strip_suffix('%')?.trim().parse::<f32>().ok()? / 100.0;
-    let l = parts[2].strip_suffix('%')?.trim().parse::<f32>().ok()? / 100.0;
-    let a = if parts.len() >= 4 {
-        (parts[3].parse::<f32>().ok()?.clamp(0.0, 1.0) * 255.0).round() as u8
-    } else {
-        255
+    let s = parts[1]
+        .trim()
+        .strip_suffix('%')?
+        .trim()
+        .parse::<f32>()
+        .ok()?
+        / 100.0;
+    let l = parts[2]
+        .trim()
+        .strip_suffix('%')?
+        .trim()
+        .parse::<f32>()
+        .ok()?
+        / 100.0;
+    let a = match alpha.map(str::trim).filter(|s| !s.is_empty()) {
+        Some(a) => parse_alpha(a)?,
+        None => 255,
     };
     let (r, g, b) = hsl_to_rgb(h, s.clamp(0.0, 1.0), l.clamp(0.0, 1.0));
     Some(Color::rgba(r, g, b, a))
@@ -449,5 +478,22 @@ mod tests {
         );
         // Malformed (missing % units) is rejected, not mis-parsed.
         assert_eq!(parse_color("hsl(120, 100, 50)"), None);
+    }
+
+    #[test]
+    fn parses_modern_hsl_syntax() {
+        // Modern space form matches the legacy comma form.
+        assert_eq!(
+            parse_color("hsl(120 100% 50%)"),
+            parse_color("hsl(120, 100%, 50%)")
+        );
+        // Slash alpha as a number and as a percentage; `deg` unit still accepted.
+        assert_eq!(
+            parse_color("hsl(0deg 100% 50% / 0.5)"),
+            Some(Color::rgba(255, 0, 0, 128))
+        );
+        assert_eq!(parse_color("hsl(240 100% 50% / 50%)").unwrap().a, 128);
+        // Too few components → no color.
+        assert_eq!(parse_color("hsl(120 100%)"), None);
     }
 }
