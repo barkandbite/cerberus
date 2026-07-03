@@ -199,6 +199,106 @@ fn named(name: &str) -> Option<Color> {
         "rebeccapurple" => (102, 51, 153),
         "beige" => (245, 245, 220),
         "ivory" => (255, 255, 240),
+        // The remainder of the CSS named-color set. Values are written as the
+        // spec's hex triplets (`0xRR, 0xGG, 0xBB`) rather than decimal so each
+        // maps 1:1 to the color table and can't drift through a hand conversion.
+        // Without these, a page using e.g. `color: lightgreen` parses to `None`
+        // and the declaration is silently dropped — rendering the default color.
+        "aliceblue" => (0xf0, 0xf8, 0xff),
+        "antiquewhite" => (0xfa, 0xeb, 0xd7),
+        "aquamarine" => (0x7f, 0xff, 0xd4),
+        "azure" => (0xf0, 0xff, 0xff),
+        "bisque" => (0xff, 0xe4, 0xc4),
+        "blanchedalmond" => (0xff, 0xeb, 0xcd),
+        "blueviolet" => (0x8a, 0x2b, 0xe2),
+        "burlywood" => (0xde, 0xb8, 0x87),
+        "cadetblue" => (0x5f, 0x9e, 0xa0),
+        "chartreuse" => (0x7f, 0xff, 0x00),
+        "chocolate" => (0xd2, 0x69, 0x1e),
+        "cornflowerblue" => (0x64, 0x95, 0xed),
+        "cornsilk" => (0xff, 0xf8, 0xdc),
+        "darkcyan" => (0x00, 0x8b, 0x8b),
+        "darkgoldenrod" => (0xb8, 0x86, 0x0b),
+        "darkkhaki" => (0xbd, 0xb7, 0x6b),
+        "darkmagenta" => (0x8b, 0x00, 0x8b),
+        "darkolivegreen" => (0x55, 0x6b, 0x2f),
+        "darkorange" => (0xff, 0x8c, 0x00),
+        "darkorchid" => (0x99, 0x32, 0xcc),
+        "darksalmon" => (0xe9, 0x96, 0x7a),
+        "darkseagreen" => (0x8f, 0xbc, 0x8f),
+        "darkslateblue" => (0x48, 0x3d, 0x8b),
+        "darkslategray" | "darkslategrey" => (0x2f, 0x4f, 0x4f),
+        "darkturquoise" => (0x00, 0xce, 0xd1),
+        "darkviolet" => (0x94, 0x00, 0xd3),
+        "deeppink" => (0xff, 0x14, 0x93),
+        "deepskyblue" => (0x00, 0xbf, 0xff),
+        "firebrick" => (0xb2, 0x22, 0x22),
+        "floralwhite" => (0xff, 0xfa, 0xf0),
+        "forestgreen" => (0x22, 0x8b, 0x22),
+        "ghostwhite" => (0xf8, 0xf8, 0xff),
+        "goldenrod" => (0xda, 0xa5, 0x20),
+        "greenyellow" => (0xad, 0xff, 0x2f),
+        "honeydew" => (0xf0, 0xff, 0xf0),
+        "hotpink" => (0xff, 0x69, 0xb4),
+        "indianred" => (0xcd, 0x5c, 0x5c),
+        "lavender" => (0xe6, 0xe6, 0xfa),
+        "lavenderblush" => (0xff, 0xf0, 0xf5),
+        "lawngreen" => (0x7c, 0xfc, 0x00),
+        "lemonchiffon" => (0xff, 0xfa, 0xcd),
+        "lightcoral" => (0xf0, 0x80, 0x80),
+        "lightcyan" => (0xe0, 0xff, 0xff),
+        "lightgoldenrodyellow" => (0xfa, 0xfa, 0xd2),
+        "lightgreen" => (0x90, 0xee, 0x90),
+        "lightpink" => (0xff, 0xb6, 0xc1),
+        "lightsalmon" => (0xff, 0xa0, 0x7a),
+        "lightseagreen" => (0x20, 0xb2, 0xaa),
+        "lightskyblue" => (0x87, 0xce, 0xfa),
+        "lightslategray" | "lightslategrey" => (0x77, 0x88, 0x99),
+        "lightsteelblue" => (0xb0, 0xc4, 0xde),
+        "lightyellow" => (0xff, 0xff, 0xe0),
+        "limegreen" => (0x32, 0xcd, 0x32),
+        "linen" => (0xfa, 0xf0, 0xe6),
+        "mediumaquamarine" => (0x66, 0xcd, 0xaa),
+        "mediumblue" => (0x00, 0x00, 0xcd),
+        "mediumorchid" => (0xba, 0x55, 0xd3),
+        "mediumpurple" => (0x93, 0x70, 0xdb),
+        "mediumseagreen" => (0x3c, 0xb3, 0x71),
+        "mediumslateblue" => (0x7b, 0x68, 0xee),
+        "mediumspringgreen" => (0x00, 0xfa, 0x9a),
+        "mediumturquoise" => (0x48, 0xd1, 0xcc),
+        "mediumvioletred" => (0xc7, 0x15, 0x85),
+        "midnightblue" => (0x19, 0x19, 0x70),
+        "mintcream" => (0xf5, 0xff, 0xfa),
+        "mistyrose" => (0xff, 0xe4, 0xe1),
+        "moccasin" => (0xff, 0xe4, 0xb5),
+        "navajowhite" => (0xff, 0xde, 0xad),
+        "oldlace" => (0xfd, 0xf5, 0xe6),
+        "olivedrab" => (0x6b, 0x8e, 0x23),
+        "orangered" => (0xff, 0x45, 0x00),
+        "orchid" => (0xda, 0x70, 0xd6),
+        "palegoldenrod" => (0xee, 0xe8, 0xaa),
+        "palegreen" => (0x98, 0xfb, 0x98),
+        "paleturquoise" => (0xaf, 0xee, 0xee),
+        "palevioletred" => (0xdb, 0x70, 0x93),
+        "papayawhip" => (0xff, 0xef, 0xd5),
+        "peachpuff" => (0xff, 0xda, 0xb9),
+        "peru" => (0xcd, 0x85, 0x3f),
+        "plum" => (0xdd, 0xa0, 0xdd),
+        "powderblue" => (0xb0, 0xe0, 0xe6),
+        "rosybrown" => (0xbc, 0x8f, 0x8f),
+        "saddlebrown" => (0x8b, 0x45, 0x13),
+        "sandybrown" => (0xf4, 0xa4, 0x60),
+        "seagreen" => (0x2e, 0x8b, 0x57),
+        "seashell" => (0xff, 0xf5, 0xee),
+        "sienna" => (0xa0, 0x52, 0x2d),
+        "slateblue" => (0x6a, 0x5a, 0xcd),
+        "snow" => (0xff, 0xfa, 0xfa),
+        "springgreen" => (0x00, 0xff, 0x7f),
+        "tan" => (0xd2, 0xb4, 0x8c),
+        "thistle" => (0xd8, 0xbf, 0xd8),
+        "turquoise" => (0x40, 0xe0, 0xd0),
+        "wheat" => (0xf5, 0xde, 0xb3),
+        "yellowgreen" => (0x9a, 0xcd, 0x32),
         _ => return None,
     };
     Some(Color::rgb(rgb.0, rgb.1, rgb.2))
@@ -216,6 +316,29 @@ mod tests {
         assert_eq!(parse_color("RoyalBlue"), Some(Color::rgb(65, 105, 225)));
         assert_eq!(parse_color("transparent").unwrap().a, 0);
         assert_eq!(parse_color("not-a-color"), None);
+    }
+
+    #[test]
+    fn parses_extended_named_colors() {
+        // Colors from the completed CSS named-color set that previously parsed
+        // to `None` (and so rendered nothing). Case-insensitive, and the
+        // gray/grey spelling variants both resolve.
+        assert_eq!(
+            parse_color("lightgreen"),
+            Some(Color::rgb(0x90, 0xee, 0x90))
+        );
+        assert_eq!(parse_color("OrangeRed"), Some(Color::rgb(0xff, 0x45, 0x00)));
+        assert_eq!(parse_color("turquoise"), Some(Color::rgb(0x40, 0xe0, 0xd0)));
+        assert_eq!(parse_color("rebeccapurple"), Some(Color::rgb(102, 51, 153)));
+        assert_eq!(
+            parse_color("darkslategrey"),
+            parse_color("darkslategray"),
+            "gray/grey aliases resolve identically"
+        );
+        assert_eq!(
+            parse_color("lightslategray"),
+            Some(Color::rgb(0x77, 0x88, 0x99))
+        );
     }
 
     #[test]
