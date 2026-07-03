@@ -678,3 +678,131 @@ pub trait StyleEngine: Send {
         self.style(doc)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn len_resolve_handles_px_pct_and_auto() {
+        assert_eq!(Len::Px(20).resolve(1000), Some(20));
+        // Percentage is of the containing extent, rounded to the nearest px.
+        assert_eq!(Len::Pct(50.0).resolve(200), Some(100));
+        assert_eq!(Len::Pct(33.0).resolve(100), Some(33));
+        // Auto and viewport units cannot resolve without a viewport.
+        assert_eq!(Len::Auto.resolve(500), None);
+        assert_eq!(Len::Vw(50.0).resolve(500), None);
+        assert_eq!(Len::Vh(50.0).resolve(500), None);
+    }
+
+    #[test]
+    fn len_resolve_vp_resolves_viewport_units() {
+        // vw/vh are percentages of the viewport axes.
+        assert_eq!(Len::Vw(50.0).resolve_vp(0, 1280, 800), Some(640));
+        assert_eq!(Len::Vh(25.0).resolve_vp(0, 1280, 800), Some(200));
+        // Everything else delegates to `resolve` (extent-relative).
+        assert_eq!(Len::Px(10).resolve_vp(500, 1280, 800), Some(10));
+        assert_eq!(Len::Pct(10.0).resolve_vp(500, 1280, 800), Some(50));
+        assert_eq!(Len::Auto.resolve_vp(500, 1280, 800), None);
+    }
+
+    #[test]
+    fn white_space_predicate_matrix() {
+        use WhiteSpace::*;
+        // (preserves_spaces, preserves_newlines, wraps) for each keyword.
+        assert_eq!(
+            (
+                Normal.preserves_spaces(),
+                Normal.preserves_newlines(),
+                Normal.wraps()
+            ),
+            (false, false, true)
+        );
+        assert_eq!(
+            (
+                Pre.preserves_spaces(),
+                Pre.preserves_newlines(),
+                Pre.wraps()
+            ),
+            (true, true, false)
+        );
+        assert_eq!(
+            (
+                PreWrap.preserves_spaces(),
+                PreWrap.preserves_newlines(),
+                PreWrap.wraps()
+            ),
+            (true, true, true)
+        );
+        assert_eq!(
+            (
+                PreLine.preserves_spaces(),
+                PreLine.preserves_newlines(),
+                PreLine.wraps()
+            ),
+            (false, true, true)
+        );
+        assert_eq!(
+            (
+                Nowrap.preserves_spaces(),
+                Nowrap.preserves_newlines(),
+                Nowrap.wraps()
+            ),
+            (false, false, false)
+        );
+    }
+
+    #[test]
+    fn initial_has_sane_defaults() {
+        let s = ComputedStyle::initial();
+        assert_eq!(s.display, Display::Block);
+        assert_eq!(s.color, Color::BLACK);
+        assert_eq!(s.font_size, 16);
+        assert_eq!(s.margin_top, 0);
+        assert_eq!(s.margin_right, 0);
+        assert_eq!(s.width, Len::Auto);
+        assert_eq!(s.vertical_align, VerticalAlign::Baseline);
+        assert_eq!(s.white_space, WhiteSpace::Normal);
+    }
+
+    #[test]
+    fn inherit_copies_inherited_and_resets_the_rest() {
+        // Set some inherited and some non-inherited properties away from initial,
+        // plus `vertical-align` (an inline text property that is nonetheless NOT
+        // inherited), then confirm which cross the parent→child boundary.
+        let mut parent = ComputedStyle::initial();
+        parent.font_size = 22; // inherited
+        parent.color = Color::rgb(1, 2, 3); // inherited
+        parent.text_indent = 12; // inherited
+        parent.white_space = WhiteSpace::Pre; // inherited
+        parent.margin_top = 9; // not inherited
+        parent.margin_right = 7; // not inherited
+        parent.width = Len::Px(300); // not inherited
+        parent.display = Display::Flex; // not inherited (child resets to Inline)
+        parent.vertical_align = VerticalAlign::Super; // not inherited
+
+        let child = parent.inherit();
+        let init = ComputedStyle::initial();
+
+        // Inherited values flow down.
+        assert_eq!(child.font_size, 22);
+        assert_eq!(child.color, Color::rgb(1, 2, 3));
+        assert_eq!(child.text_indent, 12);
+        assert_eq!(child.white_space, WhiteSpace::Pre);
+
+        // Non-inherited values reset to their initial value.
+        assert_eq!(child.margin_top, init.margin_top);
+        assert_eq!(child.margin_right, init.margin_right);
+        assert_eq!(child.width, init.width);
+        assert_eq!(
+            child.display,
+            Display::Inline,
+            "a child box starts inline, not the parent's display"
+        );
+        assert_eq!(
+            child.vertical_align,
+            VerticalAlign::Baseline,
+            "vertical-align does not inherit"
+        );
+    }
+}
