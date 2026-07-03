@@ -912,7 +912,7 @@ impl<'a> Ctx<'a> {
                 } else {
                     // `pre-line`: spaces collapse, but the surrounding `\n`s (above)
                     // are preserved and the collapsed words still wrap.
-                    for word in line.split_whitespace() {
+                    for word in line.split_ascii_whitespace() {
                         self.add_word(word, style, href);
                     }
                 }
@@ -921,12 +921,15 @@ impl<'a> Ctx<'a> {
             // `white-space: nowrap`: collapse runs of whitespace to single spaces
             // like normal text, but place the whole thing as one atomic run so it
             // never wraps (it may overflow the container, per spec).
-            let collapsed = text.split_whitespace().collect::<Vec<_>>().join(" ");
+            let collapsed = text.split_ascii_whitespace().collect::<Vec<_>>().join(" ");
             if !collapsed.is_empty() {
                 self.add_run(&collapsed, style, href);
             }
         } else {
-            for word in text.split_whitespace() {
+            // Split on ASCII whitespace only, so a non-breaking space (`&nbsp;`,
+            // U+00A0) keeps the words it joins on the same line rather than
+            // becoming a wrap opportunity.
+            for word in text.split_ascii_whitespace() {
                 self.add_word(word, style, href);
             }
         }
@@ -945,15 +948,17 @@ impl<'a> Ctx<'a> {
         let mut lead = 0i32;
         let mut chars = line.chars().peekable();
         while let Some(&c) = chars.peek() {
-            if c.is_whitespace() {
+            // Only ASCII whitespace is a break opportunity / collapsible gap; a
+            // non-breaking space stays inside the word so it never wraps.
+            if c.is_ascii_whitespace() {
                 lead += sw;
                 chars.next();
                 continue;
             }
-            // Gather the next word (run of non-whitespace).
+            // Gather the next word (run up to the next ASCII space).
             let mut word = String::new();
             while let Some(&c) = chars.peek() {
-                if c.is_whitespace() {
+                if c.is_ascii_whitespace() {
                     break;
                 }
                 word.push(c);
@@ -4679,6 +4684,26 @@ mod tests {
             total_glyphs(&norm_sp),
             2,
             "normal collapses inter-word space"
+        );
+    }
+
+    #[test]
+    fn nbsp_does_not_break_the_line() {
+        // A regular space between two words is a wrap opportunity, so in a narrow
+        // box the words fall onto separate lines. A non-breaking space (`&nbsp;`)
+        // holds them together on one line (overflowing rather than wrapping).
+        let spaced = lay("<p>aaaa bbbb</p>", 60);
+        assert!(
+            distinct(&glyph_ys(&spaced)) > 1,
+            "a normal space lets the words wrap: {:?}",
+            glyph_ys(&spaced)
+        );
+        let nbsp = lay("<p>aaaa&nbsp;bbbb</p>", 60);
+        assert_eq!(
+            distinct(&glyph_ys(&nbsp)),
+            1,
+            "nbsp keeps both words on one line: {:?}",
+            glyph_ys(&nbsp)
         );
     }
 

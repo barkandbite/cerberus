@@ -707,13 +707,17 @@ fn find_ci(haystack: &str, needle: &str) -> Option<usize> {
     haystack.to_ascii_lowercase().find(needle)
 }
 
-/// Decode HTML entities, collapse runs of whitespace to single spaces, and trim.
+/// Decode HTML entities, collapse runs of *collapsible* whitespace to single
+/// spaces, and trim. Only ASCII whitespace collapses: `&nbsp;` (U+00A0) is a
+/// non-breaking space that CSS whitespace processing preserves verbatim, so it
+/// must survive collapsing and trimming — hence `is_ascii_whitespace` rather than
+/// the Unicode `is_whitespace`, which would fold NBSP into a plain breakable space.
 fn clean_text(raw: &str) -> String {
     let decoded = decode_entities(raw);
     let mut out = String::with_capacity(decoded.len());
     let mut prev_space = false;
     for ch in decoded.chars() {
-        if ch.is_whitespace() {
+        if ch.is_ascii_whitespace() {
             if !prev_space {
                 out.push(' ');
                 prev_space = true;
@@ -723,7 +727,8 @@ fn clean_text(raw: &str) -> String {
             prev_space = false;
         }
     }
-    out.trim().to_string()
+    out.trim_matches(|c: char| c.is_ascii_whitespace())
+        .to_string()
 }
 
 fn decode_entities(s: &str) -> String {
@@ -1042,6 +1047,18 @@ mod tests {
     fn collapses_whitespace() {
         let doc = parse_html("<p>one\n\n   two\t three</p>");
         assert_eq!(doc.root().text_content(), "one two three");
+    }
+
+    #[test]
+    fn nbsp_is_preserved_not_collapsed() {
+        // `&nbsp;` (U+00A0) is a non-breaking space: it must survive whitespace
+        // collapsing and trimming rather than folding into a plain space. Runs of
+        // NBSP stay verbatim, and adjacent ASCII whitespace still collapses.
+        let doc = parse_html("<p>a&nbsp;&nbsp;b   c</p>");
+        assert_eq!(doc.root().text_content(), "a\u{a0}\u{a0}b c");
+        // A leading NBSP is not trimmed (a leading ASCII space would be).
+        let doc2 = parse_html("<p>&nbsp;x</p>");
+        assert_eq!(doc2.root().text_content(), "\u{a0}x");
     }
 
     #[test]
