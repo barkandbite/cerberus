@@ -187,6 +187,7 @@ struct LinePiece {
     color: Color,
     font: FontStyle,
     underline: bool,
+    line_through: bool,
     href: Option<String>,
     link_node: Option<NodeId>,
 }
@@ -985,6 +986,7 @@ impl<'a> Ctx<'a> {
             color: style.color,
             font: style.font,
             underline: style.underline,
+            line_through: style.line_through,
             href: href.map(str::to_string),
             link_node: self.cur_link_node,
         });
@@ -1362,6 +1364,14 @@ impl<'a> Ctx<'a> {
             if piece.underline {
                 self.display.push(DisplayItem::Rect {
                     rect: Rect::new(x, piece.y + piece.px as i32, piece.w, 1),
+                    color: piece.color,
+                });
+            }
+            if piece.line_through {
+                // A 1px rule through the vertical middle of the text (≈ half the
+                // font size below the baseline-top), in the text color.
+                self.display.push(DisplayItem::Rect {
+                    rect: Rect::new(x, piece.y + piece.px as i32 / 2, piece.w, 1),
                     color: piece.color,
                 });
             }
@@ -4508,6 +4518,39 @@ mod tests {
         let laid = lay("<input type='submit' value='Send'>", 400);
         assert!(has_rect_color(&laid, BUTTON_BG));
         assert_eq!(total_glyphs(&laid), 4, "'Send' label");
+    }
+
+    #[test]
+    fn line_through_draws_a_strike_rule() {
+        // Plain text emits no rects; a line-through run adds a 1px rule (like an
+        // underline, but through the middle of the text).
+        let plain = lay("<p>struck</p>", 400);
+        let strike = lay("<p style='text-decoration:line-through'>struck</p>", 400);
+        assert_eq!(rect_count(&plain), 0, "plain text draws no rule");
+        assert_eq!(rect_count(&strike), 1, "line-through draws one strike rule");
+        // The strike sits above the baseline (underline would be at y+px).
+        let (strike_y, px) = strike
+            .display
+            .items
+            .iter()
+            .find_map(|i| match i {
+                DisplayItem::Rect { rect, .. } => Some((rect.y, 16)),
+                _ => None,
+            })
+            .unwrap();
+        let (text_y, _) = strike
+            .display
+            .items
+            .iter()
+            .find_map(|i| match i {
+                DisplayItem::Glyphs { origin, .. } => Some((origin.y, ())),
+                _ => None,
+            })
+            .unwrap();
+        assert!(
+            strike_y < text_y + px,
+            "strike ({strike_y}) sits above the underline position"
+        );
     }
 
     #[test]

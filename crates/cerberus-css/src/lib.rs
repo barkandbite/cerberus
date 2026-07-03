@@ -791,10 +791,19 @@ fn apply_declarations(
             }
             "text-decoration" | "text-decoration-line" => {
                 let low = v.to_ascii_lowercase();
-                if low.contains("underline") {
-                    style.underline = true;
-                } else if low.contains("none") {
+                // `none` clears both lines; otherwise each named line is applied
+                // independently (a shorthand may list several, e.g.
+                // `underline line-through`).
+                if low.contains("none") {
                     style.underline = false;
+                    style.line_through = false;
+                } else {
+                    if low.contains("underline") {
+                        style.underline = true;
+                    }
+                    if low.contains("line-through") {
+                        style.line_through = true;
+                    }
                 }
             }
             "display" => {
@@ -1871,6 +1880,26 @@ mod tests {
             StyledChild::Element(e) => first(e, tag),
             StyledChild::Text(_) => None,
         })
+    }
+
+    #[test]
+    fn text_decoration_line_through_and_combos() {
+        let strike = CssEngine::new().style(&parse_html(
+            "<span style='text-decoration:line-through'>x</span>",
+        ));
+        let s = first(&strike.root, "span").unwrap();
+        assert!(s.style.line_through && !s.style.underline);
+        // A shorthand may name both lines.
+        let both = CssEngine::new().style(&parse_html(
+            "<span style='text-decoration:underline line-through'>x</span>",
+        ));
+        let b = first(&both.root, "span").unwrap();
+        assert!(b.style.underline && b.style.line_through);
+        // `none` clears the UA underline on an <a>.
+        let cleared = CssEngine::new().style(&parse_html(
+            "<a href='/x' style='text-decoration:none'>x</a>",
+        ));
+        assert!(!first(&cleared.root, "a").unwrap().style.underline);
     }
 
     #[test]

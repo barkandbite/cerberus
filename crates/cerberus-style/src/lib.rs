@@ -249,6 +249,9 @@ pub struct ComputedStyle {
     pub font: FontStyle,
     pub text_align: TextAlign,
     pub underline: bool,
+    /// `text-decoration: line-through` (strikethrough). Inherited alongside
+    /// `underline`.
+    pub line_through: bool,
     /// `line-height` resolved to px (`None` = `normal`, the 1.5× default);
     /// `text-transform`; `letter-spacing` in px (may be negative). Inherited text
     /// properties (ADR-0041).
@@ -385,6 +388,7 @@ impl ComputedStyle {
             font: FontStyle::REGULAR,
             text_align: TextAlign::Left,
             underline: false,
+            line_through: false,
             line_height: None,
             text_transform: TextTransform::None,
             letter_spacing: 0,
@@ -462,6 +466,7 @@ impl ComputedStyle {
             font: self.font,
             text_align: self.text_align,
             underline: self.underline,
+            line_through: self.line_through,
             line_height: self.line_height,
             text_transform: self.text_transform,
             letter_spacing: self.letter_spacing,
