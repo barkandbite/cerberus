@@ -1471,23 +1471,44 @@ pub const DOM_MODEL_PRELUDE: &str = r##"
     // Matching is anchored on the rightmost (subject) compound and walks back
     // through ancestors/parents, so we never need sibling links here.
     //
-    // Unsupported (by design, speed-first): sibling combinators `~`/`+`,
-    // pseudo-classes/elements (`:hover`, `::before`), leading `>`, namespaces.
-    // Attribute selectors are limited to `[name]` and `[name="value"]` /
-    // `[name='value']` (presence and exact-match; no `~=`, `^=`, `*=`, …).
+    // Supported pseudo-classes: form state (`:checked`, `:disabled`, `:enabled`,
+    // `:required`, `:optional`, `:read-only`, `:read-write`) and structural
+    // (`:first-child`, `:last-child`, `:only-child`, `:empty`, `:root`). Any other
+    // pseudo — dynamic state like `:hover`, or a `::pseudo-element` — never matches
+    // statically (as in the cascade engine). Unsupported (by design, speed-first):
+    // sibling combinators `~`/`+`, `:nth-child()`/`:not()`, leading `>`,
+    // namespaces. Attribute selectors are limited to `[name]` and `[name="value"]`
+    // / `[name='value']` (presence and exact-match; no `~=`, `^=`, `*=`, …).
     function parseCompound(text) {
       // text is one compound run with no whitespace/combinators, e.g.
       // `div.foo#bar[data-x="1"]`. Returns null if it is empty/garbage.
-      var compound = { tag: null, id: null, classes: [], attrs: [] };
+      var compound = { tag: null, id: null, classes: [], attrs: [], pseudos: [] };
       var i = 0, n = text.length, sawAny = false;
       while (i < n) {
         var ch = text.charAt(i);
         if (ch === "#") {
-          i++; var s = i; while (i < n && !".#[".includes(text.charAt(i))) i++;
+          i++; var s = i; while (i < n && !".#[:".includes(text.charAt(i))) i++;
           compound.id = text.slice(s, i); sawAny = true;
         } else if (ch === ".") {
-          i++; var s2 = i; while (i < n && !".#[".includes(text.charAt(i))) i++;
+          i++; var s2 = i; while (i < n && !".#[:".includes(text.charAt(i))) i++;
           if (i > s2) { compound.classes.push(text.slice(s2, i)); sawAny = true; }
+        } else if (ch === ":") {
+          // Pseudo-class (or `::`-prefixed pseudo-element). Read the name, and any
+          // parenthesized argument. A `:` used to fall into the type branch, so
+          // `input:checked` parsed a bogus tag "input:checked" and never matched.
+          i++;
+          if (text.charAt(i) === ":") i++; // ::pseudo-element → treated as unknown
+          var ps = i;
+          while (i < n && !".#[:(".includes(text.charAt(i))) i++;
+          var pname = text.slice(ps, i).toLowerCase();
+          var parg = null;
+          if (text.charAt(i) === "(") {
+            var pe = text.indexOf(")", i);
+            if (pe === -1) return null; // unterminated → no match
+            parg = text.slice(i + 1, pe).trim();
+            i = pe + 1;
+          }
+          if (pname) { compound.pseudos.push({ name: pname, arg: parg }); sawAny = true; }
         } else if (ch === "[") {
           var end = text.indexOf("]", i);
           if (end === -1) return null;            // unterminated → no match
@@ -1504,7 +1525,7 @@ pub const DOM_MODEL_PRELUDE: &str = r##"
           }
         } else {
           // A type (tag) selector or universal `*`; runs until the next part.
-          var s3 = i; while (i < n && !".#[".includes(text.charAt(i))) i++;
+          var s3 = i; while (i < n && !".#[:".includes(text.charAt(i))) i++;
           var tag = text.slice(s3, i);
           if (tag && tag !== "*") compound.tag = tag.toLowerCase();
           sawAny = true;
@@ -1566,7 +1587,46 @@ pub const DOM_MODEL_PRELUDE: &str = r##"
         if (v === null) return false;
         if (a.value !== null && v !== a.value) return false;
       }
+      if (compound.pseudos) {
+        for (var q = 0; q < compound.pseudos.length; q++) {
+          if (!matchesPseudo(el, compound.pseudos[q])) return false;
+        }
+      }
       return true;
+    }
+    // A small, useful set of pseudo-classes for querySelector/matches: the
+    // attribute-backed form-state ones (`:checked`, `:disabled`, …) plus the
+    // structural ones. Anything else — dynamic state like `:hover`, or an
+    // unsupported pseudo — never matches statically, matching the cascade engine.
+    var FORM_CONTROLS = {
+      input: 1, select: 1, textarea: 1, button: 1, fieldset: 1, optgroup: 1, option: 1,
+    };
+    function elementSiblingsOf(el) {
+      var p = el.__parent;
+      return p ? p.__kids.filter(function (c) { return c.__type === ELEMENT_NODE; }) : [el];
+    }
+    function matchesPseudo(el, ps) {
+      switch (ps.name) {
+        case "checked": return getAttr(el, "checked") !== null || getAttr(el, "selected") !== null;
+        case "disabled": return getAttr(el, "disabled") !== null;
+        case "enabled": return !!FORM_CONTROLS[el.__tag] && getAttr(el, "disabled") === null;
+        case "required": return getAttr(el, "required") !== null;
+        case "optional": return !!FORM_CONTROLS[el.__tag] && getAttr(el, "required") === null;
+        case "read-only": return getAttr(el, "readonly") !== null;
+        case "read-write": return getAttr(el, "readonly") === null;
+        case "root": return el.__tag === "html";
+        case "empty":
+          for (var i = 0; i < el.__kids.length; i++) {
+            var k = el.__kids[i];
+            if (k.__type === ELEMENT_NODE) return false;
+            if (k.__type === TEXT_NODE && k.__text.length) return false;
+          }
+          return true;
+        case "first-child": return elementSiblingsOf(el)[0] === el;
+        case "last-child": { var s = elementSiblingsOf(el); return s[s.length - 1] === el; }
+        case "only-child": return elementSiblingsOf(el).length === 1;
+        default: return false;
+      }
     }
     function matchesComplex(el, steps) {
       // Anchor on the rightmost step (the subject), then satisfy each earlier
