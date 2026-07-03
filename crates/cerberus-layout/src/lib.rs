@@ -15,7 +15,7 @@ use cerberus_dom::NodeId;
 use cerberus_paint::{DecodedImage, DisplayItem, DisplayList, GlyphBox, TextShaper};
 use cerberus_style::{
     AlignItems, ComputedStyle, Display, FlexDirection, JustifyContent, Len, ListStyleType,
-    StyledChild, StyledDom, StyledNode, TextAlign, TextTransform, Track, TrackMax,
+    StyledChild, StyledDom, StyledNode, TextAlign, TextTransform, Track, TrackMax, VerticalAlign,
 };
 use cerberus_types::{Color, FontStyle, Point, Rect, Size};
 use std::sync::Arc;
@@ -985,9 +985,19 @@ impl<'a> Ctx<'a> {
         style: &ComputedStyle,
         href: Option<&str>,
     ) {
+        // `vertical-align: sub`/`super` shifts the (already smaller) inline box
+        // off the shared line top. Pieces are top-aligned, so raising `super`
+        // (negative offset) lifts it toward the cap of the surrounding text and
+        // lowering `sub` drops it toward the baseline — a fraction of the piece's
+        // own font size, the usual crude-but-legible offset.
+        let voffset = match style.vertical_align {
+            VerticalAlign::Super => -(px as i32 / 3),
+            VerticalAlign::Sub => px as i32 / 3,
+            VerticalAlign::Baseline => 0,
+        };
         self.line.push(LinePiece {
             x: self.x,
-            y: self.y,
+            y: self.y + voffset,
             w,
             px,
             glyphs,
@@ -4579,6 +4589,36 @@ mod tests {
             strike_y < text_y + px,
             "strike ({strike_y}) sits above the underline position"
         );
+    }
+
+    #[test]
+    fn sub_and_sup_shift_the_baseline() {
+        // `<sup>` lifts its run above the surrounding text (smaller y); `<sub>`
+        // drops it below. The base "x" piece is emitted before the shifted "2",
+        // so ys[0] is the base line and ys[1] is the sup/sub run.
+        let sup = lay("<p>x<sup>2</sup></p>", 400);
+        let sup_ys = glyph_ys(&sup);
+        assert_eq!(sup_ys.len(), 2, "base + superscript pieces");
+        assert!(
+            sup_ys[1] < sup_ys[0],
+            "superscript ({}) sits above the baseline ({})",
+            sup_ys[1],
+            sup_ys[0]
+        );
+
+        let sub = lay("<p>x<sub>2</sub></p>", 400);
+        let sub_ys = glyph_ys(&sub);
+        assert_eq!(sub_ys.len(), 2, "base + subscript pieces");
+        assert!(
+            sub_ys[1] > sub_ys[0],
+            "subscript ({}) sits below the baseline ({})",
+            sub_ys[1],
+            sub_ys[0]
+        );
+
+        // A plain inline run with no vertical-align keeps both pieces on one line.
+        let flat = lay("<p>x<span>2</span></p>", 400);
+        assert_eq!(distinct(&glyph_ys(&flat)), 1, "no shift without sub/sup");
     }
 
     #[test]
