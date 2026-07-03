@@ -3235,6 +3235,137 @@ pub const DOM_MODEL_PRELUDE: &str = r##"
       } catch (e) {}
     };
 
+    // ---- XMLHttpRequest (over the same host fetch queue) ---------------
+    // A minimal but real XHR: open / setRequestHeader / send, plus status /
+    // responseText / readyState and the load / error / readystatechange events
+    // (both `on*` handlers and addEventListener). It enqueues onto the *same*
+    // __cerberusFetchQueue as fetch() and settles through the *same*
+    // __cerberusResolveFetch / __cerberusRejectFetch path — registering its own
+    // resolve/reject under the request id — so it inherits the per-instance
+    // sealed cookie jar and the consent gate for free, with no host changes.
+    // Bodies and responses are text (v1). Synchronous mode (`async === false`)
+    // cannot truly block here (the host services the queue only after the
+    // script yields), so it is treated as asynchronous; a script that relies on
+    // a blocking read is out of scope. This is the primitive bot-challenge
+    // sensors (e.g. reese84/Imperva) use to POST their payload — see
+    // docs/ideas/reese84-bot-challenge.md.
+    function XMLHttpRequest() {
+      this.readyState = 0; // UNSENT
+      this.status = 0;
+      this.statusText = "";
+      this.responseText = "";
+      this.response = "";
+      this.responseType = "";
+      this.responseURL = "";
+      this.withCredentials = false; // cookies always ride the sealed jar
+      this.timeout = 0;
+      this.onreadystatechange = null;
+      this.onload = null;
+      this.onerror = null;
+      this.onloadend = null;
+      this.__method = "GET";
+      this.__url = "";
+      this.__reqHeaders = [];
+      this.__respHeaders = [];
+      this.__listeners = { load: [], error: [], readystatechange: [], loadend: [] };
+      this.__sent = false;
+      this.__aborted = false;
+    }
+    XMLHttpRequest.UNSENT = 0;
+    XMLHttpRequest.OPENED = 1;
+    XMLHttpRequest.HEADERS_RECEIVED = 2;
+    XMLHttpRequest.LOADING = 3;
+    XMLHttpRequest.DONE = 4;
+    XMLHttpRequest.prototype.open = function (method, url) {
+      this.__method = String(method == null ? "GET" : method).toUpperCase();
+      this.__url = String(url == null ? "" : url);
+      this.__reqHeaders = [];
+      this.__sent = false;
+      this.__aborted = false;
+      this.readyState = 1; // OPENED
+      this.__fireReadyState();
+    };
+    XMLHttpRequest.prototype.setRequestHeader = function (name, value) {
+      if (this.readyState !== 1) return;
+      this.__reqHeaders.push([String(name), String(value)]);
+    };
+    XMLHttpRequest.prototype.getResponseHeader = function (name) {
+      var lc = String(name).toLowerCase();
+      for (var i = 0; i < this.__respHeaders.length; i++) {
+        if (String(this.__respHeaders[i][0]).toLowerCase() === lc) return this.__respHeaders[i][1];
+      }
+      return null;
+    };
+    XMLHttpRequest.prototype.getAllResponseHeaders = function () {
+      var out = "";
+      for (var i = 0; i < this.__respHeaders.length; i++) {
+        out += this.__respHeaders[i][0] + ": " + this.__respHeaders[i][1] + "\r\n";
+      }
+      return out;
+    };
+    XMLHttpRequest.prototype.addEventListener = function (type, fn) {
+      if (this.__listeners[type] && typeof fn === "function") this.__listeners[type].push(fn);
+    };
+    XMLHttpRequest.prototype.removeEventListener = function (type, fn) {
+      var l = this.__listeners[type];
+      if (!l) return;
+      for (var i = 0; i < l.length; i++) if (l[i] === fn) { l.splice(i, 1); break; }
+    };
+    XMLHttpRequest.prototype.__fire = function (type) {
+      var ev = { type: type, target: this, currentTarget: this };
+      var h = this["on" + type];
+      try { if (typeof h === "function") h.call(this, ev); } catch (e) {}
+      var l = this.__listeners[type];
+      if (l) { var snap = l.slice(); for (var i = 0; i < snap.length; i++) { try { snap[i].call(this, ev); } catch (e) {} } }
+    };
+    XMLHttpRequest.prototype.__fireReadyState = function () {
+      this.__fire("readystatechange");
+    };
+    XMLHttpRequest.prototype.send = function (body) {
+      if (this.__sent || this.readyState !== 1) return;
+      this.__sent = true;
+      var self = this;
+      var id = g.__cerberusFetchId++;
+      g.__cerberusFetchPending[id] = {
+        resolve: function (response) {
+          if (self.__aborted) return;
+          self.status = (response && typeof response.status === "number") ? response.status : 0;
+          self.statusText = (response && response.statusText) ? response.statusText : "";
+          self.responseText = (response && response._bodyText != null) ? response._bodyText : "";
+          self.response = self.responseText;
+          self.responseURL = (response && response.url) ? response.url : self.__url;
+          self.__respHeaders = (response && response.headers && response.headers.__pairs)
+            ? response.headers.__pairs() : [];
+          self.readyState = 4; // DONE
+          self.__fireReadyState();
+          self.__fire("load");
+          self.__fire("loadend");
+        },
+        reject: function (_message) {
+          if (self.__aborted) return;
+          self.status = 0;
+          self.responseText = "";
+          self.readyState = 4; // DONE (with an error)
+          self.__fireReadyState();
+          self.__fire("error");
+          self.__fire("loadend");
+        },
+      };
+      g.__cerberusFetchQueue.push({
+        id: id,
+        url: self.__url,
+        method: self.__method,
+        headers: self.__reqHeaders,
+        body: (body != null ? String(body) : ""),
+      });
+    };
+    XMLHttpRequest.prototype.abort = function () {
+      this.__aborted = true;
+      this.readyState = 0;
+      this.status = 0;
+    };
+    g.XMLHttpRequest = XMLHttpRequest;
+
     // ---- serialize: JS tree -> wire JSON -------------------------------
     g.__cerberusSerializeDOM = function () {
       try {

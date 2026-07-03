@@ -270,3 +270,102 @@ fn fetch_budget_caps_runaway_then_chain() {
         "#x still present after the capped pump"
     );
 }
+
+// ---- XMLHttpRequest (rides the same host fetch queue) --------------------
+
+#[test]
+fn xhr_get_writes_response_to_dom() {
+    // A page opens an XHR GET, and its onload writes the responseText into #x.
+    // Proves XHR enqueues onto the same host queue and settles through the same
+    // resolve path as fetch().
+    let (mut engine, realm) = engine_and_realm();
+    let doc = doc_with_div_x();
+    let mut client = StubClient::with_body("/api", r#"{"v":42}"#);
+    let scripts = vec!["var xhr = new XMLHttpRequest(); \
+         xhr.open('GET', '/api'); \
+         xhr.onload = function () { \
+           if (xhr.readyState === 4 && xhr.status === 200) \
+             document.getElementById('x').textContent = xhr.responseText; \
+         }; \
+         xhr.send();"
+        .to_string()];
+
+    let out =
+        run_page_scripts_with_fetch(engine.as_mut(), realm, &doc, &scripts, &env(), &mut client)
+            .expect("run with xhr");
+
+    let x = find_id(out.root(), "x").expect("#x present");
+    assert_eq!(x.text_content(), r#"{"v":42}"#, "onload wrote responseText");
+    assert_eq!(client.seen.len(), 1);
+    assert_eq!(client.seen[0].method, "GET");
+    assert_eq!(client.seen[0].url, "/api");
+}
+
+#[test]
+fn xhr_post_captures_body_headers_and_reads_status_and_header() {
+    // A POST with a request header and body; the load listener reads back the
+    // status and a response header. Mirrors the reese84 sensor POST shape.
+    let (mut engine, realm) = engine_and_realm();
+    let doc = doc_with_div_x();
+    let mut client = StubClient::with_body("/sensor", "{}");
+    let scripts = vec!["var xhr = new XMLHttpRequest(); \
+         xhr.open('POST', '/sensor'); \
+         xhr.setRequestHeader('X-Sensor', 'abc'); \
+         xhr.addEventListener('load', function () { \
+           var el = document.getElementById('x'); \
+           el.setAttribute('data-status', String(xhr.status)); \
+           el.setAttribute('data-ct', xhr.getResponseHeader('content-type') || ''); \
+         }); \
+         xhr.send('payload=1');"
+        .to_string()];
+
+    let out =
+        run_page_scripts_with_fetch(engine.as_mut(), realm, &doc, &scripts, &env(), &mut client)
+            .expect("run with xhr");
+
+    let req = &client.seen[0];
+    assert_eq!(req.method, "POST", "method upper-cased");
+    assert_eq!(req.body, "payload=1", "body crosses verbatim");
+    assert!(
+        req.headers
+            .iter()
+            .any(|(n, v)| n == "X-Sensor" && v == "abc"),
+        "request header captured: {:?}",
+        req.headers
+    );
+    let x = find_id(out.root(), "x").expect("#x present");
+    assert_eq!(x.attr("data-status"), Some("200"));
+    assert_eq!(x.attr("data-ct"), Some("application/json"));
+}
+
+#[test]
+fn xhr_network_error_fires_onerror_at_readystate_4() {
+    // A failing client rejects the request; XHR must reach readyState 4 with
+    // status 0 and fire onerror (not onload).
+    let (mut engine, realm) = engine_and_realm();
+    let doc = doc_with_div_x();
+    let mut client = StubClient::failing("connection refused");
+    let scripts = vec!["var xhr = new XMLHttpRequest(); \
+         xhr.open('GET', '/api'); \
+         xhr.onreadystatechange = function () { \
+           if (xhr.readyState === 4) \
+             document.getElementById('x').setAttribute('data-rs', '4'); \
+         }; \
+         xhr.onload = function () { \
+           document.getElementById('x').setAttribute('data-onload', 'yes'); \
+         }; \
+         xhr.onerror = function () { \
+           document.getElementById('x').textContent = 'error:' + xhr.status; \
+         }; \
+         xhr.send();"
+        .to_string()];
+
+    let out =
+        run_page_scripts_with_fetch(engine.as_mut(), realm, &doc, &scripts, &env(), &mut client)
+            .expect("run with xhr");
+
+    let x = find_id(out.root(), "x").expect("#x present");
+    assert_eq!(x.text_content(), "error:0", "onerror ran with status 0");
+    assert_eq!(x.attr("data-rs"), Some("4"), "reached readyState 4");
+    assert_eq!(x.attr("data-onload"), None, "onload did NOT fire on error");
+}
