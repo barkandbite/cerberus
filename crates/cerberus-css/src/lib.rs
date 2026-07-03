@@ -69,6 +69,9 @@ code, kbd, samp { white-space: pre; }
 a[href] { color: #154fd2; text-decoration: underline; }
 b, strong { font-weight: bold; }
 i, em, cite, var { font-style: italic; }
+del, s, strike { text-decoration: line-through; }
+ins, u { text-decoration: underline; }
+mark { background-color: yellow; color: black; }
 small { font-size: smaller; }
 sub { vertical-align: sub; font-size: smaller; }
 sup { vertical-align: super; font-size: smaller; }
@@ -1987,6 +1990,21 @@ mod tests {
         let a = first(&dom.root, "a").unwrap();
         assert!(a.style.underline);
         assert_eq!(a.style.color, Color::rgb(0x15, 0x4f, 0xd2));
+    }
+
+    #[test]
+    fn ua_styles_text_level_semantics() {
+        // <del>/<s> strike through, <ins>/<u> underline, <mark> highlights.
+        let dom = CssEngine::new().style(&parse_html(
+            "<del>d</del><s>s</s><ins>i</ins><u>u</u><mark>m</mark>",
+        ));
+        assert!(first(&dom.root, "del").unwrap().style.line_through);
+        assert!(first(&dom.root, "s").unwrap().style.line_through);
+        assert!(first(&dom.root, "ins").unwrap().style.underline);
+        assert!(first(&dom.root, "u").unwrap().style.underline);
+        let mark = first(&dom.root, "mark").unwrap();
+        assert_eq!(mark.style.background, Some(Color::rgb(255, 255, 0)));
+        assert_eq!(mark.style.color, Color::BLACK);
     }
 
     #[test]
