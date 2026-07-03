@@ -2503,6 +2503,34 @@ impl BrowserApp {
         self.pending.is_some()
     }
 
+    /// Load `url` as a top-level user navigation (automation/headless hook — the
+    /// programmatic parallel of typing into the toolbar and pressing enter).
+    pub fn open(&mut self, url: &str) {
+        self.navigate(url);
+    }
+
+    /// Drive one round of the worker loop (headless automation hook): process any
+    /// completed page/subresource/fetch results and run the JS they trigger.
+    /// Returns whether a redraw is due. The windowed shell calls the [`FrameApp`]
+    /// method of the same name; this is the inherent entry for headless drivers.
+    pub fn drive(&mut self) -> bool {
+        <Self as FrameApp>::poll(self)
+    }
+
+    /// Whether the page has fully settled: no navigation pending and no external
+    /// subresource (script/stylesheet/image) still in flight. A headless driver
+    /// polls until this holds (plus a few idle rounds for async JS) to know the
+    /// page — including any script-driven reload — has finished loading.
+    pub fn is_settled(&self) -> bool {
+        self.pending.is_none()
+            && self.pending_scripts.is_empty()
+            && self.pending_sheets.is_empty()
+            && !self
+                .images
+                .values()
+                .any(|s| matches!(s, ImageState::Pending))
+    }
+
     /// Click points (centers) of the current page's text fields, from the last
     /// rendered frame — an automation hook (used by the forms example).
     pub fn text_field_centers(&self) -> Vec<(i32, i32)> {
@@ -6560,6 +6588,29 @@ mod tests {
         }
         // One user-initiated request + SCRIPT_NAV_CAP script reloads, then capped.
         assert_eq!(seen.locked().len(), 1 + SCRIPT_NAV_CAP as usize);
+    }
+
+    #[test]
+    fn headless_open_drive_settles_and_reads_text() {
+        // The headless automation API (open + drive + is_settled + page_text)
+        // loads a page through the worker loop and settles.
+        let mut b = fake_app(vec![(
+            "https://site.test/",
+            Ok(page("https://site.test/", 200, None, "<p>hello headless</p>")),
+        )]);
+        b.open("https://site.test/");
+        let mut guard = 0;
+        while !b.is_settled() && guard < 50 {
+            b.drive();
+            guard += 1;
+        }
+        assert!(b.is_settled(), "page settled");
+        assert_eq!(b.status(), 200);
+        assert!(
+            b.page_text().contains("hello headless"),
+            "rendered text; got {:?}",
+            b.page_text()
+        );
     }
 
     #[test]
