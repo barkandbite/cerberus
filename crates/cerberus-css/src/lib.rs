@@ -432,12 +432,14 @@ fn take_group(after: &str) -> Option<(&str, &str)> {
 }
 
 /// Split `var()` arguments at the first top-level comma: `(name, fallback?)`.
+/// Depth is clamped at zero so an unbalanced `)` can't drive it negative and
+/// miss the separating comma.
 fn split_top_comma(s: &str) -> (&str, Option<&str>) {
-    let mut depth = 0;
+    let mut depth = 0i32;
     for (i, c) in s.char_indices() {
         match c {
             '(' => depth += 1,
-            ')' => depth -= 1,
+            ')' => depth = (depth - 1).max(0),
             ',' if depth == 0 => return (&s[..i], Some(&s[i + 1..])),
             _ => {}
         }
@@ -1166,8 +1168,18 @@ fn parse_tracks(v: &str, em_base: f32) -> Vec<Track> {
 
 /// Split on top-level whitespace, keeping `repeat(…)` groups (which contain
 /// spaces) intact.
-fn split_top(v: &str) -> Vec<String> {
-    let mut toks = Vec::new();
+/// Split `v` on every top-level char matched by `is_delim`, respecting `(...)`
+/// nesting so a delimiter inside `rgb(…)`/`calc(…)`/`repeat(…)` never splits.
+///
+/// One primitive behind [`split_top`] (whitespace) and [`split_top_commas`]
+/// (comma). `keep_empty` distinguishes their list semantics: whitespace-splitting
+/// collapses empty fields (runs of spaces are one separator), while
+/// comma-splitting keeps them (an empty field is a real, if invalid, list slot) —
+/// except a purely-whitespace trailing field, which both drop. Paren depth is
+/// clamped at zero so a stray `)` in malformed input can't drive it negative and
+/// silently swallow a later top-level delimiter.
+fn split_top_by(v: &str, is_delim: impl Fn(char) -> bool, keep_empty: bool) -> Vec<String> {
+    let mut out = Vec::new();
     let mut depth = 0i32;
     let mut cur = String::new();
     for c in v.chars() {
@@ -1177,21 +1189,28 @@ fn split_top(v: &str) -> Vec<String> {
                 cur.push(c);
             }
             ')' => {
-                depth -= 1;
+                depth = (depth - 1).max(0);
                 cur.push(c);
             }
-            c if c.is_whitespace() && depth == 0 => {
-                if !cur.is_empty() {
-                    toks.push(std::mem::take(&mut cur));
+            c if depth == 0 && is_delim(c) => {
+                if keep_empty || !cur.is_empty() {
+                    out.push(std::mem::take(&mut cur));
                 }
             }
             c => cur.push(c),
         }
     }
-    if !cur.is_empty() {
-        toks.push(cur);
+    // Final field: whitespace-splitting keeps it if non-empty; comma-splitting
+    // drops a trailing all-whitespace field (a trailing `,` yields nothing).
+    if (keep_empty && !cur.trim().is_empty()) || (!keep_empty && !cur.is_empty()) {
+        out.push(cur);
     }
-    toks
+    out
+}
+
+/// Split a CSS value on top-level whitespace (respecting parentheses).
+fn split_top(v: &str) -> Vec<String> {
+    split_top_by(v, char::is_whitespace, false)
 }
 
 /// Parse a `grid-template-columns` value into `(explicit tracks, auto-fill
@@ -1288,28 +1307,10 @@ fn parse_track_max(tok: &str, em_base: f32) -> TrackMax {
 
 /// Split on top-level commas, keeping `func(…)` groups (which contain commas,
 /// e.g. `rgba(…)`) intact.
+/// Split a CSS value on top-level commas (respecting parentheses), keeping empty
+/// interior fields — used for comma-separated layers (gradient stops, shadows).
 fn split_top_commas(v: &str) -> Vec<String> {
-    let mut out = Vec::new();
-    let mut depth = 0i32;
-    let mut cur = String::new();
-    for c in v.chars() {
-        match c {
-            '(' => {
-                depth += 1;
-                cur.push(c);
-            }
-            ')' => {
-                depth -= 1;
-                cur.push(c);
-            }
-            ',' if depth == 0 => out.push(std::mem::take(&mut cur)),
-            _ => cur.push(c),
-        }
-    }
-    if !cur.trim().is_empty() {
-        out.push(cur);
-    }
-    out
+    split_top_by(v, |c| c == ',', true)
 }
 
 /// Parse a `linear-gradient`/`radial-gradient` (incl. vendor prefixes) into a
@@ -1916,6 +1917,30 @@ fn split_num_unit(v: &str) -> Option<(f32, String)> {
 mod tests {
     use super::*;
     use cerberus_dom::parse_html;
+
+    #[test]
+    fn top_level_splitters_respect_parens_and_clamp_depth() {
+        // Whitespace split ignores spaces inside a function; comma split ignores
+        // commas inside one and keeps empty interior fields.
+        assert_eq!(
+            split_top("1px calc(2px + 3px) 4px"),
+            vec!["1px", "calc(2px + 3px)", "4px"]
+        );
+        assert_eq!(
+            split_top_commas("rgb(1, 2, 3), , blue"),
+            vec!["rgb(1, 2, 3)", " ", " blue"],
+            "interior empty/space fields are kept"
+        );
+        // A trailing comma yields no empty final field.
+        assert_eq!(split_top_commas("a,"), vec!["a"]);
+
+        // Depth clamp: an unbalanced `)` must not drive depth negative and swallow
+        // a later top-level delimiter. With clamping, the comma still splits.
+        assert_eq!(split_top_commas("a) , b"), vec!["a) ", " b"]);
+        assert_eq!(split_top("a) b"), vec!["a)", "b"]);
+        // var()-style first-comma split is likewise clamp-protected.
+        assert_eq!(split_top_comma("x), y"), ("x)", Some(" y")));
+    }
 
     fn first<'a>(node: &'a StyledNode, tag: &str) -> Option<&'a StyledNode> {
         if node.tag == tag {
