@@ -450,6 +450,11 @@ impl MirrorGroup {
             url: url.to_string(),
             viewport: self.viewport,
             user_agent: self.user_agent.clone(),
+            // Per-window `document.cookie` seeding from each mirror instance's own
+            // sealed jar is a follow-up (the group does not yet hold per-instance
+            // cookie storage here); mirror cookies are still captured via the net
+            // jar, so this only affects script *reads* of pre-existing cookies.
+            cookie: String::new(),
         }
     }
 }
