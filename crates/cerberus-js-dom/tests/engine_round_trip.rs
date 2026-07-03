@@ -66,6 +66,57 @@ fn doc_with_div_x() -> Document {
 }
 
 #[test]
+fn query_selector_attribute_operators() {
+    // The substring/word/dash attribute operators (^= $= *= ~= |=) now work in
+    // querySelector, not just presence and exact match.
+    let mut b = DocumentBuilder::new();
+    let a1 = b.element_attrs(
+        "a",
+        vec![
+            ("id".into(), "a1".into()),
+            ("href".into(), "https://example.com/x".into()),
+            ("class".into(), "btn primary".into()),
+            ("lang".into(), "en-US".into()),
+        ],
+        [],
+    );
+    let a2 = b.element_attrs(
+        "a",
+        vec![
+            ("id".into(), "a2".into()),
+            ("href".into(), "/local.png".into()),
+            ("class".into(), "btn".into()),
+        ],
+        [],
+    );
+    let probe = b.element_attrs("p", vec![("id".into(), "p".into())], []);
+    let body = b.element("body", [a1, a2, probe]);
+    let html = b.element("html", [body]);
+    let doc = b.finish(html);
+
+    let (mut engine, realm) = engine_and_realm();
+    let scripts = vec!["var p = document.getElementById('p'); \
+         p.setAttribute('pre', document.querySelector('[href^=\"https\"]').id); \
+         p.setAttribute('suf', document.querySelector('[href$=\".png\"]').id); \
+         p.setAttribute('sub', document.querySelector('[href*=\"example\"]').id); \
+         p.setAttribute('word', String(document.querySelectorAll('[class~=\"primary\"]').length)); \
+         p.setAttribute('dash', document.querySelector('[lang|=\"en\"]').id); \
+         p.setAttribute('btn', String(document.querySelectorAll('[class~=\"btn\"]').length)); \
+         p.setAttribute('none', String(document.querySelectorAll('[href^=\"ftp\"]').length));"
+        .to_string()];
+
+    let out = run_page_scripts(engine.as_mut(), realm, &doc, &scripts, &env()).expect("run");
+    let p = find_id(out.root(), "p").expect("#p present");
+    assert_eq!(p.attr("pre"), Some("a1"), "^= prefix");
+    assert_eq!(p.attr("suf"), Some("a2"), "$= suffix");
+    assert_eq!(p.attr("sub"), Some("a1"), "*= substring");
+    assert_eq!(p.attr("word"), Some("1"), "~= whitespace word");
+    assert_eq!(p.attr("dash"), Some("a1"), "|= exact-or-hyphen prefix");
+    assert_eq!(p.attr("btn"), Some("2"), "~= matches both");
+    assert_eq!(p.attr("none"), Some("0"), "no false prefix match");
+}
+
+#[test]
 fn query_selector_supports_state_and_structural_pseudos() {
     // querySelector/matches now understand the form-state pseudo-classes
     // (:checked/:disabled/:required) and the structural ones (:first-child,
