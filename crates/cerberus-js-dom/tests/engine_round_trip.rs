@@ -66,6 +66,55 @@ fn doc_with_div_x() -> Document {
 }
 
 #[test]
+fn document_collections_and_get_elements_by_name() {
+    // document.forms (with named access), .images, .links (href-only), and
+    // getElementsByName.
+    let mut b = DocumentBuilder::new();
+    let login = b.element_attrs("form", vec![("id".into(), "login".into())], []);
+    let search = b.element_attrs("form", vec![("name".into(), "search".into())], []);
+    let a1 = b.element_attrs("a", vec![("href".into(), "/a".into())], []);
+    let a_nohref = b.element("a", []);
+    let a2 = b.element_attrs("a", vec![("href".into(), "/b".into())], []);
+    let img = b.element_attrs("img", vec![("src".into(), "/x.png".into())], []);
+    let u1 = b.element_attrs("input", vec![("name".into(), "user".into())], []);
+    let u2 = b.element_attrs("input", vec![("name".into(), "user".into())], []);
+    let probe = b.element_attrs("p", vec![("id".into(), "p".into())], []);
+    let body = b.element(
+        "body",
+        [login, search, a1, a_nohref, a2, img, u1, u2, probe],
+    );
+    let html = b.element("html", [body]);
+    let doc = b.finish(html);
+
+    let (mut engine, realm) = engine_and_realm();
+    let scripts = vec!["var p = document.getElementById('p'); \
+         p.setAttribute('forms', String(document.forms.length)); \
+         p.setAttribute('byid', document.forms.login ? 'ok' : 'no'); \
+         p.setAttribute('byname', document.forms.search ? 'ok' : 'no'); \
+         p.setAttribute('images', String(document.images.length)); \
+         p.setAttribute('links', String(document.links.length)); \
+         p.setAttribute('named', String(document.getElementsByName('user').length));"
+        .to_string()];
+
+    let out = run_page_scripts(engine.as_mut(), realm, &doc, &scripts, &env()).expect("run");
+    let p = find_id(out.root(), "p").expect("#p present");
+    assert_eq!(p.attr("forms"), Some("2"), "two forms");
+    assert_eq!(p.attr("byid"), Some("ok"), "document.forms.<id> access");
+    assert_eq!(p.attr("byname"), Some("ok"), "document.forms.<name> access");
+    assert_eq!(p.attr("images"), Some("1"), "one image");
+    assert_eq!(
+        p.attr("links"),
+        Some("2"),
+        "only anchors with href count as links"
+    );
+    assert_eq!(
+        p.attr("named"),
+        Some("2"),
+        "getElementsByName collects both inputs"
+    );
+}
+
+#[test]
 fn query_selector_sibling_combinators() {
     // `+` (adjacent) and `~` (general) sibling combinators in querySelector.
     let mut b = DocumentBuilder::new();
