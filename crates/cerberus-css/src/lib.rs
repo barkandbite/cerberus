@@ -2474,7 +2474,7 @@ mod tests {
 
     #[test]
     fn supports_block_rules_are_applied_and_font_face_is_skipped() {
-        // @supports content is applied (condition not evaluated); @font-face never
+        // A supported `@supports` condition applies its rules; @font-face never
         // injects rules; text still renders (bundled font).
         let html = "<html><head><style>\
             @font-face { font-family: 'X'; src: url(x.woff2); }\
@@ -2485,6 +2485,39 @@ mod tests {
             first(&dom.root, "p").unwrap().style.color,
             Color::rgb(0xff, 0, 0),
             "@supports rule applied; @font-face caused no breakage"
+        );
+    }
+
+    #[test]
+    fn supports_not_of_a_supported_feature_is_skipped() {
+        // `not (display: grid)` is false because we support grid, so its block —
+        // a legacy fallback that would otherwise win on source order — must not
+        // apply. The plain `@supports (display: grid)` block still does.
+        let html = "<style>\
+            @supports (display: grid) { p { color: #00ff00 } }\
+            @supports not (display: grid) { p { color: #ff0000 } }\
+            </style><p>hi</p>";
+        let dom = CssEngine::new().style(&parse_html(html));
+        assert_eq!(
+            first(&dom.root, "p").unwrap().style.color,
+            Color::rgb(0, 0xff, 0),
+            "the not(grid) fallback is dropped; the grid rule wins"
+        );
+    }
+
+    #[test]
+    fn supports_not_of_an_undecidable_feature_still_applies() {
+        // We can't decide support for an unknown property, so `not(...)` falls back
+        // to the historical default of applying the block (never dropping rules we
+        // can't prove unnecessary).
+        let html = "<style>\
+            @supports not (nonexistent-prop: 1) { p { color: #ff0000 } }\
+            </style><p>hi</p>";
+        let dom = CssEngine::new().style(&parse_html(html));
+        assert_eq!(
+            first(&dom.root, "p").unwrap().style.color,
+            Color::rgb(0xff, 0, 0),
+            "undecidable not(...) still applies"
         );
     }
 

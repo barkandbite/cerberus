@@ -338,6 +338,56 @@ pub fn parse_stylesheet(css: &str) -> Stylesheet {
     Stylesheet { rules }
 }
 
+/// Whether an `@supports` block's rules should apply.
+///
+/// We can't fully probe feature support the way a complete engine does, so the
+/// default stays "apply the inner rules" — an `@supports` block is overwhelmingly
+/// a progressive enhancement. We refine that in one safe, high-value direction: a
+/// `not(<X>)` whose feature `X` we *definitely* support is false, so its block —
+/// typically a legacy fallback that would otherwise override the modern rule in
+/// source order — is dropped. Every condition we can't decide still applies, so
+/// this never discards rules we would previously have kept for a feature we do
+/// support.
+fn supports_condition_holds(cond: &str) -> bool {
+    match strip_supports_not(cond.trim()) {
+        Some(inner) => !feature_definitely_supported(inner),
+        None => true,
+    }
+}
+
+/// If `cond` is a `not(<x>)` / `not (<x>)` query, return `<x>` (still wrapped in
+/// its parentheses); otherwise `None`. Requires a `(` after `not` so a property
+/// name that merely starts with "not" isn't mistaken for the operator.
+fn strip_supports_not(cond: &str) -> Option<&str> {
+    let rest = cond.strip_prefix("not")?.trim_start();
+    rest.starts_with('(').then_some(rest)
+}
+
+/// Whether we definitely support the feature query `(prop: value)`. Conservative:
+/// only `display`/`position` — by far the most common `@supports` detections
+/// (grid/flex/sticky fallbacks) — are answered, each against the same value set
+/// the cascade actually accepts, so there's no drift. Anything else returns
+/// `false`, which makes an undecidable `not(...)` fall back to applying.
+fn feature_definitely_supported(query: &str) -> bool {
+    let Some((prop, value)) = query
+        .trim()
+        .strip_prefix('(')
+        .and_then(|s| s.strip_suffix(')'))
+        .and_then(|inner| inner.split_once(':'))
+    else {
+        return false;
+    };
+    let value = value.trim().to_ascii_lowercase();
+    match prop.trim().to_ascii_lowercase().as_str() {
+        "display" => crate::parse_display(&value).is_some(),
+        "position" => matches!(
+            value.as_str(),
+            "static" | "relative" | "absolute" | "fixed" | "sticky"
+        ),
+        _ => false,
+    }
+}
+
 /// Parse rules from `text`, tagging each with `media`. `@media` blocks recurse
 /// (their inner rules inherit the query); other `@`-rules are skipped.
 fn parse_rules_into(text: &str, media: Option<&MediaQuery>, out: &mut Vec<Rule>) {
@@ -359,15 +409,17 @@ fn parse_rules_into(text: &str, media: Option<&MediaQuery>, out: &mut Vec<Rule>)
                     }
                 }
             }
-            // `@supports`: we don't evaluate the feature condition (we can't probe
-            // support the way a full engine does); apply the inner rules, which
-            // are overwhelmingly safe progressive enhancements, preserving source
-            // order so a later fallback still wins where it should.
+            // `@supports`: apply the inner rules unless we can prove the condition
+            // is false (see `supports_condition_holds`). Source order is preserved
+            // so a later fallback still wins where it should.
             if let Some(after_at) = rest.strip_prefix("@supports") {
                 if let Some(brace) = after_at.find('{') {
+                    let cond = after_at[..brace].trim();
                     let inner = &after_at[brace + 1..];
                     if let Some(end) = matching_brace(inner) {
-                        parse_rules_into(&inner[..end], media, out);
+                        if supports_condition_holds(cond) {
+                            parse_rules_into(&inner[..end], media, out);
+                        }
                         rest = &inner[end + 1..];
                         continue;
                     }
