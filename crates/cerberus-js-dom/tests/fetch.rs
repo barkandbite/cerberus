@@ -11,7 +11,8 @@ use cerberus_dom::{Document, DocumentBuilder, NodeRef};
 use cerberus_js::{JsEngine, JsEngineFactory};
 use cerberus_js_dom::{
     drive_fetches, fire_load, install_page, run_page_scripts_with_fetch, run_scripts,
-    serialize_dom, EventLoopBudget, FetchBudget, FetchClient, FetchRequest, FetchResponse, PageEnv,
+    serialize_dom, take_cookie_writes, EventLoopBudget, FetchBudget, FetchClient, FetchRequest,
+    FetchResponse, PageEnv,
 };
 use cerberus_js_quickjs::QuickJsEngineFactory;
 use cerberus_types::RealmId;
@@ -31,6 +32,7 @@ fn env() -> PageEnv {
         url: "https://example.test/".into(),
         viewport: (1280, 800),
         user_agent: "Cerberus/0.0".into(),
+        cookie: String::new(),
     }
 }
 
@@ -368,4 +370,75 @@ fn xhr_network_error_fires_onerror_at_readystate_4() {
     assert_eq!(x.text_content(), "error:0", "onerror ran with status 0");
     assert_eq!(x.attr("data-rs"), Some("4"), "reached readyState 4");
     assert_eq!(x.attr("data-onload"), None, "onload did NOT fire on error");
+}
+
+// ---- document.cookie <-> sealed jar bridge (Phase B) --------------------
+
+#[test]
+fn document_cookie_seeds_from_env_and_captures_writes() {
+    // The host seeds document.cookie with the instance's cookies (via env), a
+    // script reads them, then sets a new cookie — which is queued verbatim (with
+    // attributes) for the host to persist into the sealed jar.
+    let (mut engine, realm) = engine_and_realm();
+    let doc = doc_with_div_x();
+    let mut e = env();
+    e.cookie = "sid=abc; theme=dark".into();
+    install_page(engine.as_mut(), realm, &doc, &e).expect("install");
+    run_scripts(
+        engine.as_mut(),
+        realm,
+        &[
+            "document.getElementById('x').setAttribute('data-seed', document.cookie);".to_string(),
+            "document.cookie = 'token=xyz; Path=/; Max-Age=3600';".to_string(),
+            // A second write; the in-memory view also reflects it for later reads.
+            "document.getElementById('x').setAttribute('data-after', document.cookie);".to_string(),
+        ],
+    )
+    .expect("scripts");
+
+    let dom = serialize_dom(engine.as_mut(), realm).expect("serialize");
+    let x = find_id(dom.document.root(), "x").expect("#x present");
+    // The script read the seeded jar cookies.
+    assert_eq!(x.attr("data-seed"), Some("sid=abc; theme=dark"));
+    // The in-memory view updated (attributes stripped for the read view).
+    assert_eq!(x.attr("data-after"), Some("sid=abc; theme=dark; token=xyz"));
+
+    // The write is queued for the host with its full raw string (attrs intact),
+    // so the sealed jar can honor Path/Max-Age exactly like a network Set-Cookie.
+    let writes = take_cookie_writes(engine.as_mut(), realm).expect("take writes");
+    assert_eq!(writes, vec!["token=xyz; Path=/; Max-Age=3600".to_string()]);
+    // Draining again yields nothing (the queue was cleared).
+    assert!(take_cookie_writes(engine.as_mut(), realm)
+        .expect("take again")
+        .is_empty());
+}
+
+#[test]
+fn document_cookie_view_honors_deletion() {
+    // A script deleting a cookie (Max-Age<=0) must see it leave the document.cookie
+    // read view within the same turn, matching the sealed jar (which expires it).
+    // The raw deletion string is still queued for the host to honor in the jar.
+    let (mut engine, realm) = engine_and_realm();
+    let doc = doc_with_div_x();
+    let mut e = env();
+    e.cookie = "a=1; b=2".into();
+    install_page(engine.as_mut(), realm, &doc, &e).expect("install");
+    run_scripts(
+        engine.as_mut(),
+        realm,
+        &[
+            "document.cookie = 'a=; Max-Age=0';".to_string(),
+            "document.getElementById('x').setAttribute('data-after', document.cookie);".to_string(),
+        ],
+    )
+    .expect("scripts");
+
+    let dom = serialize_dom(engine.as_mut(), realm).expect("serialize");
+    let x = find_id(dom.document.root(), "x").expect("#x present");
+    // `a` is dropped from the view; `b` remains.
+    assert_eq!(x.attr("data-after"), Some("b=2"));
+
+    // The deletion is still surfaced to the host so the jar expires it too.
+    let writes = take_cookie_writes(engine.as_mut(), realm).expect("take writes");
+    assert_eq!(writes, vec!["a=; Max-Age=0".to_string()]);
 }

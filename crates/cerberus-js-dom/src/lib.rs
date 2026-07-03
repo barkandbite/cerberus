@@ -486,6 +486,11 @@ pub struct PageEnv {
     /// when the honest-first ladder escalated for this site. Empty falls back to
     /// the honest default inside the prelude.
     pub user_agent: String,
+    /// The cookies the sealed jar would send to this origin, as a
+    /// `"name=value; name=value"` string (no attributes) — seeds `document.cookie`
+    /// so script reads see the instance's cookies. Empty when none. Writes back
+    /// to `document.cookie` are captured separately (`take_cookie_writes`).
+    pub cookie: String,
 }
 
 /// Encode `s` as a JS/JSON string literal (quotes included) suitable for
@@ -552,11 +557,12 @@ pub fn install_page(
 ) -> Result<(), BridgeError> {
     // Inject the ambient environment, then install the document model.
     let env_install = format!(
-        "globalThis.__CERBERUS_ENV__ = {{ url: {}, width: {}, height: {}, userAgent: {} }};",
+        "globalThis.__CERBERUS_ENV__ = {{ url: {}, width: {}, height: {}, userAgent: {}, cookie: {} }};",
         js_string(&env.url),
         env.viewport.0,
         env.viewport.1,
         js_string(&env.user_agent),
+        js_string(&env.cookie),
     );
     engine.eval(realm, &env_install)?;
     engine.eval(realm, DOM_MODEL_PRELUDE)?;
@@ -1014,6 +1020,35 @@ pub fn take_fetches(
         });
     }
     Ok(out)
+}
+
+/// Drain the realm's queued `document.cookie =` write strings, returning the raw
+/// values (each the full `"name=value; attrs…"` string a script assigned) and
+/// clearing the queue. The caller persists each into the per-instance sealed
+/// cookie jar exactly like a network `Set-Cookie`, so a script-set cookie (e.g. a
+/// bot challenge's token) survives to the next request. An empty queue yields an
+/// empty `Vec`; a malformed drain (non-string entries) is skipped, never fatal.
+pub fn take_cookie_writes(
+    engine: &mut dyn JsEngine,
+    realm: RealmId,
+) -> Result<Vec<String>, BridgeError> {
+    let json = match engine.eval(realm, "__cerberusTakeCookieWrites()")? {
+        JsValue::Str(s) => s,
+        other => {
+            return Err(BridgeError::Structure(format!(
+                "__cerberusTakeCookieWrites did not return a string: {other:?}"
+            )))
+        }
+    };
+    let value = json::parse(&json).map_err(BridgeError::Json)?;
+    let items = value.as_array().ok_or_else(|| {
+        BridgeError::Structure("__cerberusTakeCookieWrites did not return an array".to_string())
+    })?;
+    Ok(items
+        .iter()
+        .filter_map(Json::as_str)
+        .map(str::to_string)
+        .collect())
 }
 
 /// Decode a wire `headers` value (`[[name, value], …]`) into a `(name, value)`
@@ -2394,21 +2429,46 @@ pub const DOM_MODEL_PRELUDE: &str = r##"
     Object.defineProperty(document, "cookie", {
       get: function () { return this.__cookie; },
       set: function (v) {
-        // Minimal in-memory cookie jar: keep the first "name=value" pair,
-        // appending/replacing by name. Attributes (path, expires…) are ignored.
+        // A script cookie write. Record the FULL raw string (with attributes) so
+        // the host can persist it into the per-instance sealed jar exactly like a
+        // network Set-Cookie (Domain/Path/Expires/Secure honored there). Then
+        // update the in-memory view: keep the first "name=value" pair,
+        // appending/replacing by name (attributes are dropped from the view).
         var raw = String(v);
+        if (Array.isArray(g.__cerberusCookieWrites)) g.__cerberusCookieWrites.push(raw);
         var semi = raw.indexOf(";");
         var pair = (semi === -1 ? raw : raw.slice(0, semi)).trim();
         var eq = pair.indexOf("=");
         if (eq === -1) return;
         var name = pair.slice(0, eq).trim();
         var jar = this.__cookie ? this.__cookie.split("; ") : [];
+        // Deletion: a non-positive Max-Age (the modern idiom; it wins over Expires)
+        // or a past Expires drops the cookie from the view, matching the jar (which
+        // expires it) so a same-turn re-read agrees. The raw string was already
+        // queued above for the jar to honor Path/Domain/etc. exactly.
+        var isDelete = false;
+        if (semi !== -1) {
+          var attrs = raw.slice(semi + 1);
+          var ma = /(?:^|;)\s*max-age\s*=\s*(-?\d+)/i.exec(attrs);
+          if (ma) {
+            if (parseInt(ma[1], 10) <= 0) isDelete = true;
+          } else {
+            var ex = /(?:^|;)\s*expires\s*=\s*([^;]+)/i.exec(attrs);
+            if (ex) { try { var t = Date.parse(ex[1]); if (t === t && t <= Date.now()) isDelete = true; } catch (e) {} }
+          }
+        }
+        var out = [];
         var replaced = false;
         for (var i = 0; i < jar.length; i++) {
-          if (jar[i].slice(0, jar[i].indexOf("=")) === name) { jar[i] = pair; replaced = true; break; }
+          if (jar[i].slice(0, jar[i].indexOf("=")) === name) {
+            replaced = true;
+            if (!isDelete) out.push(pair);
+          } else {
+            out.push(jar[i]);
+          }
         }
-        if (!replaced) jar.push(pair);
-        this.__cookie = jar.join("; ");
+        if (!replaced && !isDelete) out.push(pair);
+        this.__cookie = out.join("; ");
       },
       enumerable: true, configurable: true,
     });
@@ -2521,6 +2581,11 @@ pub const DOM_MODEL_PRELUDE: &str = r##"
     // default; the escalated rung if this site forced it). Falls back to our
     // honest identity if absent, so header and navigator can never disagree.
     var envUA = (typeof env.userAgent === "string" && env.userAgent) ? env.userAgent : "Cerberus/0.0";
+    // Seed `document.cookie` with the cookies the sealed jar would send to this
+    // origin (a "name=value; name=value" string, no attributes). The host
+    // supplies it per install/navigation, so after a challenge sets a cookie the
+    // reload re-seeds it from the jar. Writes are captured back (see the setter).
+    document.__cookie = (typeof env.cookie === "string") ? env.cookie : "";
 
     // ---- location ------------------------------------------------------
     // A small JS regex parser for the URL into the WHATWG-ish pieces pages
@@ -2913,6 +2978,14 @@ pub const DOM_MODEL_PRELUDE: &str = r##"
     if (!Array.isArray(g.__cerberusFetchQueue)) g.__cerberusFetchQueue = [];
     if (!g.__cerberusFetchPending) g.__cerberusFetchPending = Object.create(null);
     if (typeof g.__cerberusFetchId !== "number") g.__cerberusFetchId = 1;
+    // Raw `document.cookie =` write strings awaiting persistence into the sealed
+    // jar; the host drains them via __cerberusTakeCookieWrites after each turn.
+    // RESET unconditionally on install (unlike the fetch queue above): install_page
+    // runs once per navigation, before this page's scripts, so a write the previous
+    // origin's scripts made but whose capture was skipped (e.g. a serialize failure
+    // left node_to_js empty) is DISCARDED here rather than drained later and
+    // misattributed to this new origin's first party. First-party-only, enforced.
+    g.__cerberusCookieWrites = [];
 
     // ---- Headers (case-insensitive, minimal) ---------------------------
     // Backed by an ordered array of [originalName, value]; lookups fold case.
@@ -3202,6 +3275,19 @@ pub const DOM_MODEL_PRELUDE: &str = r##"
         var q = g.__cerberusFetchQueue;
         if (!Array.isArray(q) || q.length === 0) return "[]";
         g.__cerberusFetchQueue = [];
+        return JSON.stringify(q);
+      } catch (e) {
+        return "[]";
+      }
+    };
+
+    // Drain the queued `document.cookie =` write strings as a JSON array, then
+    // CLEAR it. The host persists each into the per-instance sealed jar.
+    g.__cerberusTakeCookieWrites = function () {
+      try {
+        var q = g.__cerberusCookieWrites;
+        if (!Array.isArray(q) || q.length === 0) return "[]";
+        g.__cerberusCookieWrites = [];
         return JSON.stringify(q);
       } catch (e) {
         return "[]";

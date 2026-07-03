@@ -36,8 +36,9 @@ use cerberus_image::ImageCodec;
 use cerberus_js::JsEngineFactory;
 use cerberus_js_dom::{
     dispatch_event, fire_load, install_page, reject_fetch, resolve_fetch, run_event_loop,
-    run_page_scripts, run_page_scripts_with_fetch, serialize_dom, set_node_value, take_fetches,
-    EventLoopBudget, FetchClient, FetchRequest, FetchResponse, PageEnv, RebuiltDom,
+    run_page_scripts, run_page_scripts_with_fetch, serialize_dom, set_node_value,
+    take_cookie_writes, take_fetches, EventLoopBudget, FetchClient, FetchRequest, FetchResponse,
+    PageEnv, RebuiltDom,
 };
 use cerberus_js_quickjs::QuickJsEngineFactory;
 use cerberus_layout::{
@@ -1025,6 +1026,7 @@ pub fn render(config: &RenderConfig) -> Result<RenderOutcome, AppError> {
             url: config.url.clone(),
             viewport: (config.viewport.w, config.viewport.h),
             user_agent: active_ua,
+            cookie: cookie_seed(&storage, active_instance, &first_party, &first_party),
         };
         // JS fetch() rides the page's subresource context (sealed jar + consent),
         // performed synchronously here (the one-shot path already blocks).
@@ -1054,6 +1056,17 @@ pub fn render(config: &RenderConfig) -> Result<RenderOutcome, AppError> {
             None => run_page_scripts(engine, base_realm, &document, document.scripts(), &env)
                 .map_err(|e| AppError::Js(format!("{e:?}")))?,
         };
+        // Symmetric to the `cookie` seed above: persist any cookies the page's
+        // scripts set via `document.cookie` into the sealed jar, through the same
+        // consent gate and per-cookie disposition a network `Set-Cookie` takes.
+        // First-party only (a top-level page: request origin == first party). With
+        // `--data-dir` this is saved below, so a script-set token (e.g. a bot
+        // challenge's) survives to a later render sharing the profile.
+        if let Ok(writes) = take_cookie_writes(engine, base_realm) {
+            for value in writes {
+                jar.set_cookie(active_instance, &url, &first_party, &value);
+            }
+        }
     }
     let engine_name = engine.name().to_string();
     let realms_live = engine.realm_count();
@@ -2607,10 +2620,26 @@ impl BrowserApp {
             return doc;
         }
         let realm = RealmId(self.heads.active().id.0);
+        // Seed `document.cookie` from this instance's jar for the current origin
+        // (a top-level page: request origin == first party).
+        let cookie = self
+            .current_url
+            .as_ref()
+            .and_then(first_party_of)
+            .map(|origin| {
+                cookie_seed(
+                    &self.storage,
+                    self.heads.active().instance,
+                    &origin,
+                    &origin,
+                )
+            })
+            .unwrap_or_default();
         let env = PageEnv {
             url: self.toolbar.url_text.clone(),
             viewport: (self.last_size.w, self.last_size.h),
             user_agent: self.active_ua.clone(),
+            cookie,
         };
         let engine = match self.heads.engine() {
             Ok(engine) => engine,
@@ -2631,14 +2660,17 @@ impl BrowserApp {
         // Drain timers/microtasks the page scheduled, under the default caps
         // (ADR-0013), so first-paint reflects deferred work and no page can hang.
         let _ = run_event_loop(engine, realm, EventLoopBudget::default());
-        match serialize_dom(engine, realm) {
+        let out = match serialize_dom(engine, realm) {
             Ok(rebuilt) => {
                 let RebuiltDom { document, id_map } = rebuilt;
                 self.node_to_js = invert_id_map(&id_map);
                 document
             }
             Err(_) => doc,
-        }
+        };
+        // Persist any cookies the initial scripts set via `document.cookie`.
+        self.capture_cookie_writes();
+        out
     }
 
     fn commit_response(
@@ -2943,9 +2975,49 @@ impl BrowserApp {
         true
     }
 
+    /// Persist any `document.cookie =` writes a script made into the active
+    /// instance's sealed jar — the same store, consent gate, and per-cookie
+    /// disposition a network `Set-Cookie` goes through, so a script-set cookie
+    /// (e.g. a bot challenge's token) survives to the next request. First-party
+    /// only: the write targets the current page's own origin. A no-op when the
+    /// realm is idle (no JS correlate) or nothing was written.
+    fn capture_cookie_writes(&mut self) {
+        if self.node_to_js.is_empty() {
+            return;
+        }
+        let realm = RealmId(self.heads.active().id.0);
+        let writes = {
+            let Ok(engine) = self.heads.engine() else {
+                return;
+            };
+            match take_cookie_writes(engine, realm) {
+                Ok(w) if !w.is_empty() => w,
+                _ => return,
+            }
+        };
+        let Some(url) = self.current_url.clone() else {
+            return;
+        };
+        let Some(first_party) = first_party_of(&url) else {
+            return;
+        };
+        let instance = self.heads.active().instance;
+        // Build a jar over the shared Arcs (cheap; all state lives in `storage`).
+        let jar = SealedJar {
+            storage: self.storage.clone(),
+            policy: self.consent.clone(),
+            cookies: self.cookie_policy.clone(),
+            events: self.pending_consent.clone(),
+        };
+        for value in writes {
+            jar.set_cookie(instance, &url, &first_party, &value);
+        }
+    }
+
     /// Re-read the live realm into the rendered document + restyle, after async
     /// work (a settled fetch) may have mutated it. Reuses the dispatch reconcile.
     fn reconcile_realm(&mut self) {
+        self.capture_cookie_writes();
         let realm = RealmId(self.heads.active().id.0);
         let dom = {
             let engine = match self.heads.engine() {
@@ -3373,6 +3445,8 @@ impl BrowserApp {
         self.timings
             .record(format!("{event_type} handler"), t.elapsed());
         let prevented = dispatched.default_prevented;
+        // A handler may have set document.cookie; persist it before reconciling.
+        self.capture_cookie_writes();
         self.reconcile_dispatched(dispatched.dom);
         // A handler may have called fetch(); dispatch it to the worker (async).
         self.pump_fetches();
@@ -4431,6 +4505,30 @@ fn first_party_of(url: &cerberus_url::Url) -> Option<Origin> {
     })
 }
 
+/// The cookies this instance's sealed jar would expose to `document.cookie` for
+/// `origin` under `first_party`, formatted as `"name=value; name=value"`.
+/// Read-only in two senses: unlike the attach path it does **not** consume
+/// `Allow-once` cookies (those are spent on a real request, not a script read),
+/// and it drops `HttpOnly` cookies — those ride the network `Cookie` header but
+/// must never be visible to page script, exactly as a real browser hides them
+/// from `document.cookie`.
+fn cookie_seed(
+    storage: &Mutex<StorageEnvironment>,
+    instance: InstanceId,
+    origin: &Origin,
+    first_party: &Origin,
+) -> String {
+    storage
+        .locked()
+        .instance(instance)
+        .cookies_for_request(origin, first_party)
+        .iter()
+        .filter(|c| !c.http_only)
+        .map(|c| format!("{}={}", c.name, c.value))
+        .collect::<Vec<_>>()
+        .join("; ")
+}
+
 /// Whether a fetch-error string (the `Debug` of a `NetError`, as stringified by
 /// `fetch_page`) is a DNS-resolution failure. Switching an https upgrade to
 /// plaintext http can't fix a name that never resolved, so these are reported
@@ -5247,6 +5345,7 @@ pub fn bench_pipeline(iters: usize) -> Vec<BenchStage> {
                 url: "https://bench.test/".into(),
                 viewport: (1280, 1024),
                 user_agent: DEFAULT_USER_AGENT.into(),
+                cookie: String::new(),
             };
             std::hint::black_box(
                 run_page_scripts(engine, realm, &document, document.scripts(), &env).expect("js"),
@@ -5652,6 +5751,36 @@ mod tests {
         jar.set_cookie(a, &url, &fp, "sid=only-in-a");
         assert!(jar.cookie_header(a, &url, &fp).is_some());
         assert!(jar.cookie_header(b, &url, &fp).is_none());
+    }
+
+    #[test]
+    fn cookie_seed_hides_httponly_from_document_cookie() {
+        // `document.cookie` (seeded via cookie_seed) must mirror a real browser:
+        // HttpOnly cookies ride the network Cookie header but are invisible to
+        // script. Without the http_only filter, seeding would leak session tokens
+        // to page JS (including a bot-challenge or XSS payload).
+        let (jar, storage, _events, _cookies) = jar_with_env();
+        let instance = InstanceId::from_u64_pair(0, 0x10);
+        let url = parse_url("https://shop.example.com/").unwrap();
+        let fp = url.origin().unwrap();
+
+        jar.set_cookie(instance, &url, &fp, "vis=1; Secure");
+        jar.set_cookie(instance, &url, &fp, "sess=secret; HttpOnly; Secure");
+
+        // The read seed for document.cookie hides the HttpOnly token...
+        let seed = cookie_seed(&storage, instance, &fp, &fp);
+        assert!(seed.contains("vis=1"), "visible cookie is seeded: {seed:?}");
+        assert!(
+            !seed.contains("sess"),
+            "HttpOnly cookie must NOT reach document.cookie: {seed:?}"
+        );
+
+        // ...while the network Cookie header still carries BOTH (unchanged).
+        let header = jar.cookie_header(instance, &url, &fp).unwrap_or_default();
+        assert!(
+            header.contains("sess=secret") && header.contains("vis=1"),
+            "network header keeps HttpOnly: {header:?}"
+        );
     }
 
     #[test]

@@ -35,6 +35,7 @@ fn env() -> PageEnv {
         user_agent: "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 \
                      (KHTML, like Gecko) Chrome/142.0.0.0 Safari/537.36"
             .into(),
+        cookie: String::new(),
     }
 }
 
@@ -1529,6 +1530,7 @@ fn navigator_platform_tracks_the_user_agent() {
             url: "https://example.test/".into(),
             viewport: (800, 600),
             user_agent: ua.into(),
+            cookie: String::new(),
         };
         let scripts = vec!["var x = document.getElementById('x'); \
              x.setAttribute('data-ua', String(navigator.userAgent)); \
