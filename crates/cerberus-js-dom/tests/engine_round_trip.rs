@@ -117,6 +117,57 @@ fn query_selector_sibling_combinators() {
 }
 
 #[test]
+fn class_list_replace_and_value() {
+    // classList.replace swaps a token in place (de-duplicating), and
+    // classList.value reads/writes the whole token string.
+    let mut b = DocumentBuilder::new();
+    let x = b.element_attrs(
+        "div",
+        vec![("id".into(), "x".into()), ("class".into(), "a b c".into())],
+        [],
+    );
+    let probe = b.element_attrs("p", vec![("id".into(), "p".into())], []);
+    let body = b.element("body", [x, probe]);
+    let html = b.element("html", [body]);
+    let doc = b.finish(html);
+
+    let (mut engine, realm) = engine_and_realm();
+    let scripts = vec!["var p = document.getElementById('p'); \
+         var x = document.getElementById('x'); \
+         p.setAttribute('ret', String(x.classList.replace('b', 'B'))); \
+         p.setAttribute('cls', x.className); \
+         p.setAttribute('miss', String(x.classList.replace('zzz', 'q'))); \
+         p.setAttribute('val', x.classList.value); \
+         x.classList.value = 'one two'; \
+         p.setAttribute('setval', x.className);"
+        .to_string()];
+
+    let out = run_page_scripts(engine.as_mut(), realm, &doc, &scripts, &env()).expect("run");
+    let p = find_id(out.root(), "p").expect("#p present");
+    assert_eq!(
+        p.attr("ret"),
+        Some("true"),
+        "replace returns true when present"
+    );
+    assert_eq!(p.attr("cls"), Some("a B c"), "token replaced in place");
+    assert_eq!(
+        p.attr("miss"),
+        Some("false"),
+        "replace of an absent token is false"
+    );
+    assert_eq!(
+        p.attr("val"),
+        Some("a B c"),
+        "classList.value reads the string"
+    );
+    assert_eq!(
+        p.attr("setval"),
+        Some("one two"),
+        "classList.value writes the class"
+    );
+}
+
+#[test]
 fn query_selector_attribute_operators() {
     // The substring/word/dash attribute operators (^= $= *= ~= |=) now work in
     // querySelector, not just presence and exact match.

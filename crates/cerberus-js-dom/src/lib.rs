@@ -1402,7 +1402,25 @@ pub const DOM_MODEL_PRELUDE: &str = r##"
           writeClass(el, toks);
           return want;
         },
+        replace: function (oldT, newT) {
+          // Swap `oldT` for `newT` in place (returns whether it was present),
+          // then de-duplicate so the token list stays unique (DOMTokenList).
+          oldT = String(oldT); newT = String(newT);
+          var toks = classTokens(el);
+          var k = toks.indexOf(oldT);
+          if (k === -1) return false;
+          toks[k] = newT;
+          var seen = Object.create(null), out = [];
+          for (var i = 0; i < toks.length; i++) {
+            if (!seen[toks[i]]) { seen[toks[i]] = 1; out.push(toks[i]); }
+          }
+          writeClass(el, out);
+          return true;
+        },
         item: function (i) { return classTokens(el)[i] || null; },
+        // `classList.value` is the serialized token string, readable and writable.
+        get value() { return getAttr(el, "class") || ""; },
+        set value(v) { setAttr(el, "class", String(v)); },
         toString: function () { return getAttr(el, "class") || ""; },
       };
     }
