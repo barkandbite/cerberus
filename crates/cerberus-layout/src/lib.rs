@@ -2984,10 +2984,66 @@ fn list_marker(kind: ListStyleType, ordinal: u32) -> Option<String> {
     Some(match kind {
         ListStyleType::None => return None,
         ListStyleType::Decimal => format!("{}.", ordinal.max(1)),
+        ListStyleType::LowerAlpha => format!("{}.", alpha_ordinal(ordinal.max(1), false)),
+        ListStyleType::UpperAlpha => format!("{}.", alpha_ordinal(ordinal.max(1), true)),
+        ListStyleType::LowerRoman => format!("{}.", roman_ordinal(ordinal.max(1), false)),
+        ListStyleType::UpperRoman => format!("{}.", roman_ordinal(ordinal.max(1), true)),
         ListStyleType::Circle => "\u{25E6}".to_string(), // ◦
         ListStyleType::Square => "\u{25AA}".to_string(), // ▪
         ListStyleType::Disc => "\u{2022}".to_string(),   // •
     })
+}
+
+/// Bijective base-26 alphabetic ordinal: 1→a, 26→z, 27→aa, 28→ab, … (upper-cased
+/// when `upper`). Used for `list-style-type: lower-alpha`/`upper-alpha`.
+fn alpha_ordinal(mut n: u32, upper: bool) -> String {
+    let base = if upper { b'A' } else { b'a' };
+    let mut buf = Vec::new();
+    while n > 0 {
+        n -= 1; // 1-based → 0-based within each place
+        buf.push(base + (n % 26) as u8);
+        n /= 26;
+    }
+    buf.reverse();
+    String::from_utf8(buf).expect("ascii letters")
+}
+
+/// Roman-numeral ordinal: 1→i, 4→iv, 9→ix, 40→xl, … (upper-cased when `upper`).
+/// Used for `list-style-type: lower-roman`/`upper-roman`. Values are clamped to
+/// the classic 1..=3999 range; anything larger falls back to the decimal number
+/// so a huge list still numbers monotonically rather than overflowing the glyphs.
+fn roman_ordinal(n: u32, upper: bool) -> String {
+    if !(1..=3999).contains(&n) {
+        return n.to_string();
+    }
+    const TABLE: &[(u32, &str)] = &[
+        (1000, "m"),
+        (900, "cm"),
+        (500, "d"),
+        (400, "cd"),
+        (100, "c"),
+        (90, "xc"),
+        (50, "l"),
+        (40, "xl"),
+        (10, "x"),
+        (9, "ix"),
+        (5, "v"),
+        (4, "iv"),
+        (1, "i"),
+    ];
+    let mut rem = n;
+    let mut out = String::new();
+    for &(value, sym) in TABLE {
+        while rem >= value {
+            out.push_str(sym);
+            rem -= value;
+        }
+    }
+    if upper {
+        out.to_ascii_uppercase()
+    } else {
+        out
+    }
 }
 
 fn space_width(shaper: &dyn TextShaper, px: u32) -> u32 {
@@ -4181,6 +4237,27 @@ mod tests {
         let ul = total_glyphs(&lay("<ul start='9'><li>x</li></ul>", 400));
         let ul_plain = total_glyphs(&lay("<ul><li>x</li></ul>", 400));
         assert_eq!(ul, ul_plain, "start has no effect on an unordered list");
+    }
+
+    #[test]
+    fn alpha_and_roman_ordinals_are_correct() {
+        assert_eq!(alpha_ordinal(1, false), "a");
+        assert_eq!(alpha_ordinal(26, false), "z");
+        assert_eq!(alpha_ordinal(27, false), "aa");
+        assert_eq!(alpha_ordinal(28, false), "ab");
+        assert_eq!(alpha_ordinal(53, false), "ba");
+        assert_eq!(alpha_ordinal(1, true), "A");
+        assert_eq!(alpha_ordinal(702, true), "ZZ"); // 26*26 + 26
+
+        assert_eq!(roman_ordinal(1, false), "i");
+        assert_eq!(roman_ordinal(4, false), "iv");
+        assert_eq!(roman_ordinal(9, false), "ix");
+        assert_eq!(roman_ordinal(40, false), "xl");
+        assert_eq!(roman_ordinal(2024, false), "mmxxiv");
+        assert_eq!(roman_ordinal(3999, false), "mmmcmxcix");
+        assert_eq!(roman_ordinal(4, true), "IV");
+        // Out of the classic range → decimal fallback (still monotonic).
+        assert_eq!(roman_ordinal(4000, false), "4000");
     }
 
     #[test]
