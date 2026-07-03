@@ -637,7 +637,8 @@ impl<'a> Ctx<'a> {
         let mut fb = FloatBand::new(self.left, self.right, self.y);
         // Counts the list-item children of this block so an ordered list numbers
         // 1, 2, 3…; each `<ol>`/`<ul>` restarts it, so nested lists are independent.
-        let mut item_ordinal = 0u32;
+        // `<ol start="N">` seeds the count so the first item is N.
+        let mut item_ordinal = ol_start_base(node);
         for child in &node.children {
             match child {
                 StyledChild::Text(t) => {
@@ -2953,6 +2954,23 @@ fn resolve_flex(basis: &[f32], grow: &[f32], shrink: &[f32], mins: &[f32], avail
     size
 }
 
+/// The ordinal seed for a list block: `<ol start="N">` numbers its first item N,
+/// so the child loop (which pre-increments) must start from `N - 1`. Any other
+/// element (a `<ul>`, or an `<ol>` with no/invalid `start`) seeds 0. Only a
+/// positive `start` is honored (the common case; `reversed`/negative starts are
+/// not modeled).
+fn ol_start_base(node: &StyledNode) -> u32 {
+    if node.tag == "ol" {
+        if let Some(n) = node
+            .attr("start")
+            .and_then(|s| s.trim().parse::<u32>().ok())
+        {
+            return n.saturating_sub(1);
+        }
+    }
+    0
+}
+
 /// The marker text for a `list-item`, per `list-style-type`: a bullet glyph, or
 /// the `1.`-style decimal ordinal for an `<ol>` (the parent's child loop set the
 /// ordinal). `none` yields no marker (and the caller skips the gap too). Ordinals
@@ -4138,6 +4156,26 @@ mod tests {
             glyph_count(&ol),
             glyph_count(&ul)
         );
+    }
+
+    #[test]
+    fn ol_start_attribute_seeds_the_first_ordinal() {
+        // `<ol start="10">` numbers its first item 10, so its "10." marker has one
+        // more glyph than the default "1."; a plain `<ol>` and non-numeric starts
+        // are unaffected.
+        let default_ol = total_glyphs(&lay("<ol><li>x</li></ol>", 400));
+        let started = total_glyphs(&lay("<ol start='10'><li>x</li></ol>", 400));
+        assert_eq!(started - default_ol, 1, "'10.' adds one glyph over '1.'");
+
+        // The count continues from the seed: `start=9` → "9." then "10." markers
+        // (2 + 3 glyphs) plus the two item letters = 7.
+        let two = total_glyphs(&lay("<ol start='9'><li>x</li><li>y</li></ol>", 400));
+        assert_eq!(two, 7, "9. then 10. plus two content letters");
+
+        // `start` on a `<ul>` (or a non-numeric value) is ignored.
+        let ul = total_glyphs(&lay("<ul start='9'><li>x</li></ul>", 400));
+        let ul_plain = total_glyphs(&lay("<ul><li>x</li></ul>", 400));
+        assert_eq!(ul, ul_plain, "start has no effect on an unordered list");
     }
 
     #[test]
