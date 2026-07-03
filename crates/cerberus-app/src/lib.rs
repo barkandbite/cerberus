@@ -1734,22 +1734,50 @@ fn resolve_subresource(base: Option<&Url>, src: &str) -> String {
 /// payloads are code, not page text, and are skipped too. (Walking the raw DOM
 /// would leak text from hidden elements.)
 fn visible_text(root: &StyledNode) -> String {
+    // Block-level boxes each start on their own line, so their text must not run
+    // into a sibling's (`<li>one</li><li>two</li>` reads as "one\ntwo", not
+    // "onetwo"); `<br>` is a hard break. Inline content still concatenates. This
+    // keeps `--dump-text` a faithful reading-order transcript for the correctness
+    // oracle (#41) rather than one undifferentiated run.
+    fn is_block(node: &StyledNode) -> bool {
+        matches!(
+            node.style.display,
+            Display::Block | Display::ListItem | Display::Flex | Display::Grid
+        )
+    }
+    // Ensure the buffer ends with exactly one newline separator (no blank runs).
+    fn separate(out: &mut String) {
+        if !out.is_empty() && !out.ends_with('\n') {
+            out.push('\n');
+        }
+    }
     fn walk(node: &StyledNode, out: &mut String) {
-        if node.style.display == cerberus_style::Display::None
-            || matches!(node.tag.as_str(), "script" | "style")
-        {
+        if node.style.display == Display::None || matches!(node.tag.as_str(), "script" | "style") {
+            return;
+        }
+        if node.tag == "br" {
+            out.push('\n');
             return;
         }
         for child in &node.children {
             match child {
                 StyledChild::Text(t) => out.push_str(t),
-                StyledChild::Element(e) => walk(e, out),
+                StyledChild::Element(e) => {
+                    let block = is_block(e);
+                    if block {
+                        separate(out);
+                    }
+                    walk(e, out);
+                    if block {
+                        separate(out);
+                    }
+                }
             }
         }
     }
     let mut out = String::new();
     walk(root, &mut out);
-    out
+    out.trim().to_string()
 }
 
 /// Collect `<img>` sources from an element subtree, resolving `srcset`/`sizes`/
@@ -5382,7 +5410,23 @@ mod tests {
              <p>B</p>",
         );
         let styled = CssEngine::new().style(&doc);
-        assert_eq!(visible_text(&styled.root), "AB");
+        // The two visible <p> blocks read on their own lines.
+        assert_eq!(visible_text(&styled.root), "A\nB");
+    }
+
+    #[test]
+    fn visible_text_separates_blocks_and_keeps_inline_together() {
+        // Block-level siblings (list items, paragraphs) each get their own line;
+        // inline runs (text + <b>/<a>) stay on one line; <br> forces a break.
+        let doc = parse_html(
+            "<ul><li>one</li><li>two</li></ul>\
+             <p>in<b>line</b><br>after break</p>",
+        );
+        let styled = CssEngine::new().style(&doc);
+        // Inline `in` + `<b>line</b>` join with no break; `<br>` splits the line.
+        // (Inter-element source spaces are dropped at parse — see #137 — so this
+        // asserts only what `visible_text` itself controls.)
+        assert_eq!(visible_text(&styled.root), "one\ntwo\ninline\nafter break");
     }
 
     #[test]
