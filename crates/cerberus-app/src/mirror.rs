@@ -310,6 +310,12 @@ impl MultiSurfaceApp for MirrorShell {
         // (seeded with its current value) as the typing focus.
         let (target, focus_value) = {
             let doc = self.group.master().document();
+            // Control numbering must run over the styled tree so `display:none`
+            // controls are skipped exactly as layout skipped them when it produced
+            // `master_fields` — otherwise the ids desync (#51). Re-style here (the
+            // same engine that produced the fields); `display:none` is
+            // viewport-independent, so the numbering matches.
+            let styled = self.style.style(doc);
             // Smallest control box under the point → its node, via the canonical
             // control numbering layout shares (`collect_controls`).
             let field_node = self
@@ -318,7 +324,7 @@ impl MultiSurfaceApp for MirrorShell {
                 .filter(|f| rect_contains(f.rect, x, y))
                 .min_by_key(|f| u64::from(f.rect.w) * u64::from(f.rect.h))
                 .and_then(|f| {
-                    crate::collect_controls(doc.root())
+                    crate::collect_controls(&styled.root, doc)
                         .into_iter()
                         .find(|c| c.id == f.id)
                         .map(|c| c.el.id())

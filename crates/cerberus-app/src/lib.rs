@@ -57,7 +57,7 @@ use cerberus_storage::{
     atomic_write, parse_set_cookie, random_bytes, CookieDisposition, CookiePolicy, CookieView,
     EncryptedVault, Group, StorageEnvironment, DEFAULT_TIMED_SECS,
 };
-use cerberus_style::{ExternalSheets, StyleEngine, StyledChild, StyledDom, StyledNode};
+use cerberus_style::{Display, ExternalSheets, StyleEngine, StyledChild, StyledDom, StyledNode};
 use cerberus_text::TextEngine;
 use cerberus_tls_rustls::RustlsProvider;
 use cerberus_types::{Color, FontStyle, HeadId, InstanceId, Origin, Point, RealmId, Rect, Size};
@@ -3321,7 +3321,7 @@ impl BrowserApp {
     /// The `NodeId` (in `self.document`) of the form control with field index
     /// `field_id`, via the same canonical pre-order walk layout uses for ids.
     fn control_node_id(&self, field_id: u32) -> Option<NodeId> {
-        collect_controls(self.document.root())
+        collect_controls(&self.styled.root, &self.document)
             .iter()
             .find(|c| c.id == field_id)
             .map(|c| c.el.id())
@@ -3389,7 +3389,7 @@ impl BrowserApp {
         }
         self.dispatch_dom(node, "input", "{}");
         // A handler may have rewritten the value (input masking); reflect it.
-        if let Some(v) = control_value(self.document.root(), field_id) {
+        if let Some(v) = control_value(&self.styled.root, &self.document, field_id) {
             self.forms.values.insert(field_id, v);
         }
     }
@@ -3397,7 +3397,7 @@ impl BrowserApp {
     /// Check radio `id` and clear every other radio sharing its `name` in the
     /// same enclosing form (mutually-exclusive radio-group behaviour).
     fn check_radio(&mut self, id: u32) {
-        let controls = collect_controls(self.document.root());
+        let controls = collect_controls(&self.styled.root, &self.document);
         let Some(this) = controls.iter().find(|c| c.id == id) else {
             return;
         };
@@ -3418,7 +3418,7 @@ impl BrowserApp {
     /// Advance a `<select>` to its next option (wrapping). Reads the option count
     /// from the DOM and the current index from the store (or the DOM default).
     fn cycle_select(&mut self, id: u32) {
-        let controls = collect_controls(self.document.root());
+        let controls = collect_controls(&self.styled.root, &self.document);
         let Some(sel) = controls.iter().find(|c| c.id == id) else {
             return;
         };
@@ -3436,7 +3436,7 @@ impl BrowserApp {
     /// Submit the form enclosing control `id` (or the whole document if the
     /// control has no `<form>` ancestor), as a GET navigation.
     fn submit_from(&mut self, id: u32) {
-        let controls = collect_controls(self.document.root());
+        let controls = collect_controls(&self.styled.root, &self.document);
         let Some(this) = controls.iter().find(|c| c.id == id) else {
             return;
         };
@@ -4591,8 +4591,8 @@ fn invert_id_map(map: &HashMap<u64, NodeId>) -> HashMap<NodeId, u64> {
 
 /// The `value` attribute of the control with field index `field_id` in `root`
 /// (its current live value after a dispatch), `None` if not found.
-fn control_value(root: NodeRef<'_>, field_id: u32) -> Option<String> {
-    collect_controls(root)
+fn control_value(styled_root: &StyledNode, doc: &Document, field_id: u32) -> Option<String> {
+    collect_controls(styled_root, doc)
         .iter()
         .find(|c| c.id == field_id)
         .and_then(|c| c.el.attr("value"))
@@ -4605,36 +4605,55 @@ fn is_control_tag(tag: &str) -> bool {
     matches!(tag, "input" | "textarea" | "select" | "button")
 }
 
-/// Walk the document in pre-order, assigning each control its field id and
+/// Walk the **styled** tree in pre-order, assigning each control its field id and
 /// recording its nearest enclosing `<form>`. This is the *single canonical*
 /// numbering the app shares with layout, so a clicked box maps to the right
 /// control and submission groups controls by their real form.
-fn collect_controls(root: NodeRef<'_>) -> Vec<ControlRef<'_>> {
+///
+/// It must run over the styled tree, not the raw DOM: layout skips a
+/// `display:none` subtree entirely and never issues field ids inside it, so we
+/// have to skip the same controls. Numbering them here (as the old raw-DOM walk
+/// did) let a hidden control consume an app-side id layout never assigned,
+/// desyncing every later control's clicks and submitted values (#51). Each
+/// `ControlRef` still points at the raw DOM node (resolved via `node_id`) so all
+/// the attribute/value helpers below are unchanged.
+fn collect_controls<'a>(styled_root: &StyledNode, doc: &'a Document) -> Vec<ControlRef<'a>> {
     let mut out = Vec::new();
     let mut next_id = 0u32;
-    walk_controls(root, None, &mut next_id, &mut out);
+    walk_controls(styled_root, None, doc, &mut next_id, &mut out);
     out
 }
 
 fn walk_controls<'a>(
-    el: NodeRef<'a>,
+    node: &StyledNode,
     form: Option<NodeRef<'a>>,
+    doc: &'a Document,
     next_id: &mut u32,
     out: &mut Vec<ControlRef<'a>>,
 ) {
-    if is_control_tag(el.tag()) {
-        out.push(ControlRef {
-            id: *next_id,
-            el,
-            form,
-        });
-        *next_id += 1;
+    // Mirror layout's skip of a `display:none` subtree so the ids stay aligned.
+    if node.style.display == Display::None {
+        return;
+    }
+    if is_control_tag(&node.tag) {
+        if let Some(el) = doc.node(node.node_id) {
+            out.push(ControlRef {
+                id: *next_id,
+                el,
+                form,
+            });
+            *next_id += 1;
+        }
     }
     // Descend; controls inside a <form> inherit it as their enclosing form.
-    let inner_form = if el.tag() == "form" { Some(el) } else { form };
-    for child in el.children() {
-        if child.is_element() {
-            walk_controls(child, inner_form, next_id, out);
+    let inner_form = if node.tag == "form" {
+        doc.node(node.node_id).or(form)
+    } else {
+        form
+    };
+    for child in &node.children {
+        if let StyledChild::Element(e) = child {
+            walk_controls(e, inner_form, doc, next_id, out);
         }
     }
 }
@@ -6693,6 +6712,37 @@ mod tests {
     }
 
     #[test]
+    fn collect_controls_skips_display_none_but_keeps_type_hidden() {
+        // A `display:none` control (or one inside a display:none subtree) must not
+        // consume a field id, because layout skips it too — otherwise every later
+        // control's id desyncs from layout's numbering (#51). A `type=hidden`
+        // input, which layout *does* lay out (id consumed, nothing painted), is
+        // still counted.
+        let doc = parse_html(
+            "<input style='display:none' name='ghost'>\
+             <div style='display:none'><input name='buried'></div>\
+             <input type='hidden' name='h'>\
+             <input name='first'><input name='second'>",
+        );
+        let styled = cerberus_css::CssEngine::new().style(&doc);
+        let controls = collect_controls(&styled.root, &doc);
+        let names: Vec<_> = controls
+            .iter()
+            .map(|c| c.el.attr("name").unwrap())
+            .collect();
+        assert_eq!(
+            names,
+            vec!["h", "first", "second"],
+            "display:none controls are skipped; type=hidden is kept"
+        );
+        // Ids are the contiguous 0..n layout also assigns to these three.
+        assert_eq!(
+            controls.iter().map(|c| c.id).collect::<Vec<_>>(),
+            vec![0, 1, 2]
+        );
+    }
+
+    #[test]
     fn multipart_builds_text_and_file_parts() {
         let dir = std::env::temp_dir().join(format!("cerb-upload-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
@@ -6703,7 +6753,8 @@ mod tests {
             "<form method=\"post\" enctype=\"multipart/form-data\">\
              <input name=\"note\" value=\"hi\"><input type=\"file\" name=\"upload\"></form>",
         );
-        let controls = collect_controls(doc.root());
+        let styled = cerberus_css::CssEngine::new().style(&doc);
+        let controls = collect_controls(&styled.root, &doc);
         let form = controls[0].form;
         let mut store = FormStore::default();
         let file_id = controls.iter().find(|c| is_file_input(c.el)).unwrap().id;
