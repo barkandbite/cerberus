@@ -134,6 +134,33 @@ impl WhiteSpace {
     }
 }
 
+/// CSS `line-height`. A unitless `<number>` is special: it inherits as the
+/// **factor**, and each element re-multiplies it by its *own* font-size — so
+/// `body { line-height: 1.5 }` gives a larger heading proportionally taller
+/// leading. A length/percentage instead inherits as the resolved px. Inherited.
+#[derive(Clone, Copy, Debug, PartialEq, Default)]
+pub enum LineHeight {
+    /// `normal` — the layout's natural leading for the element's font size.
+    #[default]
+    Normal,
+    /// A unitless multiplier of the element's own font-size.
+    Factor(f32),
+    /// An absolute px value (a length, or a percentage resolved at parse time).
+    Px(i32),
+}
+
+impl LineHeight {
+    /// Resolve to a px line-box height for an element of `font_size`, using
+    /// `default_px` (the font's natural leading) for `Normal`.
+    pub fn resolve(self, font_size: u32, default_px: i32) -> i32 {
+        match self {
+            LineHeight::Normal => default_px,
+            LineHeight::Factor(f) => (f * font_size as f32).round().max(0.0) as i32,
+            LineHeight::Px(px) => px,
+        }
+    }
+}
+
 /// CSS `list-style-type`: the marker drawn before a `display: list-item`. A
 /// practical subset — the bullet glyphs and decimal numbering that cover almost
 /// all real lists. Inherited (so `<ol>`'s `decimal` reaches its `<li>` children).
@@ -303,10 +330,10 @@ pub struct ComputedStyle {
     /// `text-decoration: line-through` (strikethrough). Inherited alongside
     /// `underline`.
     pub line_through: bool,
-    /// `line-height` resolved to px (`None` = `normal`, the 1.5× default);
-    /// `text-transform`; `letter-spacing` in px (may be negative). Inherited text
-    /// properties (ADR-0041).
-    pub line_height: Option<i32>,
+    /// `line-height` (a factor, absolute px, or `normal`); `text-transform`;
+    /// `letter-spacing` in px (may be negative). Inherited text properties
+    /// (ADR-0041).
+    pub line_height: LineHeight,
     pub text_transform: TextTransform,
     pub letter_spacing: i32,
     /// `word-spacing` in px (may be negative): extra space added to each
@@ -448,7 +475,7 @@ impl ComputedStyle {
             text_align: TextAlign::Left,
             underline: false,
             line_through: false,
-            line_height: None,
+            line_height: LineHeight::Normal,
             text_transform: TextTransform::None,
             letter_spacing: 0,
             word_spacing: 0,

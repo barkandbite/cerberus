@@ -14,9 +14,9 @@ pub use color::parse_color;
 use cerberus_dom::{Document, NodeRef};
 use cerberus_style::{
     AlignItems, AlignSelf, BoxShadow, BoxSizing, Clear, ComputedStyle, Display, ExternalSheets,
-    FlexBasis, FlexDirection, Float, Gradient, JustifyContent, Len, ListStyleType, Position,
-    StyleEngine, StyledChild, StyledDom, StyledNode, TextAlign, TextTransform, Track, TrackMax,
-    VerticalAlign, Visibility, WhiteSpace,
+    FlexBasis, FlexDirection, Float, Gradient, JustifyContent, Len, LineHeight, ListStyleType,
+    Position, StyleEngine, StyledChild, StyledDom, StyledNode, TextAlign, TextTransform, Track,
+    TrackMax, VerticalAlign, Visibility, WhiteSpace,
 };
 use cerberus_types::{Color, ImageFit, ImagePos};
 use parser::{
@@ -1772,24 +1772,30 @@ fn apply_flex_shorthand(style: &mut ComputedStyle, v: &str, em: f32) {
     };
 }
 
-/// Resolve `line-height` to px against `font_size`: `normal` → `None` (engine
-/// default), a unitless number → `n × font-size`, `%` → `pct × font-size`, else a
-/// length (ADR-0041).
-fn parse_line_height(v: &str, font_size: u32) -> Option<i32> {
+/// Parse `line-height` into a [`LineHeight`]: `normal` → `Normal`, a unitless
+/// number → `Factor(n)` (kept as a multiplier so it inherits and re-resolves per
+/// element), `%` → `Px(pct × font-size)`, else a length → `Px` (ADR-0041).
+fn parse_line_height(v: &str, font_size: u32) -> LineHeight {
     let t = v.trim().to_ascii_lowercase();
     if t == "normal" || t.is_empty() {
-        return None;
+        return LineHeight::Normal;
     }
+    // A percentage resolves against the element's own font-size and inherits as
+    // that absolute px (unlike a unitless number, which inherits as the factor).
     if let Some(pct) = t
         .strip_suffix('%')
         .and_then(|n| n.trim().parse::<f32>().ok())
     {
-        return Some((pct / 100.0 * font_size as f32).round().max(0.0) as i32);
+        return LineHeight::Px((pct / 100.0 * font_size as f32).round().max(0.0) as i32);
     }
+    // A bare `<number>` is kept as a factor so each element re-multiplies it by
+    // its own font-size (correct inheritance across differently-sized elements).
     if let Ok(n) = t.parse::<f32>() {
-        return Some((n * font_size as f32).round().max(0.0) as i32);
+        return LineHeight::Factor(n.max(0.0));
     }
-    parse_len(&t, font_size as f32).map(|px| px.max(0))
+    parse_len(&t, font_size as f32)
+        .map(|px| LineHeight::Px(px.max(0)))
+        .unwrap_or(LineHeight::Normal)
 }
 
 /// Set a px field from a length value (no-op if it doesn't parse), clamped ≥ 0.
@@ -2429,6 +2435,43 @@ mod tests {
         // 2em at the default 16px font = 32px; inherited by the child.
         assert_eq!(first(&dom.root, "div").unwrap().style.text_indent, 32);
         assert_eq!(first(&dom.root, "p").unwrap().style.text_indent, 32);
+    }
+
+    #[test]
+    fn line_height_unitless_inherits_as_a_factor() {
+        use cerberus_style::LineHeight;
+        // A unitless line-height inherits as the factor, so a differently-sized
+        // child re-resolves it against its own font-size (not the parent's).
+        let dom = CssEngine::new().style(&parse_html(
+            "<div style='line-height:2;font-size:10px'>\
+             <p style='font-size:30px'>x</p></div>",
+        ));
+        let div = first(&dom.root, "div").unwrap();
+        let p = first(&dom.root, "p").unwrap();
+        assert_eq!(div.style.line_height, LineHeight::Factor(2.0));
+        assert_eq!(
+            p.style.line_height,
+            LineHeight::Factor(2.0),
+            "factor inherits"
+        );
+        assert_eq!(div.style.line_height.resolve(10, 0), 20, "2 * 10px");
+        assert_eq!(
+            p.style.line_height.resolve(30, 0),
+            60,
+            "2 * 30px, its own size"
+        );
+
+        // A px/percentage line-height inherits as the resolved absolute length.
+        // (font-size is declared first so the percentage resolves against 20px.)
+        let dom2 = CssEngine::new().style(&parse_html(
+            "<div style='font-size:20px;line-height:150%'>\
+             <p style='font-size:40px'>x</p></div>",
+        ));
+        // 150% of 20px = 30px, inherited verbatim (not re-scaled to the child).
+        assert_eq!(
+            first(&dom2.root, "p").unwrap().style.line_height,
+            LineHeight::Px(30)
+        );
     }
 
     #[test]
