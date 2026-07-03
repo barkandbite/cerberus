@@ -2,6 +2,7 @@
 //! redirects. This is *our* HTTP client (bootstrapped); rustls and the DoH
 //! resolver are injected behind the `TlsProvider`/`DnsResolver` traits.
 
+use crate::LockRecover;
 use crate::{
     http1, BuiltinHttpClient, CookieJar, DnsResolver, FetchContext, HttpClient, HttpResponse,
     NetError, ReadWrite, TlsProvider,
@@ -297,7 +298,7 @@ impl HttpEngine {
     /// JS `navigator.userAgent`, so the header and the script-visible identity
     /// can never disagree.
     pub fn user_agent_for(&self, host: &str) -> String {
-        let idx = *self.ua_memo.lock().unwrap().get(host).unwrap_or(&0);
+        let idx = *self.ua_memo.locked().get(host).unwrap_or(&0);
         self.user_agents
             .get(idx)
             .cloned()
@@ -369,7 +370,7 @@ impl HttpEngine {
         body: &[u8],
         ctx: Option<&FetchContext>,
     ) -> Result<HttpResponse, NetError> {
-        let start = *self.ua_memo.lock().unwrap().get(&url.host).unwrap_or(&0);
+        let start = *self.ua_memo.locked().get(&url.host).unwrap_or(&0);
         let mut last_blocked = None;
         for idx in start..self.user_agents.len() {
             let resp = self.fetch_redirected(
@@ -385,7 +386,7 @@ impl HttpEngine {
                 continue;
             }
             // Served: remember the rung so this origin's subresources start here.
-            self.ua_memo.lock().unwrap().insert(url.host.clone(), idx);
+            self.ua_memo.locked().insert(url.host.clone(), idx);
             return Ok(resp);
         }
         // Every rung was soft-blocked: hand back the last response (e.g. 403) so
@@ -595,6 +596,32 @@ mod tests {
             UA_LADDER.len() >= 2,
             "ladder needs at least one fallback rung"
         );
+    }
+
+    #[test]
+    fn poisoned_ua_memo_does_not_crash_lookups() {
+        // A panic while holding the ua_memo lock poisons it; a later lookup must
+        // recover the guard and return rather than propagating the panic and
+        // taking down the whole session (#56).
+        let engine = HttpEngine::new(Box::new(NoTls), Box::new(LoopbackDns));
+        // Poison the memo (suppressing the panic's default stderr noise), after
+        // writing a value so we can confirm the recovered guard still sees it.
+        let prev = std::panic::take_hook();
+        std::panic::set_hook(Box::new(|_| {}));
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            // Bind the guard so it is still held when the panic unwinds — that is
+            // what poisons the mutex (a dropped guard wouldn't).
+            let mut g = engine.ua_memo.lock().unwrap();
+            g.insert("example.com".into(), 1);
+            panic!("boom while holding ua_memo");
+        }));
+        std::panic::set_hook(prev);
+        assert!(result.is_err(), "closure panicked as intended");
+        assert!(engine.ua_memo.is_poisoned(), "the lock is now poisoned");
+
+        // Would previously panic in `.lock().unwrap()`; now recovers the guard.
+        let ua = engine.user_agent_for("example.com");
+        assert!(!ua.is_empty(), "lookup returns despite the poison: {ua:?}");
     }
 
     #[test]

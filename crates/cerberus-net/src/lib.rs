@@ -24,6 +24,23 @@ pub use cache::HttpCache;
 pub use dns::{CachingResolver, FallbackResolver, SystemResolver};
 pub use engine::{parse_proxy, HttpEngine, ProxyConfig, Router, DEFAULT_USER_AGENT};
 
+/// Lock a `Mutex`, recovering the guard if a previous holder panicked and
+/// poisoned it rather than propagating the panic. A single poisoned critical
+/// section (e.g. a worker thread that panicked mid-fetch) must not sink the whole
+/// browser — the same crash class fb35991 fixed for the app-side locks (#56). The
+/// recovered data may be logically stale, but for these caches/memos that only
+/// costs a redundant recompute, never corruption.
+pub(crate) trait LockRecover<T> {
+    fn locked(&self) -> std::sync::MutexGuard<'_, T>;
+}
+
+impl<T> LockRecover<T> for std::sync::Mutex<T> {
+    fn locked(&self) -> std::sync::MutexGuard<'_, T> {
+        self.lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+}
+
 /// A bidirectional byte stream (TCP, or TLS over TCP). Blanket-implemented so
 /// adapters can hand back any `Read + Write + Send` without naming a foreign
 /// type to callers.
