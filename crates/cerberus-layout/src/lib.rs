@@ -1104,7 +1104,7 @@ impl<'a> Ctx<'a> {
         let cols = node.attr("cols").and_then(parse_dim).unwrap_or(30).max(1);
         let w = self.fit_width(cols as i32 * self.char_w(px) + 2 * FIELD_PAD);
         let h = rows * line_height(px) as u32 + 6;
-        self.control_box(w, h, FIELD_BG);
+        self.control_box(w, h, &node.style, FIELD_BG);
         self.push_field(id, FieldKind::Textarea, w, h);
         let dom_value = node.text();
         let value: &str = match self.forms.value(id) {
@@ -1131,7 +1131,7 @@ impl<'a> Ctx<'a> {
         let text_w = self.text_width(&label, px);
         let w = self.fit_width(text_w + self.char_w(px) + 3 * FIELD_PAD);
         let h = px as i32 + 2 * FIELD_PAD;
-        self.control_box(w, h as u32, FIELD_BG);
+        self.control_box(w, h as u32, &node.style, FIELD_BG);
         self.push_field(id, FieldKind::Select, w, h as u32);
         if !label.is_empty() {
             self.box_label(px, &label, node.style.color, FIELD_PAD, FIELD_PAD);
@@ -1155,7 +1155,7 @@ impl<'a> Ctx<'a> {
         let cols = node.attr("size").and_then(parse_dim).unwrap_or(20).max(1);
         let w = self.fit_width(cols as i32 * self.char_w(px) + 2 * FIELD_PAD);
         let h = px as i32 + 2 * FIELD_PAD;
-        self.control_box(w, h as u32, FIELD_BG);
+        self.control_box(w, h as u32, &node.style, FIELD_BG);
         self.push_field(id, FieldKind::Text, w, h as u32);
 
         let live = self.forms.value(id);
@@ -1182,7 +1182,7 @@ impl<'a> Ctx<'a> {
     fn toggle_control(&mut self, node: &StyledNode, id: u32, radio: bool) {
         let px = node.style.font_size.max(1);
         let s = px + 2;
-        self.control_box(s, s, Color::WHITE);
+        self.control_box(s, s, &node.style, Color::WHITE);
         self.push_field(
             id,
             if radio {
@@ -1216,7 +1216,7 @@ impl<'a> Ctx<'a> {
         let text_w = self.text_width(label, px);
         let w = self.fit_width(text_w + 4 * FIELD_PAD);
         let h = px as i32 + 2 * FIELD_PAD;
-        self.control_box(w, h as u32, BUTTON_BG);
+        self.control_box(w, h as u32, style, BUTTON_BG);
         self.push_field(id, FieldKind::Button, w, h as u32);
         let pad_x = ((w as i32 - text_w) / 2).max(FIELD_PAD);
         self.box_label(px, label, style.color, pad_x, FIELD_PAD);
@@ -1237,11 +1237,30 @@ impl<'a> Ctx<'a> {
     /// Emit a bordered, filled control box at the current pen, wrapping first if
     /// it wouldn't fit. Does **not** advance the pen (the caller does, after
     /// drawing any label, so the label sits on top of the box).
-    fn control_box(&mut self, w: u32, h: u32, fill: Color) {
+    /// Paint a form control's chrome. The UA `default_fill`/border are just
+    /// defaults now: author CSS overrides them, so `<button style="background:
+    /// #0a7">` (or an input with a custom `border`) renders as styled instead of
+    /// the built-in grey — the control paths used to ignore the cascade entirely
+    /// (#66). A `background` set by the page wins the fill; a border color wins
+    /// only when the control actually has a border (border-color is always a
+    /// value, so the border *width* is what signals author intent).
+    fn control_box(&mut self, w: u32, h: u32, style: &ComputedStyle, default_fill: Color) {
+        let fill = style.background.unwrap_or(default_fill);
+        let has_border = style
+            .border_top
+            .max(style.border_right)
+            .max(style.border_bottom)
+            .max(style.border_left)
+            > 0;
+        let border = if has_border {
+            style.border_color
+        } else {
+            CONTROL_BORDER
+        };
         self.place_box(w, h);
         self.display.push(DisplayItem::Rect {
             rect: Rect::new(self.x, self.y, w, h),
-            color: CONTROL_BORDER,
+            color: border,
         });
         if w > 2 && h > 2 {
             self.display.push(DisplayItem::Rect {
@@ -4489,6 +4508,38 @@ mod tests {
         let laid = lay("<input type='submit' value='Send'>", 400);
         assert!(has_rect_color(&laid, BUTTON_BG));
         assert_eq!(total_glyphs(&laid), 4, "'Send' label");
+    }
+
+    #[test]
+    fn control_box_honors_author_background_and_border() {
+        // A plain button uses the UA chrome; a styled one takes the author's
+        // background, and its border color once it has a border (#66).
+        let plain = lay("<button>Go</button>", 400);
+        assert!(
+            has_rect_color(&plain, BUTTON_BG),
+            "UA button fill by default"
+        );
+        assert!(
+            has_rect_color(&plain, CONTROL_BORDER),
+            "UA border by default"
+        );
+
+        let styled = lay(
+            "<button style='background:#00ff00;border:2px solid #0000ff'>Go</button>",
+            400,
+        );
+        assert!(
+            has_rect_color(&styled, Color::rgb(0, 0xff, 0)),
+            "author background fills the control"
+        );
+        assert!(
+            has_rect_color(&styled, Color::rgb(0, 0, 0xff)),
+            "author border color drawn once the control has a border"
+        );
+        assert!(
+            !has_rect_color(&styled, BUTTON_BG),
+            "the UA grey no longer appears"
+        );
     }
 
     #[test]
