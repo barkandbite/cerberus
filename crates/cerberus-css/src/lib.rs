@@ -64,7 +64,9 @@ ul, ol { margin-top: 8px; margin-bottom: 8px; margin-left: 24px; }
 blockquote { margin-left: 24px; margin-top: 8px; margin-bottom: 8px; }
 pre { white-space: pre; margin-top: 8px; margin-bottom: 8px; }
 code, kbd, samp { white-space: pre; }
-a { color: #154fd2; text-decoration: underline; }
+/* Only anchors with an href are links (`:any-link`); a bare `<a name=…>`
+   placeholder is not styled blue/underlined. */
+a[href] { color: #154fd2; text-decoration: underline; }
 b, strong { font-weight: bold; }
 i, em, cite, var { font-style: italic; }
 small { font-size: smaller; }
@@ -1985,6 +1987,38 @@ mod tests {
         let a = first(&dom.root, "a").unwrap();
         assert!(a.style.underline);
         assert_eq!(a.style.color, Color::rgb(0x15, 0x4f, 0xd2));
+    }
+
+    #[test]
+    fn only_anchors_with_href_get_link_styling() {
+        // An `<a>` without href is a placeholder/named anchor, not a link, so it
+        // keeps the default text color and no underline; one with href is styled.
+        let dom =
+            CssEngine::new().style(&parse_html("<a name='top'>anchor</a><a href='/x'>link</a>"));
+        let anchors: Vec<_> = {
+            fn collect<'a>(n: &'a StyledNode, out: &mut Vec<&'a StyledNode>) {
+                if n.tag == "a" {
+                    out.push(n);
+                }
+                for c in &n.children {
+                    if let StyledChild::Element(e) = c {
+                        collect(e, out);
+                    }
+                }
+            }
+            let mut v = Vec::new();
+            collect(&dom.root, &mut v);
+            v
+        };
+        assert_eq!(anchors.len(), 2);
+        assert!(
+            !anchors[0].style.underline && anchors[0].style.color == Color::BLACK,
+            "the bare <a name> anchor is not styled as a link"
+        );
+        assert!(
+            anchors[1].style.underline && anchors[1].style.color == Color::rgb(0x15, 0x4f, 0xd2),
+            "the <a href> is styled as a link"
+        );
     }
 
     #[test]
