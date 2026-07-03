@@ -659,7 +659,12 @@ impl<'a> Ctx<'a> {
                     }
                     self.flush_floats(&mut fb);
                     if e.style.display == Display::ListItem {
-                        item_ordinal += 1;
+                        // `<li value="N">` sets this item's number to N; following
+                        // items continue from it. Otherwise just advance by one.
+                        item_ordinal = match e.attr("value").and_then(|v| v.trim().parse().ok()) {
+                            Some(v) => v,
+                            None => item_ordinal + 1,
+                        };
                         self.list_ordinal = item_ordinal;
                     }
                     self.walk(e, href);
@@ -4176,6 +4181,20 @@ mod tests {
         let ul = total_glyphs(&lay("<ul start='9'><li>x</li></ul>", 400));
         let ul_plain = total_glyphs(&lay("<ul><li>x</li></ul>", 400));
         assert_eq!(ul, ul_plain, "start has no effect on an unordered list");
+    }
+
+    #[test]
+    fn li_value_overrides_and_continues_the_ordinal() {
+        // `<li value="10">` sets that item to 10 and the next continues at 11:
+        // markers 1. (2) + 10. (3) + 11. (3) plus three letters = 11 glyphs.
+        let jumped = total_glyphs(&lay(
+            "<ol><li>x</li><li value='10'>y</li><li>z</li></ol>",
+            400,
+        ));
+        assert_eq!(jumped, 11, "1. then 10. then 11. plus x y z");
+        // Without the override the markers are 1. 2. 3. (2 glyphs each): 9 total.
+        let plain = total_glyphs(&lay("<ol><li>x</li><li>y</li><li>z</li></ol>", 400));
+        assert_eq!(plain, 9);
     }
 
     #[test]
