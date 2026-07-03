@@ -3,6 +3,38 @@
 All notable changes to Cerberus are recorded here. Versions are small while the
 browser is pre-1.0; this is the first tagged preview.
 
+## [0.0.9] — 2026-07-03
+
+reese84/Imperva bot-challenge handshake machinery, and the page-script fidelity
+needed to run real-world sites.
+
+### Added
+- **`XMLHttpRequest`** over the existing `fetch` transport, so a page (or a bot
+  sensor) can XHR a payload and read the response (status, headers, body).
+- **`document.cookie` ↔ sealed jar bridge.** Script cookie reads are seeded from
+  the active instance's jar (read-only; `HttpOnly` cookies stay hidden from
+  script); writes are captured verbatim and persisted through the same consent
+  gate and per-cookie disposition a network `Set-Cookie` takes — first-party
+  only, per sealed head.
+- **Script navigation.** `location.assign`/`replace`/`reload`, `location.href =`,
+  and `window.location = "…"` now navigate (http(s) only — not the internal
+  `cerberus:` scheme), so a cookie-gated reload actually re-fetches. A per-gesture
+  budget caps a page that reloads on every load.
+- **External `<script src>` execution.** External scripts are fetched on the
+  worker and run against the page realm; previously only inline `<script>` ran.
+- **`probe` subcommand.** A headless interactive driver — load a URL through the
+  real worker loop and print the settled result — used for live testing.
+
+### Notes
+- Against a live Imperva site (e.g. pokemoncenter.com) the browser now fetches
+  the interstitial, captures the Incapsula cookies, and executes the real
+  obfuscated sensor without error. It does **not** pass the full challenge: the
+  sensor defers to the `/_Incapsula_Resource` sub-document, and the privacy
+  farbling that randomizes fingerprints is itself what anti-bot systems flag.
+  Passing a live anti-bot challenge is not a supported outcome — the machinery
+  is built and functional, but the privacy posture and bot-challenge success are
+  fundamentally in tension.
+
 ## [0.0.8] — 2026-07-01
 
 Per-window egress proxy: the last axis of per-identity isolation.
