@@ -90,7 +90,13 @@ impl FarblingProvider for SeededFarbling {
         // (head, inputs); uncorrelated across heads. See FARBLING_SHIMS.
         let hi = (self.seed >> 32) as u32;
         let lo = self.seed as u32;
-        format!("(function(){{var __FARBLE_HI={hi},__FARBLE_LO={lo};\n{FARBLING_SHIMS}\n}})();\n")
+        // Export the per-head seed onto the global object so the DOM prelude's
+        // crypto.getRandomValues/randomUUID shim (guard: `typeof g.__FARBLE_HI
+        // === "number"`) reads THIS head's seed. `var __FARBLE_HI/_LO` alone are
+        // IIFE-local, so without this every head fell back to one shared crypto
+        // stream — a cross-head correlation tell. The values are u32 (< 2^53, so
+        // JS `typeof === "number"`) and per-head (derived from `seed`).
+        format!("(function(){{var __FARBLE_HI={hi},__FARBLE_LO={lo};\nglobalThis.__FARBLE_HI=__FARBLE_HI;globalThis.__FARBLE_LO=__FARBLE_LO;\n{FARBLING_SHIMS}\n}})();\n")
     }
 }
 
@@ -261,6 +267,17 @@ const FARBLING_SHIMS: &str = r##"
       HIGH_FLOAT:0x8DF2,MEDIUM_FLOAT:0x8DF1,LOW_FLOAT:0x8DF0,
       HIGH_INT:0x8DF5,MEDIUM_INT:0x8DF4,LOW_INT:0x8DF3,
       getParameter:function(p){
+        // GPU identity comes from the coherent per-window profile when present,
+        // read LAZILY here (page scripts run after all prologues, so prologue
+        // injection order does not matter). Falls through to the fixed persona
+        // below when no profile (or no .gpu) is injected.
+        var __q=p|0, __pg=globalThis.__CERBERUS_PROFILE__; __pg=__pg&&__pg.gpu;
+        if(__pg){
+          if(__q===0x1F00&&typeof __pg.vendor==="string")return __pg.vendor;
+          if(__q===0x1F01&&typeof __pg.renderer==="string")return __pg.renderer;
+          if(__q===0x9245&&typeof __pg.unmaskedVendor==="string")return __pg.unmaskedVendor;
+          if(__q===0x9246&&typeof __pg.unmaskedRenderer==="string")return __pg.unmaskedRenderer;
+        }
         switch(p|0){
           // Coherent Chrome-142-on-Windows-11 Intel/ANGLE/D3D11 persona (fixed).
           case 0x1F00: return "WebKit";

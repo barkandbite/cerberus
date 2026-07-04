@@ -1661,8 +1661,9 @@ fn window_metrics_come_from_viewport() {
 fn window_and_document_fingerprint_surface_is_complete() {
     // The window + document expose the full Chrome-on-Windows surface a scanner
     // reads: frame identity (top/parent/self all this window, no frameElement),
-    // window chrome (outerHeight > innerHeight), visualViewport, a monotonic
-    // performance clock, CSS/getSelection, and the document's static metadata
+    // self-consistent window geometry (screen == avail == outer == inner with no
+    // profile), visualViewport, a monotonic performance clock, CSS/getSelection,
+    // and the document's static metadata
     // (characterSet/compatMode/contentType/visibilityState) plus fonts,
     // implementation, and an activeElement that defaults to <body>.
     let (mut engine, realm) = engine_and_realm();
@@ -1697,8 +1698,14 @@ fn window_and_document_fingerprint_surface_is_complete() {
         Some("null:0:"),
         "no host frame, no child frames, no name"
     );
-    // Chrome adds ~88px of vertical chrome; width has no side chrome.
-    assert_eq!(x.attr("w-outer"), Some("88:0"));
+    // No profile is injected here, so this is an inert maximized surface: the
+    // outer window equals the inner viewport (no chrome), keeping the geometry
+    // self-consistent (screen == avail == outer == inner) instead of the old
+    // outerHeight > screen.height impossibility. Real ~88px browser chrome is
+    // added only under a coherent profile, whose screen is a real monitor larger
+    // than the viewport — that path is covered by the profile_persona geometry
+    // test.
+    assert_eq!(x.attr("w-outer"), Some("0:0"));
     assert_eq!(x.attr("w-vv"), Some("1280x800@1"));
     assert_eq!(
         x.attr("w-perf"),

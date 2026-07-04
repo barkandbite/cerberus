@@ -9,14 +9,22 @@
 
 use cerberus_farbling::{FarblingProvider, SeededFarbling};
 use cerberus_js::{JsEngine, JsEngineFactory, JsError};
+use cerberus_profile::{derive_profile, Profile, ProfileOverrides};
 use cerberus_types::{HeadId, InstanceId, RealmId};
 
-/// One identity: a sealed storage instance plus a farbling seed.
+/// One identity: a sealed storage instance, a farbling seed, and a coherent
+/// fingerprint profile.
 pub struct Head {
     pub id: HeadId,
     pub instance: InstanceId,
     pub label: String,
     pub farbling: SeededFarbling,
+    /// This head's internally-coherent fingerprint persona (navigator/screen/
+    /// GPU/timezone/fonts), derived deterministically from the same seed as
+    /// `farbling`. Its `profile_prologue()` is injected ahead of the farbling
+    /// prologue so the DOM model and WebGL shims present one self-consistent
+    /// identity per window — never a Windows UA over a Metal GPU, etc.
+    pub profile: Profile,
     /// This identity's own egress proxy as a raw `host:port` string, if set.
     /// `None` means it uses whatever default the app configures (or direct).
     /// Parsed and enforced in the app/network layer so each mirror window can
@@ -26,12 +34,15 @@ pub struct Head {
 
 impl Head {
     /// Construct a head. The `RealmId` for its base realm is derived from `id`.
+    /// The fingerprint profile and farbling noise both derive from `seed`, so a
+    /// head's persona and its per-head noise are coherent by construction.
     pub fn new(id: HeadId, instance: InstanceId, label: impl Into<String>, seed: u64) -> Self {
         Self {
             id,
             instance,
             label: label.into(),
             farbling: SeededFarbling::new(seed),
+            profile: derive_profile(seed, &ProfileOverrides::default()),
             proxy: None,
         }
     }
@@ -126,6 +137,12 @@ impl HeadManager {
             let head = &self.heads[self.active];
             let realm = head.base_realm();
             engine.create_realm(realm)?;
+            // Profile first (defines the persona the DOM model reads), then the
+            // farbling prologue (per-head noise + the seed export the crypto
+            // shim keys off). Order between the two is immaterial — the WebGL
+            // shim reads the profile lazily and the crypto shim reads the seed
+            // at DOM-prelude time — but this ordering matches their roles.
+            engine.inject_prologue(realm, &head.profile.profile_prologue())?;
             engine.inject_prologue(realm, &head.farbling.js_prologue())?;
             self.engine = Some(engine);
         }
@@ -185,5 +202,36 @@ mod tests {
         assert_eq!(seeds, vec![0x1111, 0x2222, 0x3333]);
         // Distinct sealed partitions.
         assert_ne!(mgr.heads()[0].instance, mgr.heads()[1].instance);
+    }
+
+    #[test]
+    fn each_head_carries_a_coherent_seed_derived_persona() {
+        let heads = three_heads();
+        for h in &heads {
+            // Every head's profile is internally consistent (no Windows UA over
+            // a Metal GPU, screen >= viewport, etc.) — the whole point of
+            // driving the surface from one derived persona per window.
+            assert!(
+                h.profile.is_coherent(),
+                "head {:?} has an incoherent persona",
+                h.label
+            );
+            // The persona presents a real browser UA, not the honest token.
+            assert!(
+                h.profile.user_agent.starts_with("Mozilla/"),
+                "expected a real-browser UA, got {:?}",
+                h.profile.user_agent
+            );
+        }
+
+        // Deterministic in the seed: reconstructing a head from the same seed
+        // yields the same persona (so a head's identity is stable across runs).
+        let again = Head::new(
+            HeadId::from_u64_pair(0, 1),
+            InstanceId::from_u64_pair(0, 1),
+            "work",
+            0x1111,
+        );
+        assert_eq!(again.profile.user_agent, heads[0].profile.user_agent);
     }
 }

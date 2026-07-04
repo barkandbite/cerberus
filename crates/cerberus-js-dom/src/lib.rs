@@ -2680,6 +2680,14 @@ pub const DOM_MODEL_PRELUDE: &str = r##"
     // injected by run_page_scripts before this prelude. We never throw: a
     // missing/garbage env falls back to inert defaults.
     var env = (g.__CERBERUS_ENV__ && typeof g.__CERBERUS_ENV__ === "object") ? g.__CERBERUS_ENV__ : {};
+    // A COHERENT per-head fingerprint profile, injected by the app before this
+    // prelude (cerberus-profile's profile_prologue). When present, EVERY identity
+    // axis (userAgent/platform/vendor/UA-CH/screen/viewport) is read from it so
+    // the axes cannot disagree — a split-brain (e.g. Linux platform + Windows
+    // userAgentData) is the canonical anti-bot cross-check. When absent (unit
+    // tests inject none), we fall back to the honest-first envUA persona below.
+    var __prof = (g.__CERBERUS_PROFILE__ && typeof g.__CERBERUS_PROFILE__ === "object") ? g.__CERBERUS_PROFILE__ : null;
+    var __pn = (__prof && __prof.navigator && typeof __prof.navigator === "object") ? __prof.navigator : null;
     var envUrl = (typeof env.url === "string") ? env.url : "about:blank";
     var vpW = (typeof env.width === "number") ? env.width : 0;
     var vpH = (typeof env.height === "number") ? env.height : 0;
@@ -2781,56 +2789,112 @@ pub const DOM_MODEL_PRELUDE: &str = r##"
     //     Imperva) or fingerprint scanner (pixelscan) fails on. The genuinely
     //     high-entropy reads (canvas / audio / WebGL / font-metrics) are ±1
     //     farbled per head by the separate farbling prologue, not here.
-    var navPlatform = envUA.indexOf("Windows") >= 0 ? "Win32"
-      : (envUA.indexOf("Mac OS X") >= 0 || envUA.indexOf("Macintosh") >= 0) ? "MacIntel"
-      : "Linux x86_64";
+    // Identity axes: from the coherent profile when present, else the honest-first
+    // envUA and its derived OS. Read defensively; a missing profile field falls
+    // back to the same default the no-profile path uses.
+    var navUA = (__pn && typeof __pn.userAgent === "string" && __pn.userAgent) ? __pn.userAgent : envUA;
+    var navPlatform = (__pn && typeof __pn.platform === "string" && __pn.platform) ? __pn.platform
+      : (navUA.indexOf("Windows") >= 0 ? "Win32"
+        : (navUA.indexOf("Mac OS X") >= 0 || navUA.indexOf("Macintosh") >= 0) ? "MacIntel"
+        : "Linux x86_64");
+    var navVendor = (__pn && typeof __pn.vendor === "string") ? __pn.vendor : "Google Inc.";
+    var navHwc = (__pn && typeof __pn.hardwareConcurrency === "number") ? __pn.hardwareConcurrency : 4;
+    var navLanguage = (__pn && typeof __pn.language === "string" && __pn.language) ? __pn.language : "en-US";
+    var navLanguages = (__pn && __pn.languages && typeof __pn.languages.length === "number" && __pn.languages.length)
+      ? __pn.languages : ["en-US", "en"];
+    var navMaxTouch = (__pn && typeof __pn.maxTouchPoints === "number") ? __pn.maxTouchPoints : 0;
     g.navigator = {
-      userAgent: envUA,
+      userAgent: navUA,
       appCodeName: "Mozilla",
       appName: "Netscape",
-      appVersion: envUA.indexOf("Mozilla/") === 0 ? envUA.slice(8) : envUA,
+      appVersion: navUA.indexOf("Mozilla/") === 0 ? navUA.slice(8) : navUA,
       product: "Gecko",
       productSub: "20030107",
-      vendor: "Google Inc.",
+      vendor: navVendor,
       vendorSub: "",
-      language: "en-US",
-      languages: ["en-US", "en"],
+      language: navLanguage,
+      languages: navLanguages,
       platform: navPlatform,
-      hardwareConcurrency: 4,
-      deviceMemory: 8,
-      maxTouchPoints: 0,
+      hardwareConcurrency: navHwc,
+      maxTouchPoints: navMaxTouch,
       onLine: true,
       cookieEnabled: true,
       doNotTrack: null,
       webdriver: false,
     };
+    // deviceMemory is quantized GiB on Chromium but ABSENT on Firefox. With a
+    // profile, a null value means "expose no such property" (real Firefox) — never
+    // an explicit null, which is itself a tell. Without a profile keep today's 8.
+    if (__pn) {
+      if (typeof __pn.deviceMemory === "number") { g.navigator.deviceMemory = __pn.deviceMemory; }
+    } else {
+      g.navigator.deviceMemory = 8;
+    }
 
-    // High-entropy Client Hints + device/permission APIs, fixed to the
-    // Chrome-142 / Windows-11 persona (coherent with `userAgent`). A scanner
-    // reads userAgentData.getHighEntropyValues(), mediaDevices.enumerateDevices(),
-    // permissions.query(), connection.effectiveType, getBattery(), etc.; any of
-    // these being undefined reads as a non-browser.
-    var __uaBrands = [
-      { brand: "Chromium", version: "142" },
-      { brand: "Google Chrome", version: "142" },
-      { brand: "Not_A Brand", version: "24" },
-    ];
-    var __uaFullVersionList = [
-      { brand: "Chromium", version: "142.0.0.0" },
-      { brand: "Google Chrome", version: "142.0.0.0" },
-      { brand: "Not_A Brand", version: "24.0.0.0" },
-    ];
-    var __highEntropyUA = {
-      architecture: "x86", bitness: "64",
-      brands: __uaBrands, fullVersionList: __uaFullVersionList,
-      mobile: false, model: "", platform: "Windows", platformVersion: "15.0.0",
-      uaFullVersion: "142.0.0.0", wow64: false,
-    };
-    g.navigator.userAgentData = {
-      brands: __uaBrands, mobile: false, platform: "Windows",
-      getHighEntropyValues: function () { return Promise.resolve(__highEntropyUA); },
-      toJSON: function () { return { brands: __uaBrands, mobile: false, platform: "Windows" }; },
-    };
+    // High-entropy Client Hints + device/permission APIs. With a profile, EVERY
+    // UA-CH axis is read from __prof.navigator.userAgentData so it can never
+    // disagree with userAgent/platform; a null there means the browser exposes no
+    // UA-CH at all (Firefox/Safari), so navigator.userAgentData stays undefined.
+    // Without a profile we keep the fixed Chrome-142 / Windows-11 persona. A
+    // scanner reads userAgentData.getHighEntropyValues(), mediaDevices.
+    // enumerateDevices(), permissions.query(), etc.; any being undefined reads as
+    // a non-browser.
+    if (!__pn) {
+      var __uaBrands = [
+        { brand: "Chromium", version: "142" },
+        { brand: "Google Chrome", version: "142" },
+        { brand: "Not_A Brand", version: "24" },
+      ];
+      var __uaFullVersionList = [
+        { brand: "Chromium", version: "142.0.0.0" },
+        { brand: "Google Chrome", version: "142.0.0.0" },
+        { brand: "Not_A Brand", version: "24.0.0.0" },
+      ];
+      var __highEntropyUA = {
+        architecture: "x86", bitness: "64",
+        brands: __uaBrands, fullVersionList: __uaFullVersionList,
+        mobile: false, model: "", platform: "Windows", platformVersion: "15.0.0",
+        uaFullVersion: "142.0.0.0", wow64: false,
+      };
+      g.navigator.userAgentData = {
+        brands: __uaBrands, mobile: false, platform: "Windows",
+        getHighEntropyValues: function () { return Promise.resolve(__highEntropyUA); },
+        toJSON: function () { return { brands: __uaBrands, mobile: false, platform: "Windows" }; },
+      };
+    } else if (__pn.userAgentData && typeof __pn.userAgentData === "object") {
+      // Profile with UA-CH: derive every axis from it (never the Windows const).
+      var __uad = __pn.userAgentData;
+      var __pBrands = (__uad.brands && typeof __uad.brands.length === "number") ? __uad.brands : [];
+      var __pMobile = __uad.mobile === true;
+      var __pUaPlatform = (typeof __uad.platform === "string") ? __uad.platform : "";
+      var __pArch = (typeof __uad.architecture === "string") ? __uad.architecture : "";
+      var __pBitness = (typeof __uad.bitness === "string") ? __uad.bitness : "";
+      var __pPlatVer = (typeof __uad.platformVersion === "string") ? __uad.platformVersion : "";
+      var __pFullVer = (typeof __uad.uaFullVersion === "string") ? __uad.uaFullVersion : "";
+      // fullVersionList is not carried in the prologue; synthesize it coherently
+      // from the brands + uaFullVersion. The real (non-GREASE) brands share the
+      // full version; a GREASE brand keeps its own <major>.0.0.0.
+      var __pMajor = __pFullVer ? String(__pFullVer).split(".")[0] : "";
+      var __pFvl = [];
+      for (var __bi = 0; __bi < __pBrands.length; __bi++) {
+        var __b = __pBrands[__bi];
+        var __bver = String(__b.version);
+        __pFvl.push({ brand: __b.brand, version: (__bver === __pMajor ? __pFullVer : (__bver + ".0.0.0")) });
+      }
+      var __pHigh = {
+        architecture: __pArch, bitness: __pBitness,
+        brands: __pBrands, fullVersionList: __pFvl,
+        mobile: __pMobile, model: "", platform: __pUaPlatform,
+        platformVersion: __pPlatVer, uaFullVersion: __pFullVer, wow64: false,
+      };
+      g.navigator.userAgentData = {
+        brands: __pBrands, mobile: __pMobile, platform: __pUaPlatform,
+        getHighEntropyValues: function () { return Promise.resolve(__pHigh); },
+        toJSON: function () { return { brands: __pBrands, mobile: __pMobile, platform: __pUaPlatform }; },
+      };
+    }
+    // else: profile present but UA-CH null (Firefox/Safari) — leave
+    // navigator.userAgentData absent, i.e. reads back as undefined.
     g.navigator.connection = {
       effectiveType: "4g", rtt: 50, downlink: 10, saveData: false, onchange: null,
       addEventListener: function () {}, removeEventListener: function () {},
@@ -2869,14 +2933,36 @@ pub const DOM_MODEL_PRELUDE: &str = r##"
     g.navigator.getGamepads = function () { return [null, null, null, null]; };
 
     // ---- screen + window metrics ---------------------------------------
+    // GEOMETRY MODEL: the physically-impossible layout (window taller than the
+    // monitor) is itself a bot flag, so we enforce
+    //   innerHeight <= outerHeight <= availHeight <= screen.height
+    // (and the width analogue) on BOTH paths. With a profile, `screen` is a real
+    // monitor whose avail* already reserve OS chrome and whose viewport already
+    // fits the work area; without one we fall back to the env viewport as an inert
+    // no-chrome surface (screen == viewport), which trivially satisfies the
+    // invariant.
+    var __ps = (__prof && __prof.screen && typeof __prof.screen === "object") ? __prof.screen : null;
+    var __pv = (__prof && __prof.viewport && typeof __prof.viewport === "object") ? __prof.viewport : null;
+    function __numOr(v, d) { return (typeof v === "number" && isFinite(v)) ? v : d; }
+    var innerW = __pv ? __numOr(__pv.innerWidth, vpW) : vpW;
+    var innerH = __pv ? __numOr(__pv.innerHeight, vpH) : vpH;
+    var scrW = __ps ? __numOr(__ps.width, innerW) : innerW;
+    var scrH = __ps ? __numOr(__ps.height, innerH) : innerH;
+    var availW = __ps ? __numOr(__ps.availWidth, scrW) : innerW;
+    var availH = __ps ? __numOr(__ps.availHeight, scrH) : innerH;
+    var availLeft = __ps ? __numOr(__ps.availLeft, 0) : 0;
+    var availTop = __ps ? __numOr(__ps.availTop, 0) : 0;
+    var colorDepth = __ps ? __numOr(__ps.colorDepth, 24) : 24;
+    var pixelDepth = __ps ? __numOr(__ps.pixelDepth, 24) : 24;
+    var devicePixelRatio = __ps ? __numOr(__ps.devicePixelRatio, 1) : 1;
     g.screen = {
-      width: vpW, height: vpH, availWidth: vpW, availHeight: vpH,
-      availLeft: 0, availTop: 0,
-      colorDepth: 24, pixelDepth: 24,
+      width: scrW, height: scrH, availWidth: availW, availHeight: availH,
+      availLeft: availLeft, availTop: availTop,
+      colorDepth: colorDepth, pixelDepth: pixelDepth,
       // ScreenOrientation: real browsers always expose this; anti-bot sensors
       // read screen.orientation.type/angle and throw if it is absent.
       orientation: {
-        type: (vpW >= vpH ? "landscape-primary" : "portrait-primary"),
+        type: (scrW >= scrH ? "landscape-primary" : "portrait-primary"),
         angle: 0, onchange: null,
         addEventListener: function () {}, removeEventListener: function () {},
         dispatchEvent: function () { return false; },
@@ -2884,14 +2970,17 @@ pub const DOM_MODEL_PRELUDE: &str = r##"
         unlock: function () {},
       },
     };
-    window.innerWidth = vpW;
-    window.innerHeight = vpH;
-    window.outerWidth = vpW;
+    window.innerWidth = innerW;
+    window.innerHeight = innerH;
     // The outer window is the viewport plus browser chrome (tabstrip + toolbar +
-    // omnibox, ~88px on Windows Chrome). outerHeight === innerHeight with no
-    // chrome is a headless tell; the width has no side chrome so it stays equal.
-    window.outerHeight = vpH + 88;
-    window.devicePixelRatio = 1;
+    // omnibox, ~88px on Windows Chrome). We CLAMP to the work area so the outer
+    // window can never exceed the monitor — outerHeight > screen.height is an
+    // instant headless tell. With no profile the surface has no chrome (screen ==
+    // viewport), so outer == inner; a window taller than the screen never occurs.
+    var __chromeH = __prof ? 88 : 0;
+    window.outerWidth = Math.min(innerW, availW);
+    window.outerHeight = Math.min(innerH + __chromeH, availH);
+    window.devicePixelRatio = devicePixelRatio;
     window.scrollX = 0; window.scrollY = 0;
     window.pageXOffset = 0; window.pageYOffset = 0;
     window.scrollTo = function () {}; window.scrollBy = function () {}; window.scroll = function () {};
@@ -2918,7 +3007,7 @@ pub const DOM_MODEL_PRELUDE: &str = r##"
     window.CSS = { supports: function () { return true; }, escape: function (s) { return String(s); } };
     // visualViewport mirrors the layout viewport (no pinch-zoom in this model).
     window.visualViewport = {
-      width: vpW, height: vpH, scale: 1, offsetLeft: 0, offsetTop: 0,
+      width: innerW, height: innerH, scale: 1, offsetLeft: 0, offsetTop: 0,
       pageLeft: 0, pageTop: 0, onresize: null, onscroll: null,
       addEventListener: function () {}, removeEventListener: function () {},
     };

@@ -97,7 +97,17 @@ pub fn mirror_group_from_heads(
     let members = heads
         .heads()
         .iter()
-        .map(|h| (h.instance, h.label.clone(), h.farbling.js_prologue()))
+        .map(|h| {
+            // Each mirror window gets its head's coherent persona (profile
+            // prologue) ahead of its per-head farbling noise, so the windows
+            // never correlate and each looks like one self-consistent browser.
+            let prologue = format!(
+                "{}\n{}",
+                h.profile.profile_prologue(),
+                h.farbling.js_prologue()
+            );
+            (h.instance, h.label.clone(), prologue)
+        })
         .collect();
     let engine = QuickJsEngineFactory
         .instantiate()

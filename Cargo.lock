@@ -351,6 +351,7 @@ version = "0.0.9"
 dependencies = [
  "cerberus-farbling",
  "cerberus-js",
+ "cerberus-profile",
  "cerberus-types",
 ]
 
@@ -379,6 +380,7 @@ dependencies = [
  "cerberus-farbling",
  "cerberus-js",
  "cerberus-js-quickjs",
+ "cerberus-profile",
  "cerberus-types",
 ]
 
