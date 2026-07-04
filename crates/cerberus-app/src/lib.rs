@@ -6474,6 +6474,139 @@ mod tests {
         BrowserApp::with_loader(Box::new(FakeLoader::new(responses)))
     }
 
+    /// A loader whose page responses are SEQUENCED per URL: each request to a URL
+    /// pops the next canned response, so a reload of the same URL can return a
+    /// different page (an anti-bot interstitial first, the real page after the
+    /// cookie is set). External scripts are served from `scripts`.
+    struct SeqLoader {
+        pages: RefCell<HashMap<String, VecDeque<Result<FetchedPage, String>>>>,
+        scripts: HashMap<String, Vec<u8>>,
+        queue: RefCell<VecDeque<Done>>,
+    }
+    impl SeqLoader {
+        fn new(
+            pages: Vec<(&str, Vec<Result<FetchedPage, String>>)>,
+            scripts: Vec<(&str, &str)>,
+        ) -> Self {
+            Self {
+                pages: RefCell::new(
+                    pages
+                        .into_iter()
+                        .map(|(u, rs)| (u.to_string(), rs.into_iter().collect()))
+                        .collect(),
+                ),
+                scripts: scripts
+                    .into_iter()
+                    .map(|(u, s)| (u.to_string(), s.as_bytes().to_vec()))
+                    .collect(),
+                queue: RefCell::new(VecDeque::new()),
+            }
+        }
+    }
+    impl PageLoader for SeqLoader {
+        fn request(&self, id: u64, url: String, _post: Option<PostBody>, _ctx: FetchContext) {
+            let result = self
+                .pages
+                .borrow_mut()
+                .get_mut(&url)
+                .and_then(|q| q.pop_front())
+                .unwrap_or_else(|| Err(format!("no more canned responses for {url}")));
+            self.queue.borrow_mut().push_back(Done::Page {
+                id,
+                requested_url: url,
+                result,
+            });
+        }
+        fn request_subresource(&self, url: String, _ctx: FetchContext) {
+            let bytes = self
+                .scripts
+                .get(&url)
+                .cloned()
+                .ok_or_else(|| format!("no script for {url}"));
+            self.queue.borrow_mut().push_back(Done::Sub {
+                url,
+                bytes,
+                elapsed: Duration::from_millis(0),
+            });
+        }
+        fn request_fetch(&self, id: u64, _req: FetchRequest, _ctx: FetchContext) {
+            // The sensor's XHR/fetch submission: answer 200 with an empty body.
+            self.queue.borrow_mut().push_back(Done::Fetch {
+                id,
+                result: Ok(FetchResponse {
+                    status: 200,
+                    status_text: "OK".into(),
+                    url: String::new(),
+                    headers: vec![],
+                    body: String::new(),
+                }),
+            });
+        }
+        fn try_recv(&mut self) -> Option<Done> {
+            self.queue.get_mut().pop_front()
+        }
+        fn set_waker(&mut self, _waker: Arc<dyn Waker>) {}
+    }
+
+    #[test]
+    fn reese84_handshake_cookie_gated_reload_renders_real_page() {
+        // End-to-end acceptance for the bot-challenge machinery, all hermetic:
+        // an interstitial serves an external sensor script; the sensor sets a
+        // challenge cookie via document.cookie and reloads; the reload (2nd hit
+        // to the same URL) serves the real page, which we render.
+        let interstitial = "<html><head>\
+             <script src=\"/sensor.js\"></script>\
+             </head><body><div id=\"x\">checking your browser</div></body></html>";
+        let real = "<html><body><h1 id=\"x\">Welcome to the real page</h1></body></html>";
+        let sensor = "document.cookie = 'reese84=solved; Path=/'; location.reload();";
+        let loader = SeqLoader::new(
+            vec![(
+                "https://shop.test/",
+                vec![
+                    Ok(page(
+                        "https://shop.test/",
+                        200,
+                        Some("no-store"),
+                        interstitial,
+                    )),
+                    Ok(page("https://shop.test/", 200, Some("no-store"), real)),
+                ],
+            )],
+            vec![("https://shop.test/sensor.js", sensor)],
+        );
+        let mut b = BrowserApp::with_loader(Box::new(loader));
+        b.navigate("https://shop.test/");
+        let mut guard = 0;
+        while b.poll() {
+            guard += 1;
+            assert!(guard < 40, "did not converge");
+        }
+        // The reload served the real page, and it rendered.
+        assert!(
+            b.document
+                .root()
+                .text_content()
+                .contains("Welcome to the real page"),
+            "expected the real page after the cookie-gated reload; got {:?}",
+            b.document.root().text_content()
+        );
+        // The challenge cookie was persisted into the sealed jar.
+        let instance = b.heads.active().instance;
+        let origin = Origin::new("https", "shop.test", None);
+        let cookies = b
+            .storage
+            .locked()
+            .instance(instance)
+            .cookies_for_request(&origin, &origin);
+        assert!(
+            cookies
+                .iter()
+                .any(|c| c.name == "reese84" && c.value == "solved"),
+            "reese84 cookie should be in the jar; got {:?}",
+            cookies.iter().map(|c| &c.name).collect::<Vec<_>>()
+        );
+    }
+
     fn fake_app_img(
         responses: Vec<(&str, Result<FetchedPage, String>)>,
         images: Vec<(&str, Result<Vec<u8>, String>)>,
