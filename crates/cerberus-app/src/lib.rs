@@ -5470,6 +5470,11 @@ fn paint_settings_overlay(
             style: FontStyle::REGULAR,
         });
     }
+    // A glyph's origin.y is the TOP of the text box, so a label is vertically
+    // centered in an `h`-tall row at `y + (h - px) / 2` — the same formula the
+    // toolbar buttons use. (The old `+ 16` was a baseline-style offset that left
+    // the 14px label hanging below the 22px row.)
+    let row_label_dy = (settings_cookies_rect(size).h as i32 - 14) / 2;
     // Entry point to the cookie inspector.
     let cr = settings_cookies_rect(size);
     list.push(DisplayItem::Rect {
@@ -5477,7 +5482,7 @@ fn paint_settings_overlay(
         color: Color::rgb(0xE6, 0xEE, 0xF6),
     });
     list.push(DisplayItem::Glyphs {
-        origin: Point::new(cr.x + 6, cr.y + 16),
+        origin: Point::new(cr.x + 8, cr.y + row_label_dy),
         glyphs: shaper.shape("manage cookies  >", 14),
         color: Color::rgb(0x20, 0x40, 0x70),
         style: FontStyle::REGULAR,
@@ -5489,7 +5494,7 @@ fn paint_settings_overlay(
         color: Color::rgb(0xE6, 0xEE, 0xF6),
     });
     list.push(DisplayItem::Glyphs {
-        origin: Point::new(tr.x + 6, tr.y + 16),
+        origin: Point::new(tr.x + 8, tr.y + row_label_dy),
         glyphs: shaper.shape(
             if hud_on {
                 "performance HUD: on"
@@ -5766,6 +5771,36 @@ mod tests {
         assert_eq!(outcome.third_party_decision, Decision::Deny);
         // A frame was produced at the requested size.
         assert_eq!(outcome.framebuffer.size, RenderConfig::default().viewport);
+    }
+
+    #[test]
+    fn settings_row_labels_stay_inside_their_highlight_boxes() {
+        // Regression: a glyph's origin.y is the TOP of the text, so a 14px label
+        // in an `h`-tall clickable row must sit at `(h - 14)/2`, not the old `+16`
+        // baseline-style offset that pushed it below the box. Paint the overlay
+        // and assert the strip just below each row's highlight box is blank — no
+        // label ink spilled out the bottom.
+        let size = Size::new(800, 650);
+        let mut fb = Framebuffer::new(size);
+        fb.clear(Color::WHITE);
+        let text = TextEngine::new();
+        paint_settings_overlay(&mut fb, size, &text, &text, true, 3, None, false, 1.0);
+        for row in [settings_cookies_rect(size), settings_timers_rect(size)] {
+            let below = (row.y + row.h as i32) as u32;
+            for y in below..below + 5 {
+                for x in (row.x as u32)..(row.x as u32 + row.w) {
+                    if let Some(c) = fb.pixel(x, y) {
+                        assert!(
+                            c.r > 0xC8 && c.g > 0xC8 && c.b > 0xC8,
+                            "label ink spilled below the row box at ({x},{y}): #{:02x}{:02x}{:02x}",
+                            c.r,
+                            c.g,
+                            c.b
+                        );
+                    }
+                }
+            }
+        }
     }
 
     #[test]
