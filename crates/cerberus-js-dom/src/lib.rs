@@ -1904,6 +1904,28 @@ pub const DOM_MODEL_PRELUDE: &str = r##"
       Object.defineProperty(proto, name, desc);
     }
 
+    // A real DOM node exposes the `__proto__` accessor (inherited from
+    // Object.prototype) that walks its prototype chain. Anti-tampering code
+    // reads `node.__proto__.someMethod` to grab a pristine, un-overridden DOM
+    // method off the prototype. Our node prototypes are rooted at
+    // Object.create(null), so that accessor is otherwise absent and
+    // `node.__proto__` reads as `undefined` — which crashes such code (and any
+    // fingerprint solver that relies on it). Define it on NODE_PROTO so
+    // `node.__proto__` returns the node's actual prototype (carrying the DOM
+    // methods), mirroring a real browser.
+    defAccessor(
+      NODE_PROTO,
+      "__proto__",
+      function () {
+        return Object.getPrototypeOf(this);
+      },
+      function (p) {
+        try {
+          Object.setPrototypeOf(this, p);
+        } catch (e) {}
+      }
+    );
+
     // -- common (NODE_PROTO): tree links + structural mutation --
     defAccessor(NODE_PROTO, "nodeType", function () { return this.__type; });
     defAccessor(NODE_PROTO, "parentNode", function () { return this.__parent; });

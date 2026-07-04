@@ -88,6 +88,38 @@ fn match_media_resolves_length_units() {
 }
 
 #[test]
+fn dom_node_exposes_proto_accessor_with_methods() {
+    // Anti-tampering / fingerprint code reads `node.__proto__.someMethod` to grab
+    // a pristine, un-overridden DOM method off the node's prototype. `node.__proto__`
+    // must therefore return the node's prototype (an object carrying the DOM
+    // methods), not `undefined` — otherwise `node.__proto__.insertBefore` throws.
+    let (mut engine, realm) = engine_and_realm();
+    let doc = doc_with_div_x();
+    let scripts = vec!["var x = document.getElementById('x'); \
+         x.setAttribute('proto', typeof x.__proto__); \
+         x.setAttribute('ins', typeof (document.body.__proto__ && document.body.__proto__.insertBefore)); \
+         x.setAttribute('gpo', String(Object.getPrototypeOf(x) === x.__proto__));"
+        .to_string()];
+    let out = run_page_scripts(engine.as_mut(), realm, &doc, &scripts, &env()).expect("run");
+    let x = find_id(out.root(), "x").expect("#x present");
+    assert_eq!(
+        x.attr("proto"),
+        Some("object"),
+        "node.__proto__ is an object"
+    );
+    assert_eq!(
+        x.attr("ins"),
+        Some("function"),
+        "the prototype carries insertBefore"
+    );
+    assert_eq!(
+        x.attr("gpo"),
+        Some("true"),
+        "__proto__ agrees with Object.getPrototypeOf"
+    );
+}
+
+#[test]
 fn document_collections_and_get_elements_by_name() {
     // document.forms (with named access), .images, .links (href-only), and
     // getElementsByName.
