@@ -1110,9 +1110,28 @@ impl<'a> Ctx<'a> {
         let src = src.as_str();
         let attr_w = node.attr("width").and_then(parse_dim);
         let attr_h = node.attr("height").and_then(parse_dim);
+        // CSS `width`/`height` (px, %, vw/vh) override the presentational
+        // width/height *attributes* on a replaced element; whichever is set wins,
+        // and a missing dimension is derived from the intrinsic aspect ratio by
+        // `replaced_size`. Without this, a stylesheet rule like `img{width:60px}`
+        // was ignored and every image rendered at full natural size, overflowing
+        // its intended box.
+        let cb_w = (self.right - self.left).max(1);
+        let css_w = node
+            .style
+            .width
+            .resolve_vp(cb_w, self.vw, self.vh)
+            .map(|v| v.max(0) as u32);
+        let css_h = node
+            .style
+            .height
+            .resolve_vp(cb_w, self.vw, self.vh)
+            .map(|v| v.max(0) as u32);
+        let spec_w = css_w.or(attr_w);
+        let spec_h = css_h.or(attr_h);
 
         if let Some(image) = self.images.get(src) {
-            let (mut w, mut h) = replaced_size(attr_w, attr_h, image.size);
+            let (mut w, mut h) = replaced_size(spec_w, spec_h, image.size);
             let max_w = (self.right - self.left).max(1) as u32;
             if w > max_w {
                 h = (h as f32 * max_w as f32 / w as f32).round() as u32;
@@ -1129,7 +1148,7 @@ impl<'a> Ctx<'a> {
                 pos,
             });
             self.advance_box(w, h);
-        } else if let (Some(w), Some(h)) = (attr_w, attr_h) {
+        } else if let (Some(w), Some(h)) = (spec_w, spec_h) {
             // Not decoded yet: reserve the declared box so layout doesn't reflow.
             self.place_box(w, h.max(1));
             self.display.push(DisplayItem::Rect {
@@ -4633,6 +4652,47 @@ mod tests {
                 800
             ),
             (200, 80)
+        );
+    }
+
+    #[test]
+    fn css_width_height_size_the_image() {
+        // A stylesheet rule sizes a replaced element. Regression: this was
+        // ignored, so the image rendered at its full 400×300 intrinsic size.
+        assert_eq!(
+            img_box(
+                "<style>img{width:60px;height:40px}</style><img src='p.png'>",
+                Size::new(400, 300),
+                800
+            ),
+            (60, 40)
+        );
+    }
+
+    #[test]
+    fn css_width_only_derives_height_from_ratio() {
+        // CSS width alone → height follows the intrinsic 4:3 ratio.
+        assert_eq!(
+            img_box(
+                "<style>img{width:200px}</style><img src='p.png'>",
+                Size::new(400, 300),
+                800
+            ),
+            (200, 150)
+        );
+    }
+
+    #[test]
+    fn css_width_overrides_the_presentational_size_attribute() {
+        // CSS `width` (a real property) beats the `width` attribute (a
+        // presentational hint); the untouched `height` attribute still applies.
+        assert_eq!(
+            img_box(
+                "<style>img{width:100px}</style><img src='p.png' width='200' height='150'>",
+                Size::new(400, 300),
+                800
+            ),
+            (100, 150)
         );
     }
 
