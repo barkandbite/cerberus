@@ -116,11 +116,17 @@ fn webgl_identity_is_uniform_but_readpixels_noise_is_per_head() {
     let (mut a, ra) = engine_for_seed(0xAAAA);
     let (mut b, rb) = engine_for_seed(0xBBBB);
 
-    // Vendor/renderer strings: uniform for every head (no entropy added).
+    // Vendor/renderer strings: a coherent, real Chrome-on-Windows-Intel GPU
+    // persona, uniform for every head (the identity strings carry no entropy —
+    // only the pixel surface below is per-head, so a canvas/WebGL hash cannot
+    // correlate heads while each head still looks like a real browser).
     let id_a = eval_str(a.as_mut(), ra, gl_id);
     let id_b = eval_str(b.as_mut(), rb, gl_id);
     assert_eq!(id_a, id_b);
-    assert_eq!(id_a, "Cerberus|Cerberus Software Renderer");
+    assert_eq!(
+        id_a,
+        "WebKit|ANGLE (Intel, Intel(R) UHD Graphics 630 (0x00003E9B) Direct3D11 vs_5_0 ps_5_0, D3D11)"
+    );
 
     // The pixel surface (the real entropy channel): per-head noise.
     let px_a = eval_str(a.as_mut(), ra, read_pixels);

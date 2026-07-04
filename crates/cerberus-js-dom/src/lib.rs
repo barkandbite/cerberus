@@ -1375,9 +1375,15 @@ pub fn run_page_scripts_with_fetch(
 ///
 /// # Anti-fingerprinting
 ///
-/// `navigator` is deliberately low-entropy and identical for every head (fixed
-/// generic `userAgent`, `en-US`, no plugins/`mediaDevices`/WebGL). Per-head
-/// fingerprint *farbling* is M6 (ADR-0002's farbling prologue), not here.
+/// The script-visible surface presents a **complete, coherent Chrome-142 on
+/// Windows-11 (Win64/x64)** persona: `navigator`/`window`/`document` expose the
+/// full set of APIs a real Chrome does (`userAgentData`, `mediaDevices`,
+/// `permissions`, `connection`, `performance`, `visualViewport`, plugins, …) with
+/// Chrome-on-Windows values, so a scanner or anti-bot sensor sees no missing or
+/// impossible reads. Values are **fixed** (a single validation-phase identity);
+/// per-head fingerprint *farbling* of the genuinely high-entropy reads (canvas /
+/// audio / WebGL / font metrics) is the separate farbling prologue (M6,
+/// ADR-0002), installed before this model, not here.
 pub const DOM_MODEL_PRELUDE: &str = r##"
 (function () {
   try {
@@ -2451,6 +2457,40 @@ pub const DOM_MODEL_PRELUDE: &str = r##"
       head: null,
       body: null,
       nodeType: 9,
+      // --- static document metadata (a coherent, served-as-HTML document) ---
+      // A missing/undefined read here reads as a non-browser environment to a
+      // scanner; these are the fixed values Chrome reports for a top-level
+      // UTF-8 HTML page.
+      referrer: "",
+      characterSet: "UTF-8",
+      charset: "UTF-8",
+      inputEncoding: "UTF-8",
+      compatMode: "CSS1Compat",
+      contentType: "text/html",
+      visibilityState: "visible",
+      hidden: false,
+      dir: "",
+      designMode: "off",
+      currentScript: null,
+      // Focus lives on <body> until a script focuses something; never
+      // undefined. Re-pinned to document.body at the end of install (below).
+      activeElement: null,
+      hasFocus: function () { return true; },
+    };
+    // FontFaceSet + DOMImplementation: present on every document; sensors read
+    // document.fonts.ready and implementation.createHTMLDocument.
+    document.fonts = {
+      ready: Promise.resolve(), status: "loaded", size: 0,
+      check: function () { return true; },
+      load: function () { return Promise.resolve([]); },
+      values: function () { return [][Symbol.iterator](); },
+      forEach: function () {},
+      addEventListener: function () {}, removeEventListener: function () {},
+    };
+    document.implementation = {
+      createHTMLDocument: function () { return document; },
+      createDocumentType: function () { return {}; },
+      hasFeature: function () { return true; },
     };
 
     Object.defineProperty(document, "title", {
@@ -2705,19 +2745,20 @@ pub const DOM_MODEL_PRELUDE: &str = r##"
     Object.defineProperty(document, "documentURI", { get: function () { return locationObj.href; }, enumerable: true, configurable: true });
 
     // ---- navigator -----------------------------------------------------
-    // IDENTITY MODEL (two rules):
+    // IDENTITY MODEL:
     //  1. The User-Agent is HONEST-FIRST and COHERENT. `userAgent` is whatever
     //     the network stack actually sent this origin — our real `Cerberus/0.0`
     //     by default, or, only if the site's bot management forced the fallback
     //     ladder, the SAME escalated string the request header carried. The OS
     //     in `platform` is derived from it. So the header and the script-visible
     //     identity can never disagree; a mismatch would itself be a fingerprint.
-    //  2. Every OTHER signal is UNIFORM and low-entropy for every user and head,
-    //     never reflecting the real device — denying a tracker a stable
-    //     cross-site identity at all times, regardless of the UA. We expose NO
-    //     high-entropy surface: no plugins, mediaDevices, WebGL, deviceMemory,
-    //     or Battery API. (Per-head ±1 farbling of the remaining high-entropy
-    //     reads — canvas / audio / font-metrics — is the separate active step.)
+    //  2. The rest of the surface is a COMPLETE, COHERENT Chrome-142-on-Windows
+    //     persona (fixed for the validation phase): every API a real Chrome
+    //     exposes is present with Chrome-on-Windows values, because a *missing*
+    //     or *impossible* read is itself the tell an anti-bot sensor (reese84 /
+    //     Imperva) or fingerprint scanner (pixelscan) fails on. The genuinely
+    //     high-entropy reads (canvas / audio / WebGL / font-metrics) are ±1
+    //     farbled per head by the separate farbling prologue, not here.
     var navPlatform = envUA.indexOf("Windows") >= 0 ? "Win32"
       : (envUA.indexOf("Mac OS X") >= 0 || envUA.indexOf("Macintosh") >= 0) ? "MacIntel"
       : "Linux x86_64";
@@ -2727,30 +2768,225 @@ pub const DOM_MODEL_PRELUDE: &str = r##"
       appName: "Netscape",
       appVersion: envUA.indexOf("Mozilla/") === 0 ? envUA.slice(8) : envUA,
       product: "Gecko",
-      vendor: "",
+      productSub: "20030107",
+      vendor: "Google Inc.",
+      vendorSub: "",
       language: "en-US",
       languages: ["en-US", "en"],
       platform: navPlatform,
       hardwareConcurrency: 4,
+      deviceMemory: 8,
       maxTouchPoints: 0,
       onLine: true,
       cookieEnabled: true,
+      doNotTrack: null,
       webdriver: false,
     };
+
+    // High-entropy Client Hints + device/permission APIs, fixed to the
+    // Chrome-142 / Windows-11 persona (coherent with `userAgent`). A scanner
+    // reads userAgentData.getHighEntropyValues(), mediaDevices.enumerateDevices(),
+    // permissions.query(), connection.effectiveType, getBattery(), etc.; any of
+    // these being undefined reads as a non-browser.
+    var __uaBrands = [
+      { brand: "Chromium", version: "142" },
+      { brand: "Google Chrome", version: "142" },
+      { brand: "Not_A Brand", version: "24" },
+    ];
+    var __uaFullVersionList = [
+      { brand: "Chromium", version: "142.0.0.0" },
+      { brand: "Google Chrome", version: "142.0.0.0" },
+      { brand: "Not_A Brand", version: "24.0.0.0" },
+    ];
+    var __highEntropyUA = {
+      architecture: "x86", bitness: "64",
+      brands: __uaBrands, fullVersionList: __uaFullVersionList,
+      mobile: false, model: "", platform: "Windows", platformVersion: "15.0.0",
+      uaFullVersion: "142.0.0.0", wow64: false,
+    };
+    g.navigator.userAgentData = {
+      brands: __uaBrands, mobile: false, platform: "Windows",
+      getHighEntropyValues: function () { return Promise.resolve(__highEntropyUA); },
+      toJSON: function () { return { brands: __uaBrands, mobile: false, platform: "Windows" }; },
+    };
+    g.navigator.connection = {
+      effectiveType: "4g", rtt: 50, downlink: 10, saveData: false, onchange: null,
+      addEventListener: function () {}, removeEventListener: function () {},
+    };
+    g.navigator.mediaDevices = {
+      enumerateDevices: function () {
+        return Promise.resolve([
+          { deviceId: "", kind: "audioinput", label: "", groupId: "" },
+          { deviceId: "", kind: "videoinput", label: "", groupId: "" },
+          { deviceId: "", kind: "audiooutput", label: "", groupId: "" },
+        ]);
+      },
+      getUserMedia: function () { return Promise.reject(new Error("NotAllowedError")); },
+      getDisplayMedia: function () { return Promise.reject(new Error("NotAllowedError")); },
+      ondevicechange: null, addEventListener: function () {},
+    };
+    g.navigator.permissions = {
+      query: function (o) {
+        return Promise.resolve({
+          state: (o && o.name === "notifications") ? "default" : "granted",
+          onchange: null,
+        });
+      },
+    };
+    g.navigator.getBattery = function () {
+      return Promise.resolve({
+        charging: true, chargingTime: 0, dischargingTime: Infinity, level: 1,
+        addEventListener: function () {},
+      });
+    };
+    g.navigator.sendBeacon = function () { return true; };
+    g.navigator.storage = {
+      estimate: function () { return Promise.resolve({ quota: 299977129984, usage: 0 }); },
+      persisted: function () { return Promise.resolve(false); },
+    };
+    g.navigator.getGamepads = function () { return [null, null, null, null]; };
 
     // ---- screen + window metrics ---------------------------------------
     g.screen = {
       width: vpW, height: vpH, availWidth: vpW, availHeight: vpH,
+      availLeft: 0, availTop: 0,
       colorDepth: 24, pixelDepth: 24,
+      // ScreenOrientation: real browsers always expose this; anti-bot sensors
+      // read screen.orientation.type/angle and throw if it is absent.
+      orientation: {
+        type: (vpW >= vpH ? "landscape-primary" : "portrait-primary"),
+        angle: 0, onchange: null,
+        addEventListener: function () {}, removeEventListener: function () {},
+        dispatchEvent: function () { return false; },
+        lock: function () { return Promise.reject(new Error("NotSupportedError")); },
+        unlock: function () {},
+      },
     };
     window.innerWidth = vpW;
     window.innerHeight = vpH;
     window.outerWidth = vpW;
-    window.outerHeight = vpH;
+    // The outer window is the viewport plus browser chrome (tabstrip + toolbar +
+    // omnibox, ~88px on Windows Chrome). outerHeight === innerHeight with no
+    // chrome is a headless tell; the width has no side chrome so it stays equal.
+    window.outerHeight = vpH + 88;
     window.devicePixelRatio = 1;
     window.scrollX = 0; window.scrollY = 0;
     window.pageXOffset = 0; window.pageYOffset = 0;
     window.scrollTo = function () {}; window.scrollBy = function () {}; window.scroll = function () {};
+
+    // ---- window frame identity + fingerprint surface -------------------
+    // A top-level browsing context: top/parent/frames/self all alias this
+    // window, there is no host <iframe> (frameElement null), and there are no
+    // child frames (length 0). A sensor cross-checks these; a mismatch (e.g.
+    // self !== window, or a stray frameElement) reads as an instrumented frame.
+    g.top = g; g.parent = g; g.frames = g;
+    window.frameElement = null;
+    window.length = 0;
+    window.name = "";
+    window.screenX = 0; window.screenY = 0;
+    window.screenLeft = 0; window.screenTop = 0;
+    window.postMessage = function () {};
+    window.getSelection = function () {
+      return {
+        toString: function () { return ""; }, rangeCount: 0,
+        removeAllRanges: function () {}, addRange: function () {},
+        getRangeAt: function () { return {}; },
+      };
+    };
+    window.CSS = { supports: function () { return true; }, escape: function (s) { return String(s); } };
+    // visualViewport mirrors the layout viewport (no pinch-zoom in this model).
+    window.visualViewport = {
+      width: vpW, height: vpH, scale: 1, offsetLeft: 0, offsetTop: 0,
+      pageLeft: 0, pageTop: 0, onresize: null, onscroll: null,
+      addEventListener: function () {}, removeEventListener: function () {},
+    };
+    // performance: a MONOTONIC ms clock via a closure counter (Date may be
+    // neutralized, so we never read wall-clock). now() returns strictly
+    // increasing floats; the timing/memory blocks carry plausible fixed values.
+    (function () {
+      var __perfCounter = 0;
+      window.performance = {
+        now: function () { __perfCounter += 0.1; return __perfCounter; },
+        timeOrigin: 0,
+        timing: {
+          navigationStart: 0, loadEventEnd: 0, domComplete: 0, domInteractive: 0,
+          responseEnd: 0, requestStart: 0, connectStart: 0, fetchStart: 0,
+        },
+        navigation: { type: 0, redirectCount: 0 },
+        memory: { jsHeapSizeLimit: 2172649472, totalJSHeapSize: 20000000, usedJSHeapSize: 10000000 },
+        getEntriesByType: function () { return []; },
+        getEntries: function () { return []; },
+        getEntriesByName: function () { return []; },
+        mark: function () {}, measure: function () {},
+        clearMarks: function () {}, clearMeasures: function () {},
+        setResourceTimingBufferSize: function () {},
+        toJSON: function () { return {}; },
+      };
+    })();
+    // TextEncoder / TextDecoder — real UTF-8 (QuickJS may ship none). Anti-bot
+    // payloads are encoded/decoded with these; a throwing or absent impl breaks
+    // the sensor. Guarded so a native impl (if present) wins.
+    if (typeof g.TextEncoder !== "function") {
+      g.TextEncoder = function () { this.encoding = "utf-8"; };
+      g.TextEncoder.prototype.encode = function (str) {
+        str = String(str === undefined ? "" : str);
+        var bytes = [];
+        for (var i = 0; i < str.length; i++) {
+          var c = str.charCodeAt(i);
+          if (c < 0x80) {
+            bytes.push(c);
+          } else if (c < 0x800) {
+            bytes.push(0xc0 | (c >> 6), 0x80 | (c & 0x3f));
+          } else if (c >= 0xd800 && c <= 0xdbff && i + 1 < str.length) {
+            var c2 = str.charCodeAt(i + 1);
+            if (c2 >= 0xdc00 && c2 <= 0xdfff) {
+              var cp = 0x10000 + ((c - 0xd800) << 10) + (c2 - 0xdc00);
+              bytes.push(0xf0 | (cp >> 18), 0x80 | ((cp >> 12) & 0x3f), 0x80 | ((cp >> 6) & 0x3f), 0x80 | (cp & 0x3f));
+              i++;
+            } else {
+              bytes.push(0xe0 | (c >> 12), 0x80 | ((c >> 6) & 0x3f), 0x80 | (c & 0x3f));
+            }
+          } else {
+            bytes.push(0xe0 | (c >> 12), 0x80 | ((c >> 6) & 0x3f), 0x80 | (c & 0x3f));
+          }
+        }
+        return new Uint8Array(bytes);
+      };
+      g.TextEncoder.prototype.encodeInto = function (str, dest) {
+        var enc = this.encode(str), n = Math.min(enc.length, dest.length);
+        for (var i = 0; i < n; i++) dest[i] = enc[i];
+        return { read: n, written: n };
+      };
+    }
+    if (typeof g.TextDecoder !== "function") {
+      g.TextDecoder = function (label) {
+        this.encoding = label ? String(label).toLowerCase() : "utf-8";
+        this.fatal = false; this.ignoreBOM = false;
+      };
+      g.TextDecoder.prototype.decode = function (buf) {
+        if (buf == null) return "";
+        var bytes = (buf instanceof Uint8Array) ? buf
+          : (buf && buf.buffer) ? new Uint8Array(buf.buffer) : new Uint8Array(buf);
+        var out = "", i = 0, n = bytes.length;
+        while (i < n) {
+          var b0 = bytes[i++];
+          if (b0 < 0x80) {
+            out += String.fromCharCode(b0);
+          } else if (b0 >= 0xc0 && b0 < 0xe0) {
+            var b1 = bytes[i++] & 0x3f;
+            out += String.fromCharCode(((b0 & 0x1f) << 6) | b1);
+          } else if (b0 >= 0xe0 && b0 < 0xf0) {
+            var e1 = bytes[i++] & 0x3f, e2 = bytes[i++] & 0x3f;
+            out += String.fromCharCode(((b0 & 0x0f) << 12) | (e1 << 6) | e2);
+          } else {
+            var f1 = bytes[i++] & 0x3f, f2 = bytes[i++] & 0x3f, f3 = bytes[i++] & 0x3f;
+            var dcp = (((b0 & 0x07) << 18) | (f1 << 12) | (f2 << 6) | f3) - 0x10000;
+            out += String.fromCharCode(0xd800 + (dcp >> 10), 0xdc00 + (dcp & 0x3ff));
+          }
+        }
+        return out;
+      };
+    }
 
     // ---- storage (in-memory, RUN-SCOPED) -------------------------------
     // getItem/setItem/removeItem/clear/key/length plus index access via the
@@ -2824,6 +3060,26 @@ pub const DOM_MODEL_PRELUDE: &str = r##"
       if (/r?em$/i.test(val)) return num * 16;
       return num; // px or unitless
     }
+    // Discrete (non-length) media features fixed to the Chrome-on-Windows
+    // desktop persona: a light-scheme, motion-allowing, mouse-driven machine.
+    // Returning `false` for *every* prefers-color-scheme value (the prior
+    // behavior) is an impossible state a scanner flags; exactly one value of
+    // each feature must match.
+    var __cerberusMediaFeatures = {
+      "prefers-color-scheme": "light",
+      "prefers-reduced-motion": "no-preference",
+      "prefers-reduced-transparency": "no-preference",
+      "prefers-contrast": "no-preference",
+      "forced-colors": "none",
+      "pointer": "fine",
+      "any-pointer": "fine",
+      "hover": "hover",
+      "any-hover": "hover",
+      "color-gamut": "srgb",
+      "dynamic-range": "standard",
+      "update": "fast",
+      "scripting": "enabled",
+    };
     function __cerberusEvalMedia(query, w, h) {
       return String(query).split(",").some(function (branch) {
         var re = /\(([a-z-]+)\s*:\s*([^)]+)\)/g, m, ok = true, any = false;
@@ -2835,6 +3091,9 @@ pub const DOM_MODEL_PRELUDE: &str = r##"
           else if (name === "min-height") ok = ok && h >= px;
           else if (name === "max-height") ok = ok && h <= px;
           else if (name === "orientation") ok = ok && (val === "portrait" ? h >= w : w > h);
+          else if (Object.prototype.hasOwnProperty.call(__cerberusMediaFeatures, name)) {
+            ok = ok && (val === __cerberusMediaFeatures[name]);
+          }
         }
         return any && ok;
       });
@@ -2922,6 +3181,9 @@ pub const DOM_MODEL_PRELUDE: &str = r##"
         document.head = headEl || null;
         document.body = bodyEl || null;
         document.__titleEl = titleEl || null;
+        // Focus defaults to <body> (never undefined) until a script focuses
+        // something; a real document.activeElement is body on load, not null.
+        document.activeElement = document.body || null;
       } catch (e) {
         // Install must never throw; leave document in whatever partial state.
       }
@@ -3224,6 +3486,86 @@ pub const DOM_MODEL_PRELUDE: &str = r##"
       }
       return out;
     };
+
+    // ---- Web Crypto (getRandomValues + a minimal subtle) ----------------
+    // Many real sites use crypto for ids/nonces; anti-bot sensors probe it.
+    // getRandomValues fills from a per-run counter mixed with the farbling seed
+    // if present (xorshift), so it is unpredictable within a run but needs no
+    // host entropy. NOTE: not cryptographically strong — a follow-up should back
+    // this with real OS entropy via a host binding.
+    if (!g.crypto || typeof g.crypto.getRandomValues !== "function") {
+      // Seed from the per-head farbling globals if the farbling prologue exposed
+      // them (deterministic, but distinct per head); else a fixed constant. The
+      // old g.__farbleSeed was never set, so the stream was a constant — the
+      // bug this fixes. Guard the seed away from 0 (xorshift sticks at 0).
+      var __seedHi = (typeof g.__FARBLE_HI === "number") ? (g.__FARBLE_HI >>> 0) : 0x2545F491;
+      var __seedLo = (typeof g.__FARBLE_LO === "number") ? (g.__FARBLE_LO >>> 0) : 0x9e3779b9;
+      var __cs = ((__seedHi ^ __seedLo ^ 0x9e3779b9) >>> 0) || 0x2545F491;
+      var __crypto = g.crypto || {};
+      __crypto.getRandomValues = function (a) {
+        for (var i = 0; i < a.length; i++) {
+          __cs ^= __cs << 13; __cs ^= __cs >>> 17; __cs ^= __cs << 5; __cs >>>= 0;
+          a[i] = (a.BYTES_PER_ELEMENT === 1) ? (__cs & 0xff)
+               : (a.BYTES_PER_ELEMENT === 2) ? (__cs & 0xffff) : (__cs >>> 0);
+        }
+        return a;
+      };
+      __crypto.randomUUID = function () {
+        var b = new Uint8Array(16); __crypto.getRandomValues(b);
+        b[6] = (b[6] & 0x0f) | 0x40; b[8] = (b[8] & 0x3f) | 0x80;
+        var h = ""; for (var i = 0; i < 16; i++) h += (b[i] + 0x100).toString(16).slice(1);
+        return h.slice(0, 8) + "-" + h.slice(8, 12) + "-" + h.slice(12, 16) + "-" + h.slice(16, 20) + "-" + h.slice(20);
+      };
+      if (!__crypto.subtle) __crypto.subtle = { digest: function () { return Promise.resolve(new ArrayBuffer(32)); } };
+      g.crypto = __crypto;
+    }
+
+    // ---- Intl (minimal DateTimeFormat/NumberFormat) ---------------------
+    // QuickJS ships no Intl; sites and sensors read the resolved timezone/locale.
+    if (typeof g.Intl === "undefined") {
+      var __tz = "America/New_York", __loc = "en-US";
+      g.Intl = {
+        DateTimeFormat: function () { return { resolvedOptions: function () {
+          return { timeZone: __tz, locale: __loc, calendar: "gregory", numberingSystem: "latn" }; },
+          format: function () { return ""; }, formatToParts: function () { return []; } }; },
+        NumberFormat: function () { return { resolvedOptions: function () {
+          return { locale: __loc, numberingSystem: "latn" }; }, format: function (x) { return String(x); } }; },
+        Collator: function () { return { resolvedOptions: function () { return { locale: __loc }; },
+          compare: function (a, b) { return a < b ? -1 : a > b ? 1 : 0; } }; },
+      };
+    }
+
+    // ---- navigator.plugins / mimeTypes (Chrome's built-in PDF set) -------
+    // Empty plugins reads as headless; real Chrome exposes 5 PDF plugin entries.
+    (function () {
+      function plugin(name) {
+        var p = { name: name, filename: "internal-pdf-viewer", description: "Portable Document Format", length: 1 };
+        p[0] = { type: "application/pdf", suffixes: "pdf", description: "", enabledPlugin: p };
+        p.item = function () { return p[0]; }; p.namedItem = function () { return p[0]; };
+        return p;
+      }
+      var list = [plugin("PDF Viewer"), plugin("Chrome PDF Viewer"), plugin("Chromium PDF Viewer"),
+                  plugin("Microsoft Edge PDF Viewer"), plugin("WebKit built-in PDF")];
+      list.item = function (i) { return list[i] || null; };
+      list.namedItem = function (nm) { for (var i = 0; i < list.length; i++) if (list[i].name === nm) return list[i]; return null; };
+      list.refresh = function () {};
+      var mimes = { length: 2, item: function (i) { return mimes[i] || null; }, namedItem: function () { return null; },
+        0: { type: "application/pdf", suffixes: "pdf", description: "", enabledPlugin: list[0] },
+        1: { type: "text/pdf", suffixes: "pdf", description: "", enabledPlugin: list[0] } };
+      try { Object.defineProperty(navigator, "plugins", { value: list, configurable: true }); } catch (e) {}
+      try { Object.defineProperty(navigator, "mimeTypes", { value: mimes, configurable: true }); } catch (e) {}
+      try { Object.defineProperty(navigator, "pdfViewerEnabled", { value: true, configurable: true }); } catch (e) {}
+    })();
+
+    // ---- window.chrome (present on every real Chrome) --------------------
+    if (!g.chrome) {
+      g.chrome = {
+        app: { isInstalled: false, InstallState: { DISABLED: "disabled", INSTALLED: "installed", NOT_INSTALLED: "not_installed" }, RunningState: { CANNOT_RUN: "cannot_run", READY_TO_RUN: "ready_to_run", RUNNING: "running" } },
+        runtime: { connect: function () {}, sendMessage: function () {}, onMessage: { addListener: function () {} } },
+        csi: function () { return { startE: 0, onloadT: 0, pageT: 0, tran: 15 }; },
+        loadTimes: function () { return { requestTime: 0, startLoadTime: 0, commitLoadTime: 0, finishDocumentLoadTime: 0, finishLoadTime: 0, firstPaintTime: 0, firstPaintAfterLoadTime: 0, navigationType: "Other", wasFetchedViaSpdy: true, wasNpnNegotiated: true, npnNegotiatedProtocol: "h2", wasAlternateProtocolAvailable: false, connectionInfo: "h2" }; },
+      };
+    }
 
     // FormData: collect a form's control values, the standard companion to
     // `fetch(url, { method: 'POST', body: new FormData(form) })`. `new
