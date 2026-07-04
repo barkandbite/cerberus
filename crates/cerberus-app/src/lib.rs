@@ -3005,6 +3005,18 @@ impl BrowserApp {
                 continue;
             }
             req.url = abs;
+            if std::env::var("CERBERUS_TRACE").is_ok() {
+                eprintln!(
+                    "[trace] JS fetch dispatched: {} {} (body {} bytes)",
+                    req.method,
+                    req.url,
+                    req.body.len()
+                );
+                eprintln!(
+                    "[trace]   body: {}",
+                    req.body.chars().take(260).collect::<String>()
+                );
+            }
             let ctx = FetchContext {
                 instance,
                 kind: FetchKind::Subresource {
@@ -3127,6 +3139,12 @@ impl BrowserApp {
         let Some(nav) = navs.into_iter().next_back() else {
             return;
         };
+        if std::env::var("CERBERUS_TRACE").is_ok() {
+            eprintln!(
+                "[trace] script navigation requested: {} (replace={})",
+                nav.url, nav.replace
+            );
+        }
         // Resolve against the current document URL — the target may be relative
         // (`location.href = '/home'`). Fall back to the raw string if there is no
         // base or it doesn't parse (begin_load re-parses and reports errors).
@@ -3289,6 +3307,9 @@ impl BrowserApp {
             if self.gate_subresource(&abs, &first_party) != Decision::Allow {
                 continue;
             }
+            if std::env::var("CERBERUS_TRACE").is_ok() {
+                eprintln!("[trace] queuing external script fetch: {abs}");
+            }
             self.pending_scripts.insert(abs.clone());
             self.loader.request_subresource(
                 abs,
@@ -3305,13 +3326,23 @@ impl BrowserApp {
     /// external sensor typically XHRs a payload and later reloads). A failed fetch
     /// or bridge error simply runs nothing — the page still stands.
     fn handle_script(&mut self, url: String, bytes: Result<Vec<u8>, String>) -> bool {
+        let trace = std::env::var("CERBERUS_TRACE").is_ok();
         if !self.pending_scripts.remove(&url) {
             return false;
         }
         let Ok(bytes) = bytes else {
+            if trace {
+                eprintln!("[trace] external script FETCH FAILED: {url}");
+            }
             return false;
         };
         let body = String::from_utf8_lossy(&bytes).into_owned();
+        if trace {
+            eprintln!(
+                "[trace] external script fetched: {url} ({} bytes)",
+                body.len()
+            );
+        }
         let realm = RealmId(self.heads.active().id.0);
         {
             let Ok(engine) = self.heads.engine() else {
@@ -3319,7 +3350,11 @@ impl BrowserApp {
             };
             // Run against the already-installed realm; swallow a script throw the
             // same way inline execution does (the page must survive a bad script).
-            let _ = cerberus_js_dom::run_scripts(engine, realm, &[body]);
+            match cerberus_js_dom::run_scripts(engine, realm, &[body]) {
+                Ok(_) if trace => eprintln!("[trace]   script ran OK: {url}"),
+                Err(e) if trace => eprintln!("[trace]   script ERROR: {url}: {e:?}"),
+                _ => {}
+            }
             let _ = run_event_loop(engine, realm, EventLoopBudget::default());
         }
         // The script may have set document.cookie, mutated the DOM, or queued a
@@ -6596,7 +6631,12 @@ mod tests {
         // loads a page through the worker loop and settles.
         let mut b = fake_app(vec![(
             "https://site.test/",
-            Ok(page("https://site.test/", 200, None, "<p>hello headless</p>")),
+            Ok(page(
+                "https://site.test/",
+                200,
+                None,
+                "<p>hello headless</p>",
+            )),
         )]);
         b.open("https://site.test/");
         let mut guard = 0;

@@ -102,9 +102,12 @@ impl FarblingProvider for SeededFarbling {
 ///   stable for one head, divergent across heads, so a canvas hash cannot
 ///   correlate identities. `toDataURL` emits a *real* PNG (stored-block
 ///   deflate + CRC/Adler in JS) so format sniffers pass.
-/// - **WebGL**: `VENDOR`/`RENDERER` answer a uniform "Cerberus" for every
-///   head (uniformity beats inventing fake GPUs); `readPixels` — the actual
-///   entropy surface — returns per-head seeded noise.
+/// - **WebGL**: identity strings (`VENDOR`/`RENDERER`/`VERSION`, unmasked
+///   vendor/renderer, limits, extensions) report one fixed, coherent
+///   Chrome-142-on-Windows-11 Intel/ANGLE/D3D11 persona — the same for every
+///   head, so the GPU identity looks like a real browser rather than an obvious
+///   "Cerberus" tell. `readPixels` — the actual entropy surface — still returns
+///   per-head seeded noise, so heads don't correlate on the pixel hash.
 /// - **audio**: analyser/offline-render readbacks return near-silence with
 ///   per-head noise in the low bits, deterministic per head.
 /// - **font metrics**: `measureText` widths get a bounded (≤2%) per-(head,
@@ -235,33 +238,82 @@ const FARBLING_SHIMS: &str = r##"
     };
     el.__cerb2d=ctx;return ctx;
   }
-  function __makeWebGL(el){
-    if(el.__cerbGL)return el.__cerbGL;
+  function __makeWebGL(el,isV2){
+    var cacheKey=isV2?"__cerbGL2":"__cerbGL";
+    if(el[cacheKey])return el[cacheKey];
     var wh=__dims(el);
     var gl={canvas:el,drawingBufferWidth:wh[0],drawingBufferHeight:wh[1],
+      // ---- GL enum constants, so gl.getParameter(gl.VENDOR) resolves (a bare
+      // gl.VENDOR would be undefined → getParameter(undefined) → default 0). ----
+      VENDOR:0x1F00,RENDERER:0x1F01,VERSION:0x1F02,SHADING_LANGUAGE_VERSION:0x8B8C,
+      UNMASKED_VENDOR_WEBGL:0x9245,UNMASKED_RENDERER_WEBGL:0x9246,
+      MAX_TEXTURE_SIZE:0x0D33,MAX_CUBE_MAP_TEXTURE_SIZE:0x851C,MAX_RENDERBUFFER_SIZE:0x84E8,
+      MAX_VIEWPORT_DIMS:0x0D3A,MAX_VERTEX_ATTRIBS:0x8869,MAX_VERTEX_UNIFORM_VECTORS:0x8DFB,
+      MAX_VARYING_VECTORS:0x8DFC,MAX_COMBINED_TEXTURE_IMAGE_UNITS:0x8B4D,
+      MAX_VERTEX_TEXTURE_IMAGE_UNITS:0x8B4C,MAX_TEXTURE_IMAGE_UNITS:0x8872,
+      MAX_FRAGMENT_UNIFORM_VECTORS:0x8DFD,ALIASED_LINE_WIDTH_RANGE:0x846E,
+      ALIASED_POINT_SIZE_RANGE:0x846D,MAX_TEXTURE_MAX_ANISOTROPY_EXT:0x84FF,
+      RED_BITS:0x0D52,GREEN_BITS:0x0D53,BLUE_BITS:0x0D54,ALPHA_BITS:0x0D55,
+      DEPTH_BITS:0x0D56,STENCIL_BITS:0x0D57,SAMPLES:0x80A9,SAMPLE_BUFFERS:0x80A8,
+      ARRAY_BUFFER:0x8892,ELEMENT_ARRAY_BUFFER:0x8893,STATIC_DRAW:0x88E4,
+      FLOAT:0x1406,TRIANGLES:0x0004,COLOR_BUFFER_BIT:0x4000,DEPTH_BUFFER_BIT:0x0100,
+      VERTEX_SHADER:0x8B31,FRAGMENT_SHADER:0x8B30,COMPILE_STATUS:0x8B81,LINK_STATUS:0x8B82,
+      HIGH_FLOAT:0x8DF2,MEDIUM_FLOAT:0x8DF1,LOW_FLOAT:0x8DF0,
+      HIGH_INT:0x8DF5,MEDIUM_INT:0x8DF4,LOW_INT:0x8DF3,
       getParameter:function(p){
         switch(p|0){
-          case 0x1F00: return "Cerberus";
-          case 0x1F01: return "Cerberus Software Renderer";
-          case 0x1F02: return "WebGL 1.0 (Cerberus)";
-          case 0x8B8C: return "WebGL GLSL ES 1.0 (Cerberus)";
-          case 0x9245: return "Cerberus";
-          case 0x9246: return "Cerberus Software Renderer";
-          case 0x0D33: case 0x851C: case 0x8869: case 0x8DFB: return 4096;
+          // Coherent Chrome-142-on-Windows-11 Intel/ANGLE/D3D11 persona (fixed).
+          case 0x1F00: return "WebKit";
+          case 0x1F01: return "WebKit WebGL";
+          case 0x1F02: return isV2?"WebGL 2.0 (OpenGL ES 3.0 Chromium)":"WebGL 1.0 (OpenGL ES 2.0 Chromium)";
+          case 0x8B8C: return isV2?"WebGL GLSL ES 3.00 (OpenGL ES GLSL ES 3.0 Chromium)":"WebGL GLSL ES 1.0 (OpenGL ES GLSL ES 1.0 Chromium)";
+          case 0x9245: return "Google Inc. (Intel)";
+          case 0x9246: return "ANGLE (Intel, Intel(R) UHD Graphics 630 (0x00003E9B) Direct3D11 vs_5_0 ps_5_0, D3D11)";
+          case 0x0D33: return 16384; // MAX_TEXTURE_SIZE
+          case 0x851C: return 16384; // MAX_CUBE_MAP_TEXTURE_SIZE
+          case 0x84E8: return 16384; // MAX_RENDERBUFFER_SIZE
+          case 0x0D3A: return new Int32Array([32767,32767]); // MAX_VIEWPORT_DIMS
+          case 0x8869: return 16;    // MAX_VERTEX_ATTRIBS
+          case 0x8DFB: return 4096;  // MAX_VERTEX_UNIFORM_VECTORS
+          case 0x8DFC: return 30;    // MAX_VARYING_VECTORS
+          case 0x8B4D: return 32;    // MAX_COMBINED_TEXTURE_IMAGE_UNITS
+          case 0x8B4C: return 16;    // MAX_VERTEX_TEXTURE_IMAGE_UNITS
+          case 0x8872: return 16;    // MAX_TEXTURE_IMAGE_UNITS
+          case 0x8DFD: return 1024;  // MAX_FRAGMENT_UNIFORM_VECTORS
+          case 0x846E: return new Float32Array([1,1]);    // ALIASED_LINE_WIDTH_RANGE
+          case 0x846D: return new Float32Array([1,1024]); // ALIASED_POINT_SIZE_RANGE
+          case 0x84FF: return 16;    // MAX_TEXTURE_MAX_ANISOTROPY_EXT
+          case 0x0D52: return 8;     // RED_BITS
+          case 0x0D53: return 8;     // GREEN_BITS
+          case 0x0D54: return 8;     // BLUE_BITS
+          case 0x0D55: return 8;     // ALPHA_BITS
+          case 0x0D56: return 24;    // DEPTH_BITS
+          case 0x0D57: return 0;     // STENCIL_BITS
+          case 0x80A9: return 0;     // SAMPLES
+          case 0x80A8: return 0;     // SAMPLE_BUFFERS
           default: return 0;
         }
       },
-      getSupportedExtensions:function(){return ["OES_texture_float","OES_element_index_uint"];},
+      getSupportedExtensions:function(){return ["ANGLE_instanced_arrays","EXT_blend_minmax","EXT_color_buffer_half_float","EXT_disjoint_timer_query","EXT_float_blend","EXT_frag_depth","EXT_shader_texture_lod","EXT_texture_compression_bptc","EXT_texture_compression_rgtc","EXT_texture_filter_anisotropic","EXT_sRGB","OES_element_index_uint","OES_fbo_render_mipmap","OES_standard_derivatives","OES_texture_float","OES_texture_float_linear","OES_texture_half_float","OES_texture_half_float_linear","OES_vertex_array_object","WEBGL_color_buffer_float","WEBGL_compressed_texture_s3tc","WEBGL_compressed_texture_s3tc_srgb","WEBGL_debug_renderer_info","WEBGL_debug_shaders","WEBGL_depth_texture","WEBGL_draw_buffers","WEBGL_lose_context","WEBGL_multi_draw"];},
       getExtension:function(name){
         if(name==="WEBGL_debug_renderer_info")return {UNMASKED_VENDOR_WEBGL:0x9245,UNMASKED_RENDERER_WEBGL:0x9246};
+        if(name==="EXT_texture_filter_anisotropic")return {MAX_TEXTURE_MAX_ANISOTROPY_EXT:0x84FF,TEXTURE_MAX_ANISOTROPY_EXT:0x84FE};
+        if(name==="OES_vertex_array_object")return {createVertexArrayOES:function(){return {};},bindVertexArrayOES:function(){},deleteVertexArrayOES:function(){},VERTEX_ARRAY_BINDING_OES:0x85B5};
+        if(name==="ANGLE_instanced_arrays")return {drawArraysInstancedANGLE:function(){},drawElementsInstancedANGLE:function(){},vertexAttribDivisorANGLE:function(){},VERTEX_ATTRIB_ARRAY_DIVISOR_ANGLE:0x88FE};
+        if(name==="WEBGL_lose_context")return {loseContext:function(){},restoreContext:function(){}};
         return null;
       },
       readPixels:function(x,y,w,h,fmt,type,out){
         if(out&&out.length){var r=__rng(3,"rp|"+x+","+y+","+w+"x"+h);
           for(var i=0;i<out.length;i++)out[i]=r()&255;}
       },
-      getContextAttributes:function(){return {alpha:true,antialias:true,depth:true};},
-      getShaderPrecisionFormat:function(){return {rangeMin:127,rangeMax:127,precision:23};},
+      getContextAttributes:function(){return {alpha:true,antialias:true,depth:true,desynchronized:false,failIfMajorPerformanceCaveat:false,powerPreference:"default",premultipliedAlpha:true,preserveDrawingBuffer:false,stencil:false,xrCompatible:false};},
+      getShaderPrecisionFormat:function(shaderType,precisionType){
+        var pt=precisionType|0;
+        // Integer precisions report a different profile from floats.
+        if(pt===0x8DF5||pt===0x8DF4||pt===0x8DF3)return {rangeMin:31,rangeMax:30,precision:0};
+        return {rangeMin:127,rangeMax:127,precision:23};
+      },
       createShader:function(){return {};},createProgram:function(){return {};},
       shaderSource:function(){},compileShader:function(){},attachShader:function(){},
       linkProgram:function(){},useProgram:function(){},deleteShader:function(){},
@@ -272,7 +324,7 @@ const FARBLING_SHIMS: &str = r##"
       clearColor:function(){},viewport:function(){},enable:function(){},disable:function(){},
       getError:function(){return 0;},finish:function(){},flush:function(){}
     };
-    el.__cerbGL=gl;return gl;
+    el[cacheKey]=gl;return gl;
   }
   function __attachCanvas(el){
     if(el.__cerbCanvas)return el;
@@ -281,7 +333,8 @@ const FARBLING_SHIMS: &str = r##"
     if(el.height===undefined)el.height=150;
     el.getContext=function(kind){
       kind=String(kind||"2d").toLowerCase();
-      if(kind.indexOf("webgl")===0||kind==="experimental-webgl")return __makeWebGL(el);
+      if(kind==="webgl2"||kind==="experimental-webgl2")return __makeWebGL(el,true);
+      if(kind.indexOf("webgl")===0||kind==="experimental-webgl")return __makeWebGL(el,false);
       if(kind==="2d")return __make2D(el);
       return null;
     };
@@ -411,5 +464,60 @@ mod tests {
             .count();
         // Distinct seeds must diverge across the surface (not be near-identical).
         assert!(differing > 256, "only {differing}/1024 samples differed");
+    }
+
+    #[test]
+    fn webgl_reports_coherent_chrome_intel_persona() {
+        // Identity strings must be a single, fixed, real Chrome-on-Windows-Intel
+        // persona — no "Cerberus" GPU tell that scanners flag instantly.
+        assert!(FARBLING_SHIMS.contains(r#"case 0x1F00: return "WebKit";"#));
+        assert!(FARBLING_SHIMS.contains(r#"case 0x1F01: return "WebKit WebGL";"#));
+        assert!(FARBLING_SHIMS.contains(r#"case 0x9245: return "Google Inc. (Intel)";"#));
+        assert!(FARBLING_SHIMS.contains(
+            "ANGLE (Intel, Intel(R) UHD Graphics 630 (0x00003E9B) Direct3D11 vs_5_0 ps_5_0, D3D11)"
+        ));
+        // WebGL1 and WebGL2 VERSION / GLSL strings.
+        assert!(FARBLING_SHIMS.contains("WebGL 1.0 (OpenGL ES 2.0 Chromium)"));
+        assert!(FARBLING_SHIMS.contains("WebGL 2.0 (OpenGL ES 3.0 Chromium)"));
+        assert!(FARBLING_SHIMS.contains("WebGL GLSL ES 1.0 (OpenGL ES GLSL ES 1.0 Chromium)"));
+        assert!(FARBLING_SHIMS.contains("WebGL GLSL ES 3.00 (OpenGL ES GLSL ES 3.0 Chromium)"));
+
+        // The old "Cerberus" GPU tells must be gone from the WebGL identity.
+        assert!(!FARBLING_SHIMS.contains("Software Renderer"));
+        assert!(!FARBLING_SHIMS.contains("(Cerberus)"));
+
+        // Real numeric getParameter values (not the old all-zero / 4096 stubs).
+        assert!(FARBLING_SHIMS.contains("case 0x0D33: return 16384;")); // MAX_TEXTURE_SIZE
+        assert!(FARBLING_SHIMS.contains("case 0x8869: return 16;")); // MAX_VERTEX_ATTRIBS
+        assert!(FARBLING_SHIMS.contains("case 0x8DFC: return 30;")); // MAX_VARYING_VECTORS
+        assert!(FARBLING_SHIMS.contains("new Int32Array([32767,32767])")); // MAX_VIEWPORT_DIMS
+
+        // GL enum constants exposed on the object so gl.getParameter(gl.VENDOR) resolves.
+        assert!(FARBLING_SHIMS.contains("VENDOR:0x1F00"));
+        assert!(FARBLING_SHIMS.contains("UNMASKED_RENDERER_WEBGL:0x9246"));
+    }
+
+    #[test]
+    fn webgl_readpixels_noise_stays_per_head() {
+        // The identity strings are now fixed/coherent, but the readPixels entropy
+        // surface must still diverge across heads (readPixels uses the
+        // WebglReadPixels channel). Two distinct seeds must not correlate.
+        let a = SeededFarbling::new(1);
+        let b = SeededFarbling::new(2);
+        let differing = (0..1024u64)
+            .filter(|&i| {
+                a.perturb(Channel::WebglReadPixels, i, 128)
+                    != b.perturb(Channel::WebglReadPixels, i, 128)
+            })
+            .count();
+        assert!(
+            differing > 256,
+            "only {differing}/1024 readPixels samples differed"
+        );
+
+        // The per-head seed is threaded into the JS shim, so two heads install
+        // distinct prologues (distinct __FARBLE_HI/__FARBLE_LO) despite sharing
+        // the identical fixed GPU identity strings.
+        assert_ne!(a.js_prologue(), b.js_prologue());
     }
 }

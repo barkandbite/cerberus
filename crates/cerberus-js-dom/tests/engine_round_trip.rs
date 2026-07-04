@@ -1467,11 +1467,12 @@ fn location_is_parsed_from_env() {
 }
 
 #[test]
-fn navigator_is_coherent_with_the_request_ua_and_locks_high_entropy() {
+fn navigator_is_a_coherent_chrome_on_windows_persona() {
     // navigator.userAgent is EXACTLY the UA the network stack presented (so the
     // request header and the script-visible identity can't disagree),
-    // navigator.platform is derived from it, language is uniform en-US, and
-    // every high-entropy surface is absent.
+    // navigator.platform is derived from it, and the rest of the surface is a
+    // COMPLETE, COHERENT Chrome-on-Windows persona: every API a real Chrome
+    // exposes is present (an *absent* read is the tell a sensor fails on).
     let (mut engine, realm) = engine_and_realm();
     let doc = doc_with_div_x();
     let scripts = vec!["var x = document.getElementById('x'); \
@@ -1479,11 +1480,16 @@ fn navigator_is_coherent_with_the_request_ua_and_locks_high_entropy() {
          x.setAttribute('data-platform', String(navigator.platform)); \
          x.setAttribute('data-lang', String(navigator.language)); \
          x.setAttribute('data-hw', String(navigator.hardwareConcurrency)); \
-         x.setAttribute('data-plugins', String(typeof navigator.plugins)); \
+         x.setAttribute('data-vendor', String(navigator.vendor)); \
+         x.setAttribute('data-psub', String(navigator.productSub)); \
+         x.setAttribute('data-mem', String(navigator.deviceMemory)); \
+         x.setAttribute('data-dnt', String(navigator.doNotTrack)); \
+         x.setAttribute('data-plugins', String(typeof navigator.plugins) + ':' + navigator.plugins.length); \
          x.setAttribute('data-media', String(typeof navigator.mediaDevices)); \
-         x.setAttribute('data-webgl', String(typeof navigator.webgl)); \
-         x.setAttribute('data-mem', String(typeof navigator.deviceMemory)); \
          x.setAttribute('data-batt', String(typeof navigator.getBattery)); \
+         x.setAttribute('data-perm', String(typeof navigator.permissions.query)); \
+         x.setAttribute('data-uad', String(navigator.userAgentData.platform) + ':' + navigator.userAgentData.mobile); \
+         x.setAttribute('data-conn', String(navigator.connection.effectiveType)); \
          x.setAttribute('data-wd', String(navigator.webdriver));"
         .to_string()];
 
@@ -1496,12 +1502,17 @@ fn navigator_is_coherent_with_the_request_ua_and_locks_high_entropy() {
     assert_eq!(x.attr("data-platform"), Some("Win32"));
     assert_eq!(x.attr("data-lang"), Some("en-US"));
     assert_eq!(x.attr("data-hw"), Some("4"));
-    // Surface lock: no high-entropy fingerprinting APIs are exposed.
-    assert_eq!(x.attr("data-plugins"), Some("undefined"));
-    assert_eq!(x.attr("data-media"), Some("undefined"));
-    assert_eq!(x.attr("data-webgl"), Some("undefined"));
-    assert_eq!(x.attr("data-mem"), Some("undefined"));
-    assert_eq!(x.attr("data-batt"), Some("undefined"));
+    // Complete, coherent Chrome-on-Windows surface.
+    assert_eq!(x.attr("data-vendor"), Some("Google Inc."));
+    assert_eq!(x.attr("data-psub"), Some("20030107"));
+    assert_eq!(x.attr("data-mem"), Some("8"));
+    assert_eq!(x.attr("data-dnt"), Some("null"));
+    assert_eq!(x.attr("data-plugins"), Some("object:5"));
+    assert_eq!(x.attr("data-media"), Some("object"));
+    assert_eq!(x.attr("data-batt"), Some("function"));
+    assert_eq!(x.attr("data-perm"), Some("function"));
+    assert_eq!(x.attr("data-uad"), Some("Windows:false"));
+    assert_eq!(x.attr("data-conn"), Some("4g"));
     // webdriver is present-and-false, so its absence isn't itself a tell.
     assert_eq!(x.attr("data-wd"), Some("false"));
 }
@@ -1612,6 +1623,172 @@ fn window_metrics_come_from_viewport() {
     let out = run_page_scripts(engine.as_mut(), realm, &doc, &scripts, &env()).expect("run");
     let x = find_id(out.root(), "x").expect("#x present");
     assert_eq!(x.text_content(), "1280x800|1280x800");
+}
+
+#[test]
+fn window_and_document_fingerprint_surface_is_complete() {
+    // The window + document expose the full Chrome-on-Windows surface a scanner
+    // reads: frame identity (top/parent/self all this window, no frameElement),
+    // window chrome (outerHeight > innerHeight), visualViewport, a monotonic
+    // performance clock, CSS/getSelection, and the document's static metadata
+    // (characterSet/compatMode/contentType/visibilityState) plus fonts,
+    // implementation, and an activeElement that defaults to <body>.
+    let (mut engine, realm) = engine_and_realm();
+    let doc = doc_with_div_x();
+    let scripts = vec!["var x = document.getElementById('x'); \
+         x.setAttribute('w-top', String(window.top === window && window.parent === window && window.self === window && window.frames === window)); \
+         x.setAttribute('w-frame', String(window.frameElement) + ':' + String(window.length) + ':' + String(window.name)); \
+         x.setAttribute('w-outer', String(window.outerHeight - window.innerHeight) + ':' + String(window.outerWidth - window.innerWidth)); \
+         x.setAttribute('w-vv', String(window.visualViewport.width) + 'x' + String(window.visualViewport.height) + '@' + String(window.visualViewport.scale)); \
+         x.setAttribute('w-perf', String(window.performance.now() < window.performance.now()) + ':' + String(window.performance.memory.jsHeapSizeLimit)); \
+         x.setAttribute('w-css', String(window.CSS.supports('display','flex')) + ':' + window.CSS.escape('a b')); \
+         x.setAttribute('w-sel', String(window.getSelection().rangeCount)); \
+         x.setAttribute('w-screenx', String(window.screenX) + ':' + String(window.screenLeft)); \
+         x.setAttribute('d-ref', 'r=' + String(document.referrer)); \
+         x.setAttribute('d-cs', document.characterSet + ':' + document.charset + ':' + document.inputEncoding); \
+         x.setAttribute('d-mode', document.compatMode + ':' + document.contentType); \
+         x.setAttribute('d-vis', document.visibilityState + ':' + String(document.hidden) + ':' + String(document.hasFocus())); \
+         x.setAttribute('d-fonts', String(typeof document.fonts) + ':' + String(document.fonts.check('12px monospace'))); \
+         x.setAttribute('d-impl', String(typeof document.implementation.createHTMLDocument)); \
+         x.setAttribute('d-active', String(document.activeElement === document.body));"
+        .to_string()];
+
+    let out = run_page_scripts(engine.as_mut(), realm, &doc, &scripts, &env()).expect("run");
+    let x = find_id(out.root(), "x").expect("#x present");
+    assert_eq!(
+        x.attr("w-top"),
+        Some("true"),
+        "top/parent/self/frames alias this window"
+    );
+    assert_eq!(
+        x.attr("w-frame"),
+        Some("null:0:"),
+        "no host frame, no child frames, no name"
+    );
+    // Chrome adds ~88px of vertical chrome; width has no side chrome.
+    assert_eq!(x.attr("w-outer"), Some("88:0"));
+    assert_eq!(x.attr("w-vv"), Some("1280x800@1"));
+    assert_eq!(
+        x.attr("w-perf"),
+        Some("true:2172649472"),
+        "performance.now() is monotonic"
+    );
+    assert_eq!(x.attr("w-css"), Some("true:a b"));
+    assert_eq!(x.attr("w-sel"), Some("0"));
+    assert_eq!(x.attr("w-screenx"), Some("0:0"));
+    assert_eq!(
+        x.attr("d-ref"),
+        Some("r="),
+        "referrer present and empty (not undefined)"
+    );
+    assert_eq!(x.attr("d-cs"), Some("UTF-8:UTF-8:UTF-8"));
+    assert_eq!(x.attr("d-mode"), Some("CSS1Compat:text/html"));
+    assert_eq!(x.attr("d-vis"), Some("visible:false:true"));
+    assert_eq!(x.attr("d-fonts"), Some("object:true"));
+    assert_eq!(x.attr("d-impl"), Some("function"));
+    assert_eq!(
+        x.attr("d-active"),
+        Some("true"),
+        "activeElement defaults to <body>"
+    );
+}
+
+#[test]
+fn matchmedia_reports_a_coherent_desktop_persona() {
+    // A light-scheme, motion-allowing, mouse-driven Windows desktop: exactly one
+    // value of each discrete feature matches. The prior all-false behavior was an
+    // impossible prefers-color-scheme state a scanner flags.
+    let (mut engine, realm) = engine_and_realm();
+    let doc = doc_with_div_x();
+    let scripts = vec!["var x = document.getElementById('x'); \
+         function mm(q) { return String(window.matchMedia(q).matches); } \
+         x.setAttribute('scheme', mm('(prefers-color-scheme: light)') + ':' + mm('(prefers-color-scheme: dark)')); \
+         x.setAttribute('motion', mm('(prefers-reduced-motion: no-preference)') + ':' + mm('(prefers-reduced-motion: reduce)')); \
+         x.setAttribute('pointer', mm('(pointer: fine)') + ':' + mm('(pointer: coarse)')); \
+         x.setAttribute('hover', mm('(hover: hover)') + ':' + mm('(any-pointer: fine)')); \
+         var one = window.matchMedia('(prefers-color-scheme: light)'); \
+         x.setAttribute('shape', typeof one.onchange + ':' + typeof one.addEventListener + ':' + typeof one.addListener + ':' + one.media);"
+        .to_string()];
+
+    let out = run_page_scripts(engine.as_mut(), realm, &doc, &scripts, &env()).expect("run");
+    let x = find_id(out.root(), "x").expect("#x present");
+    assert_eq!(
+        x.attr("scheme"),
+        Some("true:false"),
+        "light matches, dark does not"
+    );
+    assert_eq!(x.attr("motion"), Some("true:false"));
+    assert_eq!(x.attr("pointer"), Some("true:false"));
+    assert_eq!(x.attr("hover"), Some("true:true"));
+    // The MediaQueryList shape a listener-registering page needs.
+    assert_eq!(
+        x.attr("shape"),
+        Some("object:function:function:(prefers-color-scheme: light)")
+    );
+}
+
+#[test]
+fn async_high_entropy_apis_resolve_to_chrome_values() {
+    // The Promise-returning surface (userAgentData.getHighEntropyValues,
+    // mediaDevices.enumerateDevices, permissions.query, getBattery,
+    // storage.estimate) settles one microtask deep, which the per-eval job pump
+    // flushes — so a `.then` writing back into the DOM is visible on serialize.
+    let (mut engine, realm) = engine_and_realm();
+    let doc = doc_with_div_x();
+    let scripts = vec!["var x = document.getElementById('x'); \
+         navigator.userAgentData.getHighEntropyValues(['architecture','bitness','platformVersion']) \
+           .then(function (h) { x.setAttribute('uad', h.architecture + ':' + h.bitness + ':' + h.platformVersion + ':' + h.uaFullVersion); }); \
+         navigator.mediaDevices.enumerateDevices() \
+           .then(function (d) { x.setAttribute('devs', String(d.length) + ':' + d[0].kind + ':' + d[1].kind + ':' + d[2].kind); }); \
+         navigator.permissions.query({ name: 'geolocation' }) \
+           .then(function (p) { x.setAttribute('perm-geo', p.state); }); \
+         navigator.permissions.query({ name: 'notifications' }) \
+           .then(function (p) { x.setAttribute('perm-notif', p.state); }); \
+         navigator.getBattery() \
+           .then(function (b) { x.setAttribute('batt', String(b.charging) + ':' + String(b.level) + ':' + String(b.dischargingTime)); }); \
+         navigator.storage.estimate() \
+           .then(function (e) { x.setAttribute('quota', String(e.quota)); });"
+        .to_string()];
+
+    let out = run_page_scripts(engine.as_mut(), realm, &doc, &scripts, &env()).expect("run");
+    let x = find_id(out.root(), "x").expect("#x present");
+    assert_eq!(x.attr("uad"), Some("x86:64:15.0.0:142.0.0.0"));
+    assert_eq!(x.attr("devs"), Some("3:audioinput:videoinput:audiooutput"));
+    assert_eq!(x.attr("perm-geo"), Some("granted"));
+    assert_eq!(
+        x.attr("perm-notif"),
+        Some("default"),
+        "notifications default, others granted"
+    );
+    assert_eq!(x.attr("batt"), Some("true:1:Infinity"));
+    assert_eq!(x.attr("quota"), Some("299977129984"));
+}
+
+#[test]
+fn text_encoder_decoder_round_trips_utf8() {
+    // Real UTF-8: ASCII (1B), Latin-1 (2B), CJK (3B), and an astral emoji (4B)
+    // survive an encode -> decode round-trip, and the byte length is correct.
+    let (mut engine, realm) = engine_and_realm();
+    let doc = doc_with_div_x();
+    let scripts = vec!["var x = document.getElementById('x'); \
+         var s = 'A\\u00e9\\u65e5\\ud83d\\ude00'; \
+         var bytes = new TextEncoder().encode(s); \
+         var back = new TextDecoder().decode(bytes); \
+         x.setAttribute('rt', String(back === s)); \
+         x.setAttribute('len', String(bytes.length)); \
+         x.setAttribute('b0', String(bytes[0]));"
+        .to_string()];
+
+    let out = run_page_scripts(engine.as_mut(), realm, &doc, &scripts, &env()).expect("run");
+    let x = find_id(out.root(), "x").expect("#x present");
+    assert_eq!(x.attr("rt"), Some("true"), "encode/decode round-trips");
+    // 1 (A) + 2 (é) + 3 (日) + 4 (😀) = 10 bytes.
+    assert_eq!(x.attr("len"), Some("10"));
+    assert_eq!(
+        x.attr("b0"),
+        Some("65"),
+        "'A' encodes to a single 0x41 byte"
+    );
 }
 
 // ---------------------------------------------------------------------------
