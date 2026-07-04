@@ -2909,20 +2909,32 @@ pub const DOM_MODEL_PRELUDE: &str = r##"
       },
       getUserMedia: function () { return Promise.reject(new Error("NotAllowedError")); },
       getDisplayMedia: function () { return Promise.reject(new Error("NotAllowedError")); },
-      ondevicechange: null, addEventListener: function () {},
+      ondevicechange: null,
+      addEventListener: function () {}, removeEventListener: function () {},
+      dispatchEvent: function () { return false; },
     };
     g.navigator.permissions = {
       query: function (o) {
+        // A real PermissionStatus extends EventTarget: pages routinely do
+        // `permissions.query({name:...}).then(s => s.addEventListener('change', cb))`,
+        // which throws if addEventListener is missing — and a sensor probes
+        // `typeof status.addEventListener` as a conformance tell.
         return Promise.resolve({
           state: (o && o.name === "notifications") ? "default" : "granted",
+          name: (o && o.name) ? o.name : "",
           onchange: null,
+          addEventListener: function () {}, removeEventListener: function () {},
+          dispatchEvent: function () { return false; },
         });
       },
     };
     g.navigator.getBattery = function () {
       return Promise.resolve({
         charging: true, chargingTime: 0, dischargingTime: Infinity, level: 1,
-        addEventListener: function () {},
+        onchargingchange: null, onchargingtimechange: null,
+        ondischargingtimechange: null, onlevelchange: null,
+        addEventListener: function () {}, removeEventListener: function () {},
+        dispatchEvent: function () { return false; },
       });
     };
     g.navigator.sendBeacon = function () { return true; };
@@ -3011,17 +3023,42 @@ pub const DOM_MODEL_PRELUDE: &str = r##"
       pageLeft: 0, pageTop: 0, onresize: null, onscroll: null,
       addEventListener: function () {}, removeEventListener: function () {},
     };
-    // performance: a MONOTONIC ms clock via a closure counter (Date may be
-    // neutralized, so we never read wall-clock). now() returns strictly
-    // increasing floats; the timing/memory blocks carry plausible fixed values.
+    // performance: a MONOTONIC ms clock anchored to a real epoch. A loaded
+    // document with timeOrigin === 0 and all-zero timing is an impossible read
+    // (loadEventEnd would predate the epoch), and timeOrigin+now() must track
+    // Date.now() within a few thousand ms. We anchor timeOrigin to the wall
+    // clock (Date is live here) and lay a plausible ~388ms load sequence under
+    // it; now() reports elapsed time since the anchor, forced strictly
+    // increasing. If Date were ever neutralized we fall back to a fixed
+    // plausible epoch and the old counter, still never emitting a zero clock.
     (function () {
-      var __perfCounter = 0;
+      var __rawNow = (typeof Date === "function" && Date.now) ? Date.now() : 0;
+      var __hasClock = __rawNow > 1000000000000;
+      var __origin = __hasClock ? (__rawNow - 388) : 1751000000000;
+      var __perfCounter = 388;
+      var __perfLast = 0;
       window.performance = {
-        now: function () { __perfCounter += 0.1; return __perfCounter; },
-        timeOrigin: 0,
+        now: function () {
+          var t = __hasClock ? (Date.now() - __origin) : (__perfCounter += 0.1);
+          if (t <= __perfLast) { t = __perfLast + 0.001; }
+          __perfLast = t;
+          return t;
+        },
+        timeOrigin: __origin,
+        // Legacy PerformanceTiming: absolute epoch-ms, monotonically ordered
+        // navigationStart < fetchStart < ... < loadEventEnd (== ~now).
         timing: {
-          navigationStart: 0, loadEventEnd: 0, domComplete: 0, domInteractive: 0,
-          responseEnd: 0, requestStart: 0, connectStart: 0, fetchStart: 0,
+          navigationStart: __origin,
+          unloadEventStart: 0, unloadEventEnd: 0, redirectStart: 0, redirectEnd: 0,
+          fetchStart: __origin + 3,
+          domainLookupStart: __origin + 5, domainLookupEnd: __origin + 20,
+          connectStart: __origin + 20, secureConnectionStart: __origin + 30,
+          connectEnd: __origin + 45, requestStart: __origin + 46,
+          responseStart: __origin + 120, responseEnd: __origin + 180,
+          domLoading: __origin + 125, domInteractive: __origin + 260,
+          domContentLoadedEventStart: __origin + 262,
+          domContentLoadedEventEnd: __origin + 268, domComplete: __origin + 380,
+          loadEventStart: __origin + 381, loadEventEnd: __origin + 388,
         },
         navigation: { type: 0, redirectCount: 0 },
         memory: { jsHeapSizeLimit: 2172649472, totalJSHeapSize: 20000000, usedJSHeapSize: 10000000 },
@@ -3048,15 +3085,22 @@ pub const DOM_MODEL_PRELUDE: &str = r##"
             bytes.push(c);
           } else if (c < 0x800) {
             bytes.push(0xc0 | (c >> 6), 0x80 | (c & 0x3f));
-          } else if (c >= 0xd800 && c <= 0xdbff && i + 1 < str.length) {
-            var c2 = str.charCodeAt(i + 1);
+          } else if (c >= 0xd800 && c <= 0xdbff) {
+            // High surrogate: pair it with a following low surrogate for the
+            // 4-byte astral encoding, else the WHATWG encoding spec substitutes
+            // U+FFFD. Real Chrome emits EF BF BD here, NOT the raw 3-byte WTF-8
+            // surrogate value — a byte-for-byte fingerprint tell otherwise.
+            var c2 = (i + 1 < str.length) ? str.charCodeAt(i + 1) : 0;
             if (c2 >= 0xdc00 && c2 <= 0xdfff) {
               var cp = 0x10000 + ((c - 0xd800) << 10) + (c2 - 0xdc00);
               bytes.push(0xf0 | (cp >> 18), 0x80 | ((cp >> 12) & 0x3f), 0x80 | ((cp >> 6) & 0x3f), 0x80 | (cp & 0x3f));
               i++;
             } else {
-              bytes.push(0xe0 | (c >> 12), 0x80 | ((c >> 6) & 0x3f), 0x80 | (c & 0x3f));
+              bytes.push(0xef, 0xbf, 0xbd);
             }
+          } else if (c >= 0xdc00 && c <= 0xdfff) {
+            // A lone low surrogate is also ill-formed → U+FFFD.
+            bytes.push(0xef, 0xbf, 0xbd);
           } else {
             bytes.push(0xe0 | (c >> 12), 0x80 | ((c >> 6) & 0x3f), 0x80 | (c & 0x3f));
           }

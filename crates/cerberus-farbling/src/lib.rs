@@ -278,6 +278,27 @@ const FARBLING_SHIMS: &str = r##"
           if(__q===0x9245&&typeof __pg.unmaskedVendor==="string")return __pg.unmaskedVendor;
           if(__q===0x9246&&typeof __pg.unmaskedRenderer==="string")return __pg.unmaskedRenderer;
         }
+        if(isV2)switch(p|0){
+          // Core WebGL2 limits (real ANGLE/Intel WebGL2). Only reached on a
+          // webgl2 context; a webgl1 context never answers these enums.
+          case 0x8073: return 2048;       // MAX_3D_TEXTURE_SIZE
+          case 0x88FF: return 2048;       // MAX_ARRAY_TEXTURE_LAYERS
+          case 0x8CDF: return 8;          // MAX_COLOR_ATTACHMENTS
+          case 0x8824: return 8;          // MAX_DRAW_BUFFERS
+          case 0x8D57: return 8;          // MAX_SAMPLES
+          case 0x8A2F: return 72;         // MAX_UNIFORM_BUFFER_BINDINGS
+          case 0x8A2B: return 15;         // MAX_VERTEX_UNIFORM_BLOCKS
+          case 0x8A2D: return 15;         // MAX_FRAGMENT_UNIFORM_BLOCKS
+          case 0x8D6B: return 4294967294; // MAX_ELEMENT_INDEX
+          case 0x80E9: return 150000;     // MAX_ELEMENTS_INDICES
+          case 0x80E8: return 1048575;    // MAX_ELEMENTS_VERTICES
+          case 0x84FD: return 2;          // MAX_TEXTURE_LOD_BIAS
+          case 0x8B4B: return 60;         // MAX_VARYING_COMPONENTS
+          case 0x8C8A: return 4;          // MAX_TRANSFORM_FEEDBACK_SEPARATE_ATTRIBS
+          case 0x8A30: return 65536;      // MAX_UNIFORM_BLOCK_SIZE
+          case 0x8A34: return 256;        // UNIFORM_BUFFER_OFFSET_ALIGNMENT
+          case 0x8A2E: return 24;         // MAX_COMBINED_UNIFORM_BLOCKS
+        }
         switch(p|0){
           // Coherent Chrome-142-on-Windows-11 Intel/ANGLE/D3D11 persona (fixed).
           case 0x1F00: return "WebKit";
@@ -311,7 +332,7 @@ const FARBLING_SHIMS: &str = r##"
           default: return 0;
         }
       },
-      getSupportedExtensions:function(){return ["ANGLE_instanced_arrays","EXT_blend_minmax","EXT_color_buffer_half_float","EXT_disjoint_timer_query","EXT_float_blend","EXT_frag_depth","EXT_shader_texture_lod","EXT_texture_compression_bptc","EXT_texture_compression_rgtc","EXT_texture_filter_anisotropic","EXT_sRGB","OES_element_index_uint","OES_fbo_render_mipmap","OES_standard_derivatives","OES_texture_float","OES_texture_float_linear","OES_texture_half_float","OES_texture_half_float_linear","OES_vertex_array_object","WEBGL_color_buffer_float","WEBGL_compressed_texture_s3tc","WEBGL_compressed_texture_s3tc_srgb","WEBGL_debug_renderer_info","WEBGL_debug_shaders","WEBGL_depth_texture","WEBGL_draw_buffers","WEBGL_lose_context","WEBGL_multi_draw"];},
+      getSupportedExtensions:function(){return isV2?["EXT_color_buffer_float","EXT_color_buffer_half_float","EXT_disjoint_timer_query_webgl2","EXT_float_blend","EXT_texture_compression_bptc","EXT_texture_compression_rgtc","EXT_texture_filter_anisotropic","EXT_texture_norm16","KHR_parallel_shader_compile","OES_draw_buffers_indexed","OES_texture_float_linear","OVR_multiview2","WEBGL_clip_cull_distance","WEBGL_compressed_texture_s3tc","WEBGL_compressed_texture_s3tc_srgb","WEBGL_debug_renderer_info","WEBGL_debug_shaders","WEBGL_lose_context","WEBGL_multi_draw","WEBGL_provoking_vertex"]:["ANGLE_instanced_arrays","EXT_blend_minmax","EXT_color_buffer_half_float","EXT_disjoint_timer_query","EXT_float_blend","EXT_frag_depth","EXT_shader_texture_lod","EXT_texture_compression_bptc","EXT_texture_compression_rgtc","EXT_texture_filter_anisotropic","EXT_sRGB","OES_element_index_uint","OES_fbo_render_mipmap","OES_standard_derivatives","OES_texture_float","OES_texture_float_linear","OES_texture_half_float","OES_texture_half_float_linear","OES_vertex_array_object","WEBGL_color_buffer_float","WEBGL_compressed_texture_s3tc","WEBGL_compressed_texture_s3tc_srgb","WEBGL_debug_renderer_info","WEBGL_debug_shaders","WEBGL_depth_texture","WEBGL_draw_buffers","WEBGL_lose_context","WEBGL_multi_draw"];},
       getExtension:function(name){
         if(name==="WEBGL_debug_renderer_info")return {UNMASKED_VENDOR_WEBGL:0x9245,UNMASKED_RENDERER_WEBGL:0x9246};
         if(name==="EXT_texture_filter_anisotropic")return {MAX_TEXTURE_MAX_ANISOTROPY_EXT:0x84FF,TEXTURE_MAX_ANISOTROPY_EXT:0x84FE};
@@ -341,6 +362,32 @@ const FARBLING_SHIMS: &str = r##"
       clearColor:function(){},viewport:function(){},enable:function(){},disable:function(){},
       getError:function(){return 0;},finish:function(){},flush:function(){}
     };
+    if(isV2){
+      // Core WebGL2 method surface — added only to the webgl2 context so the
+      // webgl1 surface stays byte-identical. Plausible no-op / shaped returns.
+      gl.createVertexArray=function(){return {};};gl.deleteVertexArray=function(){};
+      gl.bindVertexArray=function(){};gl.isVertexArray=function(){return false;};
+      gl.createQuery=function(){return {};};gl.deleteQuery=function(){};
+      gl.beginQuery=function(){};gl.endQuery=function(){};
+      gl.getQuery=function(){return null;};gl.getQueryParameter=function(){return 0;};
+      gl.createSampler=function(){return {};};gl.deleteSampler=function(){};
+      gl.bindSampler=function(){};gl.samplerParameteri=function(){};
+      gl.createTransformFeedback=function(){return {};};gl.bindTransformFeedback=function(){};
+      gl.beginTransformFeedback=function(){};gl.endTransformFeedback=function(){};
+      gl.transformFeedbackVaryings=function(){};gl.texImage3D=function(){};
+      gl.texStorage2D=function(){};gl.texStorage3D=function(){};gl.texSubImage3D=function(){};
+      gl.getBufferSubData=function(){};gl.drawArraysInstanced=function(){};
+      gl.drawElementsInstanced=function(){};gl.vertexAttribDivisor=function(){};
+      gl.drawBuffers=function(){};gl.clearBufferfv=function(){};
+      gl.clearBufferiv=function(){};gl.clearBufferuiv=function(){};
+      gl.getUniformBlockIndex=function(){return 0;};gl.uniformBlockBinding=function(){};
+      gl.bindBufferBase=function(){};gl.bindBufferRange=function(){};
+      gl.fenceSync=function(){return {};};gl.deleteSync=function(){};
+      gl.clientWaitSync=function(){return 0;};gl.getFragDataLocation=function(){return -1;};
+      gl.getActiveUniformBlockParameter=function(){return 0;};gl.getActiveUniforms=function(){return [];};
+      gl.invalidateFramebuffer=function(){};gl.readBuffer=function(){};
+      gl.renderbufferStorageMultisample=function(){};gl.blitFramebuffer=function(){};
+    }
     el[cacheKey]=gl;return gl;
   }
   function __attachCanvas(el){
