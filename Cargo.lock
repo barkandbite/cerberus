@@ -436,6 +436,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "cerberus-profile"
+version = "0.0.9"
+
+[[package]]
 name = "cerberus-shell"
 version = "0.0.9"
 dependencies = [
