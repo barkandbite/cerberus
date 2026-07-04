@@ -17,6 +17,14 @@ use std::process::ExitCode;
 use zeroize::Zeroize;
 
 fn main() -> ExitCode {
+    // Fingerprint coherence: our JS `Intl`/persona presents an America/New_York
+    // browser, but QuickJS's `Date` reads the host zone (UTC in a container),
+    // so `Date.getTimezoneOffset()` would disagree with `Intl` — a bot tell.
+    // Pin the process zone to match the persona. (Per-head time zones move to a
+    // JS `Date` shim driven by the profile once profiles are wired through.)
+    if std::env::var_os("TZ").is_none() {
+        std::env::set_var("TZ", "America/New_York");
+    }
     let args: Vec<String> = std::env::args().skip(1).collect();
     let (command, rest) = match args.split_first() {
         Some((cmd, rest)) => (cmd.as_str(), rest),
