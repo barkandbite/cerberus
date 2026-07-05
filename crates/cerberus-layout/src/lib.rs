@@ -1117,6 +1117,14 @@ impl<'a> Ctx<'a> {
     fn add_run(&mut self, text: &str, style: &ComputedStyle, href: Option<&str>) {
         let px = style.font_size.max(1);
         let (glyphs, w) = self.shape_run(text, px, style);
+        // Consume this block's one-shot `text-indent` at the start of a line, as
+        // `add_word` does. A `white-space: nowrap` run (`.pure-button` sets it,
+        // and it inherits) is placed atomically through here, so without this an
+        // indent is dropped — notably the `text-indent:-9999px` image-replacement
+        // trick that hides a button's fallback label behind its sprite icon.
+        if self.x == self.left {
+            self.x += std::mem::take(&mut self.pending_indent);
+        }
         self.push_piece(px, w, glyphs, style, href);
     }
 
@@ -5138,6 +5146,28 @@ mod tests {
         let laid = lay("<input type='submit' value='Send'>", 400);
         assert!(has_rect_color(&laid, BUTTON_BG));
         assert_eq!(total_glyphs(&laid), 4, "'Send' label");
+    }
+
+    #[test]
+    fn text_indent_hides_a_nowrap_run_off_screen() {
+        // The image-replacement trick: `text-indent:-9999px` on a `white-space:
+        // nowrap` element (e.g. a `.pure-button` whose icon replaces its label)
+        // pushes the fallback text off-screen so only the sprite shows. A nowrap
+        // run is laid atomically, so it must honor text-indent like a wrapped
+        // word does — otherwise the label paints on top of the icon.
+        let hidden = lay(
+            "<div style='white-space:nowrap;text-indent:-9999px'>Search</div>",
+            400,
+        );
+        // Every glyph is shoved far to the left, off the visible canvas.
+        assert!(
+            glyph_xs(&hidden).iter().all(|&x| x < 0),
+            "nowrap run honors text-indent: {:?}",
+            glyph_xs(&hidden)
+        );
+        // Without the indent the same run sits at the content edge.
+        let shown = lay("<div style='white-space:nowrap'>Search</div>", 400);
+        assert!(glyph_xs(&shown).iter().all(|&x| x >= 0));
     }
 
     #[test]
