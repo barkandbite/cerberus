@@ -2793,8 +2793,13 @@ fn capitalize_words(s: &str) -> String {
     out
 }
 
+/// The `line-height: normal` leading for text of `px` font size. Browsers derive
+/// this from the font's own metrics — typically ~1.15–1.2× the font size for the
+/// common sans/serif faces; we approximate it as 1.2×. (Was 1.5×, which inflated
+/// the vertical rhythm of every text block ~25% taller than Chrome, accumulating
+/// into large below-the-fold misalignment on text-heavy pages.)
 fn line_height(px: u32) -> i32 {
-    px as i32 + px as i32 / 2
+    (px as i32 * 6) / 5
 }
 
 /// Offset a rect by `(dx, dy)` (for translating positioned output).
@@ -4422,6 +4427,26 @@ mod tests {
         );
         let min_y = *glyph_ys(&laid).iter().min().unwrap();
         assert!(min_y > 100, "content centered within the tall box: {min_y}");
+    }
+
+    #[test]
+    fn normal_line_height_is_about_1_2x_font_size() {
+        // `line-height: normal` leads ~1.2x the font size (browser-like), not the
+        // old 1.5x that made every text block a quarter too tall.
+        let laid = lay(
+            "<p style='font-size:20px;margin:0'>one</p>\
+             <p style='font-size:20px;margin:0'>two</p>",
+            400,
+        );
+        let mut ys = glyph_ys(&laid);
+        ys.sort_unstable();
+        ys.dedup();
+        assert_eq!(ys.len(), 2, "two single-line paragraphs: {ys:?}");
+        let pitch = ys[1] - ys[0];
+        assert!(
+            (pitch - 24).abs() <= 1,
+            "row pitch ~= 1.2 * 20px = 24, got {pitch}"
+        );
     }
 
     #[test]
