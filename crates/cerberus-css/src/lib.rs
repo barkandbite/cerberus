@@ -1839,8 +1839,10 @@ fn parse_inset(v: &str, em_base: f32) -> Option<Len> {
         "em" => Len::Px((num * em_base).round() as i32),
         "rem" => Len::Px((num * 16.0).round() as i32),
         "pt" => Len::Px((num * 96.0 / 72.0).round() as i32),
-        "vw" | "vmax" => Len::Vw(num),
-        "vh" | "vmin" => Len::Vh(num),
+        "vw" => Len::Vw(num),
+        "vh" => Len::Vh(num),
+        "vmin" => Len::Vmin(num),
+        "vmax" => Len::Vmax(num),
         _ => return None,
     })
 }

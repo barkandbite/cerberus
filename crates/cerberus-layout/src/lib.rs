@@ -2950,11 +2950,13 @@ fn resolve_block_height(
     vw: i32,
     vh: i32,
 ) -> i32 {
-    // Only px / vw / vh count; `%`/`auto` leave the box content-sized.
+    // Only px / viewport units count; `%`/`auto` leave the box content-sized.
     let res = |len: Len| match len {
         Len::Px(p) => Some(p.max(0)),
         Len::Vw(f) => Some((f / 100.0 * vw as f32).round().max(0.0) as i32),
         Len::Vh(f) => Some((f / 100.0 * vh as f32).round().max(0.0) as i32),
+        Len::Vmin(f) => Some((f / 100.0 * vw.min(vh) as f32).round().max(0.0) as i32),
+        Len::Vmax(f) => Some((f / 100.0 * vw.max(vh) as f32).round().max(0.0) as i32),
         Len::Auto | Len::Pct(_) => None,
     };
     let adjust = |v: i32| match style.box_sizing {

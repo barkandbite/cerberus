@@ -31,6 +31,9 @@ pub enum Len {
     /// Viewport-relative: percent of viewport width / height (ADR-0042).
     Vw(f32),
     Vh(f32),
+    /// Percent of the smaller / larger viewport dimension (`vmin`/`vmax`).
+    Vmin(f32),
+    Vmax(f32),
 }
 
 impl Len {
@@ -40,15 +43,19 @@ impl Len {
         match self {
             Len::Px(p) => Some(p),
             Len::Pct(f) => Some((f / 100.0 * extent as f32).round() as i32),
-            Len::Auto | Len::Vw(_) | Len::Vh(_) => None,
+            Len::Auto | Len::Vw(_) | Len::Vh(_) | Len::Vmin(_) | Len::Vmax(_) => None,
         }
     }
 
-    /// Resolve including viewport units (`vw`/`vh`) against `vw`×`vh` px.
+    /// Resolve including viewport units (`vw`/`vh`/`vmin`/`vmax`) against a
+    /// `vw`×`vh` px viewport.
     pub fn resolve_vp(self, extent: i32, vw: i32, vh: i32) -> Option<i32> {
+        let pct = |f: f32, basis: i32| Some((f / 100.0 * basis as f32).round() as i32);
         match self {
-            Len::Vw(f) => Some((f / 100.0 * vw as f32).round() as i32),
-            Len::Vh(f) => Some((f / 100.0 * vh as f32).round() as i32),
+            Len::Vw(f) => pct(f, vw),
+            Len::Vh(f) => pct(f, vh),
+            Len::Vmin(f) => pct(f, vw.min(vh)),
+            Len::Vmax(f) => pct(f, vw.max(vh)),
             other => other.resolve(extent),
         }
     }
@@ -792,6 +799,31 @@ mod tests {
             ),
             (false, false, false)
         );
+    }
+
+    #[test]
+    fn viewport_units_resolve_against_the_right_basis() {
+        // In portrait (w < h): vmin follows width, vmax follows height — the case
+        // the old `vmax→Vw` / `vmin→Vh` aliasing got backwards.
+        let (w, h) = (400, 800);
+        assert_eq!(Len::Vw(50.0).resolve_vp(0, w, h), Some(200));
+        assert_eq!(Len::Vh(50.0).resolve_vp(0, w, h), Some(400));
+        assert_eq!(
+            Len::Vmin(50.0).resolve_vp(0, w, h),
+            Some(200),
+            "vmin = min(w,h)"
+        );
+        assert_eq!(
+            Len::Vmax(50.0).resolve_vp(0, w, h),
+            Some(400),
+            "vmax = max(w,h)"
+        );
+        // In landscape the min/max swap dimensions.
+        assert_eq!(Len::Vmin(10.0).resolve_vp(0, 1000, 500), Some(50));
+        assert_eq!(Len::Vmax(10.0).resolve_vp(0, 1000, 500), Some(100));
+        // Without a viewport they don't resolve.
+        assert_eq!(Len::Vmin(50.0).resolve(999), None);
+        assert_eq!(Len::Vmax(50.0).resolve(999), None);
     }
 
     #[test]
