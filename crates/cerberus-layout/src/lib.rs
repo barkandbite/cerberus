@@ -506,12 +506,20 @@ impl<'a> Ctx<'a> {
             );
         let saved_right = if out_of_flow {
             let cb = self.containing_block(style.position);
-            let used_w = match (
-                style.inset_left.resolve_vp(cb.w, self.vw, self.vh),
-                style.inset_right.resolve_vp(cb.w, self.vw, self.vh),
-            ) {
-                (Some(l), Some(r)) => (cb.w - l - r).max(1),
-                _ => self.measure_intrinsic_width(node).clamp(1, cb.w.max(1)),
+            // An explicit `width` wins (CSS: a set width is the used width, even
+            // out of flow — e.g. Wikipedia's `.central-featured-lang{width:15.6rem}`,
+            // whose count text must not wrap). Otherwise: both insets set → the
+            // stretched inset gap; else shrink-to-fit intrinsic content width.
+            let used_w = if let Some(w) = style.width.resolve_vp(cb.w, self.vw, self.vh) {
+                w.max(1)
+            } else {
+                match (
+                    style.inset_left.resolve_vp(cb.w, self.vw, self.vh),
+                    style.inset_right.resolve_vp(cb.w, self.vw, self.vh),
+                ) {
+                    (Some(l), Some(r)) => (cb.w - l - r).max(1),
+                    _ => self.measure_intrinsic_width(node).clamp(1, cb.w.max(1)),
+                }
             };
             let saved = self.right;
             self.right = self.left0 + used_w;
@@ -5359,6 +5367,29 @@ mod tests {
         assert!(
             in_flow_max_y < 100,
             "in-flow content not pushed down by abs"
+        );
+    }
+
+    #[test]
+    fn absolute_element_honors_its_explicit_width() {
+        // An out-of-flow box with an explicit `width` uses it (not shrink-to-fit),
+        // even with only one inset set — so its text wraps at that width, not at
+        // its intrinsic content width. Wikipedia's `.central-featured-lang` sets
+        // width:15.6rem with only `right`, and its count line must not wrap.
+        let laid = lay(
+            "<div style='position:relative;height:300px'>\
+               <div style='position:absolute;top:0;right:0;width:250px'>\
+                 one two three four five six</div>\
+             </div>",
+            600,
+        );
+        // With a 250px box the phrase fits on one line; a shrunk box would wrap it.
+        let ys: std::collections::BTreeSet<i32> =
+            glyph_xy(&laid).into_iter().map(|(_, y)| y).collect();
+        assert_eq!(
+            ys.len(),
+            1,
+            "explicit-width box keeps the run on one line: {ys:?}"
         );
     }
 
