@@ -88,14 +88,24 @@ text block ran ~25% too tall and content drifted down, misaligning everything
 below the fold (iana's footer sat 74px low → a 71% mismatch band). Now `px*6/5`.
 iana 22.6% → 16.9% (footer realigned to 27px off); general vertical-rhythm fix.
 
-**Deferred — table auto-layout column widths** (W-C). `fn table` splits width
-equally across columns; Chrome sizes each to its content (a narrow label column
-beside a wide links column). Attempted content-proportional widths from
-`measure_intrinsic_width` per cell, but that **underestimates a cell whose
-content is `display:inline; float:left`** (iana's footer `<li>` links measured
-stacked, ~130px, not the ~450px horizontal row), so columns came out too narrow
-and wrapped — reverted. Prerequisite: make `measure_intrinsic_width` reflect the
-cell's real inline/float flow before sizing columns to it.
+**Table auto-layout column widths** (W-C): landed. `fn table` now sizes each
+column to its widest cell's content instead of an equal split (iana's footer nav
+label column is narrow, its links column wide, matching Chrome). Cells are
+measured via `measure_cell_width`, which flows a cell's *children* into a wide
+scratch — `walk` returns early on `<td>`/`<tr>` so measuring the node itself
+reads nothing — and packs floated inline children through `place_float` so a
+nav/link cell's real horizontal row width is counted, not its stacked height (an
+earlier attempt using `measure_intrinsic_width` on the cell node collapsed every
+column to 1px). iana 16.9% → 16.3%.
+
+**JS-driven show/hide** (W-F): the core capability is present and verified — a
+page script that sets `style.display = 'none'` (or toggles `classList`/`hidden`)
+drops the element from the render while it stays in the DOM
+(`script_hiding_an_element_removes_it_from_the_render`). The Wikipedia donation
+banner persists not for want of a DOM API but because its hide path is gated on
+geolocation/storage/campaign state the static mirror doesn't supply — the
+open-ended, "diffuse payoff" part of W-F the plan (§9) defers. It is also a minor
+contributor: stripping the banner from the mirror moved the diff only 9.2% → 8.8%.
 
 **First win driven by the yardstick — canvas background propagation.** The
 `example` diff (89% of pixels off by a little) root-caused to the root/body

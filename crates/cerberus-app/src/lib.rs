@@ -6811,6 +6811,41 @@ mod tests {
     }
 
     #[test]
+    fn script_hiding_an_element_removes_it_from_the_render() {
+        // The core of JS-driven show/hide (RENDERING_PARITY_PLAN.md W-F): a page
+        // script that sets `style.display = 'none'` (the mechanism a fundraising
+        // banner uses to hide itself) must drop the element from what is painted,
+        // while the node stays in the DOM. Verified against the styled tree
+        // (`visible_text` honors display:none), not the raw DOM text.
+        let mut b = fake_app(vec![(
+            "https://hide.test/",
+            Ok(page(
+                "https://hide.test/",
+                200,
+                None,
+                "<div id=\"banner\">DONATE NOW</div><p>real content</p>\
+                 <script>document.getElementById('banner').style.display = 'none'</script>",
+            )),
+        )]);
+        b.navigate("https://hide.test/");
+        assert!(b.poll());
+        let painted = visible_text(&b.styled.root);
+        assert!(
+            painted.contains("real content"),
+            "visible content present; got {painted:?}"
+        );
+        assert!(
+            !painted.contains("DONATE NOW"),
+            "script-hidden banner must not be painted; got {painted:?}"
+        );
+        // The banner is hidden, not deleted — it remains in the DOM.
+        assert!(
+            b.document.root().text_content().contains("DONATE NOW"),
+            "hidden element stays in the DOM"
+        );
+    }
+
+    #[test]
     fn browser_runs_inline_script_and_reflects_dom_mutation() {
         let mut b = fake_app(vec![(
             "https://script.test/",
