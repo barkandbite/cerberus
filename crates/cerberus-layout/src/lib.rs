@@ -1000,9 +1000,11 @@ impl<'a> Ctx<'a> {
         // The leading offset before this word: at the start of a line it is the
         // one-shot `text-indent` (usually 0), otherwise the inter-word space
         // (widened/trimmed by `word-spacing`, clamped so a large negative can't
-        // reverse the cursor).
+        // reverse the cursor). A negative `text-indent` is honored (it is the
+        // classic image-replacement trick — `text-indent:-9999px` pushes the
+        // fallback text off-screen so only the background sprite shows).
         let gap = if at_line_start {
-            std::mem::take(&mut self.pending_indent).max(0)
+            std::mem::take(&mut self.pending_indent)
         } else {
             (space_width(self.shaper, px) as i32 + style.word_spacing).max(0)
         };
@@ -5314,6 +5316,15 @@ mod tests {
             first_line_x - later_x,
             40,
             "only the first line is indented; wrapped lines reset to the left"
+        );
+
+        // A large negative text-indent (the image-replacement trick) is honored,
+        // pushing the text far off the left edge instead of being clamped to 0.
+        let hidden = lay("<p style='text-indent:-9999px'>hello world</p>", 400);
+        assert!(
+            min_x(&hidden) <= -9000,
+            "negative text-indent pushes text off-screen, got {}",
+            min_x(&hidden)
         );
     }
 
