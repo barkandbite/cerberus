@@ -12,6 +12,32 @@ implement each without re-deriving the investigation.
 
 ---
 
+## Wikipedia portal — remaining deltas (root-caused, both feature-level)
+
+The masthead, centered globe, two-column language grid, CJK, the centered search
+bar + language button, and the footer (images + sister-project icons) all match
+Chrome (subagent-verified). Two deltas remain, each precisely root-caused:
+
+1. **`<button>` renders only its text, ignoring element children.** The language
+   button's translate/chevron icon sprites don't paint because `<button>` is
+   handled by `form_button` → `push_button`, which draws a box + the button's text
+   label and never walks the button's child elements (the `<i class="sprite …">`
+   icons). Confirmed by probe: the button is `display:Inline`, not culled, but its
+   `<i>` children never reach `walk`. This is a general limitation (any icon
+   button shows only text). Fix = make `<button>` a content container: when it has
+   element children, lay it as a button-styled box that walks its subtree (keep
+   the text-only `push_button` path for simple buttons). Moderate risk — touches
+   all button rendering; do it deliberately with button regression tests, not as a
+   tail-end change.
+
+2. **Search widget sub-control micro-layout.** The language selector sits below the
+   input and the Search button has a gap, vs Chrome's inline selector + flush
+   button. The portal uses `.search-input{width:73%|100%;margin-right:-6.6rem}`
+   (a negative margin pulling the button back to overlap) plus a `.styled-select`
+   that is `position:absolute;right:…` inside the input. Needs: negative-margin
+   support in inline-block flow and the absolute select resolving against the
+   input container. Verify against the mirror once done.
+
 ## ✅ DONE — `rem` root font-size + absolute-positioning origin (was the top gap)
 
 **All three landed and verified against Chrome.** The Wikipedia portal's grid now
