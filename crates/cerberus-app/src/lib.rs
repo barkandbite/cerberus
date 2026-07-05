@@ -894,6 +894,57 @@ impl CookieJar for SealedJar {
     }
 }
 
+/// The first element with `tag` in this subtree (including `node`), depth-first
+/// in document order.
+fn find_styled_tag<'a>(node: &'a StyledNode, tag: &str) -> Option<&'a StyledNode> {
+    if node.tag == tag {
+        return Some(node);
+    }
+    node.children.iter().find_map(|c| match c {
+        StyledChild::Element(e) => find_styled_tag(e, tag),
+        StyledChild::Text(_) => None,
+    })
+}
+
+/// The canvas (viewport) background. CSS propagates the root element's used
+/// background to the whole canvas; when the root `<html>` paints none, the
+/// `<body>`'s background propagates instead. A translucent color is composited
+/// over `fallback` (the default white canvas); a fully transparent one — or the
+/// absence of both — leaves `fallback` showing. Without this the body's short,
+/// auto-height box paints its color only near the top and the rest of the
+/// viewport stays white, unlike Chrome which fills the whole page (e.g.
+/// example.com's `#f0f0f2` body background).
+fn canvas_background(styled: &StyledDom, fallback: Color) -> Color {
+    fn resolve(bg: Option<Color>, base: Color) -> Option<Color> {
+        let c = bg?;
+        match c.a {
+            0 => None,
+            255 => Some(c),
+            a => {
+                let mix = |f: u8, b: u8| {
+                    ((f as u16 * a as u16 + b as u16 * (255 - a as u16)) / 255) as u8
+                };
+                Some(Color::rgb(
+                    mix(c.r, base.r),
+                    mix(c.g, base.g),
+                    mix(c.b, base.b),
+                ))
+            }
+        }
+    }
+    let root = &styled.root;
+    let html = find_styled_tag(root, "html").unwrap_or(root);
+    if let Some(bg) = resolve(html.style.background, fallback) {
+        return bg;
+    }
+    if let Some(body) = find_styled_tag(html, "body") {
+        if let Some(bg) = resolve(body.style.background, fallback) {
+            return bg;
+        }
+    }
+    fallback
+}
+
 /// Run the full render pipeline and return a summary plus the frame.
 pub fn render(config: &RenderConfig) -> Result<RenderOutcome, AppError> {
     install_psl();
@@ -1151,13 +1202,17 @@ pub fn render(config: &RenderConfig) -> Result<RenderOutcome, AppError> {
     toolbar.url_text = config.url.clone();
     let content = toolbar.content_size(config.viewport);
 
-    // Lay out + paint the page into the content area only.
+    // Lay out + paint the page into the content area only. The canvas background
+    // is the root/body background propagated to the viewport (CSS), not just the
+    // page's default white — so a page whose `<body>` sets a color fills the
+    // whole content area, matching Chrome.
+    let canvas_bg = canvas_background(&styled, config.background);
     let layout_t = Instant::now();
     let mut layout = BlockLayout::default();
     let page = render_document(
         &styled,
         content,
-        config.background,
+        canvas_bg,
         &mut layout,
         &text,
         &text,
@@ -1169,7 +1224,7 @@ pub fn render(config: &RenderConfig) -> Result<RenderOutcome, AppError> {
 
     // Compose: page under the toolbar, toolbar painted on top.
     let mut framebuffer = Framebuffer::new(config.viewport);
-    framebuffer.clear(config.background);
+    framebuffer.clear(canvas_bg);
     framebuffer.blit(toolbar.content_origin(), &page);
     text.rasterize(&toolbar.paint(config.viewport, &text), &mut framebuffer);
 
@@ -5826,6 +5881,48 @@ mod tests {
         let styled = CssEngine::new().style(&doc);
         // The two visible <p> blocks read on their own lines.
         assert_eq!(visible_text(&styled.root), "A\nB");
+    }
+
+    #[test]
+    fn canvas_background_propagates_body_color_to_the_viewport() {
+        // A `<body>` background (with no `<html>` background) propagates to the
+        // whole canvas — the fix for pages like example.com whose grey body
+        // filled only its short box in Cerberus while Chrome filled the page.
+        let styled = CssEngine::new().style(&parse_html(
+            "<body style='background:#f0f0f2'><p>hi</p></body>",
+        ));
+        assert_eq!(
+            canvas_background(&styled, Color::WHITE),
+            Color::rgb(0xf0, 0xf0, 0xf2)
+        );
+    }
+
+    #[test]
+    fn canvas_background_prefers_html_then_falls_back() {
+        // `<html>` background wins over `<body>`'s (root-element propagation).
+        let s1 = CssEngine::new().style(&parse_html(
+            "<html style='background:#112233'><body style='background:#445566'></body></html>",
+        ));
+        assert_eq!(
+            canvas_background(&s1, Color::WHITE),
+            Color::rgb(0x11, 0x22, 0x33)
+        );
+        // Neither sets one → the fallback (white) shows.
+        let s2 = CssEngine::new().style(&parse_html("<body><p>x</p></body>"));
+        assert_eq!(canvas_background(&s2, Color::WHITE), Color::WHITE);
+    }
+
+    #[test]
+    fn canvas_background_composites_a_translucent_body_over_white() {
+        // A 50%-alpha black body background composites to mid-grey over white.
+        let styled = CssEngine::new().style(&parse_html(
+            "<body style='background:rgba(0,0,0,0.5)'></body>",
+        ));
+        let bg = canvas_background(&styled, Color::WHITE);
+        assert!(
+            (bg.r as i32 - 127).abs() <= 1 && bg.r == bg.g && bg.g == bg.b,
+            "expected ~127 grey, got {bg:?}"
+        );
     }
 
     #[test]

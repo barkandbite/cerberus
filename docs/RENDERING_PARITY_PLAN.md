@@ -72,10 +72,19 @@ and prints an **RMSE** (`0.0` = identical) plus a mismatch fraction; `--fail-ove
 <rmse>` makes it a regression gate. `docs/parity-corpus.txt` holds the corpus and
 `scripts/parity.sh` runs the whole loop (mirror → Chrome + Cerberus render →
 diff) emitting a `parity.csv`. **Current baselines** (1200×1000, toolbar cropped,
-tolerance 8): `example` RMSE 0.095 (89% of pixels off by a little — a page-wide
-uniform delta, likely the `#f0f0f2` body background), `wikipedia` RMSE 0.147
-(9% of pixels off — the search-widget + donation-banner region). Drive these
-down; a rise is a regression.
+tolerance 8): `example` RMSE **0.069** (1.6% of pixels off — was 0.095 / 89%
+before the canvas-background fix below), `wikipedia` RMSE 0.147 (9% of pixels
+off — the search-widget + donation-banner region). Drive these down; a rise is a
+regression.
+
+**First win driven by the yardstick — canvas background propagation.** The
+`example` diff (89% of pixels off by a little) root-caused to the root/body
+background not filling the viewport: Cerberus painted the `<body>`'s `#f0f0f2`
+only inside its short auto-height box, leaving the rest of the page white, while
+Chrome propagates the root element's background to the whole canvas. Fixed in
+`cerberus-app::render` via `canvas_background` (root `<html>` background, else
+`<body>`'s, composited over white) — example.com's mismatch fell from 89% to
+1.6%. This is a general fix (every page with a non-white body background).
 
 ---
 
