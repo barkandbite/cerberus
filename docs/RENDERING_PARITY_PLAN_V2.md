@@ -34,10 +34,23 @@ leave `em` for per-element resolution). A unit test confirmed `15.6rem`→156px 
 **Why it was reverted / what it needs to ship as a NET win.** Applying the rem fix
 alone made the Wikipedia portal render *worse*, because it exposes companion bugs
 that the oversized rem was accidentally masking. Land the rem fix **together with**:
-1. **Count text wraps in the (now correctly 156 px) cell.** Investigate why
-   `.central-featured-lang small` ("7,189,000+ articles", ~13 px) wraps at 156 px
-   when Chrome keeps it on one line — likely inline-block width/shrink or a padding
-   discrepancy in the `.link-box`, not the font metrics (19 chars @13 px ≪ 156 px).
+1. **Count text wraps — ROOT-CAUSED: absolute cell gives its descendants a ~1px
+   content width.** `.central-featured-lang small` ("7,189,000+ articles") measures
+   only 84 px at 13 px, far inside the 156 px cell, yet "articles" wraps. A layout
+   probe (in `add_word`, on the word "articles") showed two passes: the intrinsic
+   **measure** pass has `right=1_000_000` (max-content, no wrap, correct), but the
+   **real** layout pass has `left=227, right=228` — a **1px-wide** content box, laid
+   at `.central-featured`'s left edge (227 = (1000−546)/2), NOT inside the 156 px
+   cell. So the absolute cell (`.central-featured-lang`, `position:absolute` with
+   only `right`, `width:15.6rem`) is not establishing a 156 px content area for its
+   `.link-box → small` descendants — the width collapses to ~1px, and the number
+   overflows to x≈279 > right=228, wrapping "articles". Trace the absolute cell's
+   in-flow content-width setup (the `saved_right`/`used_w` path in `Ctx::walk`, and
+   whether `self.left`/`self.right` are correctly re-based to the cell's box before
+   its children are laid) — the explicit-width fix sets `self.right = left0 +
+   used_w`, but a descendant is still seeing the parent container's edge. This is
+   the concrete companion bug; fixing it should let the rem change land as a net
+   win. (Reproduce with the rem spike re-applied + `CERB_DBG=1` on the mirror.)
 2. **Globe / column horizontal placement.** The absolute globe (in `.central-textlogo`)
    and the `right:60%`/`left:60%` language insets must scale with the corrected
    container width so the globe centers between columns instead of overlapping the
