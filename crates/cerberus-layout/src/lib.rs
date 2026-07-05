@@ -602,12 +602,22 @@ impl<'a> Ctx<'a> {
             // A positioned block is the containing block for its descendants'
             // `absolute` (ADR-0042): push its (in-flow) border box; the whole
             // subtree is translated together if this element is later lifted.
+            // Height: absolute children resolve %-based `top`/`bottom` against
+            // THIS block's height, so an explicit `height` must be used (e.g.
+            // Wikipedia's `.central-featured{height:32.5rem}` positions its
+            // languages by `top:20%…80%`). Auto height is only known after
+            // layout, so fall back to the viewport height there.
             if positioned {
+                let cb_h = style
+                    .height
+                    .resolve_vp(self.vh, self.vw, self.vh)
+                    .map(|h| h.max(1))
+                    .unwrap_or(self.vh);
                 self.cb_stack.push(ContainingBlock {
                     x: box_left,
                     y: self.y,
                     w: box_w,
-                    h: self.vh,
+                    h: cb_h,
                 });
             }
             // Content box = border box inset by border + padding.
@@ -5349,6 +5359,26 @@ mod tests {
         assert!(
             in_flow_max_y < 100,
             "in-flow content not pushed down by abs"
+        );
+    }
+
+    #[test]
+    fn percent_top_resolves_against_the_containing_blocks_explicit_height() {
+        // A `top:%` absolute child resolves against its positioned ancestor's own
+        // height when that height is explicit — NOT the viewport height. This is
+        // Wikipedia's portal pattern (`.central-featured{height:32.5rem}` with
+        // languages at `top:20%…80%`). With a 200px-tall relative box, top:50%
+        // must land at ~100px, well short of the 600px viewport's 50% (=300px).
+        let laid = lay(
+            "<div style='position:relative;height:200px'>\
+               <div style='position:absolute;top:50%;left:0'>X</div>\
+             </div>",
+            400,
+        );
+        let (_, y) = *glyph_xy(&laid).last().unwrap();
+        assert!(
+            (80..=140).contains(&y),
+            "top:50% of the 200px container (~100px), not of the viewport: {y}"
         );
     }
 
