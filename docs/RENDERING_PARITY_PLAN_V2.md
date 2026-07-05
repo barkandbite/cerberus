@@ -12,6 +12,44 @@ implement each without re-deriving the investigation.
 
 ---
 
+## TOP FOLLOW-UP — `rem` must resolve against the root font-size (with companions)
+
+**Root cause (confirmed).** `rem` is converted to px with a hardcoded 16
+(`parse_css_px`: `"rem" => num * 16.0`). Real pages set a smaller root via the
+ubiquitous `html { font-size: 62.5% }` idiom (→ 10px), so **every rem-based box is
+1.6× too large**. On the Wikipedia portal this makes `.central-featured`
+(`height:32.5rem;width:54.6rem`) 520×873 px instead of 325×546, and the language
+cells (`15.6rem`) 250 px instead of 156 — the grid the comparison subagent flagged
+as too wide and too tall.
+
+**The fix itself is small and verified** (a spike landed then was reverted, see
+below): thread the root element's computed font-size through `CssEngine::build`
+(new `root_font_size` param; `INITIAL_ROOT_FONT_PX = 16`; update to `html`'s own
+computed font-size for its descendants) into `apply_declarations`, and fold
+`<number>rem → px` in the declaration value up front (a `substitute_rem(value,
+root_em)` helper — byte-compare the `rem` unit so multi-byte chars aren't split;
+leave `em` for per-element resolution). A unit test confirmed `15.6rem`→156px and
+`1.3rem`→13px under `font-size:62.5%`, and `2rem`→32px with no html font-size.
+
+**Why it was reverted / what it needs to ship as a NET win.** Applying the rem fix
+alone made the Wikipedia portal render *worse*, because it exposes companion bugs
+that the oversized rem was accidentally masking. Land the rem fix **together with**:
+1. **Count text wraps in the (now correctly 156 px) cell.** Investigate why
+   `.central-featured-lang small` ("7,189,000+ articles", ~13 px) wraps at 156 px
+   when Chrome keeps it on one line — likely inline-block width/shrink or a padding
+   discrepancy in the `.link-box`, not the font metrics (19 chars @13 px ≪ 156 px).
+2. **Globe / column horizontal placement.** The absolute globe (in `.central-textlogo`)
+   and the `right:60%`/`left:60%` language insets must scale with the corrected
+   container width so the globe centers between columns instead of overlapping the
+   right column. This ties into the still-open globe-centering item under
+   workstream B (the `.central-textlogo` width / margin-auto path).
+
+Do all three as one change and re-validate against the Chrome mirror before
+committing — the rem fix is correct and broadly beneficial (every 62.5% site), but
+only a net parity win once the grid it uncovers is aligned.
+
+---
+
 ## The measurement loop (unchanged, use for every task)
 
 `scratchpad/compare.sh <url> <name> [w] [h]`:
