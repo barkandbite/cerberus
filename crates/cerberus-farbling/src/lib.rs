@@ -132,6 +132,23 @@ const FARBLING_SHIMS: &str = r##"
     };
   }
 
+  // Math.random, seeded from this head's farble seed (mulberry32). QuickJS's
+  // default Math.random is seeded from process entropy, so it (a) varies every
+  // run — a non-determinism that makes a page's script-driven layout render
+  // differently each load, breaking reproducibility — and (b) is an uncorrelated
+  // per-process entropy source, a fingerprinting tell. A seeded generator makes
+  // renders reproducible and gives each head one coherent, stable random stream.
+  (function(){
+    var __mr=(__FARBLE_LO ^ Math.imul(__FARBLE_HI,0x9E3779B9))>>>0;
+    Math.random=function(){
+      __mr=(__mr+0x6D2B79F5)>>>0;
+      var t=__mr;
+      t=Math.imul(t^(t>>>15), t|1)>>>0;
+      t=(t+Math.imul(t^(t>>>7), t|61))>>>0;
+      return ((t^(t>>>14))>>>0)/4294967296;
+    };
+  })();
+
   // ---- PNG writer (stored-block zlib; real, decodable output) ----
   var __CRC_T=(function(){var t=[];for(var n=0;n<256;n++){var c=n;for(var k=0;k<8;k++)c=(c&1)?((0xEDB88320^(c>>>1))>>>0):(c>>>1);t[n]=c>>>0;}return t;})();
   function __crc32(b,s,e){var c=0xFFFFFFFF;for(var i=s;i<e;i++)c=(__CRC_T[(c^b[i])&255]^(c>>>8))>>>0;return (c^0xFFFFFFFF)>>>0;}
@@ -528,6 +545,19 @@ mod tests {
             .count();
         // Distinct seeds must diverge across the surface (not be near-identical).
         assert!(differing > 256, "only {differing}/1024 samples differed");
+    }
+
+    #[test]
+    fn math_random_is_overridden_with_the_seeded_prng() {
+        // Math.random must be replaced by a generator keyed off the per-head
+        // farble seed, not QuickJS's process-entropy default — otherwise the same
+        // script-driven page renders differently each load (non-reproducible) and
+        // Math.random leaks per-process entropy as a fingerprint tell.
+        assert!(FARBLING_SHIMS.contains("Math.random=function"));
+        assert!(
+            FARBLING_SHIMS.contains("__FARBLE_LO ^ Math.imul(__FARBLE_HI"),
+            "the Math.random seed must derive from this head's farble seed"
+        );
     }
 
     #[test]

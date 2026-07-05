@@ -3023,6 +3023,29 @@ pub const DOM_MODEL_PRELUDE: &str = r##"
       pageLeft: 0, pageTop: 0, onresize: null, onscroll: null,
       addEventListener: function () {}, removeEventListener: function () {},
     };
+    // Deterministic wall clock. The real Date.now()/new Date() read process
+    // wall-clock time, which (a) varies every render — the same script-driven
+    // page then lays out differently each load, so a screenshot is not
+    // reproducible — and (b) is a timing / clock-skew fingerprint surface. We
+    // replace the *current-time* reads with a fixed base epoch advanced by a
+    // deterministic monotonic tick; explicit dates (new Date(ms), Date.parse,
+    // Date.UTC) and every prototype method are preserved unchanged. The base is
+    // a plausible recent "now" so cookie-expiry and campaign-date logic still
+    // behaves. (This is the "Date neutralized" path the performance shim below
+    // already anticipates.)
+    (function () {
+      var __RD = Date, __base = 1751000000000, __tick = 0;
+      function __now() { __tick += 1; return __base + __tick; }
+      function CDate() {
+        if (arguments.length === 0) { return new __RD(__now()); }
+        return Reflect.construct(__RD, arguments);
+      }
+      CDate.prototype = __RD.prototype;
+      CDate.now = __now;
+      CDate.parse = __RD.parse;
+      CDate.UTC = __RD.UTC;
+      globalThis.Date = CDate;
+    })();
     // performance: a MONOTONIC ms clock anchored to a real epoch. A loaded
     // document with timeOrigin === 0 and all-zero timing is an impossible read
     // (loadEventEnd would predate the epoch), and timeOrigin+now() must track

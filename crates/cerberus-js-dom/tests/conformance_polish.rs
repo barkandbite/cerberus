@@ -82,6 +82,43 @@ fn performance_clock_is_epoch_anchored_and_monotonic() {
 }
 
 #[test]
+fn wall_clock_is_deterministic_not_process_time() {
+    // Date.now()/new Date() must read a fixed base epoch (advanced by a
+    // deterministic monotonic tick), not process wall-clock. Two fresh realms
+    // therefore see the same clock — the prerequisite for a script-driven page to
+    // render identically across loads. Explicit dates (Date.parse) still work.
+    let probe = r#"(function(){
+        var a = Date.now();
+        var b = Date.now();
+        var c = new Date().getTime();
+        // Fixed plausible base epoch (2025-ish), strictly monotonic per call.
+        var based = a >= 1751000000000 && a < 1751000001000;
+        var mono = b > a && c > b;
+        // Explicit dates are untouched.
+        var parsed = Date.parse("2020-01-01T00:00:00Z") === 1577836800000;
+        return [based, mono, parsed].join(',');
+    })()"#;
+
+    let (mut e1, r1) = installed();
+    assert_eq!(
+        eval_str(e1.as_mut(), r1, probe),
+        "true,true,true",
+        "clock is a deterministic monotonic epoch",
+    );
+
+    // Two independent, freshly-installed realms read the identical value on their
+    // first Date.now() call — no process-entropy drift between two loads of the
+    // same page (the prerequisite for reproducible screenshots).
+    let (mut e2, r2) = installed();
+    let (mut e3, r3) = installed();
+    assert_eq!(
+        eval_str(e2.as_mut(), r2, "String(Date.now())"),
+        eval_str(e3.as_mut(), r3, "String(Date.now())"),
+        "two fresh page loads see the same clock value",
+    );
+}
+
+#[test]
 fn text_encoder_substitutes_u_fffd_for_unpaired_surrogates() {
     // Well-formed text (incl. 3-byte BMP and 4-byte astral pairs) is byte-exact;
     // lone/unpaired surrogates become EF BF BD (U+FFFD), matching real Chrome
