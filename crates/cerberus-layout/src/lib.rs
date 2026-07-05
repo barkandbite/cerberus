@@ -247,6 +247,15 @@ struct Ctx<'a> {
     line_h: i32,
     line: Vec<LinePiece>,
     line_align: TextAlign,
+    /// Output-buffer lengths at the start of the current line, so `text-align`
+    /// can shift the atomic inline boxes added mid-line (inline-blocks, form
+    /// fields, buttons, inline images) — which go straight to these buffers
+    /// rather than the buffered `line` of text pieces — by the same offset as the
+    /// text. Without this, only text centered/right-aligned; boxes stayed left.
+    line_disp0: usize,
+    line_links0: usize,
+    line_fields0: usize,
+    line_elems0: usize,
     /// The `NodeId` of the enclosing `<a>` while flowing its inline content, so
     /// each link piece can carry it into a hit box for event dispatch (M12b).
     cur_link_node: Option<NodeId>,
@@ -318,6 +327,10 @@ impl<'a> Ctx<'a> {
             line_h: 0,
             line: Vec::new(),
             line_align: TextAlign::Left,
+            line_disp0: 0,
+            line_links0: 0,
+            line_fields0: 0,
+            line_elems0: 0,
             cur_link_node: None,
             opacity_hidden: false,
             scratch: None,
@@ -377,6 +390,10 @@ impl<'a> Ctx<'a> {
             line_h: 0,
             line: Vec::new(),
             line_align: TextAlign::Left,
+            line_disp0: 0,
+            line_links0: 0,
+            line_fields0: 0,
+            line_elems0: 0,
             cur_link_node: None,
             opacity_hidden: false,
             scratch: None,
@@ -656,6 +673,9 @@ impl<'a> Ctx<'a> {
             self.right = (box_left + box_w - br - pr).max(self.left + 1);
             self.y += style.border_top + style.padding_top;
             self.x = self.left;
+            // This block's first line starts here — track its atomic boxes for
+            // text-align (a fresh block may not have gone through commit_line).
+            self.mark_line_start();
             if visible && style.display == Display::ListItem {
                 if let Some(m) = list_marker(style.list_style_type, self.list_ordinal) {
                     self.add_run(&m, style, None);
@@ -1542,11 +1562,17 @@ impl<'a> Ctx<'a> {
         self.pending_indent = 0;
     }
 
+    /// Record the output-buffer lengths at the start of a line, so `commit_line`
+    /// can shift the atomic boxes added during it by the `text-align` offset.
+    fn mark_line_start(&mut self) {
+        self.line_disp0 = self.display.items.len();
+        self.line_links0 = self.links.len();
+        self.line_fields0 = self.fields.len();
+        self.line_elems0 = self.elements.len();
+    }
+
     /// Apply text-align to the buffered line, then emit it.
     fn commit_line(&mut self) {
-        if self.line.is_empty() {
-            return;
-        }
         let used = self.x - self.left;
         let available = ((self.right - self.left) - used).max(0);
         let offset = match self.line_align {
@@ -1554,6 +1580,25 @@ impl<'a> Ctx<'a> {
             TextAlign::Center => available / 2,
             TextAlign::Right => available,
         };
+        // Shift the atomic inline boxes added during this line (inline-blocks,
+        // form fields, buttons, inline images) — they went straight to the output
+        // buffers rather than the buffered text `line`, so `text-align` must move
+        // them by the same offset. Done before the text pieces are appended so the
+        // range covers only this line's boxes.
+        if offset != 0 {
+            for it in &mut self.display.items[self.line_disp0..] {
+                translate_item(it, offset, 0);
+            }
+            for l in &mut self.links[self.line_links0..] {
+                l.rect = offset_rect(l.rect, offset, 0);
+            }
+            for f in &mut self.fields[self.line_fields0..] {
+                f.rect = offset_rect(f.rect, offset, 0);
+            }
+            for e in &mut self.elements[self.line_elems0..] {
+                e.rect = offset_rect(e.rect, offset, 0);
+            }
+        }
         // Drain through a moved-out buffer so the line `Vec`'s capacity is kept
         // for the next line instead of being dropped each commit (`mem::take`
         // would leave a zero-capacity `Vec`).
@@ -1592,6 +1637,8 @@ impl<'a> Ctx<'a> {
             }
         }
         self.line = line;
+        // The next line's atomic boxes start after everything emitted here.
+        self.mark_line_start();
     }
 
     fn rule(&mut self) {
