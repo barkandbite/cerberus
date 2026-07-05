@@ -147,7 +147,19 @@ scroll containers.
 
 ---
 
-## Workstream C — JS execution determinism (investigate before "fixing")
+## Workstream C — JS execution determinism  ✅ DONE
+
+**Closed.** Root cause was two process-non-deterministic entropy/time sources:
+`Math.random` used QuickJS's entropy-seeded default, and `Date.now()`/`new Date()`
+read wall-clock. A page bucketing on either (e.g. the fundraising banner) rendered
+differently each load. Fixes: seeded `Math.random` (mulberry32 off the per-head
+`__FARBLE_HI/LO`) in the farbling prologue, and a deterministic monotonic clock
+(fixed base epoch) for `Date.now()`/`new Date()` in the DOM prelude
+(`Date.parse`/`Date.UTC`/explicit dates preserved). Four renders of a fixed-URL
+Wikipedia mirror are now byte-identical. Both were also fingerprint surfaces, so
+this is a privacy win too. Original notes retained below for reference.
+
+## Workstream C (original notes) — JS execution determinism
 
 **Observation.** The fundraising banner's visibility flipped between identical runs.
 That means the QuickJS event-loop pump or the DOM it produces is
