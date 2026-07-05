@@ -120,6 +120,10 @@ impl CssEngine {
         parent_vars: &Vars,
         path: &mut Vec<ElemRef>,
         author: &Stylesheet,
+        // Root element's computed font-size in px — the base for `rem`.
+        // `html { font-size: 62.5% }` → 1rem = 10px; a hardcoded 16 would size
+        // every rem-based box 1.6x too large.
+        root_font_size: u32,
     ) -> StyledNode {
         let is_root = node.tag() == "#root";
         let mut style = if is_root {
@@ -174,18 +178,52 @@ impl CssEngine {
             // applied last, tops author `!important`). The UA sheet declares no
             // `!important`, so UA-important is not separately elevated.
             for (_, _, _, decls) in &matched {
-                apply_declarations(&mut style, decls, parent.font_size, &vars, false);
+                apply_declarations(
+                    &mut style,
+                    decls,
+                    parent.font_size,
+                    root_font_size,
+                    &vars,
+                    false,
+                );
             }
             if let Some(decls) = &inline {
-                apply_declarations(&mut style, decls, parent.font_size, &vars, false);
+                apply_declarations(
+                    &mut style,
+                    decls,
+                    parent.font_size,
+                    root_font_size,
+                    &vars,
+                    false,
+                );
             }
             for (_, _, _, decls) in &matched {
-                apply_declarations(&mut style, decls, parent.font_size, &vars, true);
+                apply_declarations(
+                    &mut style,
+                    decls,
+                    parent.font_size,
+                    root_font_size,
+                    &vars,
+                    true,
+                );
             }
             if let Some(decls) = &inline {
-                apply_declarations(&mut style, decls, parent.font_size, &vars, true);
+                apply_declarations(
+                    &mut style,
+                    decls,
+                    parent.font_size,
+                    root_font_size,
+                    &vars,
+                    true,
+                );
             }
         }
+
+        let child_root_font_size = if node.tag() == "html" {
+            style.font_size
+        } else {
+            root_font_size
+        };
 
         // The element children, reduced for sibling / :nth-child matching, shared
         // across this level via `Rc` so the cascade stays O(n).
@@ -209,6 +247,7 @@ impl CssEngine {
                         &vars,
                         path,
                         author,
+                        child_root_font_size,
                     );
                     elem_index += 1;
                     StyledChild::Element(Box::new(styled))
@@ -254,6 +293,7 @@ impl StyleEngine for CssEngine {
             &no_vars,
             &mut path,
             &author,
+            INITIAL_ROOT_FONT_PX,
         );
         StyledDom { root: styled }
     }
@@ -656,10 +696,14 @@ impl CalcParser<'_> {
     }
 }
 
+/// Initial root font-size in px (the base for `rem` before any `html {font-size}`).
+const INITIAL_ROOT_FONT_PX: u32 = 16;
+
 fn apply_declarations(
     style: &mut ComputedStyle,
     decls: &[(String, String, bool)],
     parent_font_size: u32,
+    root_font_size: u32,
     vars: &Vars,
     important: bool,
 ) {
@@ -674,6 +718,9 @@ fn apply_declarations(
         if prop.starts_with("--") {
             continue;
         }
+        // Fold `rem` to px against the root font-size up front (`em` stays for
+        // per-element resolution), so downstream length parsers see px.
+        let value = &substitute_rem(value, root_font_size as f32);
         // Resolve `var()` references and `calc()` math before parsing the value.
         // `em` for `calc()` uses the element's current font size.
         let resolved = resolve_value(value, vars, style.font_size as f32);
@@ -1711,6 +1758,49 @@ fn parse_size(v: &str, parent: u32) -> Option<u32> {
     Some(px.round().max(1.0) as u32)
 }
 
+/// Replace every `<number>rem` in a value with its px equivalent against
+/// `root_em`. Only a numeric prefix triggers a match, so `rem` inside an
+/// identifier/function/URL is untouched, and `em`/other units are left for
+/// per-element resolution. Handles signs and decimals (`-1.5rem`).
+fn substitute_rem(value: &str, root_em: f32) -> String {
+    let bytes = value.as_bytes();
+    let mut out = String::with_capacity(value.len());
+    let mut i = 0;
+    while i < value.len() {
+        let mut j = i;
+        if j < bytes.len() && (bytes[j] == b'+' || bytes[j] == b'-') {
+            j += 1;
+        }
+        let num_start = j;
+        while j < bytes.len() && (bytes[j].is_ascii_digit() || bytes[j] == b'.') {
+            j += 1;
+        }
+        let has_digit = value[num_start..j].bytes().any(|c| c.is_ascii_digit());
+        // Byte-compare the unit ('rem' is ASCII); guarantees `j + 3` is a char
+        // boundary so the slices below never split a multi-byte char.
+        let is_rem = j + 3 <= bytes.len()
+            && bytes[j].eq_ignore_ascii_case(&b'r')
+            && bytes[j + 1].eq_ignore_ascii_case(&b'e')
+            && bytes[j + 2].eq_ignore_ascii_case(&b'm')
+            && !value[j + 3..]
+                .chars()
+                .next()
+                .is_some_and(|c| c.is_alphanumeric());
+        if has_digit && is_rem {
+            if let Ok(n) = value[i..j].parse::<f32>() {
+                out.push_str(&((n * root_em).round() as i32).to_string());
+                out.push_str("px");
+                i = j + 3;
+                continue;
+            }
+        }
+        let ch = value[i..].chars().next().unwrap();
+        out.push(ch);
+        i += ch.len_utf8();
+    }
+    out
+}
+
 fn parse_len(v: &str, em_base: f32) -> Option<i32> {
     let v = v.trim().to_ascii_lowercase();
     if v == "auto" || v == "inherit" {
@@ -2645,6 +2735,26 @@ mod tests {
         // 2em at the default 16px font = 32px; inherited by the child.
         assert_eq!(first(&dom.root, "div").unwrap().style.text_indent, 32);
         assert_eq!(first(&dom.root, "p").unwrap().style.text_indent, 32);
+    }
+
+    #[test]
+    fn rem_resolves_against_the_root_font_size() {
+        // `html { font-size: 62.5% }` → root = 10px, so 1rem = 10px everywhere,
+        // not the hardcoded 16. Both a dimension (width) and a font-size scale.
+        let dom = CssEngine::new().style(&parse_html(
+            "<html style='font-size:62.5%'><body>\
+               <div style='width:15.6rem;font-size:1.3rem'>x</div>\
+             </body></html>",
+        ));
+        let div = first(&dom.root, "div").unwrap();
+        assert_eq!(div.style.width.resolve(1000), Some(156));
+        assert_eq!(div.style.font_size, 13);
+        // Without any html font-size, rem stays 16px (the initial base).
+        let plain = CssEngine::new().style(&parse_html("<div style='width:2rem'>x</div>"));
+        assert_eq!(
+            first(&plain.root, "div").unwrap().style.width.resolve(1000),
+            Some(32)
+        );
     }
 
     #[test]

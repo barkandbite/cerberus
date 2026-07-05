@@ -531,7 +531,15 @@ impl<'a> Ctx<'a> {
                 }
             };
             let saved = self.right;
-            self.right = self.left0 + used_w;
+            // Extend the used-width box from the element's flow-start (`self.left`,
+            // the current content-left of its container), NOT `self.left0` — the
+            // latter is an ancestor reference and, inside a centered/indented
+            // container (`margin:0 auto`), sits to the LEFT of `self.left`. With a
+            // narrow container that makes `right < left`, collapsing avail to 1px
+            // and wrapping the content (Wikipedia's language cells inside the
+            // centered `.central-featured`). Was masked when the container was wide
+            // enough to keep the (wrong) width positive.
+            self.right = self.left + used_w;
             Some(saved)
         } else {
             None
