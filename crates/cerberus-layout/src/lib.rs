@@ -4479,6 +4479,34 @@ mod tests {
     }
 
     #[test]
+    fn inline_block_in_absolute_cell_gets_the_cell_width() {
+        // An inline-block inside an absolute cell (only `right` set + explicit
+        // width) must see the cell's content width, not a collapsed ~1px box —
+        // else its text wraps though it fits. This is Wikipedia's count
+        // ("N articles", a `display:inline-block` <small>) in a 156px lang cell.
+        let laid = lay(
+            "<div style='position:relative;width:600px;height:300px;text-align:center'>\
+               <div style='position:absolute;right:60%;width:200px'>\
+                 <a style='display:block'>\
+                   <strong style='display:block'>Name</strong>\
+                   <span style='display:inline-block'>a b c</span>\
+                 </a>\
+               </div>\
+             </div>",
+            800,
+        );
+        // Two lines expected: the block <strong> and the inline-block below it —
+        // NOT a third line from the inline-block's text wrapping in a collapsed box.
+        let ys: std::collections::BTreeSet<i32> =
+            glyph_xy(&laid).into_iter().map(|(_, y)| y).collect();
+        assert_eq!(
+            ys.len(),
+            2,
+            "strong on line 1, inline-block text on one line below: {ys:?}"
+        );
+    }
+
+    #[test]
     fn absolutely_positioned_img_resolves_against_its_ancestor() {
         // An absolute <img> honors top/left against its positioned ancestor,
         // instead of being laid in normal flow with its insets ignored (the

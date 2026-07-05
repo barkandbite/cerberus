@@ -51,6 +51,22 @@ that the oversized rem was accidentally masking. Land the rem fix **together wit
    used_w`, but a descendant is still seeing the parent container's edge. This is
    the concrete companion bug; fixing it should let the rem change land as a net
    win. (Reproduce with the rem spike re-applied + `CERB_DBG=1` on the mirror.)
+   **Deeper probe (2nd pass):** the cell's own width setup is *correct* — a probe
+   at the `used_w` computation prints `used_w=156, left0=8, cb.w=546` for every
+   cell, so it sets `self.right = left0 + 156 = 164`. Yet the `<small>` lays at
+   `left=227, right=228`. The coordinates are **inconsistent**: the cell is
+   referenced at body-left (`left0=8`) while its descendant is laid at
+   `.central-featured`'s *centered* content-left (227 = (1000−546)/2) in a 1px
+   box. So the collapse is not the width computation — it is a mismatch between the
+   cell's in-flow layout reference (`left0`/`left`) and the coordinate space its
+   descendants land in, specific to an absolute cell inside a centered
+   (`margin:0 auto`) relative container. A synthetic repro
+   (`inline_block_in_absolute_cell_gets_the_cell_width`, kept as a passing general
+   guard) does NOT reproduce it, so the trigger is the full centered-container +
+   reveal(`opacity`) + rem-narrowed-widths combination. Next: probe `self.left` vs
+   `self.left0` through the cell's block-open and children and the
+   `apply_positioning` translate, to find where the 227 origin enters while the
+   width reference stays at 8.
 2. **Globe / column horizontal placement.** The absolute globe (in `.central-textlogo`)
    and the `right:60%`/`left:60%` language insets must scale with the corrected
    container width so the globe centers between columns instead of overlapping the
