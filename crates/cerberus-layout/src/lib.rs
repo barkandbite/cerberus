@@ -1129,8 +1129,10 @@ impl<'a> Ctx<'a> {
             + e.style.padding_right
             + e.style.border_left
             + e.style.border_right;
+        let floor = min_border_box_width(&e.style, avail, h_extra, self.vw, self.vh);
         let w = resolve_border_box_width(&e.style, avail, h_extra, self.vw, self.vh)
             .unwrap_or_else(|| self.measure_intrinsic_width(e).min(avail))
+            .max(floor)
             .clamp(1, avail);
         if self.x != self.left && self.x + w > self.right {
             self.newline();
@@ -1930,8 +1932,14 @@ impl<'a> Ctx<'a> {
         let is_right = e.style.float == cerberus_style::Float::Right;
         let avail = (self.right - self.left).max(1);
         let explicit = resolve_block_width(&e.style, avail, self.vw, self.vh);
+        let floor = e
+            .style
+            .min_width
+            .resolve_vp(avail, self.vw, self.vh)
+            .unwrap_or(0);
         let w = explicit
             .unwrap_or_else(|| self.measure_intrinsic_width(e).min(avail))
+            .max(floor)
             .clamp(1, avail);
         if !fb.active {
             fb.active = true;
@@ -2821,6 +2829,23 @@ fn resolve_border_box_width(
     })
 }
 
+/// The `min-width` floor as a **border-box** width (box-sizing aware), or 0 when
+/// unset. Applied by shrink-to-fit callers after measuring content, since
+/// `resolve_block_width` deliberately leaves an auto-width box unconstrained
+/// rather than pinning it to `min-width`.
+fn min_border_box_width(style: &ComputedStyle, avail: i32, h_extra: i32, vw: i32, vh: i32) -> i32 {
+    match style.min_width.resolve_vp(avail, vw, vh) {
+        Some(mw) => {
+            let mw = mw.max(0);
+            match style.box_sizing {
+                cerberus_style::BoxSizing::BorderBox => mw,
+                cerberus_style::BoxSizing::ContentBox => mw + h_extra,
+            }
+        }
+        None => 0,
+    }
+}
+
 /// State for packing a run of `float` siblings into rows (ADR-0039).
 struct FloatBand {
     /// The container's content-left (where each band row starts).
@@ -2864,8 +2889,19 @@ fn resolve_block_width(style: &ComputedStyle, avail: i32, vw: i32, vh: i32) -> O
     if let Some(mw) = res(style.max_width) {
         w = Some(w.unwrap_or(avail).min(mw));
     }
+    // `min-width` is a floor, not a definite width. It clamps a width already
+    // fixed by `width`/`max-width`; but with `width:auto` and no `max-width`
+    // the box is unconstrained (a block fills `avail`, an inline-block/float
+    // shrink-fits its content) — flooring against 0 here would collapse a
+    // shrink-to-fit box to `min-width` and suppress content measurement. Leave
+    // it unconstrained then, unless `min-width` exceeds `avail` (an overflow the
+    // floor genuinely widens); the shrink-to-fit caller re-applies the floor.
     if let Some(mw) = res(style.min_width) {
-        w = Some(w.unwrap_or(0).max(mw));
+        match w {
+            Some(cur) => w = Some(cur.max(mw)),
+            None if mw > avail => w = Some(mw),
+            None => {}
+        }
     }
     let w = w?;
     // Not a constraint if `width` is auto and it wouldn't narrow the box.
@@ -5105,6 +5141,27 @@ mod tests {
     }
 
     #[test]
+    fn min_width_floors_but_does_not_pin_a_shrink_to_fit_box() {
+        // An icon-only button (Wikipedia search) sizes to its content — an
+        // inline-block icon plus padding — even though `.pure-button` sets a
+        // small `min-width`. min-width is a floor, not a fixed width: it must
+        // not suppress content measurement and collapse the box.
+        let html = "<style>.ib{display:inline-block;width:22px;height:22px}\
+b{display:inline-block;min-width:16px;padding:8px 16px;box-sizing:border-box;\
+background-color:#0645ad}</style><b><i class=\"ib\">x</i></b>";
+        let laid = lay(html, 400);
+        // 22px icon + 2*16px padding = 54px, well above the 16px min-width.
+        let wide = laid.display.items.iter().any(|it| {
+            matches!(
+            it, DisplayItem::Rect { rect, .. } if rect.w >= 50 && rect.w <= 60)
+        });
+        assert!(
+            wide,
+            "shrink-to-fit box sizes to content (~54px), not min-width"
+        );
+    }
+
+    #[test]
     fn button_with_element_children_lays_them_out_and_stays_a_button() {
         // Wikipedia's language/search buttons wrap icon `<i>` sprites and a
         // `<span>` label rather than bare text. Such a button is laid via the
@@ -5112,10 +5169,7 @@ mod tests {
         // clickable Button hit box. (Regression: routing the children through
         // `add_inline_block` used to recurse back into `form_button` during
         // intrinsic-width measurement and overflow the stack.)
-        let laid = lay(
-            "<button><i></i><span>Read this</span><i></i></button>",
-            400,
-        );
+        let laid = lay("<button><i></i><span>Read this</span><i></i></button>", 400);
         assert_eq!(total_glyphs(&laid), 8, "child span's 'Read this' laid out");
         let buttons: Vec<_> = laid
             .fields
