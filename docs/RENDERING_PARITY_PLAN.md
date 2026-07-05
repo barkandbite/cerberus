@@ -71,17 +71,31 @@ PNGs, crops Cerberus's 36px toolbar (`--crop-top 36`), compares over the overlap
 and prints an **RMSE** (`0.0` = identical) plus a mismatch fraction; `--fail-over
 <rmse>` makes it a regression gate. `docs/parity-corpus.txt` holds the corpus and
 `scripts/parity.sh` runs the whole loop (mirror → Chrome + Cerberus render →
-diff) emitting a `parity.csv`. **Current baselines** (toolbar cropped, tolerance 8): `example` RMSE **0.069**
+diff) emitting a `parity.csv`. **Current baselines** (toolbar cropped, tolerance 8): `example` RMSE **0.068**
 (1.6% — was 0.095 / 89% before the canvas-background fix below), `iana` RMSE
-**0.134** (22.6% — inline nav/link spacing now correct; remainder is the
-flex/`width:1100px` content column + font rhythm), `wikipedia` RMSE 0.147 (9% —
-the search-widget + donation-banner region). Drive these down; a rise is a
+**0.131** (16.9% — was 22.6%; inline spacing + line-height fixed, remainder is
+font-face/wrap-point drift and the footer table columns), `wikipedia` RMSE 0.147
+(9% — the search-widget + donation-banner region). Drive these down; a rise is a
 regression.
 
 **Inline box spacing** (W-C/layout): a true inline element's horizontal
 padding/margin/border is now applied, so styled inline links no longer run
 together (iana's `DomainsProtocolsNumbersAbout` → `Domains Protocols Numbers
 About`). General — affects nav menus, tag pills, inline links everywhere.
+
+**Default `line-height: normal` → ~1.2×** (W-E/layout): was 1.5×, so every
+text block ran ~25% too tall and content drifted down, misaligning everything
+below the fold (iana's footer sat 74px low → a 71% mismatch band). Now `px*6/5`.
+iana 22.6% → 16.9% (footer realigned to 27px off); general vertical-rhythm fix.
+
+**Deferred — table auto-layout column widths** (W-C). `fn table` splits width
+equally across columns; Chrome sizes each to its content (a narrow label column
+beside a wide links column). Attempted content-proportional widths from
+`measure_intrinsic_width` per cell, but that **underestimates a cell whose
+content is `display:inline; float:left`** (iana's footer `<li>` links measured
+stacked, ~130px, not the ~450px horizontal row), so columns came out too narrow
+and wrapped — reverted. Prerequisite: make `measure_intrinsic_width` reflect the
+cell's real inline/float flow before sizing columns to it.
 
 **First win driven by the yardstick — canvas background propagation.** The
 `example` diff (89% of pixels off by a little) root-caused to the root/body
