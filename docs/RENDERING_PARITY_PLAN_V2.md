@@ -60,7 +60,21 @@ on JS event-loop execution, not CSS/layout. See workstream C.
 
 ---
 
-## Workstream A — font fallback + CJK/emoji  (highest remaining visual impact)
+## Workstream A — font fallback + CJK  ✅ DONE (emoji still open)
+
+**Closed for CJK.** Bundled IPAGothic (IPA Font License v1.0, 6.2 MB) as a fallback
+face and added per-glyph font selection: `GlyphBox` carries a `FontSlot`
+(Text/Icon/Fallback); `shape()` prefers Roboto and, for a character it lacks,
+shapes from the fallback when covered (else keeps the real `.notdef`); `draw_run()`
+outlines each glyph from its own face on a shared baseline. Verified against a
+Wikipedia mirror: 日本語/記事/中文/条目/條目 now render as real glyphs (IPAGothic
+covers Kanji/Kana and, via shared Han, Wikipedia's Chinese). Renders stay
+byte-deterministic. **Emoji is still open** — 🎉 needs a color-emoji (COLR/CBDT)
+face, which ab_glyph does not rasterize; tracked separately. The original design
+notes below remain valid for extending the fallback chain (e.g. web fonts,
+workstream D — generalize `FontSlot` to a font-table index).
+
+## Workstream A (original design notes) — font fallback + CJK/emoji
 
 **Symptom.** `日本語`, `中文`, and emoji render as tofu (□) because the only bundled
 text font is Latin Roboto (`cerberus-text/assets/Roboto-Regular.ttf`). Chrome has
