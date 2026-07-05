@@ -4435,6 +4435,11 @@ impl FrameApp for BrowserApp {
         let mut origin = self.toolbar.content_origin();
         origin.y += banner_h as i32;
 
+        // The canvas background is the root/body background propagated to the
+        // viewport (CSS), so a page whose `<body>` sets a color fills the whole
+        // content area rather than leaving white below its short box.
+        let canvas_bg = canvas_background(&self.styled, self.background);
+
         // Time layout+paint (M11). The image provider's borrow of `self` is
         // scoped to this block so the timing record (a `&mut self` op) is free.
         let t = Instant::now();
@@ -4446,7 +4451,7 @@ impl FrameApp for BrowserApp {
             let mut layout = BlockLayout::default();
             let laid = layout.layout(&self.styled, content, &self.text, &provider, &self.forms);
             let mut page = Framebuffer::new(Size::new(su(content.w), su(content.h)));
-            page.clear(self.background);
+            page.clear(canvas_bg);
             self.text.rasterize(&laid.display.scaled(scale), &mut page);
             (laid, page)
         };
@@ -4513,7 +4518,7 @@ impl FrameApp for BrowserApp {
         self.paint_caret(&mut page, origin, scale);
 
         let mut fb = Framebuffer::new(size);
-        fb.clear(self.background);
+        fb.clear(canvas_bg);
         fb.blit(Point::new(si(origin.x), si(origin.y)), &page);
         self.text.rasterize(
             &self.toolbar.paint(logical, &self.text).scaled(scale),
