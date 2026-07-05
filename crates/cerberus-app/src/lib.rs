@@ -1092,7 +1092,11 @@ pub fn render(config: &RenderConfig) -> Result<RenderOutcome, AppError> {
         None => ExternalSheets::new(),
     };
     let style_t = Instant::now();
-    let styled = CssEngine::new().style_with_sheets(&document, &sheets);
+    // Evaluate @media against the actual render viewport, so width/height queries
+    // (responsive breakpoints) select the same layout Chrome shows at this size —
+    // not a hardcoded desktop default that can disagree with the layout width.
+    let styled = CssEngine::with_media(config.viewport.w, config.viewport.h)
+        .style_with_sheets(&document, &sheets);
     timings.record("style", style_t.elapsed());
 
     // Fetch + decode this page's images up front (the one-shot path is

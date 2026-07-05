@@ -418,7 +418,16 @@ impl<'a> Ctx<'a> {
             }
             "img" => {
                 if visible {
+                    // A positioned <img> (e.g. Wikipedia's globe:
+                    // position:absolute;top:158px inside the relative wordmark box)
+                    // must resolve its insets like any positioned box, not lay in
+                    // normal flow. Capture flow state, lay the replaced box, then
+                    // translate/lift it against its containing block.
+                    let base = self.positioned_base(style);
                     self.image(node, in_link);
+                    if let Some(base) = base {
+                        self.apply_positioning(style, base);
+                    }
                 }
                 return;
             }
@@ -763,6 +772,32 @@ impl<'a> Ctx<'a> {
                 w: (self.right - self.left0).max(0),
                 h: self.vh,
             }),
+        }
+    }
+
+    /// Capture the flow state before laying a `relative`/`absolute`/`fixed`
+    /// element, so [`apply_positioning`](Self::apply_positioning) can translate or
+    /// lift exactly its output. `None` for in-flow elements. Used by the replaced
+    /// (`<img>`) path, which otherwise laid positioned images in normal flow and
+    /// ignored their insets.
+    fn positioned_base(&self, style: &ComputedStyle) -> Option<PosBase> {
+        use cerberus_style::Position;
+        let positioned = self.pos_enabled
+            && matches!(
+                style.position,
+                Position::Relative | Position::Absolute | Position::Fixed
+            );
+        if positioned {
+            Some(PosBase {
+                disp: self.display.items.len(),
+                links: self.links.len(),
+                fields: self.fields.len(),
+                elements: self.elements.len(),
+                y: self.y,
+                x: self.left0,
+            })
+        } else {
+            None
         }
     }
 
@@ -4441,6 +4476,52 @@ mod tests {
             _ => panic!(),
         };
         assert!(cx > lx, "centered line starts further right");
+    }
+
+    #[test]
+    fn absolutely_positioned_img_resolves_against_its_ancestor() {
+        // An absolute <img> honors top/left against its positioned ancestor,
+        // instead of being laid in normal flow with its insets ignored (the
+        // Wikipedia-globe bug: position:absolute;top:158px inside a relative box).
+        let styled = CssEngine::new().style(&parse_html(
+            "<div style='height:100px'>spacer</div>\
+             <div style='position:relative'>\
+               <img src='g.png' style='position:absolute;top:40px;left:20px'>\
+             </div>",
+        ));
+        let img = Arc::new(DecodedImage {
+            size: Size::new(30, 30),
+            rgba: vec![255; 30 * 30 * 4],
+        });
+        let laid = BlockLayout::default().layout(
+            &styled,
+            Size::new(400, 2000),
+            &MonoShaper,
+            &OneImage(img),
+            &NoForms,
+        );
+        let rect = laid
+            .display
+            .items
+            .iter()
+            .find_map(|i| match i {
+                DisplayItem::Image { rect, .. } => Some(*rect),
+                _ => None,
+            })
+            .expect("image emitted");
+        // Relative container sits at y≈108 (100px spacer + body's 8px margin);
+        // top:40 → ~148, left:20 → ~28 (+8px body margin). Without the fix the
+        // image would land at the flow origin (~top of the relative box).
+        assert!(
+            (140..=156).contains(&rect.y),
+            "img at ancestor.y + top:40px, got y={}",
+            rect.y
+        );
+        assert!(
+            (24..=32).contains(&rect.x),
+            "img at left:20px (+ body margin), got x={}",
+            rect.x
+        );
     }
 
     #[test]
