@@ -499,7 +499,13 @@ impl<'a> Ctx<'a> {
                 fields: self.fields.len(),
                 elements: self.elements.len(),
                 y: self.y,
-                x: self.left0,
+                // The element's in-flow origin — its container's content-left
+                // (`self.left`), where its box is laid, NOT `self.left0` (an
+                // ancestor reference). In a centered container these differ, and
+                // the mismatch offset a left/top-anchored absolute box by exactly
+                // (self.left − self.left0) — e.g. Wikipedia's `left:60%` language
+                // columns landed far to the right.
+                x: self.left,
             })
         } else {
             None
@@ -802,7 +808,9 @@ impl<'a> Ctx<'a> {
                 fields: self.fields.len(),
                 elements: self.elements.len(),
                 y: self.y,
-                x: self.left0,
+                // The element's in-flow origin (`self.left`), not the ancestor
+                // reference `self.left0` — see the block-path capture above.
+                x: self.left,
             })
         } else {
             None
@@ -814,7 +822,10 @@ impl<'a> Ctx<'a> {
     fn apply_positioning(&mut self, style: &ComputedStyle, base: PosBase) {
         use cerberus_style::Position;
         let cb = self.containing_block(style.position);
-        let elem_w = (self.right - self.left0).max(0);
+        // The element's own border-box width, from its content box (`self.left`),
+        // NOT `self.left0` (an ancestor reference that, in a centered container,
+        // sits to the left). Used for right/bottom inset anchoring.
+        let elem_w = (self.right - self.left).max(0);
         let elem_h = (self.y - base.y).max(0);
 
         let (dx, dy) = match style.position {
