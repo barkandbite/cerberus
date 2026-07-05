@@ -242,6 +242,14 @@ impl Framebuffer {
 
     /// Fill a rectangle (opaque write, clipped to bounds).
     pub fn fill_rect(&mut self, rect: Rect, c: Color) {
+        // A fully transparent fill paints nothing. This matters for real pages:
+        // e.g. `background-image: linear-gradient(transparent, transparent), url(x)`
+        // is a common layering hack where the gradient layer must be invisible.
+        // Hard-writing its RGB (black) with alpha 0 would show as a black box once
+        // the framebuffer is flattened to an opaque screenshot.
+        if c.a == 0 {
+            return;
+        }
         let x0 = rect.x.max(0) as u32;
         let y0 = rect.y.max(0) as u32;
         let x1 = ((rect.x + rect.w as i32).max(0) as u32).min(self.size.w);
@@ -253,16 +261,28 @@ impl Framebuffer {
                 && x1 as i32 <= cl.x + cl.w as i32
                 && y1 as i32 <= cl.y + cl.h as i32)
         });
+        // Opaque fills overwrite; translucent fills alpha-blend over the backdrop
+        // (source-over) so a semi-transparent overlay tints rather than replaces.
+        let opaque = c.a == 255;
+        let a = c.a as f32 / 255.0;
         for y in y0..y1 {
             for x in x0..x1 {
                 if clipped && !self.in_clip(x as i32, y as i32) {
                     continue;
                 }
                 let idx = ((y * self.size.w + x) * 4) as usize;
-                self.rgba[idx] = c.r;
-                self.rgba[idx + 1] = c.g;
-                self.rgba[idx + 2] = c.b;
-                self.rgba[idx + 3] = c.a;
+                if opaque {
+                    self.rgba[idx] = c.r;
+                    self.rgba[idx + 1] = c.g;
+                    self.rgba[idx + 2] = c.b;
+                    self.rgba[idx + 3] = 255;
+                } else {
+                    for (i, ch) in [c.r, c.g, c.b].into_iter().enumerate() {
+                        let bg = self.rgba[idx + i] as f32;
+                        self.rgba[idx + i] = (bg * (1.0 - a) + ch as f32 * a).round() as u8;
+                    }
+                    self.rgba[idx + 3] = 255;
+                }
             }
         }
     }
@@ -453,6 +473,29 @@ mod tests {
         assert_eq!(fb.pixel(0, 0), Some(Color::BLACK));
         assert_eq!(fb.pixel(3, 3), Some(Color::WHITE));
         assert_eq!(fb.pixel(4, 4), None);
+    }
+
+    #[test]
+    fn fill_rect_transparent_is_a_noop() {
+        // A fully transparent fill must not touch the backdrop — a black RGB with
+        // alpha 0 (as `linear-gradient(transparent,transparent)` produces) would
+        // otherwise stamp a black box over whatever it overlays.
+        let mut fb = Framebuffer::new(Size::new(2, 2));
+        fb.clear(Color::WHITE);
+        fb.fill_rect(Rect::new(0, 0, 2, 2), Color::rgba(0, 0, 0, 0));
+        assert_eq!(fb.pixel(0, 0), Some(Color::WHITE));
+        assert_eq!(fb.pixel(1, 1), Some(Color::WHITE));
+    }
+
+    #[test]
+    fn fill_rect_translucent_blends_over_backdrop() {
+        // 50% black over white ≈ mid-grey, and the result stays opaque.
+        let mut fb = Framebuffer::new(Size::new(1, 1));
+        fb.clear(Color::WHITE);
+        fb.fill_rect(Rect::new(0, 0, 1, 1), Color::rgba(0, 0, 0, 128));
+        let p = fb.pixel(0, 0).unwrap();
+        assert!((126..=129).contains(&p.r), "blended grey, got {}", p.r);
+        assert_eq!(p.a, 255);
     }
 
     #[test]
