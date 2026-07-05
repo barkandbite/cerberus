@@ -1549,7 +1549,10 @@ fn apply_background_shorthand_geometry(style: &mut ComputedStyle, v: &str) {
     {
         style.background_size = f;
     }
-    let parts: Vec<(u8, f32)> = pos_span.split_whitespace().filter_map(classify_pos_tok).collect();
+    let parts: Vec<(u8, f32)> = pos_span
+        .split_whitespace()
+        .filter_map(classify_pos_tok)
+        .collect();
     if let Some(p) = combine_pos(&parts[parts.len().saturating_sub(2)..]) {
         style.background_position = p;
     }

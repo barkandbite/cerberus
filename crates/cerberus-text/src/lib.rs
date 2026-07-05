@@ -554,7 +554,14 @@ mod tests {
         let draw = |fit: ImageFit, pos: ImagePos| {
             let mut fb = Framebuffer::new(Size::new(20, 20));
             fb.fill_rect(Rect::new(0, 0, 20, 20), Color::WHITE);
-            TextEngine::new().draw_image(Rect::new(0, 0, 20, 20), &image, fit, pos, Point::ZERO, &mut fb);
+            TextEngine::new().draw_image(
+                Rect::new(0, 0, 20, 20),
+                &image,
+                fit,
+                pos,
+                Point::ZERO,
+                &mut fb,
+            );
             fb
         };
         // Cover anchored left keeps the green left edge; centered crops it away.
