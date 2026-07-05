@@ -18,7 +18,7 @@ use cerberus_style::{
     Position, StyleEngine, StyledChild, StyledDom, StyledNode, TextAlign, TextTransform, Track,
     TrackMax, VerticalAlign, Visibility, WhiteSpace,
 };
-use cerberus_types::{Color, ImageFit, ImagePos};
+use cerberus_types::{Color, ImageFit, ImagePos, Point};
 use parser::{
     parse_declaration_block, parse_stylesheet, ElemRef, MediaContext, SiblingRef, Specificity,
     Stylesheet,
@@ -701,7 +701,8 @@ fn apply_declarations(
                     style.background_image = parse_url_value(v);
                     style.background_gradient = parse_gradient(v).map(Box::new);
                     style.background_position = ImagePos::TOP_LEFT;
-                    style.background_size = ImageFit::Fill;
+                    style.background_position_px = Point::ZERO;
+                    style.background_size = ImageFit::Auto;
                     apply_background_shorthand_geometry(style, v);
                 } else if let Some(c) = parse_bg_color(v) {
                     // Standalone `background-color` longhand: additive — only
@@ -730,6 +731,9 @@ fn apply_declarations(
                 if let Some(p) = parse_image_pos(v) {
                     style.background_position = p;
                 }
+                // Length components (the `-304px` in `0 -304px`) crop CSS sprites;
+                // percentages/keywords are folded into the fraction above.
+                style.background_position_px = parse_bg_position_px(v, style.font_size as f32);
             }
             "border-radius" => {
                 // Uniform radius (first value of the 1–4 corner shorthand).
@@ -1436,6 +1440,9 @@ fn parse_image_fit(v: &str) -> ImageFit {
     match v.trim().to_ascii_lowercase().as_str() {
         "cover" => ImageFit::Cover,
         "contain" | "scale-down" => ImageFit::Contain,
+        // `auto` (the `background-size` initial value) and `object-fit: none` both
+        // draw at natural size — the mode CSS sprites depend on.
+        "auto" | "none" => ImageFit::Auto,
         _ => ImageFit::Fill,
     }
 }
@@ -1484,6 +1491,31 @@ fn combine_pos(parts: &[(u8, f32)]) -> Option<ImagePos> {
     }
 }
 
+/// Extract the pixel (length) components of a `background-position` value into a
+/// `(x, y)` offset, in the token order x-then-y. Percentages and keywords yield
+/// `0` on their axis (they're carried by the fractional [`ImagePos`] instead); a
+/// single token sets only x. This is what crops CSS sprites (`0 -304px`).
+fn parse_bg_position_px(v: &str, em_base: f32) -> Point {
+    let mut out = Point::ZERO;
+    for (i, tok) in v.split_whitespace().take(2).enumerate() {
+        // A length is a number with a non-`%` unit (or unitless 0). `split_num_unit`
+        // rejects keywords (no leading digit), so those fall through to 0.
+        let px = match split_num_unit(tok) {
+            Some((_, unit)) if unit == "%" => continue,
+            _ => parse_css_px(&tok.to_ascii_lowercase(), em_base),
+        };
+        if let Some(px) = px {
+            let px = px.round() as i32;
+            if i == 0 {
+                out.x = px;
+            } else {
+                out.y = px;
+            }
+        }
+    }
+    out
+}
+
 /// Parse a standalone `object-position`/`background-position` value.
 fn parse_image_pos(v: &str) -> Option<ImagePos> {
     let parts: Vec<(u8, f32)> = v
@@ -1500,23 +1532,26 @@ fn parse_image_pos(v: &str) -> Option<ImagePos> {
 /// read as geometry — ADR-0045.
 fn apply_background_shorthand_geometry(style: &mut ComputedStyle, v: &str) {
     let masked = mask_parens(v);
-    if let Some(slash) = masked.find('/') {
-        if let Some(tok) = masked[slash + 1..].split_whitespace().next() {
+    // The position (fraction + any px) lives before the `/size`, or is the whole
+    // value when there's no slash.
+    let (pos_span, size_span) = match masked.find('/') {
+        Some(slash) => (&masked[..slash], Some(&masked[slash + 1..])),
+        None => (masked.as_str(), None),
+    };
+    if let Some(size_span) = size_span {
+        if let Some(tok) = size_span.split_whitespace().next() {
             style.background_size = parse_image_fit(tok);
-        }
-        let parts: Vec<(u8, f32)> = masked[..slash]
-            .split_whitespace()
-            .filter_map(classify_pos_tok)
-            .collect();
-        if let Some(p) = combine_pos(&parts[parts.len().saturating_sub(2)..]) {
-            style.background_position = p;
         }
     } else if let Some(f) = masked
         .split_whitespace()
         .map(parse_image_fit)
-        .find(|f| *f != ImageFit::Fill)
+        .find(|f| !matches!(f, ImageFit::Fill | ImageFit::Auto))
     {
         style.background_size = f;
+    }
+    let parts: Vec<(u8, f32)> = pos_span.split_whitespace().filter_map(classify_pos_tok).collect();
+    if let Some(p) = combine_pos(&parts[parts.len().saturating_sub(2)..]) {
+        style.background_position = p;
     }
 }
 
@@ -2805,7 +2840,11 @@ mod tests {
         assert_eq!(fit("object-fit: contain"), ImageFit::Contain);
         assert_eq!(fit("object-fit: scale-down"), ImageFit::Contain);
         assert_eq!(fit("object-fit: fill"), ImageFit::Fill);
-        assert_eq!(fit("object-fit: none"), ImageFit::Fill);
+        assert_eq!(
+            fit("object-fit: none"),
+            ImageFit::Auto,
+            "object-fit: none draws at natural size"
+        );
 
         let bg = |css: &str| {
             let dom = CssEngine::new().style(&parse_html(&format!("<div style='{css}'>x</div>")));
@@ -2825,6 +2864,34 @@ mod tests {
         let s = &first(&dom.root, "img").unwrap().style;
         assert_eq!(s.object_fit, ImageFit::Cover);
         assert_eq!(s.background_size, ImageFit::Contain);
+    }
+
+    #[test]
+    fn background_position_px_crops_sprites() {
+        let sty = |css: &str| {
+            let dom = CssEngine::new().style(&parse_html(&format!("<div style='{css}'>x</div>")));
+            first(&dom.root, "div").unwrap().style.clone()
+        };
+        // Wikipedia's wordmark sprite: a pixel offset into a no-scale background.
+        let s = sty("background-position: 0 -304px");
+        assert_eq!(s.background_position_px, Point::new(0, -304));
+        // Absent background-size defaults to `auto` (natural size) — the sprite mode.
+        assert_eq!(s.background_size, ImageFit::Auto);
+        // Two lengths, x then y.
+        assert_eq!(
+            sty("background-position: -10px 20px").background_position_px,
+            Point::new(-10, 20)
+        );
+        // A keyword/percentage carries no pixel component (it's in the fraction).
+        assert_eq!(
+            sty("background-position: center").background_position_px,
+            Point::ZERO
+        );
+        // A keyword on x, a length on y: the length lands on the y axis.
+        assert_eq!(
+            sty("background-position: center -260px").background_position_px,
+            Point::new(0, -260)
+        );
     }
 
     #[test]
@@ -2913,9 +2980,9 @@ mod tests {
         );
 
         // A gradient's internal `%` stops are masked, not read as a position; with
-        // no slash the size stays the Fill default.
+        // no slash the size stays the `auto` initial value.
         let g = s("background: linear-gradient(red 50%, blue)");
-        assert_eq!(g.background_size, ImageFit::Fill);
+        assert_eq!(g.background_size, ImageFit::Auto);
         assert_eq!(g.background_position, ImagePos::TOP_LEFT);
         assert!(g.background_gradient.is_some());
 
@@ -2924,8 +2991,8 @@ mod tests {
         let reset_size = s("background-size: cover; background: url(x)");
         assert_eq!(
             reset_size.background_size,
-            ImageFit::Fill,
-            "background shorthand resets a prior background-size longhand"
+            ImageFit::Auto,
+            "background shorthand resets a prior background-size longhand to auto"
         );
         let reset_pos = s("background-position: right; background: url(x)");
         assert_eq!(

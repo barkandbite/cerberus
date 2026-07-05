@@ -46,12 +46,15 @@ pub enum DisplayItem {
         style: FontStyle,
     },
     /// A decoded image (shared) to draw into `rect` with the given fit and
-    /// position (where a `Cover`/`Contain` image anchors — ADR-0045).
+    /// position (where a `Cover`/`Contain` image anchors — ADR-0045). `pos_px` is
+    /// an additional pixel offset applied after `pos` — the length component of
+    /// `background-position` (e.g. `0 -304px` for a CSS sprite), in dest pixels.
     Image {
         rect: Rect,
         image: Arc<DecodedImage>,
         fit: ImageFit,
         pos: ImagePos,
+        pos_px: Point,
     },
     /// An anti-aliased, round-capped line segment of the given stroke width.
     /// Vector UI (icons) is built from these, so it scales crisply with
@@ -140,11 +143,13 @@ impl DisplayList {
                     image,
                     fit,
                     pos,
+                    pos_px,
                 } => DisplayItem::Image {
                     rect: sr(*rect),
                     image: image.clone(),
                     fit: *fit,
                     pos: *pos,
+                    pos_px: Point::new(si(pos_px.x), si(pos_px.y)),
                 },
                 DisplayItem::Line { a, b, width, color } => DisplayItem::Line {
                     a: Point::new(si(a.x), si(a.y)),

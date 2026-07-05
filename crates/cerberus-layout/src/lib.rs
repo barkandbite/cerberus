@@ -1146,6 +1146,7 @@ impl<'a> Ctx<'a> {
                 image,
                 fit,
                 pos,
+                pos_px: Point::ZERO,
             });
             self.advance_box(w, h);
         } else if let (Some(w), Some(h)) = (spec_w, spec_h) {
@@ -1644,6 +1645,7 @@ impl<'a> Ctx<'a> {
                         image: img,
                         fit: style.background_size,
                         pos: style.background_position,
+                        pos_px: style.background_position_px,
                     },
                 );
                 idx += 1;

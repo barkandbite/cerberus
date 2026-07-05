@@ -6,7 +6,7 @@
 //! reimplemented without touching layout. Layout consumes only these types.
 
 use cerberus_dom::{Document, NodeId};
-use cerberus_types::{Color, FontStyle, ImageFit, ImagePos};
+use cerberus_types::{Color, FontStyle, ImageFit, ImagePos, Point};
 
 /// CSS `position`. `Static` is normal flow; the rest are positioned.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
@@ -416,6 +416,11 @@ pub struct ComputedStyle {
     /// (ADR-0045). Plain values (8 bytes each), not inherited.
     pub object_position: ImagePos,
     pub background_position: ImagePos,
+    /// The pixel (length) component of `background-position` — e.g. the `-304px`
+    /// in `background-position: 0 -304px` that crops a CSS sprite. Applied on top
+    /// of the fractional `background_position`. `(0, 0)` when the position is
+    /// keyword/percentage-only. Not inherited.
+    pub background_position_px: Point,
     /// `white-space`: whitespace collapsing, newline preservation, and wrapping.
     /// Inherited.
     pub white_space: WhiteSpace,
@@ -519,9 +524,10 @@ impl ComputedStyle {
             background_gradient: None,
             box_shadow: None,
             object_fit: ImageFit::Fill,
-            background_size: ImageFit::Fill,
+            background_size: ImageFit::Auto,
             object_position: ImagePos::CENTER,
             background_position: ImagePos::TOP_LEFT,
+            background_position_px: Point::ZERO,
             white_space: WhiteSpace::Normal,
             visibility: Visibility::Visible,
             opacity: 1.0,
@@ -607,9 +613,10 @@ impl ComputedStyle {
             box_shadow: None,
             // object-fit/-position and background-size/-position are not inherited.
             object_fit: ImageFit::Fill,
-            background_size: ImageFit::Fill,
+            background_size: ImageFit::Auto,
             object_position: ImagePos::CENTER,
             background_position: ImagePos::TOP_LEFT,
+            background_position_px: Point::ZERO,
             flex_direction: FlexDirection::Row,
             flex_reverse: false,
             flex_wrap: false,

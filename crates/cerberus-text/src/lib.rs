@@ -93,6 +93,7 @@ impl TextEngine {
         image: &DecodedImage,
         fit: ImageFit,
         pos: ImagePos,
+        pos_px: Point,
         target: &mut Framebuffer,
     ) {
         if rect.w == 0 || rect.h == 0 || image.size.w == 0 || image.size.h == 0 {
@@ -103,9 +104,12 @@ impl TextEngine {
         // Per-axis scale (px of source per px of dest) and an anchoring offset in
         // dest space; `Fill` is the stretch identity. The offset places the scaled
         // image so `pos` (0..1) of the leftover space is on the left/top — center
-        // (0.5) reproduces the old centered crop/letterbox.
-        let (sxr, syr, off_x, off_y) = match fit {
+        // (0.5) reproduces the old centered crop/letterbox. `Auto` draws at natural
+        // size (scale 1) anchored by `pos`, then shifted by the `pos_px` length —
+        // this is the CSS-sprite path, where the source is clipped to the box.
+        let (sxr, syr, mut off_x, mut off_y) = match fit {
             ImageFit::Fill => (iw / rw, ih / rh, 0.0, 0.0),
+            ImageFit::Auto => (1.0, 1.0, pos.x * (rw - iw), pos.y * (rh - ih)),
             ImageFit::Cover => {
                 let s = (rw / iw).max(rh / ih); // dest px per source px
                 (
@@ -125,6 +129,10 @@ impl TextEngine {
                 )
             }
         };
+        // The length component of `background-position` (e.g. `-304px`) shifts the
+        // image within its box, on top of the fractional anchor.
+        off_x += pos_px.x as f32;
+        off_y += pos_px.y as f32;
         for dy in 0..rect.h {
             // Source row for this dest row (dest minus the centering offset).
             let syf = (dy as f32 - off_y) * syr;
@@ -419,7 +427,8 @@ impl Rasterizer for TextEngine {
                     image,
                     fit,
                     pos,
-                } => self.draw_image(*rect, image, *fit, *pos, target),
+                    pos_px,
+                } => self.draw_image(*rect, image, *fit, *pos, *pos_px, target),
                 DisplayItem::Glyphs {
                     origin,
                     glyphs,
@@ -486,6 +495,7 @@ mod tests {
                 &image,
                 fit,
                 ImagePos::CENTER,
+                Point::ZERO,
                 &mut fb,
             );
             fb
@@ -544,7 +554,7 @@ mod tests {
         let draw = |fit: ImageFit, pos: ImagePos| {
             let mut fb = Framebuffer::new(Size::new(20, 20));
             fb.fill_rect(Rect::new(0, 0, 20, 20), Color::WHITE);
-            TextEngine::new().draw_image(Rect::new(0, 0, 20, 20), &image, fit, pos, &mut fb);
+            TextEngine::new().draw_image(Rect::new(0, 0, 20, 20), &image, fit, pos, Point::ZERO, &mut fb);
             fb
         };
         // Cover anchored left keeps the green left edge; centered crops it away.

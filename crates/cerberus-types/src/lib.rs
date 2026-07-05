@@ -140,6 +140,9 @@ pub struct Point {
 }
 
 impl Point {
+    /// The origin, `(0, 0)`.
+    pub const ZERO: Point = Point { x: 0, y: 0 };
+
     /// Construct a new point.
     pub const fn new(x: i32, y: i32) -> Self {
         Self { x, y }
@@ -165,13 +168,18 @@ impl Rect {
 /// How an image fills its box (`object-fit` / `background-size`) — ADR-0044.
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
 pub enum ImageFit {
-    /// Stretch to fill the box (the default `fill`, and `background-size: 100%`).
+    /// Stretch to fill the box (the `object-fit: fill` default, and
+    /// `background-size: 100% 100%`).
     #[default]
     Fill,
     /// Scale to cover the box, cropping overflow, preserving aspect ratio.
     Cover,
     /// Scale to fit inside the box, letterboxing, preserving aspect ratio.
     Contain,
+    /// Draw at the image's natural pixel size, no scaling (`background-size: auto`,
+    /// the CSS initial value). This is what CSS sprites rely on: the intrinsic
+    /// bitmap is placed by `background-position` and clipped to the box.
+    Auto,
 }
 
 /// Where a scaled image sits in its box (`object-position` /
