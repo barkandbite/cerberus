@@ -1350,8 +1350,17 @@ impl<'a> Ctx<'a> {
     /// `placeholder` (greyed). Passwords are masked.
     fn text_field(&mut self, node: &StyledNode, id: u32, password: bool) {
         let px = node.style.font_size.max(1);
-        let cols = node.attr("size").and_then(parse_dim).unwrap_or(20).max(1);
-        let w = self.fit_width(cols as i32 * self.char_w(px) + 2 * FIELD_PAD);
+        // An explicit CSS `width` wins over the `size` attribute (CSS: a set width
+        // is the used width — e.g. a search box with `size="20"` but `width:100%`
+        // must fill its container, as Chrome renders it). Fall back to `size` cols.
+        let cb_w = (self.right - self.left).max(1);
+        let w = match node.style.width.resolve_vp(cb_w, self.vw, self.vh) {
+            Some(css_w) => self.fit_width(css_w.max(1)),
+            None => {
+                let cols = node.attr("size").and_then(parse_dim).unwrap_or(20).max(1);
+                self.fit_width(cols as i32 * self.char_w(px) + 2 * FIELD_PAD)
+            }
+        };
         let h = px as i32 + 2 * FIELD_PAD;
         self.control_box(w, h as u32, &node.style, FIELD_BG);
         self.push_field(id, FieldKind::Text, w, h as u32);
