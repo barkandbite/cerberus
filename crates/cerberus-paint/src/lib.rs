@@ -172,6 +172,7 @@ impl DisplayList {
                             h: su(g.h),
                             id: g.id,
                             px: su(g.px).max(1),
+                            font: g.font,
                         })
                         .collect(),
                     color: *color,
@@ -183,9 +184,24 @@ impl DisplayList {
     }
 }
 
+/// Which bundled face a glyph's `id` indexes into. A run can mix faces when the
+/// primary text font lacks a character (e.g. Latin from Roboto, CJK from the
+/// fallback), so the face is tracked per glyph rather than per run.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub enum FontSlot {
+    /// The primary text font (Roboto).
+    #[default]
+    Text,
+    /// The bundled icon font (private-use icon glyphs).
+    Icon,
+    /// The bundled fallback face for characters the text font can't render
+    /// (CJK, etc.).
+    Fallback,
+}
+
 /// A shaped glyph: enough for both the placeholder box rasterizer (uses `w`/`h`)
 /// and a real outline rasterizer (uses `id` + `px` to fetch the outline from the
-/// run's font). `id` is `0` for the placeholder shaper.
+/// glyph's font). `id` is `0` for the placeholder shaper.
 #[derive(Clone, Copy, Debug)]
 pub struct GlyphBox {
     /// Horizontal advance after this glyph.
@@ -194,10 +210,12 @@ pub struct GlyphBox {
     pub w: u32,
     /// Inked height (placeholder rasterizer).
     pub h: u32,
-    /// Glyph id within the font that shaped this run (`0` for the placeholder).
+    /// Glyph id within the face named by `font` (`0` for the placeholder).
     pub id: u16,
     /// Pixel size this glyph was shaped at (so the rasterizer can scale it).
     pub px: u32,
+    /// Which bundled face `id` belongs to (per-glyph, for mixed-script runs).
+    pub font: FontSlot,
 }
 
 /// An RGBA8 framebuffer (row-major, top-left origin).
@@ -411,6 +429,7 @@ impl TextShaper for MonoShaper {
                         h: 0,
                         id: 0,
                         px: cell,
+                        font: FontSlot::Text,
                     }
                 } else {
                     GlyphBox {
@@ -419,6 +438,7 @@ impl TextShaper for MonoShaper {
                         h: cell,
                         id: 0,
                         px: cell,
+                        font: FontSlot::Text,
                     }
                 }
             })
@@ -518,6 +538,7 @@ mod tests {
                 h: 0,
                 id: 42,
                 px: 16,
+                font: FontSlot::Text,
             }],
             color: Color::BLACK,
             style: FontStyle::REGULAR,

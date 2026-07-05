@@ -12,7 +12,7 @@
 
 use ab_glyph::{point, Font, FontRef, GlyphId, PxScale, ScaleFont};
 use cerberus_paint::{
-    DecodedImage, DisplayItem, DisplayList, Framebuffer, GlyphBox, Rasterizer, TextShaper,
+    DecodedImage, DisplayItem, DisplayList, FontSlot, Framebuffer, GlyphBox, Rasterizer, TextShaper,
 };
 use cerberus_types::{Color, FontStyle, ImageFit, ImagePos, Point, Rect};
 
@@ -20,20 +20,42 @@ use cerberus_types::{Color, FontStyle, ImageFit, ImagePos, Point, Rect};
 const FONT_BYTES: &[u8] = include_bytes!("../assets/Roboto-Regular.ttf");
 /// Bundled icon font (user-supplied IcoMoon subset). See `assets/icomoon-LICENSE.txt`.
 const ICON_FONT_BYTES: &[u8] = include_bytes!("../assets/icomoon.ttf");
+/// Bundled CJK fallback (IPAGothic, IPA Font License v1.0). See
+/// `assets/IPAGothic-LICENSE.txt`. Renders characters Roboto lacks (Kanji/Kana,
+/// and — via shared Han — much Chinese) instead of tofu. Bundled, not read from
+/// the system, so the font set stays fixed and reproducible (ADR-0005).
+const FALLBACK_FONT_BYTES: &[u8] = include_bytes!("../assets/IPAGothic.ttf");
 
-/// A software text shaper + rasterizer over the bundled text and icon fonts.
+/// A software text shaper + rasterizer over the bundled text, icon, and fallback
+/// fonts.
 pub struct TextEngine {
     font: FontRef<'static>,
     icon_font: FontRef<'static>,
+    fallback_font: FontRef<'static>,
 }
 
 impl TextEngine {
-    /// Load the bundled text + icon fonts.
+    /// Load the bundled text + icon + fallback fonts.
     pub fn new() -> Self {
         let font = FontRef::try_from_slice(FONT_BYTES).expect("bundled Roboto font is valid");
         let icon_font =
             FontRef::try_from_slice(ICON_FONT_BYTES).expect("bundled icon font is valid");
-        Self { font, icon_font }
+        let fallback_font = FontRef::try_from_slice(FALLBACK_FONT_BYTES)
+            .expect("bundled IPAGothic fallback font is valid");
+        Self {
+            font,
+            icon_font,
+            fallback_font,
+        }
+    }
+
+    /// The face a glyph was shaped from.
+    fn face_for(&self, slot: FontSlot) -> &FontRef<'static> {
+        match slot {
+            FontSlot::Text => &self.font,
+            FontSlot::Icon => &self.icon_font,
+            FontSlot::Fallback => &self.fallback_font,
+        }
     }
 
     fn draw_run(
@@ -45,18 +67,15 @@ impl TextEngine {
         target: &mut Framebuffer,
     ) {
         let mut pen_x = origin.x as f32;
-        // Icon runs are outlined from the icon font; everything else from Roboto.
-        let font = if style.icon {
-            &self.icon_font
-        } else {
-            &self.font
-        };
         // Synthetic styling — memory-first, no extra font faces (real weight/slant
         // faces would be a drop-in asset swap behind this path). Faux-bold smears a
         // second sample 1px right; faux-italic shears each scanline rightward above
         // the baseline (~12°).
         let slant = if style.italic { 0.21f32 } else { 0.0 };
         for g in glyphs {
+            // Each glyph names its own face (a run can mix Roboto + CJK fallback);
+            // the baseline uses that face's ascent so mixed scripts share a line.
+            let font = self.face_for(g.font);
             let scale = PxScale::from(g.px.max(1) as f32);
             let scaled = font.as_scaled(scale);
             let baseline = origin.y as f32 + scaled.ascent();
@@ -200,17 +219,45 @@ impl Default for TextEngine {
 impl TextShaper for TextEngine {
     fn shape(&self, text: &str, px: u32) -> Vec<GlyphBox> {
         let scale = PxScale::from(px.max(1) as f32);
-        let scaled = self.font.as_scaled(scale);
+        let text_scaled = self.font.as_scaled(scale);
+        let fb_scaled = self.fallback_font.as_scaled(scale);
         text.chars()
             .map(|ch| {
+                // Prefer the primary text font. If it has no glyph for `ch`
+                // (Roboto is Latin/Cyrillic/Greek), and the CJK fallback does,
+                // shape from the fallback — matching a browser's font substitution
+                // instead of rendering tofu. Advances come from the chosen face.
                 let id = self.font.glyph_id(ch);
-                let advance = scaled.h_advance(id).round().max(0.0) as u32;
+                if id.0 != 0 || ch.is_whitespace() {
+                    return GlyphBox {
+                        advance: text_scaled.h_advance(id).round().max(0.0) as u32,
+                        w: 0,
+                        h: 0,
+                        id: id.0,
+                        px,
+                        font: FontSlot::Text,
+                    };
+                }
+                let fb = self.fallback_font.glyph_id(ch);
+                if fb.0 != 0 {
+                    return GlyphBox {
+                        advance: fb_scaled.h_advance(fb).round().max(0.0) as u32,
+                        w: 0,
+                        h: 0,
+                        id: fb.0,
+                        px,
+                        font: FontSlot::Fallback,
+                    };
+                }
+                // Neither face covers it: keep the text-font .notdef (real tofu,
+                // as a browser with no matching font would show).
                 GlyphBox {
-                    advance,
+                    advance: text_scaled.h_advance(id).round().max(0.0) as u32,
                     w: 0,
                     h: 0,
                     id: id.0,
                     px,
+                    font: FontSlot::Text,
                 }
             })
             .collect()
@@ -227,6 +274,7 @@ impl TextShaper for TextEngine {
             h: 0,
             id: id.0,
             px,
+            font: FontSlot::Icon,
         }]
     }
 
@@ -691,6 +739,29 @@ mod tests {
         // Real glyphs have non-zero ids and advances.
         assert!(glyphs.iter().all(|g| g.id != 0));
         assert!(glyphs.iter().all(|g| g.advance > 0));
+    }
+
+    #[test]
+    fn cjk_falls_back_to_the_bundled_fallback_face() {
+        // Latin comes from the primary text font; CJK the primary font can't render
+        // is shaped from the bundled fallback (real glyph, not tofu) — a browser's
+        // font substitution. Both get non-zero ids and advances.
+        let engine = TextEngine::new();
+
+        let latin = &engine.shape("A", 24)[0];
+        assert_eq!(latin.font, FontSlot::Text);
+        assert!(latin.id != 0);
+
+        for cjk in ["日", "本", "語", "中", "文"] {
+            let g = &engine.shape(cjk, 24)[0];
+            assert_eq!(
+                g.font,
+                FontSlot::Fallback,
+                "{cjk} should use the fallback face"
+            );
+            assert!(g.id != 0, "{cjk} resolved to a real fallback glyph");
+            assert!(g.advance > 0, "{cjk} has a positive advance");
+        }
     }
 
     #[test]
