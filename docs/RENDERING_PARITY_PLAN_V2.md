@@ -53,9 +53,23 @@ language-button and search-button deltas:
    `.search-input`'s box as its containing block *across that sub-context
    boundary*. Cerberus supports absolute positioning against a `cb_stack` entry,
    but an inline-block relative parent laid via `add_inline_block` does not push
-   its box as a containing block for abs descendants. Also `.search-input`'s
-   `margin-right:-6.6rem` (a negative margin pulling the button flush) is not
-   applied in inline-block flow. Both are general limitations, not portal-specific.
+   its box as a containing block for abs descendants. (Inline-block margins
+   themselves are now applied — the `margin-right:-6.6rem` pull-back is a mobile
+   `@media (max-width:480px)` rule and does not fire at desktop width; at 1200px
+   `.search-input` is `width:73%`, matching Chrome.)
+
+   **Deeper root cause found (instrumented at 1200px):** the input renders narrow
+   (~285px, the `size="20"` fallback) because its `width:100%` resolves against a
+   containing block of only ~288px instead of `.search-input`'s ~394px. Two links
+   in the chain are wrong: (a) the `<fieldset>`'s `margin-left:1rem;
+   margin-right:6.6rem` do **not** narrow the block it establishes — `.search-input`
+   measures `avail=540` (the full `.search-container` content) instead of the
+   fieldset's ~464px, so `<form>`/`<fieldset>` are not applying block margins to
+   their content box; (b) the `#searchInput` containing block resolves to 288px,
+   narrower than `.search-input`'s own laid width (394px), so `%`-width does not
+   propagate cleanly through the inline-block/relative nesting. Fixing the input
+   width is the highest-value next step for this widget — start by making
+   `<fieldset>` a normal margin-applying block, then re-check the `%`-width cb.
 2. **Footer sister-project grid absent.** `.other-projects`/`.other-project`/
    `footer-sidebar`/`app-badges` appear **only in CSS/JS**, never in the static
    DOM (0 occurrences after the last `</style>`). The grid is built by the portal's
