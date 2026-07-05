@@ -362,13 +362,15 @@ pub struct ComputedStyle {
     /// `text-indent` in px: the first-line indent of a block's inline content.
     /// Inherited.
     pub text_indent: i32,
-    pub margin_top: i32,
-    pub margin_bottom: i32,
-    pub margin_left: i32,
-    /// `margin-right` in px. Shrinks an auto-width block's box from the right
-    /// (its `auto` value, for centering, is tracked by `margin_right_auto`
-    /// instead). Not inherited.
-    pub margin_right: i32,
+    /// Margins as lengths, resolved against the containing-block **width** at
+    /// layout (CSS resolves `%` margins — top/bottom included — against the
+    /// container's width). `Auto` resolves to 0 here; horizontal `auto` for
+    /// centering is tracked separately by `margin_{left,right}_auto`. Not
+    /// inherited. Was `i32` px, which dropped `%`/`vw`/`vh` margins at parse.
+    pub margin_top: Len,
+    pub margin_bottom: Len,
+    pub margin_left: Len,
+    pub margin_right: Len,
     /// `margin-left`/`-right: auto` — used to center a width-constrained block
     /// (ADR-0039). Not inherited.
     pub margin_left_auto: bool,
@@ -502,10 +504,10 @@ impl ComputedStyle {
             list_style_type: ListStyleType::Disc,
             vertical_align: VerticalAlign::Baseline,
             text_indent: 0,
-            margin_top: 0,
-            margin_bottom: 0,
-            margin_left: 0,
-            margin_right: 0,
+            margin_top: Len::Px(0),
+            margin_bottom: Len::Px(0),
+            margin_left: Len::Px(0),
+            margin_right: Len::Px(0),
             margin_left_auto: false,
             margin_right_auto: false,
             width: Len::Auto,
@@ -590,10 +592,10 @@ impl ComputedStyle {
             background: None,
             background_image: None,
             opacity: 1.0,
-            margin_top: 0,
-            margin_bottom: 0,
-            margin_left: 0,
-            margin_right: 0,
+            margin_top: Len::Px(0),
+            margin_bottom: Len::Px(0),
+            margin_left: Len::Px(0),
+            margin_right: Len::Px(0),
             margin_left_auto: false,
             margin_right_auto: false,
             width: Len::Auto,
@@ -832,8 +834,8 @@ mod tests {
         assert_eq!(s.display, Display::Block);
         assert_eq!(s.color, Color::BLACK);
         assert_eq!(s.font_size, 16);
-        assert_eq!(s.margin_top, 0);
-        assert_eq!(s.margin_right, 0);
+        assert_eq!(s.margin_top, Len::Px(0));
+        assert_eq!(s.margin_right, Len::Px(0));
         assert_eq!(s.width, Len::Auto);
         assert_eq!(s.vertical_align, VerticalAlign::Baseline);
         assert_eq!(s.white_space, WhiteSpace::Normal);
@@ -849,8 +851,8 @@ mod tests {
         parent.color = Color::rgb(1, 2, 3); // inherited
         parent.text_indent = 12; // inherited
         parent.white_space = WhiteSpace::Pre; // inherited
-        parent.margin_top = 9; // not inherited
-        parent.margin_right = 7; // not inherited
+        parent.margin_top = Len::Px(9); // not inherited
+        parent.margin_right = Len::Px(7); // not inherited
         parent.width = Len::Px(300); // not inherited
         parent.display = Display::Flex; // not inherited (child resets to Inline)
         parent.vertical_align = VerticalAlign::Super; // not inherited

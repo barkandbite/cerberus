@@ -893,24 +893,24 @@ fn apply_declarations(
             }
             "margin" => apply_margin_shorthand(style, v, style.font_size as f32),
             "margin-top" => {
-                if let Some(m) = parse_len(v, style.font_size as f32) {
+                if let Some(m) = parse_inset(v, style.font_size as f32) {
                     style.margin_top = m;
                 }
             }
             "margin-bottom" => {
-                if let Some(m) = parse_len(v, style.font_size as f32) {
+                if let Some(m) = parse_inset(v, style.font_size as f32) {
                     style.margin_bottom = m;
                 }
             }
             "margin-left" => {
-                style.margin_left_auto = v.trim().eq_ignore_ascii_case("auto");
-                if let Some(m) = parse_len(v, style.font_size as f32) {
+                if let Some(m) = parse_inset(v, style.font_size as f32) {
+                    style.margin_left_auto = m == Len::Auto;
                     style.margin_left = m;
                 }
             }
             "margin-right" => {
-                style.margin_right_auto = v.trim().eq_ignore_ascii_case("auto");
-                if let Some(m) = parse_len(v, style.font_size as f32) {
+                if let Some(m) = parse_inset(v, style.font_size as f32) {
+                    style.margin_right_auto = m == Len::Auto;
                     style.margin_right = m;
                 }
             }
@@ -1695,9 +1695,9 @@ fn apply_font_shorthand(style: &mut ComputedStyle, v: &str, parent_font_size: u3
 
 fn apply_margin_shorthand(style: &mut ComputedStyle, v: &str, em_base: f32) {
     let toks: Vec<&str> = v.split_whitespace().collect();
-    let parts: Vec<i32> = toks
+    let parts: Vec<Len> = toks
         .iter()
-        .map(|p| parse_len(p, em_base).unwrap_or(0))
+        .map(|p| parse_inset(p, em_base).unwrap_or(Len::Px(0)))
         .collect();
     // Track which sides are `auto` (for centering): horizontal sides are index 1
     // (right) and 3 (left) in the 4-value form, or index 1 in the 2/3-value form.
@@ -2132,16 +2132,19 @@ mod tests {
     fn ua_indents_dd() {
         // A description-list definition is indented 40px by the UA stylesheet.
         let dom = CssEngine::new().style(&parse_html("<dl><dt>t</dt><dd>d</dd></dl>"));
-        assert_eq!(first(&dom.root, "dd").unwrap().style.margin_left, 40);
+        assert_eq!(
+            first(&dom.root, "dd").unwrap().style.margin_left,
+            Len::Px(40)
+        );
     }
 
     #[test]
     fn ua_gives_figure_default_margins() {
         let dom = CssEngine::new().style(&parse_html("<figure>f</figure>"));
         let f = first(&dom.root, "figure").unwrap();
-        assert_eq!(f.style.margin_left, 40);
-        assert_eq!(f.style.margin_right, 40);
-        assert_eq!(f.style.margin_top, 16);
+        assert_eq!(f.style.margin_left, Len::Px(40));
+        assert_eq!(f.style.margin_right, Len::Px(40));
+        assert_eq!(f.style.margin_top, Len::Px(16));
     }
 
     #[test]
@@ -2486,15 +2489,28 @@ mod tests {
         // The `margin-right` longhand is honored (previously only its `auto` flag
         // was), and each shorthand arity fills the right side correctly.
         let one = CssEngine::new().style(&parse_html("<p style='margin:5px'>x</p>"));
-        assert_eq!(first(&one.root, "p").unwrap().style.margin_right, 5);
+        assert_eq!(
+            first(&one.root, "p").unwrap().style.margin_right,
+            Len::Px(5)
+        );
         let two = CssEngine::new().style(&parse_html("<p style='margin:5px 10px'>x</p>"));
-        assert_eq!(first(&two.root, "p").unwrap().style.margin_right, 10);
+        assert_eq!(
+            first(&two.root, "p").unwrap().style.margin_right,
+            Len::Px(10)
+        );
         let four = CssEngine::new().style(&parse_html("<p style='margin:1px 2px 3px 4px'>x</p>"));
         let p = first(&four.root, "p").unwrap();
-        assert_eq!(p.style.margin_right, 2, "right is the 2nd of four values");
-        assert_eq!(p.style.margin_left, 4, "left is the 4th");
+        assert_eq!(
+            p.style.margin_right,
+            Len::Px(2),
+            "right is the 2nd of four values"
+        );
+        assert_eq!(p.style.margin_left, Len::Px(4), "left is the 4th");
         let long = CssEngine::new().style(&parse_html("<p style='margin-right:12px'>x</p>"));
-        assert_eq!(first(&long.root, "p").unwrap().style.margin_right, 12);
+        assert_eq!(
+            first(&long.root, "p").unwrap().style.margin_right,
+            Len::Px(12)
+        );
     }
 
     #[test]
@@ -2505,8 +2521,8 @@ mod tests {
             "<p style='--g:8px;margin-top:calc(2 * 4px + 1rem);margin-left:calc(var(--g) * 3)'>x</p>";
         let dom = CssEngine::new().style(&parse_html(html));
         let p = first(&dom.root, "p").unwrap();
-        assert_eq!(p.style.margin_top, 24, "2*4 + 16(rem) = 24");
-        assert_eq!(p.style.margin_left, 24, "8 * 3 = 24");
+        assert_eq!(p.style.margin_top, Len::Px(24), "2*4 + 16(rem) = 24");
+        assert_eq!(p.style.margin_left, Len::Px(24), "8 * 3 = 24");
     }
 
     #[test]

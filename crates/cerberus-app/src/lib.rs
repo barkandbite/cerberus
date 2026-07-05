@@ -4336,13 +4336,24 @@ fn computed_css(s: &cerberus_style::ComputedStyle) -> Vec<(String, String)> {
         ("display".to_string(), display.to_string()),
         ("visibility".to_string(), visibility.to_string()),
         ("opacity".to_string(), format!("{}", s.opacity)),
-        ("margin-top".to_string(), format!("{}px", s.margin_top)),
-        (
-            "margin-bottom".to_string(),
-            format!("{}px", s.margin_bottom),
-        ),
-        ("margin-left".to_string(), format!("{}px", s.margin_left)),
+        ("margin-top".to_string(), fmt_len(s.margin_top)),
+        ("margin-bottom".to_string(), fmt_len(s.margin_bottom)),
+        ("margin-left".to_string(), fmt_len(s.margin_left)),
     ]
+}
+
+/// Serialize a margin `Len` as a CSS string for `getComputedStyle` reporting.
+fn fmt_len(len: cerberus_style::Len) -> String {
+    use cerberus_style::Len;
+    match len {
+        Len::Auto => "auto".to_string(),
+        Len::Px(p) => format!("{p}px"),
+        Len::Pct(f) => format!("{f}%"),
+        Len::Vw(f) => format!("{f}vw"),
+        Len::Vh(f) => format!("{f}vh"),
+        Len::Vmin(f) => format!("{f}vmin"),
+        Len::Vmax(f) => format!("{f}vmax"),
+    }
 }
 
 /// Collect `(js-id, computed-css)` for every styled element that has a live

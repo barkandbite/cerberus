@@ -610,9 +610,9 @@ impl<'a> Ctx<'a> {
 
         if is_block {
             self.flush_line();
-            self.y += style.margin_top;
             self.line_align = style.text_align;
             let avail = (self.right - self.left).max(1);
+            self.y += self.resolve_margin(style.margin_top, avail);
             let (pl, pr) = (style.padding_left, style.padding_right);
             let (bl, br) = (style.border_left, style.border_right);
             let h_extra = pl + pr + bl + br;
@@ -630,7 +630,8 @@ impl<'a> Ctx<'a> {
                         } else if style.margin_right_auto {
                             0
                         } else {
-                            style.margin_left.clamp(0, extra)
+                            self.resolve_margin(style.margin_left, avail)
+                                .clamp(0, extra)
                         };
                         (self.left + off, bw)
                     }
@@ -639,8 +640,9 @@ impl<'a> Ctx<'a> {
                         // non-auto `margin-right` shrinks the box from the right
                         // (an `auto` right margin computes to 0 here, and its value
                         // is 0, so this is a no-op for centering).
-                        let l = self.left + style.margin_left;
-                        let r = (self.right - style.margin_right).max(l + 1);
+                        let l = self.left + self.resolve_margin(style.margin_left, avail);
+                        let r = (self.right - self.resolve_margin(style.margin_right, avail))
+                            .max(l + 1);
                         (l, (r - l).max(1))
                     }
                 };
@@ -714,8 +716,11 @@ impl<'a> Ctx<'a> {
         // on the current line — an inline box that soft-wraps is approximated
         // (the common styled-link/nav case does not wrap).
         let inline_box = !is_block && style.display == Display::Inline;
+        let inline_cb = (self.right - self.left).max(1);
         if inline_box && visible {
-            self.x += style.margin_left + style.border_left + style.padding_left;
+            self.x += self.resolve_margin(style.margin_left, inline_cb)
+                + style.border_left
+                + style.padding_left;
             self.max_x = self.max_x.max(self.x);
         }
         for child in &node.children {
@@ -752,7 +757,9 @@ impl<'a> Ctx<'a> {
         }
         self.flush_floats(&mut fb);
         if inline_box && visible {
-            self.x += style.padding_right + style.border_right + style.margin_right;
+            self.x += style.padding_right
+                + style.border_right
+                + self.resolve_margin(style.margin_right, inline_cb);
             self.max_x = self.max_x.max(self.x);
         }
         self.opacity_hidden = saved_opacity_hidden;
@@ -788,7 +795,7 @@ impl<'a> Ctx<'a> {
             if self.measuring {
                 self.max_x += style.padding_right + style.border_right;
             }
-            self.y += style.margin_bottom;
+            self.y += self.resolve_margin(style.margin_bottom, (saved_right0 - saved_left).max(1));
             self.left = saved_left;
             self.right = saved_right0;
             self.x = self.left;
@@ -1144,6 +1151,14 @@ impl<'a> Ctx<'a> {
         self.push_piece(px, w, glyphs, style, href);
     }
 
+    /// Resolve a margin `Len` to px against the containing-block width `cb_w`
+    /// (CSS resolves `%` margins — on every side — against the container's
+    /// width). `auto` and other non-resolving values yield 0; horizontal `auto`
+    /// for centering is handled separately via the `margin_*_auto` flags.
+    fn resolve_margin(&self, len: Len, cb_w: i32) -> i32 {
+        len.resolve_vp(cb_w, self.vw, self.vh).unwrap_or(0)
+    }
+
     /// Place an `inline-block` as an atomic box on the current line (ADR-0042): a
     /// `width`-sized (else shrink-to-fit) sub laid with the full block box model,
     /// positioned at the inline cursor and advancing it; wraps if it overflows.
@@ -1167,12 +1182,12 @@ impl<'a> Ctx<'a> {
         let ml = if e.style.margin_left_auto {
             0
         } else {
-            e.style.margin_left
+            self.resolve_margin(e.style.margin_left, avail)
         };
         let mr = if e.style.margin_right_auto {
             0
         } else {
-            e.style.margin_right
+            self.resolve_margin(e.style.margin_right, avail)
         };
         if self.x != self.left && self.x + ml + w > self.right {
             self.newline();
@@ -4513,6 +4528,23 @@ mod tests {
         assert!(
             *widths.last().unwrap() > widths[0],
             "content column is wider than the label: {widths:?}"
+        );
+    }
+
+    #[test]
+    fn percent_and_viewport_margins_resolve_at_layout() {
+        // `%` margins resolve against the containing-block width (all sides), and
+        // `vh`/`vw` against the viewport — both were dropped when margins were
+        // stored as parse-time px. A 10% top margin in a 400px-wide container is
+        // 40px; a following block sits that much lower.
+        let pct = lay("<div style='margin-top:10%'>x</div><div>y</div>", 400);
+        let plain = lay("<div>x</div><div>y</div>", 400);
+        let first_y = |l: &LaidOut| glyph_ys(l)[0];
+        assert!(
+            first_y(&pct) - first_y(&plain) >= 38,
+            "10% of 400px ~= 40px top margin: {} vs {}",
+            first_y(&pct),
+            first_y(&plain)
         );
     }
 
