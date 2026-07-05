@@ -12,31 +12,55 @@ implement each without re-deriving the investigation.
 
 ---
 
-## Wikipedia portal — remaining deltas (root-caused, both feature-level)
+## Wikipedia portal — remaining deltas
 
 The masthead, centered globe, two-column language grid, CJK, the centered search
-bar + language button, and the footer (images + sister-project icons) all match
-Chrome (subagent-verified). Two deltas remain, each precisely root-caused:
+bar + language button, and the icon-only search button now match Chrome
+(subagent-verified).
 
-1. **`<button>` renders only its text, ignoring element children.** The language
-   button's translate/chevron icon sprites don't paint because `<button>` is
-   handled by `form_button` → `push_button`, which draws a box + the button's text
-   label and never walks the button's child elements (the `<i class="sprite …">`
-   icons). Confirmed by probe: the button is `display:Inline`, not culled, but its
-   `<i>` children never reach `walk`. This is a general limitation (any icon
-   button shows only text). Fix = make `<button>` a content container: when it has
-   element children, lay it as a button-styled box that walks its subtree (keep
-   the text-only `push_button` path for simple buttons). Moderate risk — touches
-   all button rendering; do it deliberately with button regression tests, not as a
-   tail-end change.
+### ✅ DONE — icon `<button>` children + icon-only button sizing
 
-2. **Search widget sub-control micro-layout.** The language selector sits below the
-   input and the Search button has a gap, vs Chrome's inline selector + flush
-   button. The portal uses `.search-input{width:73%|100%;margin-right:-6.6rem}`
-   (a negative margin pulling the button back to overlap) plus a `.styled-select`
-   that is `position:absolute;right:…` inside the input. Needs: negative-margin
-   support in inline-block flow and the absolute select resolving against the
-   input container. Verify against the mirror once done.
+Three general layout fixes landed (all with regression tests) and closed the
+language-button and search-button deltas:
+
+1. **`<button>` element children render.** A `<button>` with element children
+   (icon `<i>` sprites, a label `<span>`) is now routed through
+   `add_inline_block` so its subtree lays out via the block box model and paints,
+   while still registering a `Button` hit box. The measurement path
+   (`measure_intrinsic_width`/`measure_min_content_width`) takes the same block
+   path for such a button (shared `button_wants_block` predicate), else the
+   scratch walk re-dispatches to `form_button` and overflows the stack.
+2. **`min-width` is a floor, not a fixed width.** `resolve_block_width` pinned a
+   box to a lone `min-width` (auto width, no max-width) via `unwrap_or(0).max(mw)`,
+   collapsing the icon-only search button (`.pure-button` `min-width:1.6rem`) to
+   16px and suppressing content measurement. It now leaves an auto-width box
+   unconstrained and re-applies the `min-width` floor as a border-box value in the
+   shrink-to-fit callers (`add_inline_block`, `place_float`) after measuring.
+3. **`text-indent` honored on `white-space:nowrap` runs.** A nowrap run is placed
+   atomically through `add_run`, which never consumed the block's one-shot
+   `text-indent`. `.pure-button{white-space:nowrap}` inherits to the search
+   button's `<i>`, so `text-indent:-9999px` (the image-replacement trick) was
+   dropped and the "Search" label painted over the magnifying-glass sprite.
+   `add_run` now consumes `pending_indent` at line start, matching `add_word`.
+
+### ⏳ Remaining — search-widget positioning + JS-built footer
+
+1. **`.styled-select` language dropdown wraps below the input** instead of sitting
+   inside its right edge, and the Search button has a **gap** instead of being
+   flush. Root cause: `.search-input` is `display:inline-block; position:relative`
+   — laid in a separate `add_inline_block` sub-context — and the absolute
+   `.styled-select` (`position:absolute; right:1.2rem; top:1rem`) needs
+   `.search-input`'s box as its containing block *across that sub-context
+   boundary*. Cerberus supports absolute positioning against a `cb_stack` entry,
+   but an inline-block relative parent laid via `add_inline_block` does not push
+   its box as a containing block for abs descendants. Also `.search-input`'s
+   `margin-right:-6.6rem` (a negative margin pulling the button flush) is not
+   applied in inline-block flow. Both are general limitations, not portal-specific.
+2. **Footer sister-project grid absent.** `.other-projects`/`.other-project`/
+   `footer-sidebar`/`app-badges` appear **only in CSS/JS**, never in the static
+   DOM (0 occurrences after the last `</style>`). The grid is built by the portal's
+   JavaScript at runtime; rendering it requires executing that script, not a
+   layout change.
 
 ## ✅ DONE — `rem` root font-size + absolute-positioning origin (was the top gap)
 
