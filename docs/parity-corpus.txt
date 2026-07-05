@@ -1,0 +1,19 @@
+# Rendering-parity corpus (RENDERING_PARITY_PLAN.md, Workstream 0).
+#
+# One page per line: `<name> <url> [width] [height]`. `scripts/parity.sh`
+# mirrors each page to 127.0.0.1, renders it in headless Chrome (reference) and
+# Cerberus, and scores the difference with `cerberus-app diff`. Lower RMSE is
+# closer to Chrome; track the numbers over time to catch regressions and prove
+# progress. Blank lines and `#` comments are ignored.
+#
+# Ordered simple → complex, matching the plan's build-up: foundational pages
+# first, image/script-heavy ones later.
+
+example    http://example.com                 1000 800
+wikipedia  https://www.wikipedia.org          1200 1000
+
+# Add as fidelity improves (see plan §11 sequencing):
+# mdn      https://developer.mozilla.org/en-US/docs/Web/CSS  1200 1000
+# news     <a stable news front page>          1200 1000
+# pokemon  https://www.pokemoncenter.com       1200 1000   # needs reese84 (separate track)
+# amazon   https://www.amazon.com              1200 1000

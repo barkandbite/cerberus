@@ -65,6 +65,18 @@ number, not a vibe:
 - Store reference Chrome PNGs so regressions are caught. Gate a CI job (optional,
   behind a feature) that renders the corpus and flags diff-score regressions.
 
+**✅ LANDED.** The pixel diff is a `cerberus-app diff` subcommand
+(`crates/cerberus-app/src/parity.rs`, pure + unit-tested core): it reads two
+PNGs, crops Cerberus's 36px toolbar (`--crop-top 36`), compares over the overlap,
+and prints an **RMSE** (`0.0` = identical) plus a mismatch fraction; `--fail-over
+<rmse>` makes it a regression gate. `docs/parity-corpus.txt` holds the corpus and
+`scripts/parity.sh` runs the whole loop (mirror → Chrome + Cerberus render →
+diff) emitting a `parity.csv`. **Current baselines** (1200×1000, toolbar cropped,
+tolerance 8): `example` RMSE 0.095 (89% of pixels off by a little — a page-wide
+uniform delta, likely the `#f0f0f2` body background), `wikipedia` RMSE 0.147
+(9% of pixels off — the search-widget + donation-banner region). Drive these
+down; a rise is a regression.
+
 ---
 
 ## 3. Current state (as of this plan)

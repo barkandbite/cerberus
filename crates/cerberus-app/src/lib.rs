@@ -9,6 +9,7 @@
 //! present, with the consent and farbling seams exercised along the way.
 
 pub mod mirror;
+pub mod parity;
 
 /// Lock a `Mutex`, recovering the guard if a previous holder panicked and
 /// poisoned it instead of propagating the panic — one poisoned critical
