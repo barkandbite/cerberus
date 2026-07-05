@@ -104,8 +104,20 @@ drops the element from the render while it stays in the DOM
 (`script_hiding_an_element_removes_it_from_the_render`). The Wikipedia donation
 banner persists not for want of a DOM API but because its hide path is gated on
 geolocation/storage/campaign state the static mirror doesn't supply — the
-open-ended, "diffuse payoff" part of W-F the plan (§9) defers. It is also a minor
-contributor: stripping the banner from the mirror moved the diff only 9.2% → 8.8%.
+open-ended, "diffuse payoff" part of W-F the plan (§9) defers. §9's own
+clean-geometry check is now reproducible: `scripts/parity.sh --hide '<selector>'`
+injects `display:none` into both browsers before diffing, and running it on the
+banner selectors gives **8.83% vs 9.19% full-page** — the banner is worth only
+0.36pp, confirming the deferral. The remaining 8.8% is the search widget, the
+JS-built sister-project footer, and font-face/wrap drift.
+
+**Percent / viewport-unit margins** (W-D): landed. Margins are now `Len`,
+resolved against the containing-block width at layout (`resolve_margin`), so
+`%`/`vw`/`vh`/`vmin`/`vmax` margins work instead of being dropped at parse.
+example.com's `body{margin:15vh auto}` top margin now applies (content moved from
+71px-off to 34px-off Chrome). px margins are unchanged, so no corpus regression.
+The residual example gap is the `15vh` basis (content viewport vs full window)
+and body-margin collapsing — a smaller secondary detail.
 
 **First win driven by the yardstick — canvas background propagation.** The
 `example` diff (89% of pixels off by a little) root-caused to the root/body

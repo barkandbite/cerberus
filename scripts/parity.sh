@@ -30,7 +30,7 @@ TOOLBAR_PX=36 # Cerberus's chrome; cropped off the Cerberus image before diffing
 
 OUT_DIR="${TMPDIR:-/tmp}/cerberus-parity"
 CORPUS="$REPO/docs/parity-corpus.txt"
-ONE_URL=""; ONE_NAME=""; ONE_W=""; ONE_H=""
+ONE_URL=""; ONE_NAME=""; ONE_W=""; ONE_H=""; HIDE=""
 while [ $# -gt 0 ]; do
   case "$1" in
     --out-dir) OUT_DIR="$2"; shift 2 ;;
@@ -39,6 +39,10 @@ while [ $# -gt 0 ]; do
     --name)    ONE_NAME="$2"; shift 2 ;;
     --width)   ONE_W="$2"; shift 2 ;;
     --height)  ONE_H="$2"; shift 2 ;;
+    # CSS selector(s) hidden (display:none) in BOTH browsers before diffing, for
+    # a clean geometric comparison of a page whose JS would hide them (e.g. a
+    # fundraising banner Chrome's JS removes but our mirror keeps) — plan §9.
+    --hide)    HIDE="$2"; shift 2 ;;
     *) echo "parity.sh: unknown arg $1" >&2; exit 2 ;;
   esac
 done
@@ -60,6 +64,19 @@ score_one() {
   if ! curl -fsSL -A "Mozilla/5.0" "$url" -o "$mir/index.html"; then
     echo "parity.sh: could not fetch $url — skipping $name" >&2
     return 0
+  fi
+  # Inject a hide rule for the requested selector(s) into <head>, so both
+  # browsers render without them (plan §9 clean-geometry comparison).
+  if [ -n "$HIDE" ]; then
+    local hidecss="<style>$HIDE{display:none!important}</style>"
+    # Insert right before </head> (first occurrence).
+    python3 - "$mir/index.html" "$hidecss" <<'PYHIDE'
+import sys
+path, css = sys.argv[1], sys.argv[2]
+html = open(path, encoding="utf-8", errors="replace").read()
+html = html.replace("</head>", css + "</head>", 1)
+open(path, "w", encoding="utf-8").write(html)
+PYHIDE
   fi
   # Mirror same-origin relative assets referenced in the HTML (best-effort). The
   # `|| true` keeps a no-match `grep` (a page with no assets, e.g. example.com)
