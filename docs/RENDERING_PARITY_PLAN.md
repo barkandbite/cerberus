@@ -71,11 +71,17 @@ PNGs, crops Cerberus's 36px toolbar (`--crop-top 36`), compares over the overlap
 and prints an **RMSE** (`0.0` = identical) plus a mismatch fraction; `--fail-over
 <rmse>` makes it a regression gate. `docs/parity-corpus.txt` holds the corpus and
 `scripts/parity.sh` runs the whole loop (mirror → Chrome + Cerberus render →
-diff) emitting a `parity.csv`. **Current baselines** (1200×1000, toolbar cropped,
-tolerance 8): `example` RMSE **0.069** (1.6% of pixels off — was 0.095 / 89%
-before the canvas-background fix below), `wikipedia` RMSE 0.147 (9% of pixels
-off — the search-widget + donation-banner region). Drive these down; a rise is a
+diff) emitting a `parity.csv`. **Current baselines** (toolbar cropped, tolerance 8): `example` RMSE **0.069**
+(1.6% — was 0.095 / 89% before the canvas-background fix below), `iana` RMSE
+**0.134** (22.6% — inline nav/link spacing now correct; remainder is the
+flex/`width:1100px` content column + font rhythm), `wikipedia` RMSE 0.147 (9% —
+the search-widget + donation-banner region). Drive these down; a rise is a
 regression.
+
+**Inline box spacing** (W-C/layout): a true inline element's horizontal
+padding/margin/border is now applied, so styled inline links no longer run
+together (iana's `DomainsProtocolsNumbersAbout` → `Domains Protocols Numbers
+About`). General — affects nav menus, tag pills, inline links everywhere.
 
 **First win driven by the yardstick — canvas background propagation.** The
 `example` diff (89% of pixels off by a little) root-caused to the root/body
