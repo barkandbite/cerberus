@@ -2591,6 +2591,40 @@ impl<'a> Ctx<'a> {
     /// Pragmatic, not spec-perfect: equal columns only (no content-based sizing),
     /// and colspan/rowspan are ignored — every cell is one column by one row.
     // TODO: honour colspan/rowspan and content-based column widths.
+    /// Intrinsic content width of a table cell: flow its children into a very
+    /// wide scratch (nothing wraps) and read the widest extent. This walks the
+    /// cell's *children*, not the cell node — `walk` returns early on a
+    /// `<td>`/`<tr>` (they are laid only by `table`), so measuring the cell node
+    /// directly reads nothing. Floated inline children (a common nav/link cell)
+    /// pack horizontally in the wide scratch, so their real row width is counted.
+    fn measure_cell_width(&mut self, cell: &StyledNode) -> i32 {
+        let mut sub = Ctx::sub(
+            0,
+            1_000_000,
+            0,
+            self.shaper,
+            self.images,
+            self.forms,
+            self.field_id,
+            self.vw,
+            self.vh,
+        );
+        sub.measuring = true;
+        let mut fb = FloatBand::new(sub.left, sub.right, sub.y);
+        for child in &cell.children {
+            match child {
+                StyledChild::Text(t) => sub.add_text(t, &cell.style, None),
+                StyledChild::Element(e) if e.style.float != cerberus_style::Float::None => {
+                    sub.place_float(e, None, &mut fb)
+                }
+                StyledChild::Element(e) => sub.walk(e, None),
+            }
+        }
+        sub.flush_floats(&mut fb);
+        sub.flush_line();
+        sub.max_x.max(1)
+    }
+
     fn table(&mut self, node: &StyledNode) {
         self.flush_line();
         let left = self.left;
@@ -2622,7 +2656,39 @@ impl<'a> Ctx<'a> {
             return;
         }
 
-        let col_w = ((right - left) / num_cols as i32).max(1);
+        // Content-proportional column widths (auto table layout) rather than an
+        // equal split: size each column to its widest cell's intrinsic content
+        // (plus padding). An auto-width table whose content fits shrinks to it
+        // (Chrome's footer nav: a narrow label column beside a wide links
+        // column); an explicit-width table — or content that overflows — fills
+        // the target width proportionally. `col_x` holds the column left edges;
+        // `col_x[num_cols]` is the table's right edge.
+        let avail = (right - left).max(num_cols as i32);
+        let mut col_max = vec![1i32; num_cols];
+        for row in &rows {
+            for (col, cell) in cell_children(row).enumerate() {
+                if col < num_cols {
+                    let w = (self.measure_cell_width(cell) + 2 * CELL_PAD).max(1);
+                    col_max[col] = col_max[col].max(w);
+                }
+            }
+        }
+        let total: i64 = col_max.iter().map(|&w| w as i64).sum();
+        let explicit = resolve_block_width(&node.style, avail, self.vw, self.vh);
+        let target = explicit.unwrap_or(avail).clamp(num_cols as i32, avail);
+        let col_widths: Vec<i32> = if explicit.is_some() || total > target as i64 {
+            col_max
+                .iter()
+                .map(|&c| ((c as i64 * target as i64) / total).max(1) as i32)
+                .collect()
+        } else {
+            col_max
+        };
+        let mut col_x = vec![left; num_cols + 1];
+        for col in 0..num_cols {
+            col_x[col + 1] = col_x[col] + col_widths[col];
+        }
+
         let mut row_y = self.y;
 
         for row in rows {
@@ -2635,13 +2701,8 @@ impl<'a> Ctx<'a> {
             let mut laid: Vec<CellLayout> = Vec::with_capacity(cells.len());
             let mut row_h = line_height(node.style.font_size.max(1));
             for (col, cell) in cells.iter().enumerate() {
-                let cell_x = left + col as i32 * col_w;
-                let cell_w = if col + 1 == num_cols {
-                    right - cell_x
-                } else {
-                    col_w
-                }
-                .max(1);
+                let cell_x = col_x[col.min(num_cols - 1)];
+                let cell_w = (col_x[(col + 1).min(num_cols)] - cell_x).max(1);
                 let (items, links, fields, h) =
                     self.flow_cell(cell, cell_x, cell_x + cell_w, row_y);
                 row_h = row_h.max(h);
@@ -2651,13 +2712,8 @@ impl<'a> Ctx<'a> {
 
             // Emit each cell's box (fill + border) under its content.
             for (col, cell) in cells.iter().enumerate() {
-                let cell_x = left + col as i32 * col_w;
-                let cell_w = if col + 1 == num_cols {
-                    right - cell_x
-                } else {
-                    col_w
-                }
-                .max(1) as u32;
+                let cell_x = col_x[col.min(num_cols - 1)];
+                let cell_w = (col_x[(col + 1).min(num_cols)] - cell_x).max(1) as u32;
                 let is_header = cell.tag == "th";
                 let fill = cell
                     .style
@@ -4427,6 +4483,37 @@ mod tests {
         );
         let min_y = *glyph_ys(&laid).iter().min().unwrap();
         assert!(min_y > 100, "content centered within the tall box: {min_y}");
+    }
+
+    #[test]
+    fn table_columns_size_to_content_not_equal_split() {
+        // Auto table layout: a short label column stays narrow beside a wide
+        // content column, rather than each taking an equal half of the width.
+        let laid = lay(
+            "<table><tr><td>Hi</td>\
+             <td>a considerably longer stretch of cell content goes here</td></tr></table>",
+            600,
+        );
+        // Cells draw horizontal border rects (height 1) spanning each column.
+        let mut widths: Vec<u32> = laid
+            .display
+            .items
+            .iter()
+            .filter_map(|it| match it {
+                DisplayItem::Rect { rect, .. } if rect.h == 1 && rect.w > 2 => Some(rect.w),
+                _ => None,
+            })
+            .collect();
+        widths.sort_unstable();
+        widths.dedup();
+        assert!(widths.len() >= 2, "two distinct column widths: {widths:?}");
+        // An equal split would make each column ~300px; the label shrinks well
+        // below that, and the content column is wider.
+        assert!(widths[0] < 200, "label column sized to content: {widths:?}");
+        assert!(
+            *widths.last().unwrap() > widths[0],
+            "content column is wider than the label: {widths:?}"
+        );
     }
 
     #[test]
