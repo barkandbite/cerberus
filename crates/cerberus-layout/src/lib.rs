@@ -455,10 +455,16 @@ impl<'a> Ctx<'a> {
                 return;
             }
             "button" => {
-                if visible {
-                    self.form_button(node);
+                // `as_block_once` means `form_button` is re-laying this button as a
+                // content container (to render its icon/span children) — fall
+                // through to block layout, which paints its box and walks children.
+                // Otherwise handle it as a form control.
+                if !self.as_block_once {
+                    if visible {
+                        self.form_button(node);
+                    }
+                    return;
                 }
-                return;
             }
             "textarea" => {
                 if visible {
@@ -1296,9 +1302,34 @@ impl<'a> Ctx<'a> {
     }
 
     /// A `<button>`: a button box labelled with its text (or `value`).
+    ///
+    /// A button that contains child *elements* (icon `<i>`s, styled `<span>`s —
+    /// e.g. Wikipedia's "Read Wikipedia in your language" pill with a translate
+    /// icon + chevron) is a content container: lay its subtree as an inline-block
+    /// so those children render (and its CSS box/border paints), then record the
+    /// Button hit box over the result. A text-only button keeps the simple
+    /// labelled-box path.
     fn form_button(&mut self, node: &StyledNode) {
         let id = self.field_id;
         self.field_id += 1;
+        let has_elem_children = node
+            .children
+            .iter()
+            .any(|c| matches!(c, StyledChild::Element(_)));
+        if has_elem_children {
+            let (x0, y0) = (self.x, self.y);
+            self.add_inline_block(node, None);
+            let w = (self.x - x0).max(1) as u32;
+            let h = self.line_h.max(1) as u32;
+            // Registered after layout; the line's `text-align` shift (which moves
+            // fields added this line) then centers this hit box with its content.
+            self.fields.push(FormFieldBox {
+                rect: Rect::new(x0, y0, w, h),
+                id,
+                kind: FieldKind::Button,
+            });
+            return;
+        }
         let text = node.text();
         let label = if text.trim().is_empty() {
             node.attr("value").unwrap_or("Button")
@@ -1698,8 +1729,11 @@ impl<'a> Ctx<'a> {
         });
         scratch.reset_for_measure(field_id);
         // Measure an inline-block by its block content (avoids re-routing into
-        // `add_inline_block`, which would recurse here) — ADR-0042.
-        scratch.as_block_once = matches!(node.style.display, Display::InlineBlock);
+        // `add_inline_block`, which would recurse here) — ADR-0042. An
+        // element-children `<button>` takes the same block path, else the walk
+        // re-dispatches to `form_button` and recurses back into measurement.
+        scratch.as_block_once =
+            matches!(node.style.display, Display::InlineBlock) || button_wants_block(node);
         scratch.walk(node, None);
         scratch.flush_line();
         let width = scratch.max_x.max(1);
@@ -1728,7 +1762,8 @@ impl<'a> Ctx<'a> {
         });
         scratch.reset_for_measure(field_id);
         scratch.right = 1; // force a wrap at every opportunity
-        scratch.as_block_once = matches!(node.style.display, Display::InlineBlock);
+        scratch.as_block_once =
+            matches!(node.style.display, Display::InlineBlock) || button_wants_block(node);
         scratch.walk(node, None);
         scratch.flush_line();
         let width = scratch.max_x.max(1);
@@ -2882,6 +2917,20 @@ fn is_flex_grid_item(e: &StyledNode) -> bool {
             e.style.position,
             cerberus_style::Position::Absolute | cerberus_style::Position::Fixed
         )
+}
+
+/// A `<button>` with element children (icon `<i>`/`<span>` sprites, not just a
+/// text label) is laid as an atomic block-model box so its children paint —
+/// `form_button` routes it through `add_inline_block`. During intrinsic-width
+/// measurement the button must take the same block path; otherwise the scratch
+/// walk re-dispatches to `form_button`, which re-enters measurement and
+/// overflows the stack.
+fn button_wants_block(node: &StyledNode) -> bool {
+    node.tag == "button"
+        && node
+            .children
+            .iter()
+            .any(|c| matches!(c, StyledChild::Element(_)))
 }
 
 /// One item's resolved grid placement: top-left cell + span (ADR-0038).
@@ -5053,6 +5102,28 @@ mod tests {
         let laid = lay("<input type='submit' value='Send'>", 400);
         assert!(has_rect_color(&laid, BUTTON_BG));
         assert_eq!(total_glyphs(&laid), 4, "'Send' label");
+    }
+
+    #[test]
+    fn button_with_element_children_lays_them_out_and_stays_a_button() {
+        // Wikipedia's language/search buttons wrap icon `<i>` sprites and a
+        // `<span>` label rather than bare text. Such a button is laid via the
+        // block box model so its children paint, and still registers as a
+        // clickable Button hit box. (Regression: routing the children through
+        // `add_inline_block` used to recurse back into `form_button` during
+        // intrinsic-width measurement and overflow the stack.)
+        let laid = lay(
+            "<button><i></i><span>Read this</span><i></i></button>",
+            400,
+        );
+        assert_eq!(total_glyphs(&laid), 8, "child span's 'Read this' laid out");
+        let buttons: Vec<_> = laid
+            .fields
+            .iter()
+            .filter(|f| f.kind == FieldKind::Button)
+            .collect();
+        assert_eq!(buttons.len(), 1, "one Button hit box registered");
+        assert!(buttons[0].rect.w > 1, "hit box spans the laid content");
     }
 
     #[test]
