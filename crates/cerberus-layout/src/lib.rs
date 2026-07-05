@@ -706,6 +706,18 @@ impl<'a> Ctx<'a> {
         // 1, 2, 3…; each `<ol>`/`<ul>` restarts it, so nested lists are independent.
         // `<ol start="N">` seeds the count so the first item is N.
         let mut item_ordinal = ol_start_base(node);
+        // Horizontal insets of an inline (non-replaced) box: its left
+        // margin/border/padding push following content rightward at the box's
+        // start, the right ones after its content. Block and inline-block boxes
+        // model padding through their content box already; this is only for a
+        // true inline element (e.g. a nav `<a>` with `padding:4px 6px`). Applied
+        // on the current line — an inline box that soft-wraps is approximated
+        // (the common styled-link/nav case does not wrap).
+        let inline_box = !is_block && style.display == Display::Inline;
+        if inline_box && visible {
+            self.x += style.margin_left + style.border_left + style.padding_left;
+            self.max_x = self.max_x.max(self.x);
+        }
         for child in &node.children {
             match child {
                 StyledChild::Text(t) => {
@@ -739,6 +751,10 @@ impl<'a> Ctx<'a> {
             }
         }
         self.flush_floats(&mut fb);
+        if inline_box && visible {
+            self.x += style.padding_right + style.border_right + style.margin_right;
+            self.max_x = self.max_x.max(self.x);
+        }
         self.opacity_hidden = saved_opacity_hidden;
 
         if is_block {
@@ -5168,6 +5184,25 @@ mod tests {
         let laid = lay("<input type='submit' value='Send'>", 400);
         assert!(has_rect_color(&laid, BUTTON_BG));
         assert_eq!(total_glyphs(&laid), 4, "'Send' label");
+    }
+
+    #[test]
+    fn inline_horizontal_padding_spaces_surrounding_content() {
+        // A true inline element's horizontal padding (and margin) pushes the
+        // content after it rightward — the spacing that separates nav links like
+        // iana.org's `#header .navigation li a { padding:4px 6px }`. Without it,
+        // styled inline links render run-together.
+        let padded = lay("<p>A<a style='padding:0 10px;margin:0 5px'>B</a>C</p>", 400);
+        let plain = lay("<p>A<a>B</a>C</p>", 400);
+        let last_x = |l: &LaidOut| *glyph_xs(l).iter().max().unwrap();
+        // 'C' (the rightmost glyph) sits farther right with the inline box's
+        // 10px+10px padding and 5px+5px margins around 'B'.
+        assert!(
+            last_x(&padded) >= last_x(&plain) + 28,
+            "inline padding+margin pushed following content right: {} vs {}",
+            last_x(&padded),
+            last_x(&plain)
+        );
     }
 
     #[test]

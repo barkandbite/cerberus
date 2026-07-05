@@ -10,6 +10,7 @@
 # first, image/script-heavy ones later.
 
 example    http://example.com                 1000 800
+iana       https://www.iana.org/help/example-domains  1000 800
 wikipedia  https://www.wikipedia.org          1200 1000
 
 # Add as fidelity improves (see plan §11 sequencing):
