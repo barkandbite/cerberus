@@ -12,7 +12,25 @@ implement each without re-deriving the investigation.
 
 ---
 
-## TOP FOLLOW-UP — `rem` must resolve against the root font-size (with companions)
+## ✅ DONE — `rem` root font-size + absolute-positioning origin (was the top gap)
+
+**All three landed and verified against Chrome.** The Wikipedia portal's grid now
+matches Chrome: two language columns flanking the centered globe, counts on one
+line, CJK glyphs, compact height. The fixes:
+1. **`rem` vs root font-size** — thread the root element's computed font-size
+   through `build`/`apply_declarations`; fold `<number>rem → px` up front
+   (`substitute_rem`).
+2. **Out-of-flow width origin** — extend the used-width box from `self.left` (the
+   element's flow-start), not `self.left0` (an ancestor reference); the latter
+   collapsed the cell to 1px inside a centered container once rem narrowed it.
+3. **Absolute static-position origin** — `apply_positioning` captures `base.x =
+   self.left` and computes `elem_w = self.right - self.left`; using `self.left0`
+   offset a left/top-anchored box by `(self.left − self.left0)`, spreading the
+   columns and stranding the globe.
+
+Original investigation retained below for reference.
+
+## (historical) `rem` must resolve against the root font-size (with companions)
 
 **Root cause (confirmed).** `rem` is converted to px with a hardcoded 16
 (`parse_css_px`: `"rem" => num * 16.0`). Real pages set a smaller root via the
