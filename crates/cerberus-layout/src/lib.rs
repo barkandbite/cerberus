@@ -3117,7 +3117,7 @@ pub fn pick_img_url<'a>(attr: impl Fn(&str) -> Option<&'a str>, viewport_w: u32)
         return Some(d.to_string());
     }
     if let Some(ss) = attr("data-srcset").or_else(|| attr("srcset")) {
-        if let Some(u) = select_srcset(ss, attr("sizes"), viewport_w) {
+        if let Some(u) = select_srcset_with_src(ss, attr("sizes"), viewport_w, attr("src")) {
             return Some(u);
         }
     }
@@ -3187,6 +3187,22 @@ fn srcset_candidates(input: &str) -> Vec<(&str, Option<&str>)> {
 /// first, at device-pixel-ratio 1); density (`x`/bare) candidates pick `1x` (we
 /// render at 1x). `None` for an empty/unparseable list (caller falls back to `src`).
 pub fn select_srcset(srcset: &str, sizes: Option<&str>, viewport_w: u32) -> Option<String> {
+    select_srcset_with_src(srcset, sizes, viewport_w, None)
+}
+
+/// Like [`select_srcset`] but also considers the element's plain `src` as an
+/// implicit 1x density candidate. Per the HTML "update the source set" algorithm,
+/// when a `srcset` carries only density (`x`) descriptors, `src` participates as
+/// the 1x source — so at device-pixel-ratio 1 a `src="a.png" srcset="a@2x.png 2x"`
+/// resolves to `a.png`, not the 2x image (which a naive srcset-only pick returns
+/// as the smallest density ≥ 1). `src` is ignored when width (`w`) descriptors are
+/// present (the spec drops density selection entirely in that mode).
+pub fn select_srcset_with_src(
+    srcset: &str,
+    sizes: Option<&str>,
+    viewport_w: u32,
+    src: Option<&str>,
+) -> Option<String> {
     let mut width: Vec<(u32, &str)> = Vec::new();
     let mut density: Vec<(f32, &str)> = Vec::new();
     for (url, descriptor) in srcset_candidates(srcset) {
@@ -3203,6 +3219,15 @@ pub fn select_srcset(srcset: &str, sizes: Option<&str>, viewport_w: u32) -> Opti
             }
             Some(_) => continue,              // unknown descriptor
             None => density.push((1.0, url)), // a bare candidate is 1x
+        }
+    }
+    // A plain `src` joins the density pool as 1x, but only in density mode and
+    // only if it isn't already listed as a candidate.
+    if width.is_empty() {
+        if let Some(s) = src {
+            if !density.iter().any(|(_, u)| *u == s) {
+                density.push((1.0, s));
+            }
         }
     }
     if !width.is_empty() {
@@ -4505,6 +4530,20 @@ mod tests {
         assert_eq!(
             select_srcset("b.png 2x, c.png 3x", None, 1000).as_deref(),
             Some("b.png")
+        );
+        // `src` is the implicit 1x candidate when srcset lists only higher
+        // densities (Wikipedia's globe: src=v2.png srcset="v2@2x.png 2x").
+        assert_eq!(
+            select_srcset_with_src("v2@2x.png 2x", None, 1000, Some("v2.png")).as_deref(),
+            Some("v2.png"),
+            "at DPR 1, plain src (1x) beats the only srcset entry (2x)"
+        );
+        // `src` does not override width-descriptor selection.
+        assert_eq!(
+            select_srcset_with_src("s.png 480w, l.png 1200w", None, 400, Some("orig.png"))
+                .as_deref(),
+            Some("s.png"),
+            "width mode ignores src"
         );
         // Width: smallest candidate covering the sizes target.
         let ss = "s.png 480w, m.png 800w, l.png 1200w";
