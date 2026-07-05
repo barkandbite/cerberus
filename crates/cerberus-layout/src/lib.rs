@@ -1142,9 +1142,26 @@ impl<'a> Ctx<'a> {
             .unwrap_or_else(|| self.measure_intrinsic_width(e).min(avail))
             .max(floor)
             .clamp(1, avail);
-        if self.x != self.left && self.x + w > self.right {
+        // Inline-block margins flow along the line: the left margin offsets the
+        // box, the right margin advances the cursor for the next atom — and a
+        // negative right margin pulls it back to overlap (Wikipedia's search box
+        // uses `.search-input{margin-right:-6.6rem}` to seat the Search button
+        // against the input's right edge). Auto margins compute to 0 in inline
+        // flow (no centering).
+        let ml = if e.style.margin_left_auto {
+            0
+        } else {
+            e.style.margin_left
+        };
+        let mr = if e.style.margin_right_auto {
+            0
+        } else {
+            e.style.margin_right
+        };
+        if self.x != self.left && self.x + ml + w > self.right {
             self.newline();
         }
+        self.x += ml;
         let mut sub = Ctx::sub(
             self.x,
             self.x + w,
@@ -1164,7 +1181,10 @@ impl<'a> Ctx<'a> {
         let h = (sub.y - self.y).max(1);
         self.merge_sub(sub, 0, 0);
         self.x += w;
+        // Content extent is the box's right edge; a trailing margin (empty space,
+        // or a negative pull-back) does not extend it.
         self.max_x = self.max_x.max(self.x);
+        self.x += mr;
         self.line_h = self.line_h.max(h);
     }
 
@@ -5146,6 +5166,46 @@ mod tests {
         let laid = lay("<input type='submit' value='Send'>", 400);
         assert!(has_rect_color(&laid, BUTTON_BG));
         assert_eq!(total_glyphs(&laid), 4, "'Send' label");
+    }
+
+    #[test]
+    fn inline_block_margins_advance_and_pull_back_the_cursor() {
+        // Rects (left edges), in document order, of two inline-block boxes.
+        fn rect_lefts(laid: &LaidOut) -> Vec<i32> {
+            laid.display
+                .items
+                .iter()
+                .filter_map(|i| match i {
+                    DisplayItem::Rect { rect, .. } => Some(rect.x),
+                    _ => None,
+                })
+                .collect()
+        }
+        // A positive right margin on the first box spaces the second box away.
+        let spaced = lay(
+            "<div><span style='display:inline-block;width:30px;height:10px;\
+background:#111;margin-right:40px'></span>\
+<span style='display:inline-block;width:30px;height:10px;background:#222'></span></div>",
+            400,
+        );
+        let l = rect_lefts(&spaced);
+        assert_eq!(l.len(), 2, "two inline-block backgrounds: {l:?}");
+        // second.left = first.left(0) + width(30) + margin-right(40) = 70.
+        assert_eq!(l[1] - l[0], 70, "positive right margin spaces the next box");
+
+        // A negative right margin pulls the following box back to overlap.
+        let overlap = lay(
+            "<div><span style='display:inline-block;width:30px;height:10px;\
+background:#111;margin-right:-10px'></span>\
+<span style='display:inline-block;width:30px;height:10px;background:#222'></span></div>",
+            400,
+        );
+        let o = rect_lefts(&overlap);
+        assert_eq!(
+            o[1] - o[0],
+            20,
+            "negative right margin overlaps the next box"
+        );
     }
 
     #[test]
