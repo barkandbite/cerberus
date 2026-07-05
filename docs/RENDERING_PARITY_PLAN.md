@@ -90,21 +90,39 @@ Chrome propagates the root element's background to the whole canvas. Fixed in
 
 ## 3. Current state (as of this plan)
 
-Landed + pushed on the branch:
-- **`@media prefers-color-scheme` / preference features** now evaluate against the
-  fixed light desktop persona; unknown features → false (was: vacuous match, so
-  dark-mode blocks applied on light pages → washed-out text). `cerberus-css`.
-- **`@media` bare media types**: only `screen`/`all` match; `print` no longer
-  leaks onto the screen render. `cerberus-css` (`parse_media_query`).
-- **CSS `width`/`height` on `<img>`** now honored (override the presentational
-  attributes). `cerberus-layout` (`fn image`).
-- **Settings-overlay button labels** vertically centered. `cerberus-app`.
-- Coherent per-window fingerprint personas (separate track, already released as
-  v0.0.10).
+**Measurement framework (W0) is in place** — `cerberus-app diff`,
+`docs/parity-corpus.txt`, `scripts/parity.sh` — so every item below is now
+tracked by a number (see §2). Renders are byte-deterministic, so identical
+inputs diff to `PERFECT`.
 
-In flight (a subagent owns `cerberus-layout`/`-style`/`-css` right now): the
-Wikipedia **featured-language float grid** (`float:left; width:33%` blocks around
-the centered globe). Do not edit those crates until it lands and is integrated.
+Landed + pushed on the branch (parity workstreams):
+- **W0 measurement**: pixel-diff subcommand + corpus + harness (this plan's
+  linchpin — "closer to Chrome is a number").
+- **Canvas background propagation** (W-A/render): root/body background fills the
+  whole viewport (headless *and* interactive paint paths). example.com 89% → 1.6%.
+- **`vmin`/`vmax`** resolve against the smaller/larger viewport dimension (were
+  aliased to `vw`/`vh`, backwards in portrait). `cerberus-style`/`-css`.
+- **CSS sprites / pixel `background-position`** and **SVG decoding** (W-A/W-B):
+  landed earlier (`cerberus-image` uses `resvg`; sprite offsets in paint).
+- **Featured-language float grid** (W-C): matches Chrome (float rows, centered
+  absolute globe, `rem` root-font-size, out-of-flow width origin).
+- **`SSL_CERT_FILE`** honored by the TLS provider (W-G).
+- Earlier: `@media prefers-color-scheme`/type filtering, CSS `width`/`height` on
+  `<img>`, settings-overlay label centering. `cerberus-css`/`-layout`/`-app`.
+- Coherent per-window fingerprint personas (separate track, released as v0.0.10).
+
+**Open, ranked by the yardstick:**
+- `wikipedia` RMSE 0.147 (9%): dominated by the donation banner (Cerberus shows
+  it, Chrome's JS hides it) shifting all content down ~40px, plus the
+  JS-generated sister-project footer — both **W-F (deferred)**. A cleaner number
+  needs the page mirrored with the banner removed (plan §9).
+- `example` RMSE 0.069 (1.6%): the `15vh` top margin. Viewport-unit and `%`
+  margins are dropped because margins are stored as resolved px, not `Len` —
+  fixing needs a margin→`Len` refactor (defer until a page's diff is dominated
+  by it).
+- Search-widget micro-layout on wikipedia: `<fieldset>` not narrowing its content
+  box by its own margins + `%`-width through inline-block/relative nesting (see
+  RENDERING_PARITY_PLAN_V2.md).
 
 Known open diffs on wikipedia.org (from the Chrome comparison), prioritized below:
 1. Featured-language grid layout (in flight).
