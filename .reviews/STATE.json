@@ -17,7 +17,9 @@
       "category": "Security",
       "title": "QuickJS runtime has no memory limit, interrupt handler, or stack cap — a single script can hang or OOM the entire browser",
       "primary_file": "crates/cerberus-js-quickjs/src/lib.rs",
-      "fingerprint": "cerberus|crates/cerberus-js-quickjs/src/lib.rs|quickjs-no-runtime-limits"
+      "fingerprint": "cerberus|crates/cerberus-js-quickjs/src/lib.rs|quickjs-no-runtime-limits",
+      "status": "obsolete",
+      "resolution": "Already implemented on this branch since review: with_eval_timeout() sets a 192 MiB memory limit (MAX_JS_HEAP_BYTES), a 256 KiB stack cap (MAX_JS_STACK_BYTES), and installs a per-eval deadline interrupt watchdog. Regression tests infinite_loop_is_interrupted_within_configured_timeout, allocation_loop_is_interrupted_within_configured_timeout, memory_limit_bounds_unbounded_allocation, and runaway_recursion_errors_instead_of_crashing pass. Verified 2026-07-06 via `cargo test -p cerberus-js-quickjs`."
     },
     {
       "issue": 69,
@@ -26,7 +28,9 @@
       "category": "Architecture",
       "title": "Mirror-group windows never get the farbling prologue — identities are trivially correlatable in mirror mode",
       "primary_file": "crates/cerberus-mirror/src/group.rs",
-      "fingerprint": "cerberus|crates/cerberus-mirror/src/group.rs|mirror-no-farbling-injection"
+      "fingerprint": "cerberus|crates/cerberus-mirror/src/group.rs|mirror-no-farbling-injection",
+      "status": "obsolete",
+      "resolution": "Already implemented on this branch since review: MirrorGroup::new threads a per-identity farbling_prologue and MirrorGroup::catch_up injects it into each realm before any page script (group.rs:296-302). Regression tests each_instance_gets_its_own_farbling_prologue_injected and each_window_renders_its_own_session_independently pass. Verified 2026-07-06 via `cargo test -p cerberus-mirror`."
     },
     {
       "issue": 70,
@@ -35,7 +39,9 @@
       "category": "maintainability",
       "title": "is_public_suffix returns true for every single-label host (operator-precedence bug), breaking cookies on localhost/intranet names",
       "primary_file": "crates/cerberus-consent/src/psl.rs",
-      "fingerprint": "cerberus|crates/cerberus-consent/src/psl.rs|is_public_suffix-precedence-bug"
+      "fingerprint": "cerberus|crates/cerberus-consent/src/psl.rs|is_public_suffix-precedence-bug",
+      "status": "obsolete",
+      "resolution": "Already fixed on this branch since review: is_public_suffix now only returns true when the PSL data has an exact-rule or wildcard-rule hit (psl.rs:112-124), no longer letting a bare single-label host qualify on label-count alone. Regression test is_public_suffix_rejects_bare_intranet_hostnames (localhost/router/myintranet) passes. Verified 2026-07-06 via `cargo test -p cerberus-consent`."
     },
     {
       "issue": 71,
@@ -44,7 +50,9 @@
       "category": "maintainability",
       "title": "Consent rule serialization has no escaping — a whitespace-containing site/host corrupts the persisted rule format",
       "primary_file": "crates/cerberus-consent/src/lib.rs",
-      "fingerprint": "cerberus|crates/cerberus-consent/src/lib.rs|consent-rule-serialize-no-escaping"
+      "fingerprint": "cerberus|crates/cerberus-consent/src/lib.rs|consent-rule-serialize-no-escaping",
+      "status": "obsolete",
+      "resolution": "Already fixed on this branch since review: escape_field/unescape_field percent-escape whitespace and `%` and are wired into serialize_rules/load_rules, so a whitespace-containing site no longer shifts field boundaries on load. Regression tests escape_field_round_trips_arbitrary_bytes and rule_with_a_whitespace_containing_site_round_trips_without_corrupting_fields pass. Verified 2026-07-06 via `cargo test -p cerberus-consent`."
     }
   ],
   "fixed_this_run": [
