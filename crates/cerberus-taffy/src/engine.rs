@@ -113,6 +113,15 @@ fn is_block_container(child: &StyledChild) -> bool {
     }
 }
 
+/// A margin length in px if it is a plain `px` value (the common case for UA and
+/// author block margins); `None` for `%`/viewport/auto, which we don't collapse.
+fn px_len(l: cerberus_style::Len) -> Option<i32> {
+    match l {
+        cerberus_style::Len::Px(p) => Some(p),
+        _ => None,
+    }
+}
+
 /// Whether a run of children carries anything worth a box (non-whitespace text or
 /// any element), so purely-whitespace gaps between blocks don't add empty leaves.
 fn run_has_content(run: &[StyledChild]) -> bool {
@@ -142,6 +151,15 @@ impl<'a> Builder<'a> {
             leaves: Vec::new(),
             vw,
             vh,
+        }
+    }
+
+    /// Overwrite a node's top margin (px) — used to apply collapsed margins.
+    fn set_margin_top(&mut self, id: NodeId, top: i32) {
+        if let Ok(style) = self.tree.style(id) {
+            let mut style = style.clone();
+            style.margin.top = taffy::style::LengthPercentageAuto::length(top as f32);
+            let _ = self.tree.set_style(id, style);
         }
     }
 
@@ -197,6 +215,13 @@ impl<'a> Builder<'a> {
         let mut child_ids: Vec<NodeId> = Vec::new();
         let mut run_start = 0usize;
         let children = &node.children;
+        // Adjacent-sibling margin collapsing: taffy sums vertical margins, but CSS
+        // collapses a block's bottom margin with the next block's top margin to
+        // their max. Only meaningful in a block formatting context (not flex/grid),
+        // and we track the previous block child's bottom margin to shrink the next
+        // one's top so the gap becomes max(bottom, top) instead of their sum.
+        let collapsing = node.style.display == Display::Block;
+        let mut prev_bottom: Option<i32> = None;
         for i in 0..children.len() {
             if is_block_container(&children[i]) {
                 let run = &children[run_start..i];
@@ -204,10 +229,21 @@ impl<'a> Builder<'a> {
                     let ni = self.push_leaf(run, node.style.clone(), node.style.text_align);
                     child_ids.push(self.nodes[ni].id);
                     child_nodes.push(ni);
+                    // Inline content between blocks breaks margin adjacency.
+                    prev_bottom = None;
                 }
                 if let StyledChild::Element(e) = &children[i] {
                     if let Some(ni) = self.build(e, None) {
-                        child_ids.push(self.nodes[ni].id);
+                        let id = self.nodes[ni].id;
+                        if collapsing {
+                            if let (Some(pb), Some(top)) = (prev_bottom, px_len(e.style.margin_top))
+                            {
+                                // gap = pb + collapsed_top = max(pb, top).
+                                self.set_margin_top(id, (top.max(pb) - pb).max(0));
+                            }
+                            prev_bottom = px_len(e.style.margin_bottom);
+                        }
+                        child_ids.push(id);
                         child_nodes.push(ni);
                     }
                 }

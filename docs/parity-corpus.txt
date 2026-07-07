@@ -11,7 +11,10 @@
 
 example    http://example.com                 1000 800
 iana       https://www.iana.org/help/example-domains  1000 800
+mfws       https://motherfuckingwebsite.com   1000 800
+rfc1       https://www.rfc-editor.org/rfc/rfc1.html   1000 800
 wikipedia  https://www.wikipedia.org          1200 1000
+hn         https://news.ycombinator.com       1200 1000
 
 # Add as fidelity improves (see plan §11 sequencing):
 # mdn      https://developer.mozilla.org/en-US/docs/Web/CSS  1200 1000
