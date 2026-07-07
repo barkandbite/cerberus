@@ -75,6 +75,184 @@ pub struct LaidOut {
     pub elements: Vec<ElementBox>,
 }
 
+/// The result of flowing a run of inline-level content into a fixed-width box —
+/// the output of [`flow_inline`], the leaf painter shared with the taffy engine.
+/// All coordinates are absolute (the box's own origin), so the caller splices the
+/// items straight into its display list.
+#[derive(Clone, Debug, Default)]
+pub struct InlineFlow {
+    pub display: Vec<DisplayItem>,
+    pub links: Vec<LinkBox>,
+    pub fields: Vec<FormFieldBox>,
+    pub elements: Vec<ElementBox>,
+    /// Content width actually used (rightmost inline cursor − left edge).
+    pub width: i32,
+    /// Content height (final flow cursor − top edge), floored at one line.
+    pub height: i32,
+    /// The form-control id counter after flowing, so the caller continues the
+    /// document-wide pre-order numbering across leaves.
+    pub next_field_id: u32,
+}
+
+/// Flow a slice of styled children (text / inline / inline-block / images / form
+/// controls / lists / tables) into a box of width `right − left` with its top-left
+/// at `(left, top)`, reusing the block engine's inline machinery — line breaking,
+/// shaping, `text-align`, atomic inline boxes, list markers, and replaced content.
+///
+/// This is the **inline formatting context leaf painter** the taffy engine uses
+/// (`RENDERING_ARCHITECTURE_PLAN.md`, Stage 3): taffy owns the block/flex/grid box
+/// geometry, and every inline run inside a box is measured and painted here, so the
+/// existing shaping/inline flow stays the single source of truth below the box
+/// level. Output is in absolute coordinates.
+#[allow(clippy::too_many_arguments)]
+pub fn flow_inline(
+    children: &[StyledChild],
+    text_style: &ComputedStyle,
+    align: TextAlign,
+    left: i32,
+    right: i32,
+    top: i32,
+    shaper: &dyn TextShaper,
+    images: &dyn ImageProvider,
+    forms: &dyn FormState,
+    field_id: u32,
+    vw: i32,
+    vh: i32,
+) -> InlineFlow {
+    let mut sub = Ctx::sub(left, right, top, shaper, images, forms, field_id, vw, vh);
+    sub.line_align = align;
+    for child in children {
+        match child {
+            // Bare text uses the containing element's inherited style (color, font,
+            // size); the caller passes it as `text_style`. Nested inline elements
+            // carry their own cascaded style through `walk`.
+            StyledChild::Text(t) => sub.add_text(t, text_style, None),
+            StyledChild::Element(e) => sub.walk(e, None),
+        }
+    }
+    sub.flush_line();
+    let width = (sub.max_x - left).max(0);
+    let height = (sub.y - top).max(0);
+    let next_field_id = sub.field_id;
+    InlineFlow {
+        display: sub.display.items,
+        links: sub.links,
+        fields: sub.fields,
+        elements: sub.elements,
+        width,
+        height,
+        next_field_id,
+    }
+}
+
+/// Append a block box's decorations — drop shadow, background (color / gradient /
+/// image), then border — for a border-box `rect`, in the same paint order as the
+/// walker's own box painting. The taffy engine calls this for each element box
+/// before flowing that box's content on top, so both engines decorate boxes
+/// identically (`RENDERING_ARCHITECTURE_PLAN.md`, Stage 3). Content the caller
+/// appends afterward therefore paints over the background, as in normal flow.
+pub fn box_decorations(
+    style: &ComputedStyle,
+    rect: Rect,
+    images: &dyn ImageProvider,
+    out: &mut Vec<DisplayItem>,
+) {
+    if let Some(sh) = style.box_shadow.as_deref() {
+        out.push(DisplayItem::Shadow {
+            rect: Rect::new(rect.x + sh.dx, rect.y + sh.dy, rect.w, rect.h),
+            blur: sh.blur.max(0) as u16,
+            color: sh.color,
+        });
+    }
+    let (bt, br, bb, bl) = (
+        style.border_top.max(0),
+        style.border_right.max(0),
+        style.border_bottom.max(0),
+        style.border_left.max(0),
+    );
+    let radius = style.border_radius;
+    let has_border = bt > 0 || br > 0 || bb > 0 || bl > 0;
+    // Background fill (gradient wins, else solid color), then background-image.
+    let fill = |rect: Rect, radius: u16, out: &mut Vec<DisplayItem>| {
+        if let Some(g) = style.background_gradient.as_deref() {
+            out.push(DisplayItem::Gradient {
+                rect,
+                start: g.start,
+                end: g.end,
+                vertical: g.vertical,
+                radius,
+            });
+        } else if let Some(color) = style.background {
+            out.push(if radius > 0 {
+                DisplayItem::RoundRect {
+                    rect,
+                    color,
+                    radius,
+                }
+            } else {
+                DisplayItem::Rect { rect, color }
+            });
+        }
+        if let Some(url) = &style.background_image {
+            if let Some(img) = images.get(url) {
+                out.push(DisplayItem::Image {
+                    rect,
+                    image: img,
+                    fit: style.background_size,
+                    pos: style.background_position,
+                    pos_px: style.background_position_px,
+                });
+            }
+        }
+    };
+    if radius > 0 {
+        if has_border {
+            out.push(DisplayItem::RoundRect {
+                rect,
+                color: style.border_color,
+                radius,
+            });
+        }
+        let inner = Rect::new(
+            rect.x + bl,
+            rect.y + bt,
+            (rect.w as i32 - bl - br).max(0) as u32,
+            (rect.h as i32 - bt - bb).max(0) as u32,
+        );
+        let inner_r = (radius as i32 - bl.max(br).max(bt).max(bb)).max(0) as u16;
+        fill(inner, inner_r, out);
+    } else {
+        fill(rect, 0, out);
+        let col = style.border_color;
+        let (l, t) = (rect.x, rect.y);
+        let (w, h) = (rect.w as i32, rect.h as i32);
+        if bt > 0 {
+            out.push(DisplayItem::Rect {
+                rect: Rect::new(l, t, w.max(0) as u32, bt as u32),
+                color: col,
+            });
+        }
+        if bb > 0 {
+            out.push(DisplayItem::Rect {
+                rect: Rect::new(l, t + h - bb, w.max(0) as u32, bb as u32),
+                color: col,
+            });
+        }
+        if bl > 0 {
+            out.push(DisplayItem::Rect {
+                rect: Rect::new(l, t, bl as u32, h.max(0) as u32),
+                color: col,
+            });
+        }
+        if br > 0 {
+            out.push(DisplayItem::Rect {
+                rect: Rect::new(l + w - br, t, br as u32, h.max(0) as u32),
+                color: col,
+            });
+        }
+    }
+}
+
 /// Supplies the live state of form controls to layout, keyed by field id (the
 /// same pre-order index layout assigns). An implementation returns `Some`/`true`
 /// only for fields the user has actually touched; layout falls back to the DOM

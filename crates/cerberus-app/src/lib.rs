@@ -44,9 +44,21 @@ use cerberus_js_dom::{
 use cerberus_js_quickjs::QuickJsEngineFactory;
 pub use cerberus_layout::LayoutEngineKind;
 use cerberus_layout::{
-    make_layout, pick_img_url, BlockLayout, ElementBox, FieldKind, FormFieldBox, FormState,
-    ImageProvider, LayoutEngine, LinkBox, NoForms, NoImages,
+    pick_img_url, BlockLayout, ElementBox, FieldKind, FormFieldBox, FormState, ImageProvider,
+    LayoutEngine, LinkBox, NoForms, NoImages,
 };
+
+/// Construct the selected layout engine, composing the two adapters here (in the
+/// app) so `cerberus-layout` need not depend on `cerberus-taffy` — the taffy
+/// engine implements `cerberus-layout`'s trait, and this is the only place that
+/// knows both. `Block` is the hand-rolled walker; `Taffy` is the standardized
+/// block/flex/grid box engine (`RENDERING_ARCHITECTURE_PLAN.md`, Stage 3).
+fn make_layout(kind: LayoutEngineKind) -> Box<dyn LayoutEngine> {
+    match kind {
+        LayoutEngineKind::Block => Box::new(BlockLayout::default()),
+        LayoutEngineKind::Taffy => Box::new(cerberus_taffy::TaffyLayout),
+    }
+}
 use cerberus_net::{
     parse_proxy, BuiltinHttpClient, CachingResolver, CookieJar, FallbackResolver, FetchContext,
     FetchKind, HttpCache, HttpClient, HttpResponse, ProxyConfig, Router, SystemResolver,

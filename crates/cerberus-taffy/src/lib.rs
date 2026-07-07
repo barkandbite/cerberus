@@ -22,6 +22,9 @@
 //! below has a test), and it lets the engine layer land separately once the
 //! mapping is trusted.
 
+mod engine;
+pub use engine::TaffyLayout;
+
 use cerberus_style::{
     AlignItems, ComputedStyle, Display, FlexBasis, JustifyContent, Len, Track, TrackMax,
 };
