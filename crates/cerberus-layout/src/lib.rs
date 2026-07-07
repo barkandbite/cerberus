@@ -2953,6 +2953,15 @@ impl<'a> Ctx<'a> {
             col_x[col + 1] = col_x[col] + col_widths[col];
         }
 
+        // HTML `border` attribute: cells get 1px rules only when it is present and
+        // non-zero (HTML §15). Layout tables (`border="0"` or absent, as on Hacker
+        // News) draw no grid lines — matching Chrome, which otherwise diverges by a
+        // black line around every cell.
+        let draw_border = node
+            .attr("border")
+            .and_then(parse_dim)
+            .is_some_and(|b| b > 0);
+
         let mut row_y = self.y;
 
         for row in rows {
@@ -2983,7 +2992,7 @@ impl<'a> Ctx<'a> {
                     .style
                     .background
                     .or(if is_header { Some(TH_BG) } else { None });
-                self.cell_box(cell_x, row_y, cell_w, row_h as u32, fill);
+                self.cell_box(cell_x, row_y, cell_w, row_h as u32, fill, draw_border);
             }
 
             // Then the captured cell content, on top of the boxes.
@@ -3062,8 +3071,9 @@ impl<'a> Ctx<'a> {
         (sub.display.items, sub.links, sub.fields, height)
     }
 
-    /// Draw a cell's optional background fill and its 1px border outline.
-    fn cell_box(&mut self, x: i32, y: i32, w: u32, h: u32, fill: Option<Color>) {
+    /// Draw a cell's optional background fill and, when the table requested a
+    /// border, its 1px outline.
+    fn cell_box(&mut self, x: i32, y: i32, w: u32, h: u32, fill: Option<Color>, border: bool) {
         if w == 0 || h == 0 {
             return;
         }
@@ -3072,6 +3082,9 @@ impl<'a> Ctx<'a> {
                 rect: Rect::new(x, y, w, h),
                 color,
             });
+        }
+        if !border {
+            return;
         }
         // Four thin rects form a hollow border (so a fill stays visible inside).
         let b = TABLE_BORDER;
@@ -4754,7 +4767,7 @@ mod tests {
         // Auto table layout: a short label column stays narrow beside a wide
         // content column, rather than each taking an equal half of the width.
         let laid = lay(
-            "<table><tr><td>Hi</td>\
+            "<table border=\"1\"><tr><td>Hi</td>\
              <td>a considerably longer stretch of cell content goes here</td></tr></table>",
             600,
         );
@@ -6083,12 +6096,12 @@ background-color:#0645ad}</style><b><i class=\"ib\">x</i></b>";
 
     #[test]
     fn table_draws_cell_borders_and_grids_text() {
-        // A 2x2 grid of <td> cells. Each cell draws a hollow 1px border made of
-        // four rects, so a table emits many more rects than the plain-text
-        // baseline (which emits none).
+        // A 2x2 grid of bordered <td> cells (border="1"). Each cell draws a hollow
+        // 1px border made of four rects, so a table emits many more rects than the
+        // plain-text baseline (which emits none).
         let baseline = lay("<p>aa bb cc dd</p>", 400);
         let laid = lay(
-            "<table><tr><td>aa</td><td>bb</td></tr>\
+            "<table border=\"1\"><tr><td>aa</td><td>bb</td></tr>\
              <tr><td>cc</td><td>dd</td></tr></table>",
             400,
         );
@@ -6159,9 +6172,23 @@ background-color:#0645ad}</style><b><i class=\"ib\">x</i></b>";
         // Sane result: the loose cell is dropped (no row), so nothing is painted.
         assert!(rect_count(&laid) == 0);
         // A row of one bare cell is also tolerated and produces a real grid.
-        let one = lay("<table><tr><td>x</td></tr></table>", 400);
+        let one = lay("<table border=\"1\"><tr><td>x</td></tr></table>", 400);
         assert_eq!(total_glyphs(&one), 1, "single-cell table lays out its text");
         assert!(rect_count(&one) >= 4, "single cell has a four-rect border");
+    }
+
+    #[test]
+    fn borderless_table_draws_no_grid_lines() {
+        // Without a `border` attribute (or `border="0"`) a table is a layout grid:
+        // no cell rules, matching Chrome. Only text (and any fills) are painted.
+        let none = lay("<table><tr><td>a</td><td>b</td></tr></table>", 400);
+        let zero = lay(
+            "<table border=\"0\"><tr><td>a</td><td>b</td></tr></table>",
+            400,
+        );
+        assert_eq!(rect_count(&none), 0, "no border attr → no grid rects");
+        assert_eq!(rect_count(&zero), 0, "border=0 → no grid rects");
+        assert_eq!(total_glyphs(&none), 2, "cell text still laid out");
     }
 
     // ---- CSS positioning (ADR-0034) ----

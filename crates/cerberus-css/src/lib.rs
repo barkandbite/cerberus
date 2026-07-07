@@ -142,6 +142,13 @@ impl CssEngine {
         let mut vars = parent_vars.clone();
 
         if !is_root {
+            // Legacy HTML presentational attributes (`width`/`bgcolor`/…) act as
+            // the lowest-priority author style (HTML §15 presentational hints), so
+            // apply them before the cascade — any real CSS rule overrides them, but
+            // old table-driven pages (Hacker News, forums) still get their intended
+            // widths and colors.
+            apply_presentational_hints(&mut style, node);
+
             // Collect matching declarations: (origin, specificity, source-order),
             // honoring @media against the engine's viewport.
             let mut matched: Vec<MatchedRule<'_>> = Vec::new();
@@ -1165,6 +1172,66 @@ fn apply_declarations(
 
 fn parse_bg_color(v: &str) -> Option<Color> {
     parse_color(v).or_else(|| v.split_whitespace().find_map(parse_color))
+}
+
+/// Parse an HTML attribute color: a CSS color, or a bare hex triplet/sextet the
+/// `bgcolor`/`color` attributes allow without a leading `#` (e.g. `ff6600`).
+fn parse_attr_color(v: &str) -> Option<Color> {
+    let v = v.trim();
+    parse_color(v).or_else(|| {
+        let hex = v.trim_start_matches('#');
+        ((hex.len() == 3 || hex.len() == 6) && hex.bytes().all(|b| b.is_ascii_hexdigit()))
+            .then(|| parse_color(&format!("#{hex}")))
+            .flatten()
+    })
+}
+
+/// Apply the legacy HTML presentational attributes we support as computed style:
+/// `width`/`height` (table model + `<hr>`), `bgcolor` (table model + `<body>`),
+/// `align` (cell text-align; a table centers via auto margins), and `nowrap`
+/// (cells). These are the HTML UA stylesheet's presentational hints (HTML §15) —
+/// specificity 0, so the caller applies them before the author cascade.
+fn apply_presentational_hints(style: &mut ComputedStyle, node: NodeRef<'_>) {
+    let tag = node.tag();
+    let em = style.font_size as f32;
+
+    if matches!(
+        tag,
+        "table" | "td" | "th" | "tr" | "col" | "colgroup" | "thead" | "tbody" | "tfoot" | "hr"
+    ) {
+        if let Some(w) = node.attr("width").and_then(|v| parse_inset(v, em)) {
+            style.width = w;
+        }
+        if let Some(h) = node.attr("height").and_then(|v| parse_inset(v, em)) {
+            style.height = h;
+        }
+    }
+
+    if matches!(
+        tag,
+        "table" | "td" | "th" | "tr" | "thead" | "tbody" | "tfoot" | "body"
+    ) {
+        if let Some(c) = node.attr("bgcolor").and_then(parse_attr_color) {
+            style.background = Some(c);
+        }
+    }
+
+    if let Some(a) = node.attr("align") {
+        match a.trim().to_ascii_lowercase().as_str() {
+            "center" if tag == "table" => {
+                style.margin_left_auto = true;
+                style.margin_right_auto = true;
+            }
+            "center" => style.text_align = TextAlign::Center,
+            "right" if tag != "table" => style.text_align = TextAlign::Right,
+            "left" if tag != "table" => style.text_align = TextAlign::Left,
+            _ => {}
+        }
+    }
+
+    if matches!(tag, "td" | "th") && node.attr("nowrap").is_some() {
+        style.white_space = WhiteSpace::Nowrap;
+    }
 }
 
 fn is_bold(v: &str) -> bool {
@@ -2238,6 +2305,44 @@ mod tests {
         let p = first(&dom.root, "p").unwrap();
         // inline beats #id beats type.
         assert_eq!(p.style.color, Color::rgb(0, 0, 255));
+    }
+
+    #[test]
+    fn presentational_attributes_map_to_style() {
+        // width/bgcolor/align HTML attributes become style (HTML §15 hints).
+        let dom = CssEngine::new().style(&parse_html(
+            "<table width='85%' bgcolor='#ff6600' align='center'>\
+             <tr><td align='right' bgcolor='eee'>x</td></tr></table>",
+        ));
+        let table = first(&dom.root, "table").unwrap();
+        assert_eq!(table.style.width, Len::Pct(85.0), "width='85%' → 85%");
+        assert_eq!(
+            table.style.background,
+            Some(Color::rgb(255, 102, 0)),
+            "bgcolor"
+        );
+        assert!(
+            table.style.margin_left_auto && table.style.margin_right_auto,
+            "align=center on a table centers it"
+        );
+        let td = first(&dom.root, "td").unwrap();
+        assert_eq!(td.style.text_align, TextAlign::Right, "td align=right");
+        // Bare hex (no '#') is accepted for attribute colors.
+        assert_eq!(td.style.background, Some(Color::rgb(238, 238, 238)));
+    }
+
+    #[test]
+    fn author_css_overrides_presentational_hint() {
+        // A hint sits at specificity 0, so any author rule wins.
+        let dom = CssEngine::new().style(&parse_html(
+            "<style>table{width:400px}</style><table width='85%'><tr><td>x</td></tr></table>",
+        ));
+        let table = first(&dom.root, "table").unwrap();
+        assert_eq!(
+            table.style.width,
+            Len::Px(400),
+            "author width wins over attr"
+        );
     }
 
     #[test]
