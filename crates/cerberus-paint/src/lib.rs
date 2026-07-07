@@ -73,6 +73,40 @@ pub enum DisplayItem {
     ClipPop,
 }
 
+/// Offset every primitive in `items` by `(dx, dy)` in place. Used to reuse a
+/// display list laid at the origin at its final position without re-shaping (the
+/// taffy engine flows an inline leaf once, while measuring, then translates it
+/// into place at paint time).
+pub fn translate_items(items: &mut [DisplayItem], dx: i32, dy: i32) {
+    if dx == 0 && dy == 0 {
+        return;
+    }
+    for it in items {
+        match it {
+            DisplayItem::Rect { rect, .. }
+            | DisplayItem::RoundRect { rect, .. }
+            | DisplayItem::Gradient { rect, .. }
+            | DisplayItem::Shadow { rect, .. }
+            | DisplayItem::Image { rect, .. }
+            | DisplayItem::ClipPush { rect } => {
+                rect.x += dx;
+                rect.y += dy;
+            }
+            DisplayItem::Glyphs { origin, .. } => {
+                origin.x += dx;
+                origin.y += dy;
+            }
+            DisplayItem::Line { a, b, .. } => {
+                a.x += dx;
+                a.y += dy;
+                b.x += dx;
+                b.y += dy;
+            }
+            DisplayItem::ClipPop => {}
+        }
+    }
+}
+
 /// A flat, ordered list of paint primitives produced by layout.
 #[derive(Clone, Debug, Default)]
 pub struct DisplayList {

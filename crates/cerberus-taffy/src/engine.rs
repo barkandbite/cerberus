@@ -19,14 +19,24 @@
 //! default until a page's taffy RMSE is no worse on the parity corpus.
 
 use cerberus_layout::{
-    box_decorations, flow_inline, ElementBox, FormState, ImageProvider, LaidOut, LayoutEngine,
+    box_decorations, flow_inline, ElementBox, FormState, ImageProvider, InlineFlow, LaidOut,
+    LayoutEngine,
 };
-use cerberus_paint::{DisplayList, TextShaper};
+use cerberus_paint::{translate_items, DisplayList, TextShaper};
 use cerberus_style::{ComputedStyle, Display, StyledChild, StyledDom, StyledNode, TextAlign};
 use cerberus_types::{Rect, Size};
+use std::cell::RefCell;
+use std::collections::HashMap;
 use taffy::geometry::Size as TaffySize;
 use taffy::style::{AvailableSpace, Dimension};
 use taffy::{NodeId, TaffyTree};
+
+/// Memoized inline-leaf flows, keyed by `(leaf index, flow width)`. taffy calls
+/// the measure closure while sizing; the flow it produces there is reused at
+/// paint time (translated into place) instead of re-shaping the run — the leaf's
+/// content is otherwise flowed twice. Keyed by width so a paint at a different
+/// width than the last measure safely re-flows.
+type FlowCache = RefCell<HashMap<(usize, i32), InlineFlow>>;
 
 /// The taffy box engine. Stateless between calls — a fresh tree is built per
 /// layout so there is nothing to carry across documents.
@@ -298,6 +308,7 @@ impl LayoutEngine for TaffyLayout {
         // Compute geometry. Width is the definite viewport; height grows to content
         // (max-content) so the document can be taller than the viewport.
         let leaves = &b.leaves;
+        let cache: FlowCache = RefCell::new(HashMap::new());
         b.tree
             .compute_layout_with_measure(
                 root_id,
@@ -319,12 +330,13 @@ impl LayoutEngine for TaffyLayout {
                         (None, AvailableSpace::MinContent) => 0.0,
                         (None, AvailableSpace::MaxContent) => 1_000_000.0,
                     };
+                    let key_w = (content_w as i32).max(1);
                     let flow = flow_inline(
                         leaf.children,
                         &leaf.text_style,
                         leaf.align,
                         0,
-                        (content_w as i32).max(1),
+                        key_w,
                         0,
                         shaper,
                         images,
@@ -333,10 +345,13 @@ impl LayoutEngine for TaffyLayout {
                         vw,
                         vh,
                     );
-                    TaffySize {
+                    let size = TaffySize {
                         width: flow.width as f32,
                         height: flow.height as f32,
-                    }
+                    };
+                    // Stash for the paint pass to reuse (translated) at this width.
+                    cache.borrow_mut().insert((leaf_idx, key_w), flow);
+                    size
                 },
             )
             .expect("taffy compute");
@@ -360,6 +375,7 @@ impl LayoutEngine for TaffyLayout {
             forms,
             vw,
             vh,
+            &cache,
             &mut out,
             &mut field_counter,
         );
@@ -380,6 +396,7 @@ fn paint(
     forms: &dyn FormState,
     vw: i32,
     vh: i32,
+    cache: &FlowCache,
     out: &mut LaidOut,
     field_counter: &mut u32,
 ) {
@@ -403,26 +420,50 @@ fn paint(
         let leaf = &b.leaves[leaf_idx];
         // taffy already positioned this anonymous leaf at its parent's content box
         // (inset by the parent's padding + border), so its own rect is where the
-        // inline content flows.
-        let flow = flow_inline(
-            leaf.children,
-            &leaf.text_style,
-            leaf.align,
-            x,
-            (x + w).max(x + 1),
-            y,
-            shaper,
-            images,
-            forms,
-            *field_counter,
-            vw,
-            vh,
-        );
-        out.display.items.extend(flow.display);
-        out.links.extend(flow.links);
-        out.fields.extend(flow.fields);
-        out.elements.extend(flow.elements);
-        *field_counter = flow.next_field_id;
+        // inline content flows. The measure pass already flowed this run at this
+        // width, so reuse that (translated into place) instead of re-shaping —
+        // except when it produced form fields, whose ids were numbered from 0 in
+        // measure and must instead continue the document counter here.
+        let key_w = w.max(1);
+        let cached = cache.borrow_mut().remove(&(leaf_idx, key_w));
+        match cached {
+            Some(mut f) if f.fields.is_empty() => {
+                translate_items(&mut f.display, x, y);
+                for l in &mut f.links {
+                    l.rect.x += x;
+                    l.rect.y += y;
+                }
+                for e in &mut f.elements {
+                    e.rect.x += x;
+                    e.rect.y += y;
+                }
+                out.display.items.append(&mut f.display);
+                out.links.append(&mut f.links);
+                out.elements.append(&mut f.elements);
+                // No fields → the counter is unchanged.
+            }
+            _ => {
+                let flow = flow_inline(
+                    leaf.children,
+                    &leaf.text_style,
+                    leaf.align,
+                    x,
+                    (x + w).max(x + 1),
+                    y,
+                    shaper,
+                    images,
+                    forms,
+                    *field_counter,
+                    vw,
+                    vh,
+                );
+                out.display.items.extend(flow.display);
+                out.links.extend(flow.links);
+                out.fields.extend(flow.fields);
+                out.elements.extend(flow.elements);
+                *field_counter = flow.next_field_id;
+            }
+        }
     }
 
     for &c in &node.children {
@@ -436,6 +477,7 @@ fn paint(
             forms,
             vw,
             vh,
+            cache,
             out,
             field_counter,
         );
