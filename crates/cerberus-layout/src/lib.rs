@@ -597,6 +597,14 @@ impl<'a> Ctx<'a> {
             self.cur_link_node = saved_link_node;
             return;
         }
+        // `as_block_once` marks an inline-block (or table cell / float) laying its
+        // own box into a sub that `add_inline_block`/`place_float` already sized
+        // to its resolved width. Such an atom must FILL that sub, not re-resolve
+        // its own `width` — a percentage width would otherwise apply twice (e.g.
+        // Wikipedia's `.search-input{width:73%}` became 73% of 73%, collapsing
+        // the search field's containing block). Not while measuring, where the
+        // sub is a huge probe and the box must shrink to its content instead.
+        let fills_sub = self.as_block_once && !self.measuring;
         let is_block =
             matches!(style.display, Display::Block | Display::ListItem) || self.as_block_once;
         self.as_block_once = false;
@@ -617,8 +625,12 @@ impl<'a> Ctx<'a> {
             let (bl, br) = (style.border_left, style.border_right);
             let h_extra = pl + pr + bl + br;
             // Border-box width from width/max-width (box-sizing aware); `margin:
-            // auto` centers it, else margin-left offsets (ADR-0039/0040).
-            let (box_left, box_w) =
+            // auto` centers it, else margin-left offsets (ADR-0039/0040). An atom
+            // filling its pre-sized sub takes the whole `avail` (its width and
+            // margins were already resolved by the caller).
+            let (box_left, box_w) = if fills_sub {
+                (self.left, avail)
+            } else {
                 match resolve_border_box_width(style, avail, h_extra, self.vw, self.vh) {
                     Some(bw) => {
                         let bw = bw.clamp(1, avail);
@@ -645,7 +657,8 @@ impl<'a> Ctx<'a> {
                             .max(l + 1);
                         (l, (r - l).max(1))
                     }
-                };
+                }
+            };
             bbox = Some(BorderBox {
                 left: box_left,
                 right: box_left + box_w,
@@ -1466,6 +1479,16 @@ impl<'a> Ctx<'a> {
         // is the used width — e.g. a search box with `size="20"` but `width:100%`
         // must fill its container, as Chrome renders it). Fall back to `size` cols.
         let cb_w = (self.right - self.left).max(1);
+        if std::env::var("CERB_DBG_SI").is_ok() && node.attr("id") == Some("searchInput") {
+            eprintln!(
+                "DBG searchInput width={:?} cb_w={} left={} right={} resolved={:?}",
+                node.style.width,
+                cb_w,
+                self.left,
+                self.right,
+                node.style.width.resolve_vp(cb_w, self.vw, self.vh)
+            );
+        }
         let w = match node.style.width.resolve_vp(cb_w, self.vw, self.vh) {
             Some(css_w) => self.fit_width(css_w.max(1)),
             None => {
@@ -5409,6 +5432,40 @@ background:#111;margin-right:-10px'></span>\
         // Without the indent the same run sits at the content edge.
         let shown = lay("<div style='white-space:nowrap'>Search</div>", 400);
         assert!(glyph_xs(&shown).iter().all(|&x| x >= 0));
+    }
+
+    #[test]
+    fn percent_width_inline_block_does_not_resolve_twice() {
+        // An inline-block `width:50%` in a 400px container is 200px, and a
+        // `width:100%` child fills that 200px — not 50%-of-50% (100px). Regression:
+        // the percentage was applied once to size the atom's sub and again inside
+        // it, collapsing Wikipedia's `.search-input{width:73%}` search field.
+        let laid = lay(
+            "<div style='width:400px'>\
+             <span style='display:inline-block;width:50%'>\
+             <div style='width:100%;background:#123456;height:10px'></div></span></div>",
+            400,
+        );
+        let filled = laid.display.items.iter().any(|it| {
+            matches!(
+                it,
+                DisplayItem::Rect { rect, color }
+                    if *color == Color::rgb(0x12, 0x34, 0x56) && (190..=210).contains(&rect.w)
+            )
+        });
+        assert!(
+            filled,
+            "inner width:100% fills the 200px atom, not 100px: {:?}",
+            laid.display
+                .items
+                .iter()
+                .filter_map(|it| match it {
+                    DisplayItem::Rect { rect, color } if *color == Color::rgb(0x12, 0x34, 0x56) =>
+                        Some(rect.w),
+                    _ => None,
+                })
+                .collect::<Vec<_>>()
+        );
     }
 
     #[test]
