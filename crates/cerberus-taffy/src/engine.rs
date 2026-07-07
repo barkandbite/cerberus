@@ -33,14 +33,12 @@ use taffy::{NodeId, TaffyTree};
 #[derive(Clone, Copy, Debug, Default)]
 pub struct TaffyLayout;
 
-/// One inline formatting context to flow — either an element's own inline content
-/// (`element: Some`) or an anonymous run of inline children between block siblings
-/// (`element: None`). Holds borrowed styled data (valid for the layout call) plus
-/// the inherited style bare text runs paint with.
+/// One anonymous inline formatting context — a run of inline-level children of a
+/// block container. taffy places it at the container's content box (already inset
+/// by the container's padding/border), so its own rect is where the text flows.
+/// Holds borrowed styled data (valid for the layout call) plus the inherited style
+/// bare text runs paint with.
 struct Leaf<'a> {
-    /// The element this leaf belongs to (for its content box insets), or `None`
-    /// for an anonymous inline run inside a block container.
-    element: Option<&'a StyledNode>,
     /// The inline-level children flowed into this box.
     children: &'a [StyledChild],
     /// Inherited style for bare text runs (color/font/size).
@@ -129,41 +127,45 @@ struct Builder<'a> {
     tree: TaffyTree<usize>,
     nodes: Vec<Built<'a>>,
     leaves: Vec<Leaf<'a>>,
+    /// Viewport px, so `to_taffy_style` resolves `vw`/`vh`/`vmin`/`vmax` units on
+    /// every node (not just the root) — a `width: 60vw` must become 600px at a
+    /// 1000px viewport, not 0.
+    vw: i32,
+    vh: i32,
 }
 
 impl<'a> Builder<'a> {
-    fn new() -> Self {
+    fn new(vw: i32, vh: i32) -> Self {
         Self {
             tree: TaffyTree::new(),
             nodes: Vec::new(),
             leaves: Vec::new(),
+            vw,
+            vh,
         }
     }
 
-    /// Push a leaf (IFC) node and return its `nodes` index.
+    /// Push an anonymous inline-leaf node and return its `nodes` index.
     fn push_leaf(
         &mut self,
-        style: taffy::Style,
-        element: Option<&'a StyledNode>,
         children: &'a [StyledChild],
         text_style: ComputedStyle,
         align: TextAlign,
     ) -> usize {
         let leaf_idx = self.leaves.len();
         self.leaves.push(Leaf {
-            element,
             children,
             text_style,
             align,
         });
         let id = self
             .tree
-            .new_leaf_with_context(style, leaf_idx)
+            .new_leaf_with_context(taffy::Style::default(), leaf_idx)
             .expect("taffy leaf");
         let node_idx = self.nodes.len();
         self.nodes.push(Built {
             id,
-            element,
+            element: None,
             leaf: Some(leaf_idx),
             children: Vec::new(),
         });
@@ -180,23 +182,17 @@ impl<'a> Builder<'a> {
         if node.style.display == Display::None {
             return None;
         }
-        let style = style_override.unwrap_or_else(|| crate::to_taffy_style(&node.style, 0, 0));
+        let style =
+            style_override.unwrap_or_else(|| crate::to_taffy_style(&node.style, self.vw, self.vh));
 
-        // An element with no block-container child is itself an inline formatting
-        // context: flow its own children, decorate its own box.
-        let has_block = node.children.iter().any(is_block_container);
-        if !has_block {
-            return Some(self.push_leaf(
-                style,
-                Some(node),
-                &node.children,
-                node.style.clone(),
-                node.style.text_align,
-            ));
-        }
-
-        // Mixed/container: interleave anonymous inline runs and block children in
-        // visual order.
+        // Every element is a taffy **container** (block/flex/grid box); its inline
+        // content becomes anonymous inline-leaf children. Crucially a block box
+        // with only text is NOT a measure-leaf — a taffy leaf sized by its measure
+        // function shrink-to-fits its content, but a block box must fill the
+        // container width (CSS 2.1 §10.3.3) and only *then* wrap its inline content
+        // into that width. Wrapping the text in an anonymous leaf child gives the
+        // block its normal stretch while the leaf, placed at the container's
+        // content box, measures the height for that definite width.
         let mut child_nodes: Vec<usize> = Vec::new();
         let mut child_ids: Vec<NodeId> = Vec::new();
         let mut run_start = 0usize;
@@ -205,13 +201,7 @@ impl<'a> Builder<'a> {
             if is_block_container(&children[i]) {
                 let run = &children[run_start..i];
                 if run_has_content(run) {
-                    let ni = self.push_leaf(
-                        taffy::Style::default(),
-                        None,
-                        run,
-                        node.style.clone(),
-                        node.style.text_align,
-                    );
+                    let ni = self.push_leaf(run, node.style.clone(), node.style.text_align);
                     child_ids.push(self.nodes[ni].id);
                     child_nodes.push(ni);
                 }
@@ -226,13 +216,7 @@ impl<'a> Builder<'a> {
         }
         let tail = &children[run_start..];
         if run_has_content(tail) {
-            let ni = self.push_leaf(
-                taffy::Style::default(),
-                None,
-                tail,
-                node.style.clone(),
-                node.style.text_align,
-            );
+            let ni = self.push_leaf(tail, node.style.clone(), node.style.text_align);
             child_ids.push(self.nodes[ni].id);
             child_nodes.push(ni);
         }
@@ -267,7 +251,7 @@ impl LayoutEngine for TaffyLayout {
         // Build the tree. Pin the root to the viewport width so block children have
         // a definite containing block to stretch into (matching the walker's
         // full-width page box).
-        let mut b = Builder::new();
+        let mut b = Builder::new(vw, vh);
         let mut root_style = crate::to_taffy_style(&styled.root.style, vw, vh);
         root_style.size.width = Dimension::length(vw as f32);
         let Some(root_idx) = b.build(&styled.root, Some(root_style)) else {
@@ -381,29 +365,16 @@ fn paint(
 
     if let Some(leaf_idx) = node.leaf {
         let leaf = &b.leaves[leaf_idx];
-        // Content box = border box minus this element's border + padding (an
-        // anonymous run has neither).
-        let (bl, bt, br, pl, pt, pr) = match leaf.element {
-            Some(el) => (
-                el.style.border_left.max(0),
-                el.style.border_top.max(0),
-                el.style.border_right.max(0),
-                el.style.padding_left.max(0),
-                el.style.padding_top.max(0),
-                el.style.padding_right.max(0),
-            ),
-            None => (0, 0, 0, 0, 0, 0),
-        };
-        let content_left = x + bl + pl;
-        let content_top = y + bt + pt;
-        let content_right = (x + w - br - pr).max(content_left + 1);
+        // taffy already positioned this anonymous leaf at its parent's content box
+        // (inset by the parent's padding + border), so its own rect is where the
+        // inline content flows.
         let flow = flow_inline(
             leaf.children,
             &leaf.text_style,
             leaf.align,
-            content_left,
-            content_right,
-            content_top,
+            x,
+            (x + w).max(x + 1),
+            y,
             shaper,
             images,
             forms,
