@@ -17,7 +17,9 @@
       "category": "Security",
       "title": "QuickJS runtime has no memory limit, interrupt handler, or stack cap — a single script can hang or OOM the entire browser",
       "primary_file": "crates/cerberus-js-quickjs/src/lib.rs",
-      "fingerprint": "cerberus|crates/cerberus-js-quickjs/src/lib.rs|quickjs-no-runtime-limits"
+      "fingerprint": "cerberus|crates/cerberus-js-quickjs/src/lib.rs|quickjs-no-runtime-limits",
+      "status": "obsolete",
+      "status_reason": "Already fixed in PR #72 (issue closed 2026-07-01). Working tree has set_memory_limit/set_max_stack_size/set_interrupt_handler + with_eval_timeout in cerberus-js-quickjs/src/lib.rs."
     },
     {
       "issue": 69,
@@ -26,7 +28,9 @@
       "category": "Architecture",
       "title": "Mirror-group windows never get the farbling prologue — identities are trivially correlatable in mirror mode",
       "primary_file": "crates/cerberus-mirror/src/group.rs",
-      "fingerprint": "cerberus|crates/cerberus-mirror/src/group.rs|mirror-no-farbling-injection"
+      "fingerprint": "cerberus|crates/cerberus-mirror/src/group.rs|mirror-no-farbling-injection",
+      "status": "obsolete",
+      "status_reason": "Already fixed in PR #72 (issue closed 2026-07-01). MirrorGroup now carries a per-instance farbling_prologue and injects it via inject_prologue in group.rs."
     },
     {
       "issue": 70,
@@ -35,7 +39,9 @@
       "category": "maintainability",
       "title": "is_public_suffix returns true for every single-label host (operator-precedence bug), breaking cookies on localhost/intranet names",
       "primary_file": "crates/cerberus-consent/src/psl.rs",
-      "fingerprint": "cerberus|crates/cerberus-consent/src/psl.rs|is_public_suffix-precedence-bug"
+      "fingerprint": "cerberus|crates/cerberus-consent/src/psl.rs|is_public_suffix-precedence-bug",
+      "status": "obsolete",
+      "status_reason": "Already fixed in PR #72 (issue closed 2026-07-01). is_public_suffix now requires an exact/wildcard PSL table hit; a bare single-label host no longer qualifies on label-count alone."
     },
     {
       "issue": 71,
@@ -44,9 +50,15 @@
       "category": "maintainability",
       "title": "Consent rule serialization has no escaping — a whitespace-containing site/host corrupts the persisted rule format",
       "primary_file": "crates/cerberus-consent/src/lib.rs",
-      "fingerprint": "cerberus|crates/cerberus-consent/src/lib.rs|consent-rule-serialize-no-escaping"
+      "fingerprint": "cerberus|crates/cerberus-consent/src/lib.rs|consent-rule-serialize-no-escaping",
+      "status": "obsolete",
+      "status_reason": "Already fixed in PR #72 (issue closed 2026-07-01). escape_field/unescape_field percent-escape whitespace/`%` in consent-rule fields, so a whitespace-containing host round-trips without shearing adjacent fields."
     }
   ],
+  "reconciled_2026-07-07": {
+    "note": "Daily issue-resolution run. All four NEW findings (#68 critical, #69 high, #70 medium, #71 low) were confirmed already fixed in PR #72 (merged to main, released 0.0.6) and closed as completed on GitHub on 2026-07-01. Re-confirmed against the current working tree (branch at v0.0.9): every fix is present. No code changes made — findings marked obsolete so future runs skip them.",
+    "findings_obsolete": [68, 69, 70, 71]
+  },
   "fixed_this_run": [
     { "issue": 62, "summary": "combine_pos same-axis keyword pairs now return None instead of misparsing to a bogus 2-D point" },
     { "issue": 35, "summary": "select_srcset now tokenizes per the WHATWG srcset grammar; commas inside candidate URLs no longer shear candidates" },
