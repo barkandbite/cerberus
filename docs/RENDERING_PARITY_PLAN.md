@@ -73,10 +73,22 @@ and prints an **RMSE** (`0.0` = identical) plus a mismatch fraction; `--fail-ove
 `scripts/parity.sh` runs the whole loop (mirror → Chrome + Cerberus render →
 diff) emitting a `parity.csv`. **Current baselines** (toolbar cropped, tolerance 8): `example` RMSE **0.068**
 (1.6% — was 0.095 / 89% before the canvas-background fix below), `iana` RMSE
-**0.131** (16.9% — was 22.6%; inline spacing + line-height fixed, remainder is
-font-face/wrap-point drift and the footer table columns), `wikipedia` RMSE 0.147
-(9% — the search-widget + donation-banner region). Drive these down; a rise is a
-regression.
+**0.131** (16.3% — was 22.6%; inline spacing + line-height + table columns fixed,
+remainder is font-face/wrap-point drift), `wikipedia` RMSE **0.143** (9.05% — was
+9.19%; search field now fills its container and its language dropdown is pinned
+out of flow, remainder is the JS-built footer + font drift). Drive these down; a
+rise is a regression.
+
+**Search-widget layout** (W-C): two general inline-block fixes closed most of it.
+(1) An inline-block's percentage `width` was resolved twice — once to size its
+atom sub, once inside it — so `.search-input{width:73%}` became 73%-of-73% and
+collapsed the field to its `size=20` fallback with a gap before the button; an
+atom now fills its pre-sized sub (`fills_sub`) and the field fills its container
+flush to the button. (2) `Ctx::sub` disabled positioning, so the absolute
+`.styled-select` dropdown flowed below the field; `add_inline_block` now enables
+positioning in a real inline-block sub (the relative parent pushes its containing
+block, `finish_positioned` folds the out-of-flow layers up), lifting the dropdown
+out of flow. Both are general (any %-width or dropdown-in-relative-inline-block).
 
 **Inline box spacing** (W-C/layout): a true inline element's horizontal
 padding/margin/border is now applied, so styled inline links no longer run
