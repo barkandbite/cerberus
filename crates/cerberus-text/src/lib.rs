@@ -6,9 +6,11 @@
 //! outlines). System fonts are never read — the font set is fixed, which is both
 //! reproducible and an anti-fingerprinting choice (see ADR-0005).
 //!
-//! Shaping here is per-character (good for Latin); complex-script shaping
-//! (rustybuzz) can be added later behind the same `TextShaper` trait with no
-//! caller changes. ab_glyph is chosen over swash as a leaner first rasterizer.
+//! Glyph **advances** come from `rustybuzz` (a pure-Rust HarfBuzz port) — real
+//! shaping with kerning/ligatures/GPOS/GSUB, the foundation for complex scripts —
+//! while `ab_glyph` remains the outline **rasterizer** (glyph ids are shared font
+//! indices). Both read the same bundled bytes, so text metrics stay reproducible
+//! (ADR-0005). See `RENDERING_ARCHITECTURE_PLAN.md`.
 
 use ab_glyph::{point, Font, FontRef, GlyphId, PxScale, ScaleFont};
 use cerberus_paint::{
@@ -27,11 +29,19 @@ const ICON_FONT_BYTES: &[u8] = include_bytes!("../assets/icomoon.ttf");
 const FALLBACK_FONT_BYTES: &[u8] = include_bytes!("../assets/IPAGothic.ttf");
 
 /// A software text shaper + rasterizer over the bundled text, icon, and fallback
-/// fonts.
+/// fonts. Glyph **advances** come from rustybuzz (a HarfBuzz port) so run widths
+/// — and therefore soft-wrap points — match a real browser (kerning, ligatures,
+/// GPOS/GSUB), instead of `ab_glyph`'s per-character unkerned advances. Glyph
+/// **outlining** stays on `ab_glyph`: rustybuzz returns font glyph indices, which
+/// `ab_glyph` rasterizes by the same id, so shaping and rasterization decouple.
 pub struct TextEngine {
     font: FontRef<'static>,
     icon_font: FontRef<'static>,
     fallback_font: FontRef<'static>,
+    /// rustybuzz shaping faces over the same bundled bytes (deterministic — no
+    /// system fonts, no `fontdb`; ADR-0005).
+    rb_font: rustybuzz::Face<'static>,
+    rb_fallback: rustybuzz::Face<'static>,
 }
 
 impl TextEngine {
@@ -42,11 +52,53 @@ impl TextEngine {
             FontRef::try_from_slice(ICON_FONT_BYTES).expect("bundled icon font is valid");
         let fallback_font = FontRef::try_from_slice(FALLBACK_FONT_BYTES)
             .expect("bundled IPAGothic fallback font is valid");
+        let rb_font =
+            rustybuzz::Face::from_slice(FONT_BYTES, 0).expect("bundled Roboto font shapes");
+        let rb_fallback = rustybuzz::Face::from_slice(FALLBACK_FONT_BYTES, 0)
+            .expect("bundled IPAGothic fallback shapes");
         Self {
             font,
             icon_font,
             fallback_font,
+            rb_font,
+            rb_fallback,
         }
+    }
+
+    /// Which bundled face covers `ch`: the primary text font if it has a glyph
+    /// (or the char is whitespace), else the CJK fallback, else the text font's
+    /// `.notdef` (real tofu, as a browser with no matching font shows). This is
+    /// the font-itemization a browser does before shaping.
+    fn slot_for_char(&self, ch: char) -> FontSlot {
+        if ch.is_whitespace() || self.font.glyph_id(ch).0 != 0 {
+            FontSlot::Text
+        } else if self.fallback_font.glyph_id(ch).0 != 0 {
+            FontSlot::Fallback
+        } else {
+            FontSlot::Text
+        }
+    }
+
+    /// Split `text` into maximal same-face runs (font itemization), so each run
+    /// is shaped by one face and adjacent kerning/ligatures apply within it.
+    fn itemize<'t>(&self, text: &'t str) -> Vec<(FontSlot, &'t str)> {
+        let mut runs: Vec<(FontSlot, &str)> = Vec::new();
+        let mut cur: Option<(FontSlot, usize)> = None;
+        for (i, ch) in text.char_indices() {
+            let slot = self.slot_for_char(ch);
+            match cur {
+                Some((s, _)) if s == slot => {}
+                Some((s, start)) => {
+                    runs.push((s, &text[start..i]));
+                    cur = Some((slot, i));
+                }
+                None => cur = Some((slot, i)),
+            }
+        }
+        if let Some((s, start)) = cur {
+            runs.push((s, &text[start..]));
+        }
+        runs
     }
 
     /// The face a glyph was shaped from.
@@ -216,51 +268,66 @@ impl Default for TextEngine {
     }
 }
 
+/// Shape one same-face run with rustybuzz and append its glyphs to `out`.
+/// Advances are HarfBuzz-accurate (kerning/ligatures/GPOS). `units_to_px` is the
+/// **ab_glyph** scale factor (`px / height_unscaled`, NOT `px / units_per_em`):
+/// the run is rasterized by ab_glyph at `PxScale::from(px)`, which scales by the
+/// font's height metric, so advances must use that same factor or the run width
+/// and its painted glyphs disagree (letters spread out). Rounding is
+/// **run-accurate**: fractional advances accumulate and the running sum is
+/// rounded, so each glyph's integer advance sums to the true run width — a
+/// per-glyph round would drift wrap points from Chrome.
+fn shape_run_rb(
+    face: &rustybuzz::Face<'_>,
+    text: &str,
+    px: u32,
+    slot: FontSlot,
+    units_to_px: f32,
+    out: &mut Vec<GlyphBox>,
+) {
+    if text.is_empty() {
+        return;
+    }
+    let mut buf = rustybuzz::UnicodeBuffer::new();
+    buf.push_str(text);
+    buf.guess_segment_properties();
+    let shaped = rustybuzz::shape(face, &[], buf);
+    let infos = shaped.glyph_infos();
+    let positions = shaped.glyph_positions();
+    let mut acc = 0.0f32;
+    let mut prev = 0i32;
+    for (info, pos) in infos.iter().zip(positions) {
+        acc += pos.x_advance as f32 * units_to_px;
+        let rounded = acc.round() as i32;
+        let advance = (rounded - prev).max(0) as u32;
+        prev = rounded;
+        out.push(GlyphBox {
+            advance,
+            w: 0,
+            h: 0,
+            id: info.glyph_id as u16,
+            px,
+            font: slot,
+        });
+    }
+}
+
 impl TextShaper for TextEngine {
     fn shape(&self, text: &str, px: u32) -> Vec<GlyphBox> {
-        let scale = PxScale::from(px.max(1) as f32);
-        let text_scaled = self.font.as_scaled(scale);
-        let fb_scaled = self.fallback_font.as_scaled(scale);
-        text.chars()
-            .map(|ch| {
-                // Prefer the primary text font. If it has no glyph for `ch`
-                // (Roboto is Latin/Cyrillic/Greek), and the CJK fallback does,
-                // shape from the fallback — matching a browser's font substitution
-                // instead of rendering tofu. Advances come from the chosen face.
-                let id = self.font.glyph_id(ch);
-                if id.0 != 0 || ch.is_whitespace() {
-                    return GlyphBox {
-                        advance: text_scaled.h_advance(id).round().max(0.0) as u32,
-                        w: 0,
-                        h: 0,
-                        id: id.0,
-                        px,
-                        font: FontSlot::Text,
-                    };
-                }
-                let fb = self.fallback_font.glyph_id(ch);
-                if fb.0 != 0 {
-                    return GlyphBox {
-                        advance: fb_scaled.h_advance(fb).round().max(0.0) as u32,
-                        w: 0,
-                        h: 0,
-                        id: fb.0,
-                        px,
-                        font: FontSlot::Fallback,
-                    };
-                }
-                // Neither face covers it: keep the text-font .notdef (real tofu,
-                // as a browser with no matching font would show).
-                GlyphBox {
-                    advance: text_scaled.h_advance(id).round().max(0.0) as u32,
-                    w: 0,
-                    h: 0,
-                    id: id.0,
-                    px,
-                    font: FontSlot::Text,
-                }
-            })
-            .collect()
+        let mut out = Vec::with_capacity(text.len());
+        let pxf = px.max(1) as f32;
+        for (slot, run) in self.itemize(text) {
+            // rustybuzz shapes; the run is rasterized by the matching ab_glyph
+            // face, so scale font-unit advances by that face's ab_glyph factor
+            // (px / height_unscaled) to stay consistent with the outlining.
+            let (face, ag_height) = match slot {
+                FontSlot::Fallback => (&self.rb_fallback, self.fallback_font.height_unscaled()),
+                _ => (&self.rb_font, self.font.height_unscaled()),
+            };
+            let units_to_px = pxf / ag_height.max(1.0);
+            shape_run_rb(face, run, px, slot, units_to_px, &mut out);
+        }
+        out
     }
 
     fn shape_icon(&self, ch: char, px: u32) -> Vec<GlyphBox> {
@@ -280,11 +347,15 @@ impl TextShaper for TextEngine {
 
     /// Read the space glyph's advance directly — identical to the first (only)
     /// element of `shape(" ", px)` but with no `Vec` allocation, since inline
-    /// layout calls this once per word.
+    /// layout calls this once per word. A lone space carries no GPOS adjustment,
+    /// so the plain glyph advance matches what rustybuzz would shape.
     fn space_advance(&self, px: u32) -> u32 {
-        let scale = PxScale::from(px.max(1) as f32);
-        let scaled = self.font.as_scaled(scale);
-        scaled.h_advance(self.font.glyph_id(' ')).round().max(0.0) as u32
+        let f = &self.rb_font;
+        let units_to_px = px.max(1) as f32 / self.font.height_unscaled().max(1.0);
+        f.glyph_index(' ')
+            .and_then(|g| f.glyph_hor_advance(g))
+            .map(|a| (a as f32 * units_to_px).round().max(0.0) as u32)
+            .unwrap_or_else(|| px.max(2) / 2)
     }
 }
 
