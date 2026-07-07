@@ -42,9 +42,10 @@ use cerberus_js_dom::{
     FetchResponse, PageEnv, RebuiltDom,
 };
 use cerberus_js_quickjs::QuickJsEngineFactory;
+pub use cerberus_layout::LayoutEngineKind;
 use cerberus_layout::{
-    pick_img_url, BlockLayout, ElementBox, FieldKind, FormFieldBox, FormState, ImageProvider,
-    LayoutEngine, LinkBox, NoForms, NoImages,
+    make_layout, pick_img_url, BlockLayout, ElementBox, FieldKind, FormFieldBox, FormState,
+    ImageProvider, LayoutEngine, LinkBox, NoForms, NoImages,
 };
 use cerberus_net::{
     parse_proxy, BuiltinHttpClient, CachingResolver, CookieJar, FallbackResolver, FetchContext,
@@ -99,6 +100,10 @@ pub struct RenderConfig {
     pub proxy: Option<String>,
     /// Collect per-stage timings into [`RenderOutcome::timings`] (`--timers`).
     pub timers: bool,
+    /// Which layout engine to use (`--engine block|taffy`), for A/B parity
+    /// comparison during the layout migration. Defaults to the `CERB_LAYOUT` env
+    /// (else the block walker).
+    pub layout_engine: LayoutEngineKind,
 }
 
 impl Default for RenderConfig {
@@ -113,6 +118,7 @@ impl Default for RenderConfig {
             dump_text: false,
             proxy: None,
             timers: false,
+            layout_engine: LayoutEngineKind::from_env(),
         }
     }
 }
@@ -1208,12 +1214,12 @@ pub fn render(config: &RenderConfig) -> Result<RenderOutcome, AppError> {
     // whole content area, matching Chrome.
     let canvas_bg = canvas_background(&styled, config.background);
     let layout_t = Instant::now();
-    let mut layout = BlockLayout::default();
+    let mut layout = make_layout(config.layout_engine);
     let page = render_document(
         &styled,
         content,
         canvas_bg,
-        &mut layout,
+        &mut *layout,
         &text,
         &text,
         &provider,

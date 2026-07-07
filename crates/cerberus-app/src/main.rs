@@ -124,6 +124,9 @@ fn cmd_render(args: &[String]) -> ExitCode {
     config.dump_text = has_flag(args, "--dump-text");
     config.proxy = flag(args, "--proxy");
     config.timers = has_flag(args, "--timers");
+    if let Some(engine) = flag(args, "--engine") {
+        config.layout_engine = cerberus_app::LayoutEngineKind::parse(&engine);
+    }
     config.background = Color::WHITE;
 
     let outcome = match render(&config) {

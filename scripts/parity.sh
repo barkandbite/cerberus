@@ -30,7 +30,7 @@ TOOLBAR_PX=36 # Cerberus's chrome; cropped off the Cerberus image before diffing
 
 OUT_DIR="${TMPDIR:-/tmp}/cerberus-parity"
 CORPUS="$REPO/docs/parity-corpus.txt"
-ONE_URL=""; ONE_NAME=""; ONE_W=""; ONE_H=""; HIDE=""
+ONE_URL=""; ONE_NAME=""; ONE_W=""; ONE_H=""; HIDE=""; ENGINE=""
 while [ $# -gt 0 ]; do
   case "$1" in
     --out-dir) OUT_DIR="$2"; shift 2 ;;
@@ -39,6 +39,8 @@ while [ $# -gt 0 ]; do
     --name)    ONE_NAME="$2"; shift 2 ;;
     --width)   ONE_W="$2"; shift 2 ;;
     --height)  ONE_H="$2"; shift 2 ;;
+    # Layout engine to A/B (block|taffy) during the layout migration.
+    --engine)  ENGINE="$2"; shift 2 ;;
     # CSS selector(s) hidden (display:none) in BOTH browsers before diffing, for
     # a clean geometric comparison of a page whose JS would hide them (e.g. a
     # fundraising banner Chrome's JS removes but our mirror keeps) — plan §9.
@@ -104,8 +106,10 @@ PYHIDE
     --disable-background-networking --no-first-run --force-color-profile=srgb \
     --force-device-scale-factor=1 --window-size="$w,$h" \
     --screenshot="$chrome_png" "$local_url" >/dev/null 2>&1 || true
+  local engine_arg=""
+  [ -n "$ENGINE" ] && engine_arg="--engine $ENGINE"
   timeout 90 "$CERB" render --url "$local_url" --out "$cerb_png" --width "$w" --height "$h" \
-    >/dev/null 2>&1 || true
+    $engine_arg >/dev/null 2>&1 || true
 
   if [ ! -f "$chrome_png" ] || [ ! -f "$cerb_png" ]; then
     echo "parity.sh: a render failed for $name — skipping score" >&2

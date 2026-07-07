@@ -119,6 +119,46 @@ impl ImageProvider for NoImages {
     }
 }
 
+/// Which layout engine to use. `Block` is the current hand-rolled single-pass
+/// walker; `Taffy` will be a spec-correct block/flex/grid box engine
+/// (`RENDERING_ARCHITECTURE_PLAN.md`). During the strangler-fig migration both
+/// are constructed via [`make_layout`] and A/B-compared on the parity corpus,
+/// with `Block` the default until a page's `Taffy` RMSE is no worse.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub enum LayoutEngineKind {
+    #[default]
+    Block,
+    Taffy,
+}
+
+impl LayoutEngineKind {
+    /// Parse an engine name (`block` / `taffy`); unknown names fall back to
+    /// `Block`.
+    pub fn parse(s: &str) -> Self {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "taffy" => LayoutEngineKind::Taffy,
+            _ => LayoutEngineKind::Block,
+        }
+    }
+
+    /// Read the engine from the `CERB_LAYOUT` env var (default `Block`), so the
+    /// corpus harness can A/B without a rebuild.
+    pub fn from_env() -> Self {
+        std::env::var("CERB_LAYOUT")
+            .map(|v| Self::parse(&v))
+            .unwrap_or_default()
+    }
+}
+
+/// Construct the selected layout engine behind the [`LayoutEngine`] trait. Until
+/// the taffy engine lands, `Taffy` aliases the walker so the selection seam and
+/// A/B harness can be exercised with byte-identical output.
+pub fn make_layout(kind: LayoutEngineKind) -> Box<dyn LayoutEngine> {
+    match kind {
+        LayoutEngineKind::Block | LayoutEngineKind::Taffy => Box::new(BlockLayout::default()),
+    }
+}
+
 /// Produces a `LaidOut` from a styled document for a given viewport.
 pub trait LayoutEngine: Send {
     /// Lay out `styled` into `viewport`, shaping with `shaper`, images via
