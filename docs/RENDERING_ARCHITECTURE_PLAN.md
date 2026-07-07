@@ -255,3 +255,55 @@ scripts/parity.sh --engine both
 Merge gate: both CSV columns emit identical RMSE (example 0.068 / iana 0.131 /
 wikipedia 0.143 unchanged) and `cargo test` is green — proving the seam is swappable and the
 harness can A/B **before** any taffy code or dependency lands.
+
+---
+
+## 7. Progress log (2026-07-07)
+
+Landed so far, all behind the Stage-0 seam (`--engine block|taffy` / `CERB_LAYOUT`):
+
+- **Stage 0 — seam + dual-run harness.** `LayoutEngineKind`, `make_layout`, `--engine`
+  passthrough, `CERB_LAYOUT`. Block is the default; taffy is opt-in.
+- **Stage 2 — rustybuzz shaping.** `cerberus-text` shapes advances with HarfBuzz
+  (rustybuzz), ab_glyph still rasterizes. Parity-neutral on the corpus because the residual
+  is a bundled-font vs Chrome-font *face* mismatch, not shaping — but the correct foundation.
+- **Stages 1/3/4 combined — the taffy engine.** Rather than a separate box-tree refactor
+  first, the `cerberus-taffy` crate does box-tree normalization, block geometry, and the
+  flex/grid mapping together:
+  - `to_taffy_style(&ComputedStyle, vw, vh) -> taffy::Style` — pure, unit-tested mapping of
+    display/position/size/min/max/margins (auto)/padding/border/inset/flex/grid/gap.
+  - `TaffyLayout: LayoutEngine` — builds a `TaffyTree`, every element a container and each
+    inline run an anonymous leaf measured + painted via the walker's shared
+    `flow_inline` (so lists/tables/inline stay the single source of truth); box
+    backgrounds/borders via the shared `box_decorations`. Adjacent-sibling margin collapsing
+    approximated in the block formatting context.
+  - The app composes both adapters, so `cerberus-layout` need not depend on `cerberus-taffy`.
+
+Paired corpus (RMSE vs headless Chrome, lower = closer):
+
+|            | block   | taffy   |
+|------------|---------|---------|
+| example    | 0.06782 | 0.06401 |
+| iana       | 0.13052 | 0.12434 |
+| rfc1       | 0.12301 | 0.12229 |
+| wikipedia  | 0.14252 | 0.13086 |
+| hn         | 0.17295 | 0.17466 |
+| mfws       | 0.24013 | 0.25874 |
+
+taffy is better or tied on five of six; the two it trails are dominated by the font-face
+floor (mfws is a bare, CSS-less page). Also landed as shared-walker fidelity, benefiting
+both engines: HTML presentational hints (`width`/`bgcolor`/`align`/`nowrap`) and honoring
+the table `border` attribute (no grid lines on layout tables) — Hacker News now renders its
+orange header, full width, and clean rows.
+
+Remaining gaps (next targets):
+
+- **Parent/first-child margin collapsing** — the naive version over-corrects; needs the
+  collapsed margin to move outside the parent. Sibling collapsing only, for now.
+- **Taffy table speed** — each inline leaf is flowed in `measure` and again in `paint`;
+  table-dense pages (HN) pay ~35% over the walker. Cache the measured flow and translate it.
+- **Font-face floor** — the clean pages' residual is bundled Roboto vs Chrome's default
+  face. Determinism (ADR-0005) forbids system fonts, so this is a bundled-face choice, not a
+  shaping bug.
+- **Graduation** — flip a page's default to taffy once its RMSE is ≤ the walker's and speed
+  is comparable. Not yet flipped anywhere.
