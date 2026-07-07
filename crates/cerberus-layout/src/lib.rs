@@ -1218,9 +1218,17 @@ impl<'a> Ctx<'a> {
             self.vh,
         );
         sub.measuring = self.measuring;
+        // Enable out-of-flow positioning inside a real (non-probe) inline-block:
+        // a `position:relative` inline-block is the containing block for its
+        // `absolute` descendants (e.g. Wikipedia's `.styled-select` language
+        // dropdown pinned to the right edge of the relatively-positioned
+        // `.search-input`). `finish_positioned` below folds those layers onto the
+        // sub's content before it merges up. Measurement probes stay flat.
+        sub.pos_enabled = !self.measuring;
         sub.as_block_once = true; // lay `e` with the block box model, filling [x, x+w]
         sub.walk(e, in_link);
         sub.flush_line();
+        sub.finish_positioned();
         self.field_id = sub.field_id;
         let h = (sub.y - self.y).max(1);
         self.merge_sub(sub, 0, 0);
@@ -5432,6 +5440,24 @@ background:#111;margin-right:-10px'></span>\
         // Without the indent the same run sits at the content edge.
         let shown = lay("<div style='white-space:nowrap'>Search</div>", 400);
         assert!(glyph_xs(&shown).iter().all(|&x| x >= 0));
+    }
+
+    #[test]
+    fn absolute_child_positions_against_a_relative_inline_block() {
+        // An `absolute` element inside a `position:relative` inline-block uses
+        // that inline-block as its containing block (Wikipedia's language dropdown
+        // pinned to the right edge of the search input): a `right`-anchored child
+        // lands on the right side of the 200px box, not at the flow's left edge.
+        let laid = lay(
+            "<div style='display:inline-block;position:relative;width:200px'>\
+             <div style='position:absolute;top:0;right:4px;width:20px'>Z</div></div>",
+            400,
+        );
+        let z_x = *glyph_xs(&laid).iter().max().unwrap();
+        assert!(
+            z_x > 150,
+            "right-anchored absolute child sits near the box's right edge (~176), got x={z_x}"
+        );
     }
 
     #[test]
