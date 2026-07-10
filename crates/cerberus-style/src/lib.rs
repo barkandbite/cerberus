@@ -6,7 +6,7 @@
 //! reimplemented without touching layout. Layout consumes only these types.
 
 use cerberus_dom::{Document, NodeId};
-use cerberus_types::{Color, FontStyle, ImageFit, ImagePos};
+use cerberus_types::{Color, FontStyle, ImageFit, ImagePos, Point};
 
 /// CSS `position`. `Static` is normal flow; the rest are positioned.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
@@ -31,6 +31,9 @@ pub enum Len {
     /// Viewport-relative: percent of viewport width / height (ADR-0042).
     Vw(f32),
     Vh(f32),
+    /// Percent of the smaller / larger viewport dimension (`vmin`/`vmax`).
+    Vmin(f32),
+    Vmax(f32),
 }
 
 impl Len {
@@ -40,15 +43,19 @@ impl Len {
         match self {
             Len::Px(p) => Some(p),
             Len::Pct(f) => Some((f / 100.0 * extent as f32).round() as i32),
-            Len::Auto | Len::Vw(_) | Len::Vh(_) => None,
+            Len::Auto | Len::Vw(_) | Len::Vh(_) | Len::Vmin(_) | Len::Vmax(_) => None,
         }
     }
 
-    /// Resolve including viewport units (`vw`/`vh`) against `vw`×`vh` px.
+    /// Resolve including viewport units (`vw`/`vh`/`vmin`/`vmax`) against a
+    /// `vw`×`vh` px viewport.
     pub fn resolve_vp(self, extent: i32, vw: i32, vh: i32) -> Option<i32> {
+        let pct = |f: f32, basis: i32| Some((f / 100.0 * basis as f32).round() as i32);
         match self {
-            Len::Vw(f) => Some((f / 100.0 * vw as f32).round() as i32),
-            Len::Vh(f) => Some((f / 100.0 * vh as f32).round() as i32),
+            Len::Vw(f) => pct(f, vw),
+            Len::Vh(f) => pct(f, vh),
+            Len::Vmin(f) => pct(f, vw.min(vh)),
+            Len::Vmax(f) => pct(f, vw.max(vh)),
             other => other.resolve(extent),
         }
     }
@@ -355,13 +362,15 @@ pub struct ComputedStyle {
     /// `text-indent` in px: the first-line indent of a block's inline content.
     /// Inherited.
     pub text_indent: i32,
-    pub margin_top: i32,
-    pub margin_bottom: i32,
-    pub margin_left: i32,
-    /// `margin-right` in px. Shrinks an auto-width block's box from the right
-    /// (its `auto` value, for centering, is tracked by `margin_right_auto`
-    /// instead). Not inherited.
-    pub margin_right: i32,
+    /// Margins as lengths, resolved against the containing-block **width** at
+    /// layout (CSS resolves `%` margins — top/bottom included — against the
+    /// container's width). `Auto` resolves to 0 here; horizontal `auto` for
+    /// centering is tracked separately by `margin_{left,right}_auto`. Not
+    /// inherited. Was `i32` px, which dropped `%`/`vw`/`vh` margins at parse.
+    pub margin_top: Len,
+    pub margin_bottom: Len,
+    pub margin_left: Len,
+    pub margin_right: Len,
     /// `margin-left`/`-right: auto` — used to center a width-constrained block
     /// (ADR-0039). Not inherited.
     pub margin_left_auto: bool,
@@ -416,6 +425,11 @@ pub struct ComputedStyle {
     /// (ADR-0045). Plain values (8 bytes each), not inherited.
     pub object_position: ImagePos,
     pub background_position: ImagePos,
+    /// The pixel (length) component of `background-position` — e.g. the `-304px`
+    /// in `background-position: 0 -304px` that crops a CSS sprite. Applied on top
+    /// of the fractional `background_position`. `(0, 0)` when the position is
+    /// keyword/percentage-only. Not inherited.
+    pub background_position_px: Point,
     /// `white-space`: whitespace collapsing, newline preservation, and wrapping.
     /// Inherited.
     pub white_space: WhiteSpace,
@@ -490,10 +504,10 @@ impl ComputedStyle {
             list_style_type: ListStyleType::Disc,
             vertical_align: VerticalAlign::Baseline,
             text_indent: 0,
-            margin_top: 0,
-            margin_bottom: 0,
-            margin_left: 0,
-            margin_right: 0,
+            margin_top: Len::Px(0),
+            margin_bottom: Len::Px(0),
+            margin_left: Len::Px(0),
+            margin_right: Len::Px(0),
             margin_left_auto: false,
             margin_right_auto: false,
             width: Len::Auto,
@@ -519,9 +533,10 @@ impl ComputedStyle {
             background_gradient: None,
             box_shadow: None,
             object_fit: ImageFit::Fill,
-            background_size: ImageFit::Fill,
+            background_size: ImageFit::Auto,
             object_position: ImagePos::CENTER,
             background_position: ImagePos::TOP_LEFT,
+            background_position_px: Point::ZERO,
             white_space: WhiteSpace::Normal,
             visibility: Visibility::Visible,
             opacity: 1.0,
@@ -577,10 +592,10 @@ impl ComputedStyle {
             background: None,
             background_image: None,
             opacity: 1.0,
-            margin_top: 0,
-            margin_bottom: 0,
-            margin_left: 0,
-            margin_right: 0,
+            margin_top: Len::Px(0),
+            margin_bottom: Len::Px(0),
+            margin_left: Len::Px(0),
+            margin_right: Len::Px(0),
             margin_left_auto: false,
             margin_right_auto: false,
             width: Len::Auto,
@@ -607,9 +622,10 @@ impl ComputedStyle {
             box_shadow: None,
             // object-fit/-position and background-size/-position are not inherited.
             object_fit: ImageFit::Fill,
-            background_size: ImageFit::Fill,
+            background_size: ImageFit::Auto,
             object_position: ImagePos::CENTER,
             background_position: ImagePos::TOP_LEFT,
+            background_position_px: Point::ZERO,
             flex_direction: FlexDirection::Row,
             flex_reverse: false,
             flex_wrap: false,
@@ -788,13 +804,38 @@ mod tests {
     }
 
     #[test]
+    fn viewport_units_resolve_against_the_right_basis() {
+        // In portrait (w < h): vmin follows width, vmax follows height — the case
+        // the old `vmax→Vw` / `vmin→Vh` aliasing got backwards.
+        let (w, h) = (400, 800);
+        assert_eq!(Len::Vw(50.0).resolve_vp(0, w, h), Some(200));
+        assert_eq!(Len::Vh(50.0).resolve_vp(0, w, h), Some(400));
+        assert_eq!(
+            Len::Vmin(50.0).resolve_vp(0, w, h),
+            Some(200),
+            "vmin = min(w,h)"
+        );
+        assert_eq!(
+            Len::Vmax(50.0).resolve_vp(0, w, h),
+            Some(400),
+            "vmax = max(w,h)"
+        );
+        // In landscape the min/max swap dimensions.
+        assert_eq!(Len::Vmin(10.0).resolve_vp(0, 1000, 500), Some(50));
+        assert_eq!(Len::Vmax(10.0).resolve_vp(0, 1000, 500), Some(100));
+        // Without a viewport they don't resolve.
+        assert_eq!(Len::Vmin(50.0).resolve(999), None);
+        assert_eq!(Len::Vmax(50.0).resolve(999), None);
+    }
+
+    #[test]
     fn initial_has_sane_defaults() {
         let s = ComputedStyle::initial();
         assert_eq!(s.display, Display::Block);
         assert_eq!(s.color, Color::BLACK);
         assert_eq!(s.font_size, 16);
-        assert_eq!(s.margin_top, 0);
-        assert_eq!(s.margin_right, 0);
+        assert_eq!(s.margin_top, Len::Px(0));
+        assert_eq!(s.margin_right, Len::Px(0));
         assert_eq!(s.width, Len::Auto);
         assert_eq!(s.vertical_align, VerticalAlign::Baseline);
         assert_eq!(s.white_space, WhiteSpace::Normal);
@@ -810,8 +851,8 @@ mod tests {
         parent.color = Color::rgb(1, 2, 3); // inherited
         parent.text_indent = 12; // inherited
         parent.white_space = WhiteSpace::Pre; // inherited
-        parent.margin_top = 9; // not inherited
-        parent.margin_right = 7; // not inherited
+        parent.margin_top = Len::Px(9); // not inherited
+        parent.margin_right = Len::Px(7); // not inherited
         parent.width = Len::Px(300); // not inherited
         parent.display = Display::Flex; // not inherited (child resets to Inline)
         parent.vertical_align = VerticalAlign::Super; // not inherited

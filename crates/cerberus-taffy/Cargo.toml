@@ -1,0 +1,28 @@
+[package]
+publish = false
+name = "cerberus-taffy"
+description = "Taffy adapter: maps ComputedStyle → taffy::Style and lays out block/flex/grid box geometry behind the LayoutEngine seam."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+cerberus-style = { path = "../cerberus-style" }
+# The engine implements cerberus-layout's LayoutEngine trait and reuses its
+# inline formatting-context painter (flow_inline) for every text/inline leaf, so
+# shaping and inline flow stay the single source of truth. cerberus-layout does
+# NOT depend on this crate (the app composes the two), so there is no cycle.
+cerberus-layout = { path = "../cerberus-layout" }
+cerberus-paint = { path = "../cerberus-paint" }
+cerberus-types = { path = "../cerberus-types" }
+cerberus-dom = { path = "../cerberus-dom" }
+# Modular adoption behind the LayoutEngine seam (RENDERING_ARCHITECTURE_PLAN.md,
+# Stage 3): taffy owns block/flex/grid box geometry; we keep inline/text/replaced
+# leaves in cerberus-layout via a measure closure. Its only transitive dep is
+# arrayvec, so the footprint stays small (ADR bar for heavy deps).
+taffy = { version = "0.12.1", default-features = false, features = ["std", "taffy_tree", "flexbox", "grid", "block_layout"] }

@@ -18,7 +18,7 @@ use cerberus_style::{
     Position, StyleEngine, StyledChild, StyledDom, StyledNode, TextAlign, TextTransform, Track,
     TrackMax, VerticalAlign, Visibility, WhiteSpace,
 };
-use cerberus_types::{Color, ImageFit, ImagePos};
+use cerberus_types::{Color, ImageFit, ImagePos, Point};
 use parser::{
     parse_declaration_block, parse_stylesheet, ElemRef, MediaContext, SiblingRef, Specificity,
     Stylesheet,
@@ -120,6 +120,10 @@ impl CssEngine {
         parent_vars: &Vars,
         path: &mut Vec<ElemRef>,
         author: &Stylesheet,
+        // Root element's computed font-size in px — the base for `rem`.
+        // `html { font-size: 62.5% }` → 1rem = 10px; a hardcoded 16 would size
+        // every rem-based box 1.6x too large.
+        root_font_size: u32,
     ) -> StyledNode {
         let is_root = node.tag() == "#root";
         let mut style = if is_root {
@@ -138,6 +142,13 @@ impl CssEngine {
         let mut vars = parent_vars.clone();
 
         if !is_root {
+            // Legacy HTML presentational attributes (`width`/`bgcolor`/…) act as
+            // the lowest-priority author style (HTML §15 presentational hints), so
+            // apply them before the cascade — any real CSS rule overrides them, but
+            // old table-driven pages (Hacker News, forums) still get their intended
+            // widths and colors.
+            apply_presentational_hints(&mut style, node);
+
             // Collect matching declarations: (origin, specificity, source-order),
             // honoring @media against the engine's viewport.
             let mut matched: Vec<MatchedRule<'_>> = Vec::new();
@@ -174,18 +185,52 @@ impl CssEngine {
             // applied last, tops author `!important`). The UA sheet declares no
             // `!important`, so UA-important is not separately elevated.
             for (_, _, _, decls) in &matched {
-                apply_declarations(&mut style, decls, parent.font_size, &vars, false);
+                apply_declarations(
+                    &mut style,
+                    decls,
+                    parent.font_size,
+                    root_font_size,
+                    &vars,
+                    false,
+                );
             }
             if let Some(decls) = &inline {
-                apply_declarations(&mut style, decls, parent.font_size, &vars, false);
+                apply_declarations(
+                    &mut style,
+                    decls,
+                    parent.font_size,
+                    root_font_size,
+                    &vars,
+                    false,
+                );
             }
             for (_, _, _, decls) in &matched {
-                apply_declarations(&mut style, decls, parent.font_size, &vars, true);
+                apply_declarations(
+                    &mut style,
+                    decls,
+                    parent.font_size,
+                    root_font_size,
+                    &vars,
+                    true,
+                );
             }
             if let Some(decls) = &inline {
-                apply_declarations(&mut style, decls, parent.font_size, &vars, true);
+                apply_declarations(
+                    &mut style,
+                    decls,
+                    parent.font_size,
+                    root_font_size,
+                    &vars,
+                    true,
+                );
             }
         }
+
+        let child_root_font_size = if node.tag() == "html" {
+            style.font_size
+        } else {
+            root_font_size
+        };
 
         // The element children, reduced for sibling / :nth-child matching, shared
         // across this level via `Rc` so the cascade stays O(n).
@@ -209,6 +254,7 @@ impl CssEngine {
                         &vars,
                         path,
                         author,
+                        child_root_font_size,
                     );
                     elem_index += 1;
                     StyledChild::Element(Box::new(styled))
@@ -254,6 +300,7 @@ impl StyleEngine for CssEngine {
             &no_vars,
             &mut path,
             &author,
+            INITIAL_ROOT_FONT_PX,
         );
         StyledDom { root: styled }
     }
@@ -656,10 +703,14 @@ impl CalcParser<'_> {
     }
 }
 
+/// Initial root font-size in px (the base for `rem` before any `html {font-size}`).
+const INITIAL_ROOT_FONT_PX: u32 = 16;
+
 fn apply_declarations(
     style: &mut ComputedStyle,
     decls: &[(String, String, bool)],
     parent_font_size: u32,
+    root_font_size: u32,
     vars: &Vars,
     important: bool,
 ) {
@@ -674,6 +725,9 @@ fn apply_declarations(
         if prop.starts_with("--") {
             continue;
         }
+        // Fold `rem` to px against the root font-size up front (`em` stays for
+        // per-element resolution), so downstream length parsers see px.
+        let value = &substitute_rem(value, root_font_size as f32);
         // Resolve `var()` references and `calc()` math before parsing the value.
         // `em` for `calc()` uses the element's current font size.
         let resolved = resolve_value(value, vars, style.font_size as f32);
@@ -701,7 +755,8 @@ fn apply_declarations(
                     style.background_image = parse_url_value(v);
                     style.background_gradient = parse_gradient(v).map(Box::new);
                     style.background_position = ImagePos::TOP_LEFT;
-                    style.background_size = ImageFit::Fill;
+                    style.background_position_px = Point::ZERO;
+                    style.background_size = ImageFit::Auto;
                     apply_background_shorthand_geometry(style, v);
                 } else if let Some(c) = parse_bg_color(v) {
                     // Standalone `background-color` longhand: additive — only
@@ -730,6 +785,9 @@ fn apply_declarations(
                 if let Some(p) = parse_image_pos(v) {
                     style.background_position = p;
                 }
+                // Length components (the `-304px` in `0 -304px`) crop CSS sprites;
+                // percentages/keywords are folded into the fraction above.
+                style.background_position_px = parse_bg_position_px(v, style.font_size as f32);
             }
             "border-radius" => {
                 // Uniform radius (first value of the 1–4 corner shorthand).
@@ -842,24 +900,24 @@ fn apply_declarations(
             }
             "margin" => apply_margin_shorthand(style, v, style.font_size as f32),
             "margin-top" => {
-                if let Some(m) = parse_len(v, style.font_size as f32) {
+                if let Some(m) = parse_inset(v, style.font_size as f32) {
                     style.margin_top = m;
                 }
             }
             "margin-bottom" => {
-                if let Some(m) = parse_len(v, style.font_size as f32) {
+                if let Some(m) = parse_inset(v, style.font_size as f32) {
                     style.margin_bottom = m;
                 }
             }
             "margin-left" => {
-                style.margin_left_auto = v.trim().eq_ignore_ascii_case("auto");
-                if let Some(m) = parse_len(v, style.font_size as f32) {
+                if let Some(m) = parse_inset(v, style.font_size as f32) {
+                    style.margin_left_auto = m == Len::Auto;
                     style.margin_left = m;
                 }
             }
             "margin-right" => {
-                style.margin_right_auto = v.trim().eq_ignore_ascii_case("auto");
-                if let Some(m) = parse_len(v, style.font_size as f32) {
+                if let Some(m) = parse_inset(v, style.font_size as f32) {
+                    style.margin_right_auto = m == Len::Auto;
                     style.margin_right = m;
                 }
             }
@@ -1114,6 +1172,66 @@ fn apply_declarations(
 
 fn parse_bg_color(v: &str) -> Option<Color> {
     parse_color(v).or_else(|| v.split_whitespace().find_map(parse_color))
+}
+
+/// Parse an HTML attribute color: a CSS color, or a bare hex triplet/sextet the
+/// `bgcolor`/`color` attributes allow without a leading `#` (e.g. `ff6600`).
+fn parse_attr_color(v: &str) -> Option<Color> {
+    let v = v.trim();
+    parse_color(v).or_else(|| {
+        let hex = v.trim_start_matches('#');
+        ((hex.len() == 3 || hex.len() == 6) && hex.bytes().all(|b| b.is_ascii_hexdigit()))
+            .then(|| parse_color(&format!("#{hex}")))
+            .flatten()
+    })
+}
+
+/// Apply the legacy HTML presentational attributes we support as computed style:
+/// `width`/`height` (table model + `<hr>`), `bgcolor` (table model + `<body>`),
+/// `align` (cell text-align; a table centers via auto margins), and `nowrap`
+/// (cells). These are the HTML UA stylesheet's presentational hints (HTML §15) —
+/// specificity 0, so the caller applies them before the author cascade.
+fn apply_presentational_hints(style: &mut ComputedStyle, node: NodeRef<'_>) {
+    let tag = node.tag();
+    let em = style.font_size as f32;
+
+    if matches!(
+        tag,
+        "table" | "td" | "th" | "tr" | "col" | "colgroup" | "thead" | "tbody" | "tfoot" | "hr"
+    ) {
+        if let Some(w) = node.attr("width").and_then(|v| parse_inset(v, em)) {
+            style.width = w;
+        }
+        if let Some(h) = node.attr("height").and_then(|v| parse_inset(v, em)) {
+            style.height = h;
+        }
+    }
+
+    if matches!(
+        tag,
+        "table" | "td" | "th" | "tr" | "thead" | "tbody" | "tfoot" | "body"
+    ) {
+        if let Some(c) = node.attr("bgcolor").and_then(parse_attr_color) {
+            style.background = Some(c);
+        }
+    }
+
+    if let Some(a) = node.attr("align") {
+        match a.trim().to_ascii_lowercase().as_str() {
+            "center" if tag == "table" => {
+                style.margin_left_auto = true;
+                style.margin_right_auto = true;
+            }
+            "center" => style.text_align = TextAlign::Center,
+            "right" if tag != "table" => style.text_align = TextAlign::Right,
+            "left" if tag != "table" => style.text_align = TextAlign::Left,
+            _ => {}
+        }
+    }
+
+    if matches!(tag, "td" | "th") && node.attr("nowrap").is_some() {
+        style.white_space = WhiteSpace::Nowrap;
+    }
 }
 
 fn is_bold(v: &str) -> bool {
@@ -1436,6 +1554,9 @@ fn parse_image_fit(v: &str) -> ImageFit {
     match v.trim().to_ascii_lowercase().as_str() {
         "cover" => ImageFit::Cover,
         "contain" | "scale-down" => ImageFit::Contain,
+        // `auto` (the `background-size` initial value) and `object-fit: none` both
+        // draw at natural size — the mode CSS sprites depend on.
+        "auto" | "none" => ImageFit::Auto,
         _ => ImageFit::Fill,
     }
 }
@@ -1484,6 +1605,31 @@ fn combine_pos(parts: &[(u8, f32)]) -> Option<ImagePos> {
     }
 }
 
+/// Extract the pixel (length) components of a `background-position` value into a
+/// `(x, y)` offset, in the token order x-then-y. Percentages and keywords yield
+/// `0` on their axis (they're carried by the fractional [`ImagePos`] instead); a
+/// single token sets only x. This is what crops CSS sprites (`0 -304px`).
+fn parse_bg_position_px(v: &str, em_base: f32) -> Point {
+    let mut out = Point::ZERO;
+    for (i, tok) in v.split_whitespace().take(2).enumerate() {
+        // A length is a number with a non-`%` unit (or unitless 0). `split_num_unit`
+        // rejects keywords (no leading digit), so those fall through to 0.
+        let px = match split_num_unit(tok) {
+            Some((_, unit)) if unit == "%" => continue,
+            _ => parse_css_px(&tok.to_ascii_lowercase(), em_base),
+        };
+        if let Some(px) = px {
+            let px = px.round() as i32;
+            if i == 0 {
+                out.x = px;
+            } else {
+                out.y = px;
+            }
+        }
+    }
+    out
+}
+
 /// Parse a standalone `object-position`/`background-position` value.
 fn parse_image_pos(v: &str) -> Option<ImagePos> {
     let parts: Vec<(u8, f32)> = v
@@ -1500,23 +1646,29 @@ fn parse_image_pos(v: &str) -> Option<ImagePos> {
 /// read as geometry — ADR-0045.
 fn apply_background_shorthand_geometry(style: &mut ComputedStyle, v: &str) {
     let masked = mask_parens(v);
-    if let Some(slash) = masked.find('/') {
-        if let Some(tok) = masked[slash + 1..].split_whitespace().next() {
+    // The position (fraction + any px) lives before the `/size`, or is the whole
+    // value when there's no slash.
+    let (pos_span, size_span) = match masked.find('/') {
+        Some(slash) => (&masked[..slash], Some(&masked[slash + 1..])),
+        None => (masked.as_str(), None),
+    };
+    if let Some(size_span) = size_span {
+        if let Some(tok) = size_span.split_whitespace().next() {
             style.background_size = parse_image_fit(tok);
-        }
-        let parts: Vec<(u8, f32)> = masked[..slash]
-            .split_whitespace()
-            .filter_map(classify_pos_tok)
-            .collect();
-        if let Some(p) = combine_pos(&parts[parts.len().saturating_sub(2)..]) {
-            style.background_position = p;
         }
     } else if let Some(f) = masked
         .split_whitespace()
         .map(parse_image_fit)
-        .find(|f| *f != ImageFit::Fill)
+        .find(|f| !matches!(f, ImageFit::Fill | ImageFit::Auto))
     {
         style.background_size = f;
+    }
+    let parts: Vec<(u8, f32)> = pos_span
+        .split_whitespace()
+        .filter_map(classify_pos_tok)
+        .collect();
+    if let Some(p) = combine_pos(&parts[parts.len().saturating_sub(2)..]) {
+        style.background_position = p;
     }
 }
 
@@ -1610,9 +1762,9 @@ fn apply_font_shorthand(style: &mut ComputedStyle, v: &str, parent_font_size: u3
 
 fn apply_margin_shorthand(style: &mut ComputedStyle, v: &str, em_base: f32) {
     let toks: Vec<&str> = v.split_whitespace().collect();
-    let parts: Vec<i32> = toks
+    let parts: Vec<Len> = toks
         .iter()
-        .map(|p| parse_len(p, em_base).unwrap_or(0))
+        .map(|p| parse_inset(p, em_base).unwrap_or(Len::Px(0)))
         .collect();
     // Track which sides are `auto` (for centering): horizontal sides are index 1
     // (right) and 3 (left) in the 4-value form, or index 1 in the 2/3-value form.
@@ -1673,6 +1825,49 @@ fn parse_size(v: &str, parent: u32) -> Option<u32> {
     Some(px.round().max(1.0) as u32)
 }
 
+/// Replace every `<number>rem` in a value with its px equivalent against
+/// `root_em`. Only a numeric prefix triggers a match, so `rem` inside an
+/// identifier/function/URL is untouched, and `em`/other units are left for
+/// per-element resolution. Handles signs and decimals (`-1.5rem`).
+fn substitute_rem(value: &str, root_em: f32) -> String {
+    let bytes = value.as_bytes();
+    let mut out = String::with_capacity(value.len());
+    let mut i = 0;
+    while i < value.len() {
+        let mut j = i;
+        if j < bytes.len() && (bytes[j] == b'+' || bytes[j] == b'-') {
+            j += 1;
+        }
+        let num_start = j;
+        while j < bytes.len() && (bytes[j].is_ascii_digit() || bytes[j] == b'.') {
+            j += 1;
+        }
+        let has_digit = value[num_start..j].bytes().any(|c| c.is_ascii_digit());
+        // Byte-compare the unit ('rem' is ASCII); guarantees `j + 3` is a char
+        // boundary so the slices below never split a multi-byte char.
+        let is_rem = j + 3 <= bytes.len()
+            && bytes[j].eq_ignore_ascii_case(&b'r')
+            && bytes[j + 1].eq_ignore_ascii_case(&b'e')
+            && bytes[j + 2].eq_ignore_ascii_case(&b'm')
+            && !value[j + 3..]
+                .chars()
+                .next()
+                .is_some_and(|c| c.is_alphanumeric());
+        if has_digit && is_rem {
+            if let Ok(n) = value[i..j].parse::<f32>() {
+                out.push_str(&((n * root_em).round() as i32).to_string());
+                out.push_str("px");
+                i = j + 3;
+                continue;
+            }
+        }
+        let ch = value[i..].chars().next().unwrap();
+        out.push(ch);
+        i += ch.len_utf8();
+    }
+    out
+}
+
 fn parse_len(v: &str, em_base: f32) -> Option<i32> {
     let v = v.trim().to_ascii_lowercase();
     if v == "auto" || v == "inherit" {
@@ -1711,8 +1906,10 @@ fn parse_inset(v: &str, em_base: f32) -> Option<Len> {
         "em" => Len::Px((num * em_base).round() as i32),
         "rem" => Len::Px((num * 16.0).round() as i32),
         "pt" => Len::Px((num * 96.0 / 72.0).round() as i32),
-        "vw" | "vmax" => Len::Vw(num),
-        "vh" | "vmin" => Len::Vh(num),
+        "vw" => Len::Vw(num),
+        "vh" => Len::Vh(num),
+        "vmin" => Len::Vmin(num),
+        "vmax" => Len::Vmax(num),
         _ => return None,
     })
 }
@@ -2002,16 +2199,19 @@ mod tests {
     fn ua_indents_dd() {
         // A description-list definition is indented 40px by the UA stylesheet.
         let dom = CssEngine::new().style(&parse_html("<dl><dt>t</dt><dd>d</dd></dl>"));
-        assert_eq!(first(&dom.root, "dd").unwrap().style.margin_left, 40);
+        assert_eq!(
+            first(&dom.root, "dd").unwrap().style.margin_left,
+            Len::Px(40)
+        );
     }
 
     #[test]
     fn ua_gives_figure_default_margins() {
         let dom = CssEngine::new().style(&parse_html("<figure>f</figure>"));
         let f = first(&dom.root, "figure").unwrap();
-        assert_eq!(f.style.margin_left, 40);
-        assert_eq!(f.style.margin_right, 40);
-        assert_eq!(f.style.margin_top, 16);
+        assert_eq!(f.style.margin_left, Len::Px(40));
+        assert_eq!(f.style.margin_right, Len::Px(40));
+        assert_eq!(f.style.margin_top, Len::Px(16));
     }
 
     #[test]
@@ -2105,6 +2305,44 @@ mod tests {
         let p = first(&dom.root, "p").unwrap();
         // inline beats #id beats type.
         assert_eq!(p.style.color, Color::rgb(0, 0, 255));
+    }
+
+    #[test]
+    fn presentational_attributes_map_to_style() {
+        // width/bgcolor/align HTML attributes become style (HTML §15 hints).
+        let dom = CssEngine::new().style(&parse_html(
+            "<table width='85%' bgcolor='#ff6600' align='center'>\
+             <tr><td align='right' bgcolor='eee'>x</td></tr></table>",
+        ));
+        let table = first(&dom.root, "table").unwrap();
+        assert_eq!(table.style.width, Len::Pct(85.0), "width='85%' → 85%");
+        assert_eq!(
+            table.style.background,
+            Some(Color::rgb(255, 102, 0)),
+            "bgcolor"
+        );
+        assert!(
+            table.style.margin_left_auto && table.style.margin_right_auto,
+            "align=center on a table centers it"
+        );
+        let td = first(&dom.root, "td").unwrap();
+        assert_eq!(td.style.text_align, TextAlign::Right, "td align=right");
+        // Bare hex (no '#') is accepted for attribute colors.
+        assert_eq!(td.style.background, Some(Color::rgb(238, 238, 238)));
+    }
+
+    #[test]
+    fn author_css_overrides_presentational_hint() {
+        // A hint sits at specificity 0, so any author rule wins.
+        let dom = CssEngine::new().style(&parse_html(
+            "<style>table{width:400px}</style><table width='85%'><tr><td>x</td></tr></table>",
+        ));
+        let table = first(&dom.root, "table").unwrap();
+        assert_eq!(
+            table.style.width,
+            Len::Px(400),
+            "author width wins over attr"
+        );
     }
 
     #[test]
@@ -2356,15 +2594,28 @@ mod tests {
         // The `margin-right` longhand is honored (previously only its `auto` flag
         // was), and each shorthand arity fills the right side correctly.
         let one = CssEngine::new().style(&parse_html("<p style='margin:5px'>x</p>"));
-        assert_eq!(first(&one.root, "p").unwrap().style.margin_right, 5);
+        assert_eq!(
+            first(&one.root, "p").unwrap().style.margin_right,
+            Len::Px(5)
+        );
         let two = CssEngine::new().style(&parse_html("<p style='margin:5px 10px'>x</p>"));
-        assert_eq!(first(&two.root, "p").unwrap().style.margin_right, 10);
+        assert_eq!(
+            first(&two.root, "p").unwrap().style.margin_right,
+            Len::Px(10)
+        );
         let four = CssEngine::new().style(&parse_html("<p style='margin:1px 2px 3px 4px'>x</p>"));
         let p = first(&four.root, "p").unwrap();
-        assert_eq!(p.style.margin_right, 2, "right is the 2nd of four values");
-        assert_eq!(p.style.margin_left, 4, "left is the 4th");
+        assert_eq!(
+            p.style.margin_right,
+            Len::Px(2),
+            "right is the 2nd of four values"
+        );
+        assert_eq!(p.style.margin_left, Len::Px(4), "left is the 4th");
         let long = CssEngine::new().style(&parse_html("<p style='margin-right:12px'>x</p>"));
-        assert_eq!(first(&long.root, "p").unwrap().style.margin_right, 12);
+        assert_eq!(
+            first(&long.root, "p").unwrap().style.margin_right,
+            Len::Px(12)
+        );
     }
 
     #[test]
@@ -2375,8 +2626,8 @@ mod tests {
             "<p style='--g:8px;margin-top:calc(2 * 4px + 1rem);margin-left:calc(var(--g) * 3)'>x</p>";
         let dom = CssEngine::new().style(&parse_html(html));
         let p = first(&dom.root, "p").unwrap();
-        assert_eq!(p.style.margin_top, 24, "2*4 + 16(rem) = 24");
-        assert_eq!(p.style.margin_left, 24, "8 * 3 = 24");
+        assert_eq!(p.style.margin_top, Len::Px(24), "2*4 + 16(rem) = 24");
+        assert_eq!(p.style.margin_left, Len::Px(24), "8 * 3 = 24");
     }
 
     #[test]
@@ -2610,6 +2861,26 @@ mod tests {
     }
 
     #[test]
+    fn rem_resolves_against_the_root_font_size() {
+        // `html { font-size: 62.5% }` → root = 10px, so 1rem = 10px everywhere,
+        // not the hardcoded 16. Both a dimension (width) and a font-size scale.
+        let dom = CssEngine::new().style(&parse_html(
+            "<html style='font-size:62.5%'><body>\
+               <div style='width:15.6rem;font-size:1.3rem'>x</div>\
+             </body></html>",
+        ));
+        let div = first(&dom.root, "div").unwrap();
+        assert_eq!(div.style.width.resolve(1000), Some(156));
+        assert_eq!(div.style.font_size, 13);
+        // Without any html font-size, rem stays 16px (the initial base).
+        let plain = CssEngine::new().style(&parse_html("<div style='width:2rem'>x</div>"));
+        assert_eq!(
+            first(&plain.root, "div").unwrap().style.width.resolve(1000),
+            Some(32)
+        );
+    }
+
+    #[test]
     fn line_height_unitless_inherits_as_a_factor() {
         use cerberus_style::LineHeight;
         // A unitless line-height inherits as the factor, so a differently-sized
@@ -2805,7 +3076,11 @@ mod tests {
         assert_eq!(fit("object-fit: contain"), ImageFit::Contain);
         assert_eq!(fit("object-fit: scale-down"), ImageFit::Contain);
         assert_eq!(fit("object-fit: fill"), ImageFit::Fill);
-        assert_eq!(fit("object-fit: none"), ImageFit::Fill);
+        assert_eq!(
+            fit("object-fit: none"),
+            ImageFit::Auto,
+            "object-fit: none draws at natural size"
+        );
 
         let bg = |css: &str| {
             let dom = CssEngine::new().style(&parse_html(&format!("<div style='{css}'>x</div>")));
@@ -2825,6 +3100,34 @@ mod tests {
         let s = &first(&dom.root, "img").unwrap().style;
         assert_eq!(s.object_fit, ImageFit::Cover);
         assert_eq!(s.background_size, ImageFit::Contain);
+    }
+
+    #[test]
+    fn background_position_px_crops_sprites() {
+        let sty = |css: &str| {
+            let dom = CssEngine::new().style(&parse_html(&format!("<div style='{css}'>x</div>")));
+            first(&dom.root, "div").unwrap().style.clone()
+        };
+        // Wikipedia's wordmark sprite: a pixel offset into a no-scale background.
+        let s = sty("background-position: 0 -304px");
+        assert_eq!(s.background_position_px, Point::new(0, -304));
+        // Absent background-size defaults to `auto` (natural size) — the sprite mode.
+        assert_eq!(s.background_size, ImageFit::Auto);
+        // Two lengths, x then y.
+        assert_eq!(
+            sty("background-position: -10px 20px").background_position_px,
+            Point::new(-10, 20)
+        );
+        // A keyword/percentage carries no pixel component (it's in the fraction).
+        assert_eq!(
+            sty("background-position: center").background_position_px,
+            Point::ZERO
+        );
+        // A keyword on x, a length on y: the length lands on the y axis.
+        assert_eq!(
+            sty("background-position: center -260px").background_position_px,
+            Point::new(0, -260)
+        );
     }
 
     #[test]
@@ -2913,9 +3216,9 @@ mod tests {
         );
 
         // A gradient's internal `%` stops are masked, not read as a position; with
-        // no slash the size stays the Fill default.
+        // no slash the size stays the `auto` initial value.
         let g = s("background: linear-gradient(red 50%, blue)");
-        assert_eq!(g.background_size, ImageFit::Fill);
+        assert_eq!(g.background_size, ImageFit::Auto);
         assert_eq!(g.background_position, ImagePos::TOP_LEFT);
         assert!(g.background_gradient.is_some());
 
@@ -2924,8 +3227,8 @@ mod tests {
         let reset_size = s("background-size: cover; background: url(x)");
         assert_eq!(
             reset_size.background_size,
-            ImageFit::Fill,
-            "background shorthand resets a prior background-size longhand"
+            ImageFit::Auto,
+            "background shorthand resets a prior background-size longhand to auto"
         );
         let reset_pos = s("background-position: right; background: url(x)");
         assert_eq!(

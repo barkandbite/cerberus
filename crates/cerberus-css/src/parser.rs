@@ -9,8 +9,11 @@
 //! `:root`), grouping `,`, and the descendant / child (`>`) / adjacent-sibling
 //! (`+`) / general-sibling (`~`) combinators. State pseudo-classes (`:hover`,
 //! `:focus`, `:active`, `:visited`, `:link`) parse but never match in the static
-//! cascade. `@media` blocks are parsed and gated on the viewport; other `@`-rules
-//! are skipped.
+//! cascade. `@media` blocks are parsed and gated on the viewport plus the fixed
+//! desktop persona (`prefers-color-scheme: light`, no reduced-motion/contrast,
+//! `hover`/`pointer: fine`, no forced colors) — matching what JS `matchMedia`
+//! reports; an unrecognized `@media` feature evaluates to false (never a vacuous
+//! match). Other `@`-rules are skipped.
 
 use std::rc::Rc;
 
@@ -278,6 +281,24 @@ enum MediaFeature {
     MaxHeight(u32),
     Portrait,
     Landscape,
+    /// A discrete preference/capability feature the desktop persona satisfies
+    /// (e.g. `prefers-color-scheme: light`), pre-evaluated at parse time.
+    AlwaysTrue,
+    /// A recognized feature the persona does NOT satisfy (e.g. a
+    /// `prefers-color-scheme: dark` block), or an *unrecognized* feature — which
+    /// per the CSS spec evaluates to false. Dropping unknown features instead
+    /// left an empty, vacuously-matching branch, so every dark-mode block
+    /// applied on a light page and washed out the design-system colors.
+    AlwaysFalse,
+}
+
+/// Map a persona-match boolean to the corresponding pre-evaluated feature.
+fn persona(matches: bool) -> MediaFeature {
+    if matches {
+        MediaFeature::AlwaysTrue
+    } else {
+        MediaFeature::AlwaysFalse
+    }
 }
 
 impl MediaQuery {
@@ -297,6 +318,8 @@ fn feature_matches(f: MediaFeature, ctx: MediaContext) -> bool {
         MediaFeature::MaxHeight(px) => ctx.height <= px,
         MediaFeature::Portrait => ctx.height >= ctx.width,
         MediaFeature::Landscape => ctx.width > ctx.height,
+        MediaFeature::AlwaysTrue => true,
+        MediaFeature::AlwaysFalse => false,
     }
 }
 
@@ -488,13 +511,28 @@ fn parse_media_query(text: &str) -> MediaQuery {
         .split(',')
         .map(|branch| {
             let mut feats = Vec::new();
-            // Split on `and`; ignore a leading media type (screen/all/print) and
-            // `only`/`not` qualifiers (best-effort).
+            // Split on `and`. Each part is either a `(feature)` or a bare media
+            // type/qualifier. We render as a screen, so only `screen`/`all` match;
+            // `print` (and other non-screen types) must NOT — they were vacuously
+            // matching, so e.g. Wikipedia's `@media print{a{color:#000!important}}`
+            // leaked onto the screen render.
             for part in branch.split(" and ") {
                 let part = part.trim().trim_start_matches("only ").trim();
                 if let Some(inner) = part.strip_prefix('(').and_then(|p| p.strip_suffix(')')) {
                     if let Some(f) = parse_media_feature(inner.trim()) {
                         feats.push(f);
+                    }
+                } else if !part.is_empty() {
+                    // A bare media type, optionally negated with `not`.
+                    let (ty, negated) = match part.strip_prefix("not ") {
+                        Some(rest) => (rest.trim(), true),
+                        None => (part, false),
+                    };
+                    let is_screen =
+                        ty.eq_ignore_ascii_case("screen") || ty.eq_ignore_ascii_case("all");
+                    // `screen`/`all` match; `not screen` / `print` / others don't.
+                    if is_screen == negated {
+                        feats.push(MediaFeature::AlwaysFalse);
                     }
                 }
             }
@@ -523,7 +561,23 @@ fn parse_media_feature(text: &str) -> Option<MediaFeature> {
             "landscape" => Some(MediaFeature::Landscape),
             _ => None,
         },
-        _ => None,
+        // Discrete preference/capability features, evaluated against the fixed
+        // desktop persona: light theme, no motion/contrast preference, a mouse
+        // (hover + fine pointer), no forced colors. This is the SAME persona JS
+        // `matchMedia` reports, so CSS `@media` and script agree. A block the
+        // persona doesn't satisfy (e.g. `prefers-color-scheme: dark`) must NOT
+        // apply.
+        "prefers-color-scheme" => Some(persona(value == "light")),
+        "prefers-reduced-motion" => Some(persona(value != "reduce")),
+        "prefers-reduced-transparency" => Some(persona(value != "reduce")),
+        "prefers-contrast" => Some(persona(value == "no-preference" || value.is_empty())),
+        "forced-colors" => Some(persona(value == "none")),
+        "inverted-colors" => Some(persona(value == "none")),
+        "hover" | "any-hover" => Some(persona(value == "hover")),
+        "pointer" | "any-pointer" => Some(persona(value == "fine")),
+        // Any other feature is unrecognized → false (CSS spec), rather than
+        // being dropped into a vacuously-matching empty branch.
+        _ => Some(MediaFeature::AlwaysFalse),
     }
 }
 
@@ -975,6 +1029,73 @@ mod tests {
             width: 1200,
             height: 800
         }));
+    }
+
+    #[test]
+    fn media_preference_features_track_the_light_desktop_persona() {
+        let ctx = MediaContext {
+            width: 1000,
+            height: 700,
+        };
+        let applies = |css: &str| parse_stylesheet(css).rules[0].applies(ctx);
+        // A dark-scheme block must NOT apply on the light persona. Regression:
+        // the unrecognized feature was dropped, leaving an empty branch that
+        // vacuously matched, so dark colors overrode the light ones everywhere.
+        assert!(!applies(
+            "@media (prefers-color-scheme: dark) { p { color: red } }"
+        ));
+        assert!(!applies(
+            "@media only screen and (prefers-color-scheme: dark) { p { color: red } }"
+        ));
+        // The matching light-scheme block does apply.
+        assert!(applies(
+            "@media (prefers-color-scheme: light) { p { color: red } }"
+        ));
+        // Reduced-motion / forced-colors blocks the persona doesn't request.
+        assert!(!applies(
+            "@media (prefers-reduced-motion: reduce) { p { color: red } }"
+        ));
+        assert!(!applies(
+            "@media (forced-colors: active) { p { color: red } }"
+        ));
+        // Desktop capabilities the persona has.
+        assert!(applies(
+            "@media (hover: hover) and (pointer: fine) { p { color: red } }"
+        ));
+        // A genuinely unknown feature evaluates to false, not a vacuous match.
+        assert!(!applies(
+            "@media (some-future-feature: 3) { p { color: red } }"
+        ));
+        // A width branch combined with an unmet dark scheme still fails.
+        assert!(!applies(
+            "@media (min-width: 100px) and (prefers-color-scheme: dark) { p { color: red } }"
+        ));
+    }
+
+    #[test]
+    fn print_and_non_screen_media_types_do_not_match_the_screen() {
+        let ctx = MediaContext {
+            width: 1000,
+            height: 700,
+        };
+        let applies = |css: &str| parse_stylesheet(css).rules[0].applies(ctx);
+        // Regression: bare media types were skipped, leaving an empty branch that
+        // vacuously matched, so `@media print` styles leaked onto the screen
+        // render (e.g. Wikipedia's `a{color:#000!important}`).
+        assert!(!applies("@media print { a { color: #000 } }"));
+        assert!(!applies("@media handheld { a { color: red } }"));
+        assert!(!applies(
+            "@media print and (min-width: 100px) { a { color: red } }"
+        ));
+        // `screen` / `all` still match, with or without features.
+        assert!(applies("@media screen { a { color: red } }"));
+        assert!(applies("@media all { a { color: red } }"));
+        assert!(applies(
+            "@media only screen and (min-width: 100px) { a { color: red } }"
+        ));
+        // Negation: `not print` matches a screen; `not screen` does not.
+        assert!(applies("@media not print { a { color: red } }"));
+        assert!(!applies("@media not screen { a { color: red } }"));
     }
 
     #[test]

@@ -38,6 +38,7 @@
 
 use cerberus_js::{JsEngine, JsEngineFactory, JsError, JsValue};
 use cerberus_types::RealmId;
+use rquickjs::context::EvalOptions;
 use rquickjs::{CatchResultExt, Coerced, Context, Ctx, Runtime, Value};
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
@@ -345,7 +346,7 @@ impl JsEngine for QuickJsEngine {
         let context = self.realms.get(&id).ok_or(JsError::NoSuchRealm(id))?;
         self.with_deadline(|| {
             context.with(|ctx| {
-                ctx.eval::<(), _>(script)
+                ctx.eval_with_options::<(), _>(script, sloppy_eval_options())
                     .catch(&ctx)
                     .map_err(|e| JsError::Eval(e.to_string()))
             })
@@ -357,7 +358,7 @@ impl JsEngine for QuickJsEngine {
         self.with_deadline(|| {
             context.with(|ctx| {
                 let value = ctx
-                    .eval::<Value<'_>, _>(source)
+                    .eval_with_options::<Value<'_>, _>(source, sloppy_eval_options())
                     .catch(&ctx)
                     .map_err(|e| JsError::Eval(e.to_string()))?;
                 // Drain the job queue so Promise reactions and queueMicrotask
@@ -380,6 +381,18 @@ impl JsEngine for QuickJsEngine {
     fn realm_count(&self) -> usize {
         self.realms.len()
     }
+}
+
+/// Eval options that match a browser's classic inline `<script>`: global scope,
+/// **sloppy** (non-strict) mode. rquickjs defaults `strict` to `true`, which
+/// makes an implicit global assignment (`foo = 1` with no prior declaration)
+/// throw `ReferenceError`. Real pages rely on sloppy-mode semantics — e.g.
+/// Wikipedia's portal reveal script assigns `portalSearchDomain = '…'` without
+/// declaring it — so we evaluate page scripts in sloppy mode to keep parity.
+fn sloppy_eval_options() -> EvalOptions {
+    let mut opts = EvalOptions::default();
+    opts.strict = false;
+    opts
 }
 
 /// Convert a QuickJS [`Value`] into the engine-neutral [`JsValue`].
@@ -487,6 +500,22 @@ mod tests {
         assert_eq!(e.eval(r, "let q = 5;").unwrap(), JsValue::Undefined);
         // null collapses to Undefined (the seam has no null).
         assert_eq!(e.eval(r, "null").unwrap(), JsValue::Undefined);
+    }
+
+    #[test]
+    fn implicit_global_assignment_is_sloppy_not_strict() {
+        // Browsers run classic inline <script> in sloppy mode, where assigning to
+        // an undeclared identifier creates a global rather than throwing. rquickjs
+        // defaults to strict mode, so without an override this would be a
+        // ReferenceError (regression: Wikipedia's portal reveal script does
+        // `portalSearchDomain = '…'` and relied on this).
+        let r = realm(1);
+        let mut e = engine_with_realm(r);
+        e.eval(r, "portalSearchDomain = 'wikipedia.org';").unwrap();
+        assert_eq!(
+            e.eval(r, "portalSearchDomain").unwrap(),
+            JsValue::Str("wikipedia.org".to_string())
+        );
     }
 
     #[test]

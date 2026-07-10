@@ -9,6 +9,7 @@
 //! present, with the consent and farbling seams exercised along the way.
 
 pub mod mirror;
+pub mod parity;
 
 /// Lock a `Mutex`, recovering the guard if a previous holder panicked and
 /// poisoned it instead of propagating the panic — one poisoned critical
@@ -41,10 +42,23 @@ use cerberus_js_dom::{
     FetchResponse, PageEnv, RebuiltDom,
 };
 use cerberus_js_quickjs::QuickJsEngineFactory;
+pub use cerberus_layout::LayoutEngineKind;
 use cerberus_layout::{
     pick_img_url, BlockLayout, ElementBox, FieldKind, FormFieldBox, FormState, ImageProvider,
     LayoutEngine, LinkBox, NoForms, NoImages,
 };
+
+/// Construct the selected layout engine, composing the two adapters here (in the
+/// app) so `cerberus-layout` need not depend on `cerberus-taffy` — the taffy
+/// engine implements `cerberus-layout`'s trait, and this is the only place that
+/// knows both. `Block` is the hand-rolled walker; `Taffy` is the standardized
+/// block/flex/grid box engine (`RENDERING_ARCHITECTURE_PLAN.md`, Stage 3).
+fn make_layout(kind: LayoutEngineKind) -> Box<dyn LayoutEngine> {
+    match kind {
+        LayoutEngineKind::Block => Box::new(BlockLayout::default()),
+        LayoutEngineKind::Taffy => Box::new(cerberus_taffy::TaffyLayout),
+    }
+}
 use cerberus_net::{
     parse_proxy, BuiltinHttpClient, CachingResolver, CookieJar, FallbackResolver, FetchContext,
     FetchKind, HttpCache, HttpClient, HttpResponse, ProxyConfig, Router, SystemResolver,
@@ -98,6 +112,10 @@ pub struct RenderConfig {
     pub proxy: Option<String>,
     /// Collect per-stage timings into [`RenderOutcome::timings`] (`--timers`).
     pub timers: bool,
+    /// Which layout engine to use (`--engine block|taffy`), for A/B parity
+    /// comparison during the layout migration. Defaults to the `CERB_LAYOUT` env
+    /// (else the block walker).
+    pub layout_engine: LayoutEngineKind,
 }
 
 impl Default for RenderConfig {
@@ -112,6 +130,7 @@ impl Default for RenderConfig {
             dump_text: false,
             proxy: None,
             timers: false,
+            layout_engine: LayoutEngineKind::from_env(),
         }
     }
 }
@@ -893,6 +912,57 @@ impl CookieJar for SealedJar {
     }
 }
 
+/// The first element with `tag` in this subtree (including `node`), depth-first
+/// in document order.
+fn find_styled_tag<'a>(node: &'a StyledNode, tag: &str) -> Option<&'a StyledNode> {
+    if node.tag == tag {
+        return Some(node);
+    }
+    node.children.iter().find_map(|c| match c {
+        StyledChild::Element(e) => find_styled_tag(e, tag),
+        StyledChild::Text(_) => None,
+    })
+}
+
+/// The canvas (viewport) background. CSS propagates the root element's used
+/// background to the whole canvas; when the root `<html>` paints none, the
+/// `<body>`'s background propagates instead. A translucent color is composited
+/// over `fallback` (the default white canvas); a fully transparent one — or the
+/// absence of both — leaves `fallback` showing. Without this the body's short,
+/// auto-height box paints its color only near the top and the rest of the
+/// viewport stays white, unlike Chrome which fills the whole page (e.g.
+/// example.com's `#f0f0f2` body background).
+fn canvas_background(styled: &StyledDom, fallback: Color) -> Color {
+    fn resolve(bg: Option<Color>, base: Color) -> Option<Color> {
+        let c = bg?;
+        match c.a {
+            0 => None,
+            255 => Some(c),
+            a => {
+                let mix = |f: u8, b: u8| {
+                    ((f as u16 * a as u16 + b as u16 * (255 - a as u16)) / 255) as u8
+                };
+                Some(Color::rgb(
+                    mix(c.r, base.r),
+                    mix(c.g, base.g),
+                    mix(c.b, base.b),
+                ))
+            }
+        }
+    }
+    let root = &styled.root;
+    let html = find_styled_tag(root, "html").unwrap_or(root);
+    if let Some(bg) = resolve(html.style.background, fallback) {
+        return bg;
+    }
+    if let Some(body) = find_styled_tag(html, "body") {
+        if let Some(bg) = resolve(body.style.background, fallback) {
+            return bg;
+        }
+    }
+    fallback
+}
+
 /// Run the full render pipeline and return a summary plus the frame.
 pub fn render(config: &RenderConfig) -> Result<RenderOutcome, AppError> {
     install_psl();
@@ -1092,7 +1162,11 @@ pub fn render(config: &RenderConfig) -> Result<RenderOutcome, AppError> {
         None => ExternalSheets::new(),
     };
     let style_t = Instant::now();
-    let styled = CssEngine::new().style_with_sheets(&document, &sheets);
+    // Evaluate @media against the actual render viewport, so width/height queries
+    // (responsive breakpoints) select the same layout Chrome shows at this size —
+    // not a hardcoded desktop default that can disagree with the layout width.
+    let styled = CssEngine::with_media(config.viewport.w, config.viewport.h)
+        .style_with_sheets(&document, &sheets);
     timings.record("style", style_t.elapsed());
 
     // Fetch + decode this page's images up front (the one-shot path is
@@ -1146,14 +1220,18 @@ pub fn render(config: &RenderConfig) -> Result<RenderOutcome, AppError> {
     toolbar.url_text = config.url.clone();
     let content = toolbar.content_size(config.viewport);
 
-    // Lay out + paint the page into the content area only.
+    // Lay out + paint the page into the content area only. The canvas background
+    // is the root/body background propagated to the viewport (CSS), not just the
+    // page's default white — so a page whose `<body>` sets a color fills the
+    // whole content area, matching Chrome.
+    let canvas_bg = canvas_background(&styled, config.background);
     let layout_t = Instant::now();
-    let mut layout = BlockLayout::default();
+    let mut layout = make_layout(config.layout_engine);
     let page = render_document(
         &styled,
         content,
-        config.background,
-        &mut layout,
+        canvas_bg,
+        &mut *layout,
         &text,
         &text,
         &provider,
@@ -1164,7 +1242,7 @@ pub fn render(config: &RenderConfig) -> Result<RenderOutcome, AppError> {
 
     // Compose: page under the toolbar, toolbar painted on top.
     let mut framebuffer = Framebuffer::new(config.viewport);
-    framebuffer.clear(config.background);
+    framebuffer.clear(canvas_bg);
     framebuffer.blit(toolbar.content_origin(), &page);
     text.rasterize(&toolbar.paint(config.viewport, &text), &mut framebuffer);
 
@@ -4276,13 +4354,24 @@ fn computed_css(s: &cerberus_style::ComputedStyle) -> Vec<(String, String)> {
         ("display".to_string(), display.to_string()),
         ("visibility".to_string(), visibility.to_string()),
         ("opacity".to_string(), format!("{}", s.opacity)),
-        ("margin-top".to_string(), format!("{}px", s.margin_top)),
-        (
-            "margin-bottom".to_string(),
-            format!("{}px", s.margin_bottom),
-        ),
-        ("margin-left".to_string(), format!("{}px", s.margin_left)),
+        ("margin-top".to_string(), fmt_len(s.margin_top)),
+        ("margin-bottom".to_string(), fmt_len(s.margin_bottom)),
+        ("margin-left".to_string(), fmt_len(s.margin_left)),
     ]
+}
+
+/// Serialize a margin `Len` as a CSS string for `getComputedStyle` reporting.
+fn fmt_len(len: cerberus_style::Len) -> String {
+    use cerberus_style::Len;
+    match len {
+        Len::Auto => "auto".to_string(),
+        Len::Px(p) => format!("{p}px"),
+        Len::Pct(f) => format!("{f}%"),
+        Len::Vw(f) => format!("{f}vw"),
+        Len::Vh(f) => format!("{f}vh"),
+        Len::Vmin(f) => format!("{f}vmin"),
+        Len::Vmax(f) => format!("{f}vmax"),
+    }
 }
 
 /// Collect `(js-id, computed-css)` for every styled element that has a live
@@ -4375,6 +4464,11 @@ impl FrameApp for BrowserApp {
         let mut origin = self.toolbar.content_origin();
         origin.y += banner_h as i32;
 
+        // The canvas background is the root/body background propagated to the
+        // viewport (CSS), so a page whose `<body>` sets a color fills the whole
+        // content area rather than leaving white below its short box.
+        let canvas_bg = canvas_background(&self.styled, self.background);
+
         // Time layout+paint (M11). The image provider's borrow of `self` is
         // scoped to this block so the timing record (a `&mut self` op) is free.
         let t = Instant::now();
@@ -4386,7 +4480,7 @@ impl FrameApp for BrowserApp {
             let mut layout = BlockLayout::default();
             let laid = layout.layout(&self.styled, content, &self.text, &provider, &self.forms);
             let mut page = Framebuffer::new(Size::new(su(content.w), su(content.h)));
-            page.clear(self.background);
+            page.clear(canvas_bg);
             self.text.rasterize(&laid.display.scaled(scale), &mut page);
             (laid, page)
         };
@@ -4453,7 +4547,7 @@ impl FrameApp for BrowserApp {
         self.paint_caret(&mut page, origin, scale);
 
         let mut fb = Framebuffer::new(size);
-        fb.clear(self.background);
+        fb.clear(canvas_bg);
         fb.blit(Point::new(si(origin.x), si(origin.y)), &page);
         self.text.rasterize(
             &self.toolbar.paint(logical, &self.text).scaled(scale),
@@ -5470,6 +5564,11 @@ fn paint_settings_overlay(
             style: FontStyle::REGULAR,
         });
     }
+    // A glyph's origin.y is the TOP of the text box, so a label is vertically
+    // centered in an `h`-tall row at `y + (h - px) / 2` — the same formula the
+    // toolbar buttons use. (The old `+ 16` was a baseline-style offset that left
+    // the 14px label hanging below the 22px row.)
+    let row_label_dy = (settings_cookies_rect(size).h as i32 - 14) / 2;
     // Entry point to the cookie inspector.
     let cr = settings_cookies_rect(size);
     list.push(DisplayItem::Rect {
@@ -5477,7 +5576,7 @@ fn paint_settings_overlay(
         color: Color::rgb(0xE6, 0xEE, 0xF6),
     });
     list.push(DisplayItem::Glyphs {
-        origin: Point::new(cr.x + 6, cr.y + 16),
+        origin: Point::new(cr.x + 8, cr.y + row_label_dy),
         glyphs: shaper.shape("manage cookies  >", 14),
         color: Color::rgb(0x20, 0x40, 0x70),
         style: FontStyle::REGULAR,
@@ -5489,7 +5588,7 @@ fn paint_settings_overlay(
         color: Color::rgb(0xE6, 0xEE, 0xF6),
     });
     list.push(DisplayItem::Glyphs {
-        origin: Point::new(tr.x + 6, tr.y + 16),
+        origin: Point::new(tr.x + 8, tr.y + row_label_dy),
         glyphs: shaper.shape(
             if hud_on {
                 "performance HUD: on"
@@ -5769,6 +5868,36 @@ mod tests {
     }
 
     #[test]
+    fn settings_row_labels_stay_inside_their_highlight_boxes() {
+        // Regression: a glyph's origin.y is the TOP of the text, so a 14px label
+        // in an `h`-tall clickable row must sit at `(h - 14)/2`, not the old `+16`
+        // baseline-style offset that pushed it below the box. Paint the overlay
+        // and assert the strip just below each row's highlight box is blank — no
+        // label ink spilled out the bottom.
+        let size = Size::new(800, 650);
+        let mut fb = Framebuffer::new(size);
+        fb.clear(Color::WHITE);
+        let text = TextEngine::new();
+        paint_settings_overlay(&mut fb, size, &text, &text, true, 3, None, false, 1.0);
+        for row in [settings_cookies_rect(size), settings_timers_rect(size)] {
+            let below = (row.y + row.h as i32) as u32;
+            for y in below..below + 5 {
+                for x in (row.x as u32)..(row.x as u32 + row.w) {
+                    if let Some(c) = fb.pixel(x, y) {
+                        assert!(
+                            c.r > 0xC8 && c.g > 0xC8 && c.b > 0xC8,
+                            "label ink spilled below the row box at ({x},{y}): #{:02x}{:02x}{:02x}",
+                            c.r,
+                            c.g,
+                            c.b
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
     fn visible_text_skips_hidden_and_display_none() {
         // `--dump-text` must reflect what is painted: a `[hidden]` element (UA
         // `display:none`), an inline `display:none`, and everything nested under
@@ -5786,6 +5915,48 @@ mod tests {
         let styled = CssEngine::new().style(&doc);
         // The two visible <p> blocks read on their own lines.
         assert_eq!(visible_text(&styled.root), "A\nB");
+    }
+
+    #[test]
+    fn canvas_background_propagates_body_color_to_the_viewport() {
+        // A `<body>` background (with no `<html>` background) propagates to the
+        // whole canvas — the fix for pages like example.com whose grey body
+        // filled only its short box in Cerberus while Chrome filled the page.
+        let styled = CssEngine::new().style(&parse_html(
+            "<body style='background:#f0f0f2'><p>hi</p></body>",
+        ));
+        assert_eq!(
+            canvas_background(&styled, Color::WHITE),
+            Color::rgb(0xf0, 0xf0, 0xf2)
+        );
+    }
+
+    #[test]
+    fn canvas_background_prefers_html_then_falls_back() {
+        // `<html>` background wins over `<body>`'s (root-element propagation).
+        let s1 = CssEngine::new().style(&parse_html(
+            "<html style='background:#112233'><body style='background:#445566'></body></html>",
+        ));
+        assert_eq!(
+            canvas_background(&s1, Color::WHITE),
+            Color::rgb(0x11, 0x22, 0x33)
+        );
+        // Neither sets one → the fallback (white) shows.
+        let s2 = CssEngine::new().style(&parse_html("<body><p>x</p></body>"));
+        assert_eq!(canvas_background(&s2, Color::WHITE), Color::WHITE);
+    }
+
+    #[test]
+    fn canvas_background_composites_a_translucent_body_over_white() {
+        // A 50%-alpha black body background composites to mid-grey over white.
+        let styled = CssEngine::new().style(&parse_html(
+            "<body style='background:rgba(0,0,0,0.5)'></body>",
+        ));
+        let bg = canvas_background(&styled, Color::WHITE);
+        assert!(
+            (bg.r as i32 - 127).abs() <= 1 && bg.r == bg.g && bg.g == bg.b,
+            "expected ~127 grey, got {bg:?}"
+        );
     }
 
     #[test]
@@ -6666,6 +6837,41 @@ mod tests {
         assert_eq!(b.status(), 200);
         assert!(b.document.root().text_content().contains("Hello"));
         assert!(!b.toolbar.loading);
+    }
+
+    #[test]
+    fn script_hiding_an_element_removes_it_from_the_render() {
+        // The core of JS-driven show/hide (RENDERING_PARITY_PLAN.md W-F): a page
+        // script that sets `style.display = 'none'` (the mechanism a fundraising
+        // banner uses to hide itself) must drop the element from what is painted,
+        // while the node stays in the DOM. Verified against the styled tree
+        // (`visible_text` honors display:none), not the raw DOM text.
+        let mut b = fake_app(vec![(
+            "https://hide.test/",
+            Ok(page(
+                "https://hide.test/",
+                200,
+                None,
+                "<div id=\"banner\">DONATE NOW</div><p>real content</p>\
+                 <script>document.getElementById('banner').style.display = 'none'</script>",
+            )),
+        )]);
+        b.navigate("https://hide.test/");
+        assert!(b.poll());
+        let painted = visible_text(&b.styled.root);
+        assert!(
+            painted.contains("real content"),
+            "visible content present; got {painted:?}"
+        );
+        assert!(
+            !painted.contains("DONATE NOW"),
+            "script-hidden banner must not be painted; got {painted:?}"
+        );
+        // The banner is hidden, not deleted — it remains in the DOM.
+        assert!(
+            b.document.root().text_content().contains("DONATE NOW"),
+            "hidden element stays in the DOM"
+        );
     }
 
     #[test]

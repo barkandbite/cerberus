@@ -3,6 +3,66 @@
 All notable changes to Cerberus are recorded here. Versions are small while the
 browser is pre-1.0; this is the first tagged preview.
 
+## [0.0.10] — 2026-07-04
+
+Coherent per-window fingerprint personas: each identity now presents one
+internally-consistent browser, and the fingerprint surface a real page (or an
+anti-bot sensor) reads is complete and self-consistent rather than a mix of
+honest and hardcoded values.
+
+### Added
+- **Coherent per-window profiles (`cerberus-profile`).** Every head derives a
+  full, internally-consistent persona from its seed — OS, `navigator.userAgent`
+  and platform, UA client hints, hardware concurrency / device memory, screen
+  resolution and DPR, WebGL vendor/renderer, timezone, languages, and fonts — all
+  picked from a market-share-weighted table of real device classes so the axes
+  are coherent by construction (never, say, a Windows UA over an Apple/Metal GPU).
+  The persona is injected ahead of the per-head farbling prologue in both the
+  single-window and mirror paths, so the DOM model and WebGL shims read one
+  identity per window.
+- **Complete JS fingerprint surface.** The DOM model now exposes the full set a
+  real Chrome does: `screen.orientation`, seeded `crypto` (`getRandomValues`/
+  `subtle`/`randomUUID`), `Intl` (`DateTimeFormat`/`NumberFormat`/`Collator`),
+  `navigator.plugins`/`mimeTypes`/`userAgentData`/`connection`/`mediaDevices`/
+  `permissions`/`getBattery`/`storage`, `window.chrome`/`visualViewport`/
+  frame-identity/`CSS`/`TextEncoder`/`TextDecoder`, and document metadata
+  (`characterSet`/`compatMode`/`visibilityState`/`fonts`/`implementation`). A
+  missing or impossible read is itself the tell these fill in.
+
+### Fixed
+- **Split-brain identity (critical).** `navigator.userAgent`/`platform` used to
+  track the honest env UA while `userAgentData`, high-entropy hints, and the
+  WebGL renderer were hardcoded Chrome-on-Windows, so the OS axes disagreed. All
+  axes now read the one injected persona; a non-Chromium persona exposes no UA-CH,
+  matching a real Firefox.
+- **Impossible window geometry.** `outerHeight` could exceed `screen.height` (a
+  window taller than its monitor). The screen is now a real monitor larger than
+  the viewport with the work area reserving OS chrome, so
+  `screen ≥ avail ≥ outer ≥ inner` holds with real browser chrome.
+- **Constant `crypto` stream across heads.** The per-head seed for
+  `crypto.getRandomValues`/`randomUUID` was never reachable, so every head (and
+  every install) emitted an identical random stream — a perfect cross-head
+  correlation key. Each head now seeds a distinct stream.
+- **reese84 solver crash.** DOM nodes now expose `__proto__`, so the obfuscated
+  Imperva sensor's `node.__proto__.method` access no longer throws; the process
+  time zone is pinned to the persona's zone so `Date`/`Intl` agree.
+- **Conformance polish.** `PermissionStatus`/`mediaDevices`/`getBattery` are now
+  `EventTarget`s (`addEventListener` no longer throws); `performance` reports an
+  epoch-anchored `timeOrigin` with a coherent monotonic timing sequence instead
+  of an all-zero clock; `TextEncoder` substitutes U+FFFD for unpaired surrogates
+  (matching Chrome byte-for-byte); and a WebGL2 context advertises the WebGL2
+  extension set, core WebGL2 limits, and WebGL2 methods rather than the WebGL1
+  surface.
+
+### Notes
+- The JS fingerprint surface a page reads is now coherent and complete, and the
+  Imperva sensor executes without error. The browser still does **not** pass a
+  live anti-bot challenge end-to-end: the network `User-Agent` remains
+  honest-first (the persona drives the script-visible surface, not yet the HTTP
+  request header), and the sensor still defers its final solution to the
+  `/_Incapsula_Resource` sub-document, which is not yet executed. Passing a live
+  challenge is not a supported outcome — see the standing note in 0.0.9.
+
 ## [0.0.9] — 2026-07-03
 
 reese84/Imperva bot-challenge handshake machinery, and the page-script fidelity

@@ -75,6 +75,184 @@ pub struct LaidOut {
     pub elements: Vec<ElementBox>,
 }
 
+/// The result of flowing a run of inline-level content into a fixed-width box —
+/// the output of [`flow_inline`], the leaf painter shared with the taffy engine.
+/// All coordinates are absolute (the box's own origin), so the caller splices the
+/// items straight into its display list.
+#[derive(Clone, Debug, Default)]
+pub struct InlineFlow {
+    pub display: Vec<DisplayItem>,
+    pub links: Vec<LinkBox>,
+    pub fields: Vec<FormFieldBox>,
+    pub elements: Vec<ElementBox>,
+    /// Content width actually used (rightmost inline cursor − left edge).
+    pub width: i32,
+    /// Content height (final flow cursor − top edge), floored at one line.
+    pub height: i32,
+    /// The form-control id counter after flowing, so the caller continues the
+    /// document-wide pre-order numbering across leaves.
+    pub next_field_id: u32,
+}
+
+/// Flow a slice of styled children (text / inline / inline-block / images / form
+/// controls / lists / tables) into a box of width `right − left` with its top-left
+/// at `(left, top)`, reusing the block engine's inline machinery — line breaking,
+/// shaping, `text-align`, atomic inline boxes, list markers, and replaced content.
+///
+/// This is the **inline formatting context leaf painter** the taffy engine uses
+/// (`RENDERING_ARCHITECTURE_PLAN.md`, Stage 3): taffy owns the block/flex/grid box
+/// geometry, and every inline run inside a box is measured and painted here, so the
+/// existing shaping/inline flow stays the single source of truth below the box
+/// level. Output is in absolute coordinates.
+#[allow(clippy::too_many_arguments)]
+pub fn flow_inline(
+    children: &[StyledChild],
+    text_style: &ComputedStyle,
+    align: TextAlign,
+    left: i32,
+    right: i32,
+    top: i32,
+    shaper: &dyn TextShaper,
+    images: &dyn ImageProvider,
+    forms: &dyn FormState,
+    field_id: u32,
+    vw: i32,
+    vh: i32,
+) -> InlineFlow {
+    let mut sub = Ctx::sub(left, right, top, shaper, images, forms, field_id, vw, vh);
+    sub.line_align = align;
+    for child in children {
+        match child {
+            // Bare text uses the containing element's inherited style (color, font,
+            // size); the caller passes it as `text_style`. Nested inline elements
+            // carry their own cascaded style through `walk`.
+            StyledChild::Text(t) => sub.add_text(t, text_style, None),
+            StyledChild::Element(e) => sub.walk(e, None),
+        }
+    }
+    sub.flush_line();
+    let width = (sub.max_x - left).max(0);
+    let height = (sub.y - top).max(0);
+    let next_field_id = sub.field_id;
+    InlineFlow {
+        display: sub.display.items,
+        links: sub.links,
+        fields: sub.fields,
+        elements: sub.elements,
+        width,
+        height,
+        next_field_id,
+    }
+}
+
+/// Append a block box's decorations — drop shadow, background (color / gradient /
+/// image), then border — for a border-box `rect`, in the same paint order as the
+/// walker's own box painting. The taffy engine calls this for each element box
+/// before flowing that box's content on top, so both engines decorate boxes
+/// identically (`RENDERING_ARCHITECTURE_PLAN.md`, Stage 3). Content the caller
+/// appends afterward therefore paints over the background, as in normal flow.
+pub fn box_decorations(
+    style: &ComputedStyle,
+    rect: Rect,
+    images: &dyn ImageProvider,
+    out: &mut Vec<DisplayItem>,
+) {
+    if let Some(sh) = style.box_shadow.as_deref() {
+        out.push(DisplayItem::Shadow {
+            rect: Rect::new(rect.x + sh.dx, rect.y + sh.dy, rect.w, rect.h),
+            blur: sh.blur.max(0) as u16,
+            color: sh.color,
+        });
+    }
+    let (bt, br, bb, bl) = (
+        style.border_top.max(0),
+        style.border_right.max(0),
+        style.border_bottom.max(0),
+        style.border_left.max(0),
+    );
+    let radius = style.border_radius;
+    let has_border = bt > 0 || br > 0 || bb > 0 || bl > 0;
+    // Background fill (gradient wins, else solid color), then background-image.
+    let fill = |rect: Rect, radius: u16, out: &mut Vec<DisplayItem>| {
+        if let Some(g) = style.background_gradient.as_deref() {
+            out.push(DisplayItem::Gradient {
+                rect,
+                start: g.start,
+                end: g.end,
+                vertical: g.vertical,
+                radius,
+            });
+        } else if let Some(color) = style.background {
+            out.push(if radius > 0 {
+                DisplayItem::RoundRect {
+                    rect,
+                    color,
+                    radius,
+                }
+            } else {
+                DisplayItem::Rect { rect, color }
+            });
+        }
+        if let Some(url) = &style.background_image {
+            if let Some(img) = images.get(url) {
+                out.push(DisplayItem::Image {
+                    rect,
+                    image: img,
+                    fit: style.background_size,
+                    pos: style.background_position,
+                    pos_px: style.background_position_px,
+                });
+            }
+        }
+    };
+    if radius > 0 {
+        if has_border {
+            out.push(DisplayItem::RoundRect {
+                rect,
+                color: style.border_color,
+                radius,
+            });
+        }
+        let inner = Rect::new(
+            rect.x + bl,
+            rect.y + bt,
+            (rect.w as i32 - bl - br).max(0) as u32,
+            (rect.h as i32 - bt - bb).max(0) as u32,
+        );
+        let inner_r = (radius as i32 - bl.max(br).max(bt).max(bb)).max(0) as u16;
+        fill(inner, inner_r, out);
+    } else {
+        fill(rect, 0, out);
+        let col = style.border_color;
+        let (l, t) = (rect.x, rect.y);
+        let (w, h) = (rect.w as i32, rect.h as i32);
+        if bt > 0 {
+            out.push(DisplayItem::Rect {
+                rect: Rect::new(l, t, w.max(0) as u32, bt as u32),
+                color: col,
+            });
+        }
+        if bb > 0 {
+            out.push(DisplayItem::Rect {
+                rect: Rect::new(l, t + h - bb, w.max(0) as u32, bb as u32),
+                color: col,
+            });
+        }
+        if bl > 0 {
+            out.push(DisplayItem::Rect {
+                rect: Rect::new(l, t, bl as u32, h.max(0) as u32),
+                color: col,
+            });
+        }
+        if br > 0 {
+            out.push(DisplayItem::Rect {
+                rect: Rect::new(l + w - br, t, br as u32, h.max(0) as u32),
+                color: col,
+            });
+        }
+    }
+}
+
 /// Supplies the live state of form controls to layout, keyed by field id (the
 /// same pre-order index layout assigns). An implementation returns `Some`/`true`
 /// only for fields the user has actually touched; layout falls back to the DOM
@@ -116,6 +294,46 @@ pub struct NoImages;
 impl ImageProvider for NoImages {
     fn get(&self, _src: &str) -> Option<Arc<DecodedImage>> {
         None
+    }
+}
+
+/// Which layout engine to use. `Block` is the current hand-rolled single-pass
+/// walker; `Taffy` will be a spec-correct block/flex/grid box engine
+/// (`RENDERING_ARCHITECTURE_PLAN.md`). During the strangler-fig migration both
+/// are constructed via [`make_layout`] and A/B-compared on the parity corpus,
+/// with `Block` the default until a page's `Taffy` RMSE is no worse.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub enum LayoutEngineKind {
+    #[default]
+    Block,
+    Taffy,
+}
+
+impl LayoutEngineKind {
+    /// Parse an engine name (`block` / `taffy`); unknown names fall back to
+    /// `Block`.
+    pub fn parse(s: &str) -> Self {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "taffy" => LayoutEngineKind::Taffy,
+            _ => LayoutEngineKind::Block,
+        }
+    }
+
+    /// Read the engine from the `CERB_LAYOUT` env var (default `Block`), so the
+    /// corpus harness can A/B without a rebuild.
+    pub fn from_env() -> Self {
+        std::env::var("CERB_LAYOUT")
+            .map(|v| Self::parse(&v))
+            .unwrap_or_default()
+    }
+}
+
+/// Construct the selected layout engine behind the [`LayoutEngine`] trait. Until
+/// the taffy engine lands, `Taffy` aliases the walker so the selection seam and
+/// A/B harness can be exercised with byte-identical output.
+pub fn make_layout(kind: LayoutEngineKind) -> Box<dyn LayoutEngine> {
+    match kind {
+        LayoutEngineKind::Block | LayoutEngineKind::Taffy => Box::new(BlockLayout::default()),
     }
 }
 
@@ -247,6 +465,15 @@ struct Ctx<'a> {
     line_h: i32,
     line: Vec<LinePiece>,
     line_align: TextAlign,
+    /// Output-buffer lengths at the start of the current line, so `text-align`
+    /// can shift the atomic inline boxes added mid-line (inline-blocks, form
+    /// fields, buttons, inline images) — which go straight to these buffers
+    /// rather than the buffered `line` of text pieces — by the same offset as the
+    /// text. Without this, only text centered/right-aligned; boxes stayed left.
+    line_disp0: usize,
+    line_links0: usize,
+    line_fields0: usize,
+    line_elems0: usize,
     /// The `NodeId` of the enclosing `<a>` while flowing its inline content, so
     /// each link piece can carry it into a hit box for event dispatch (M12b).
     cur_link_node: Option<NodeId>,
@@ -318,6 +545,10 @@ impl<'a> Ctx<'a> {
             line_h: 0,
             line: Vec::new(),
             line_align: TextAlign::Left,
+            line_disp0: 0,
+            line_links0: 0,
+            line_fields0: 0,
+            line_elems0: 0,
             cur_link_node: None,
             opacity_hidden: false,
             scratch: None,
@@ -377,6 +608,10 @@ impl<'a> Ctx<'a> {
             line_h: 0,
             line: Vec::new(),
             line_align: TextAlign::Left,
+            line_disp0: 0,
+            line_links0: 0,
+            line_fields0: 0,
+            line_elems0: 0,
             cur_link_node: None,
             opacity_hidden: false,
             scratch: None,
@@ -418,7 +653,16 @@ impl<'a> Ctx<'a> {
             }
             "img" => {
                 if visible {
+                    // A positioned <img> (e.g. Wikipedia's globe:
+                    // position:absolute;top:158px inside the relative wordmark box)
+                    // must resolve its insets like any positioned box, not lay in
+                    // normal flow. Capture flow state, lay the replaced box, then
+                    // translate/lift it against its containing block.
+                    let base = self.positioned_base(style);
                     self.image(node, in_link);
+                    if let Some(base) = base {
+                        self.apply_positioning(style, base);
+                    }
                 }
                 return;
             }
@@ -429,10 +673,16 @@ impl<'a> Ctx<'a> {
                 return;
             }
             "button" => {
-                if visible {
-                    self.form_button(node);
+                // `as_block_once` means `form_button` is re-laying this button as a
+                // content container (to render its icon/span children) — fall
+                // through to block layout, which paints its box and walks children.
+                // Otherwise handle it as a form control.
+                if !self.as_block_once {
+                    if visible {
+                        self.form_button(node);
+                    }
+                    return;
                 }
-                return;
             }
             "textarea" => {
                 if visible {
@@ -490,7 +740,13 @@ impl<'a> Ctx<'a> {
                 fields: self.fields.len(),
                 elements: self.elements.len(),
                 y: self.y,
-                x: self.left0,
+                // The element's in-flow origin — its container's content-left
+                // (`self.left`), where its box is laid, NOT `self.left0` (an
+                // ancestor reference). In a centered container these differ, and
+                // the mismatch offset a left/top-anchored absolute box by exactly
+                // (self.left − self.left0) — e.g. Wikipedia's `left:60%` language
+                // columns landed far to the right.
+                x: self.left,
             })
         } else {
             None
@@ -506,15 +762,31 @@ impl<'a> Ctx<'a> {
             );
         let saved_right = if out_of_flow {
             let cb = self.containing_block(style.position);
-            let used_w = match (
-                style.inset_left.resolve_vp(cb.w, self.vw, self.vh),
-                style.inset_right.resolve_vp(cb.w, self.vw, self.vh),
-            ) {
-                (Some(l), Some(r)) => (cb.w - l - r).max(1),
-                _ => self.measure_intrinsic_width(node).clamp(1, cb.w.max(1)),
+            // An explicit `width` wins (CSS: a set width is the used width, even
+            // out of flow — e.g. Wikipedia's `.central-featured-lang{width:15.6rem}`,
+            // whose count text must not wrap). Otherwise: both insets set → the
+            // stretched inset gap; else shrink-to-fit intrinsic content width.
+            let used_w = if let Some(w) = style.width.resolve_vp(cb.w, self.vw, self.vh) {
+                w.max(1)
+            } else {
+                match (
+                    style.inset_left.resolve_vp(cb.w, self.vw, self.vh),
+                    style.inset_right.resolve_vp(cb.w, self.vw, self.vh),
+                ) {
+                    (Some(l), Some(r)) => (cb.w - l - r).max(1),
+                    _ => self.measure_intrinsic_width(node).clamp(1, cb.w.max(1)),
+                }
             };
             let saved = self.right;
-            self.right = self.left0 + used_w;
+            // Extend the used-width box from the element's flow-start (`self.left`,
+            // the current content-left of its container), NOT `self.left0` — the
+            // latter is an ancestor reference and, inside a centered/indented
+            // container (`margin:0 auto`), sits to the LEFT of `self.left`. With a
+            // narrow container that makes `right < left`, collapsing avail to 1px
+            // and wrapping the content (Wikipedia's language cells inside the
+            // centered `.central-featured`). Was masked when the container was wide
+            // enough to keep the (wrong) width positive.
+            self.right = self.left + used_w;
             Some(saved)
         } else {
             None
@@ -543,6 +815,14 @@ impl<'a> Ctx<'a> {
             self.cur_link_node = saved_link_node;
             return;
         }
+        // `as_block_once` marks an inline-block (or table cell / float) laying its
+        // own box into a sub that `add_inline_block`/`place_float` already sized
+        // to its resolved width. Such an atom must FILL that sub, not re-resolve
+        // its own `width` — a percentage width would otherwise apply twice (e.g.
+        // Wikipedia's `.search-input{width:73%}` became 73% of 73%, collapsing
+        // the search field's containing block). Not while measuring, where the
+        // sub is a huge probe and the box must shrink to its content instead.
+        let fills_sub = self.as_block_once && !self.measuring;
         let is_block =
             matches!(style.display, Display::Block | Display::ListItem) || self.as_block_once;
         self.as_block_once = false;
@@ -556,15 +836,19 @@ impl<'a> Ctx<'a> {
 
         if is_block {
             self.flush_line();
-            self.y += style.margin_top;
             self.line_align = style.text_align;
             let avail = (self.right - self.left).max(1);
+            self.y += self.resolve_margin(style.margin_top, avail);
             let (pl, pr) = (style.padding_left, style.padding_right);
             let (bl, br) = (style.border_left, style.border_right);
             let h_extra = pl + pr + bl + br;
             // Border-box width from width/max-width (box-sizing aware); `margin:
-            // auto` centers it, else margin-left offsets (ADR-0039/0040).
-            let (box_left, box_w) =
+            // auto` centers it, else margin-left offsets (ADR-0039/0040). An atom
+            // filling its pre-sized sub takes the whole `avail` (its width and
+            // margins were already resolved by the caller).
+            let (box_left, box_w) = if fills_sub {
+                (self.left, avail)
+            } else {
                 match resolve_border_box_width(style, avail, h_extra, self.vw, self.vh) {
                     Some(bw) => {
                         let bw = bw.clamp(1, avail);
@@ -576,7 +860,8 @@ impl<'a> Ctx<'a> {
                         } else if style.margin_right_auto {
                             0
                         } else {
-                            style.margin_left.clamp(0, extra)
+                            self.resolve_margin(style.margin_left, avail)
+                                .clamp(0, extra)
                         };
                         (self.left + off, bw)
                     }
@@ -585,11 +870,13 @@ impl<'a> Ctx<'a> {
                         // non-auto `margin-right` shrinks the box from the right
                         // (an `auto` right margin computes to 0 here, and its value
                         // is 0, so this is a no-op for centering).
-                        let l = self.left + style.margin_left;
-                        let r = (self.right - style.margin_right).max(l + 1);
+                        let l = self.left + self.resolve_margin(style.margin_left, avail);
+                        let r = (self.right - self.resolve_margin(style.margin_right, avail))
+                            .max(l + 1);
                         (l, (r - l).max(1))
                     }
-                };
+                }
+            };
             bbox = Some(BorderBox {
                 left: box_left,
                 right: box_left + box_w,
@@ -602,12 +889,22 @@ impl<'a> Ctx<'a> {
             // A positioned block is the containing block for its descendants'
             // `absolute` (ADR-0042): push its (in-flow) border box; the whole
             // subtree is translated together if this element is later lifted.
+            // Height: absolute children resolve %-based `top`/`bottom` against
+            // THIS block's height, so an explicit `height` must be used (e.g.
+            // Wikipedia's `.central-featured{height:32.5rem}` positions its
+            // languages by `top:20%…80%`). Auto height is only known after
+            // layout, so fall back to the viewport height there.
             if positioned {
+                let cb_h = style
+                    .height
+                    .resolve_vp(self.vh, self.vw, self.vh)
+                    .map(|h| h.max(1))
+                    .unwrap_or(self.vh);
                 self.cb_stack.push(ContainingBlock {
                     x: box_left,
                     y: self.y,
                     w: box_w,
-                    h: self.vh,
+                    h: cb_h,
                 });
             }
             // Content box = border box inset by border + padding.
@@ -615,6 +912,9 @@ impl<'a> Ctx<'a> {
             self.right = (box_left + box_w - br - pr).max(self.left + 1);
             self.y += style.border_top + style.padding_top;
             self.x = self.left;
+            // This block's first line starts here — track its atomic boxes for
+            // text-align (a fresh block may not have gone through commit_line).
+            self.mark_line_start();
             if visible && style.display == Display::ListItem {
                 if let Some(m) = list_marker(style.list_style_type, self.list_ordinal) {
                     self.add_run(&m, style, None);
@@ -639,6 +939,21 @@ impl<'a> Ctx<'a> {
         // 1, 2, 3…; each `<ol>`/`<ul>` restarts it, so nested lists are independent.
         // `<ol start="N">` seeds the count so the first item is N.
         let mut item_ordinal = ol_start_base(node);
+        // Horizontal insets of an inline (non-replaced) box: its left
+        // margin/border/padding push following content rightward at the box's
+        // start, the right ones after its content. Block and inline-block boxes
+        // model padding through their content box already; this is only for a
+        // true inline element (e.g. a nav `<a>` with `padding:4px 6px`). Applied
+        // on the current line — an inline box that soft-wraps is approximated
+        // (the common styled-link/nav case does not wrap).
+        let inline_box = !is_block && style.display == Display::Inline;
+        let inline_cb = (self.right - self.left).max(1);
+        if inline_box && visible {
+            self.x += self.resolve_margin(style.margin_left, inline_cb)
+                + style.border_left
+                + style.padding_left;
+            self.max_x = self.max_x.max(self.x);
+        }
         for child in &node.children {
             match child {
                 StyledChild::Text(t) => {
@@ -672,6 +987,12 @@ impl<'a> Ctx<'a> {
             }
         }
         self.flush_floats(&mut fb);
+        if inline_box && visible {
+            self.x += style.padding_right
+                + style.border_right
+                + self.resolve_margin(style.margin_right, inline_cb);
+            self.max_x = self.max_x.max(self.x);
+        }
         self.opacity_hidden = saved_opacity_hidden;
 
         if is_block {
@@ -705,7 +1026,7 @@ impl<'a> Ctx<'a> {
             if self.measuring {
                 self.max_x += style.padding_right + style.border_right;
             }
-            self.y += style.margin_bottom;
+            self.y += self.resolve_margin(style.margin_bottom, (saved_right0 - saved_left).max(1));
             self.left = saved_left;
             self.right = saved_right0;
             self.x = self.left;
@@ -748,12 +1069,43 @@ impl<'a> Ctx<'a> {
         }
     }
 
+    /// Capture the flow state before laying a `relative`/`absolute`/`fixed`
+    /// element, so [`apply_positioning`](Self::apply_positioning) can translate or
+    /// lift exactly its output. `None` for in-flow elements. Used by the replaced
+    /// (`<img>`) path, which otherwise laid positioned images in normal flow and
+    /// ignored their insets.
+    fn positioned_base(&self, style: &ComputedStyle) -> Option<PosBase> {
+        use cerberus_style::Position;
+        let positioned = self.pos_enabled
+            && matches!(
+                style.position,
+                Position::Relative | Position::Absolute | Position::Fixed
+            );
+        if positioned {
+            Some(PosBase {
+                disp: self.display.items.len(),
+                links: self.links.len(),
+                fields: self.fields.len(),
+                elements: self.elements.len(),
+                y: self.y,
+                // The element's in-flow origin (`self.left`), not the ancestor
+                // reference `self.left0` — see the block-path capture above.
+                x: self.left,
+            })
+        } else {
+            None
+        }
+    }
+
     /// Translate a `relative` element in place, or lift an `absolute`/`fixed`
     /// element out of flow into a paint-on-top layer (ADR-0034).
     fn apply_positioning(&mut self, style: &ComputedStyle, base: PosBase) {
         use cerberus_style::Position;
         let cb = self.containing_block(style.position);
-        let elem_w = (self.right - self.left0).max(0);
+        // The element's own border-box width, from its content box (`self.left`),
+        // NOT `self.left0` (an ancestor reference that, in a centered container,
+        // sits to the left). Used for right/bottom inset anchoring.
+        let elem_w = (self.right - self.left).max(0);
         let elem_h = (self.y - base.y).max(0);
 
         let (dx, dy) = match style.position {
@@ -1000,9 +1352,11 @@ impl<'a> Ctx<'a> {
         // The leading offset before this word: at the start of a line it is the
         // one-shot `text-indent` (usually 0), otherwise the inter-word space
         // (widened/trimmed by `word-spacing`, clamped so a large negative can't
-        // reverse the cursor).
+        // reverse the cursor). A negative `text-indent` is honored (it is the
+        // classic image-replacement trick — `text-indent:-9999px` pushes the
+        // fallback text off-screen so only the background sprite shows).
         let gap = if at_line_start {
-            std::mem::take(&mut self.pending_indent).max(0)
+            std::mem::take(&mut self.pending_indent)
         } else {
             (space_width(self.shaper, px) as i32 + style.word_spacing).max(0)
         };
@@ -1017,7 +1371,23 @@ impl<'a> Ctx<'a> {
     fn add_run(&mut self, text: &str, style: &ComputedStyle, href: Option<&str>) {
         let px = style.font_size.max(1);
         let (glyphs, w) = self.shape_run(text, px, style);
+        // Consume this block's one-shot `text-indent` at the start of a line, as
+        // `add_word` does. A `white-space: nowrap` run (`.pure-button` sets it,
+        // and it inherits) is placed atomically through here, so without this an
+        // indent is dropped — notably the `text-indent:-9999px` image-replacement
+        // trick that hides a button's fallback label behind its sprite icon.
+        if self.x == self.left {
+            self.x += std::mem::take(&mut self.pending_indent);
+        }
         self.push_piece(px, w, glyphs, style, href);
+    }
+
+    /// Resolve a margin `Len` to px against the containing-block width `cb_w`
+    /// (CSS resolves `%` margins — on every side — against the container's
+    /// width). `auto` and other non-resolving values yield 0; horizontal `auto`
+    /// for centering is handled separately via the `margin_*_auto` flags.
+    fn resolve_margin(&self, len: Len, cb_w: i32) -> i32 {
+        len.resolve_vp(cb_w, self.vw, self.vh).unwrap_or(0)
     }
 
     /// Place an `inline-block` as an atomic box on the current line (ADR-0042): a
@@ -1029,12 +1399,31 @@ impl<'a> Ctx<'a> {
             + e.style.padding_right
             + e.style.border_left
             + e.style.border_right;
+        let floor = min_border_box_width(&e.style, avail, h_extra, self.vw, self.vh);
         let w = resolve_border_box_width(&e.style, avail, h_extra, self.vw, self.vh)
             .unwrap_or_else(|| self.measure_intrinsic_width(e).min(avail))
+            .max(floor)
             .clamp(1, avail);
-        if self.x != self.left && self.x + w > self.right {
+        // Inline-block margins flow along the line: the left margin offsets the
+        // box, the right margin advances the cursor for the next atom — and a
+        // negative right margin pulls it back to overlap (Wikipedia's search box
+        // uses `.search-input{margin-right:-6.6rem}` to seat the Search button
+        // against the input's right edge). Auto margins compute to 0 in inline
+        // flow (no centering).
+        let ml = if e.style.margin_left_auto {
+            0
+        } else {
+            self.resolve_margin(e.style.margin_left, avail)
+        };
+        let mr = if e.style.margin_right_auto {
+            0
+        } else {
+            self.resolve_margin(e.style.margin_right, avail)
+        };
+        if self.x != self.left && self.x + ml + w > self.right {
             self.newline();
         }
+        self.x += ml;
         let mut sub = Ctx::sub(
             self.x,
             self.x + w,
@@ -1047,14 +1436,25 @@ impl<'a> Ctx<'a> {
             self.vh,
         );
         sub.measuring = self.measuring;
+        // Enable out-of-flow positioning inside a real (non-probe) inline-block:
+        // a `position:relative` inline-block is the containing block for its
+        // `absolute` descendants (e.g. Wikipedia's `.styled-select` language
+        // dropdown pinned to the right edge of the relatively-positioned
+        // `.search-input`). `finish_positioned` below folds those layers onto the
+        // sub's content before it merges up. Measurement probes stay flat.
+        sub.pos_enabled = !self.measuring;
         sub.as_block_once = true; // lay `e` with the block box model, filling [x, x+w]
         sub.walk(e, in_link);
         sub.flush_line();
+        sub.finish_positioned();
         self.field_id = sub.field_id;
         let h = (sub.y - self.y).max(1);
         self.merge_sub(sub, 0, 0);
         self.x += w;
+        // Content extent is the box's right edge; a trailing margin (empty space,
+        // or a negative pull-back) does not extend it.
         self.max_x = self.max_x.max(self.x);
+        self.x += mr;
         self.line_h = self.line_h.max(h);
     }
 
@@ -1110,9 +1510,28 @@ impl<'a> Ctx<'a> {
         let src = src.as_str();
         let attr_w = node.attr("width").and_then(parse_dim);
         let attr_h = node.attr("height").and_then(parse_dim);
+        // CSS `width`/`height` (px, %, vw/vh) override the presentational
+        // width/height *attributes* on a replaced element; whichever is set wins,
+        // and a missing dimension is derived from the intrinsic aspect ratio by
+        // `replaced_size`. Without this, a stylesheet rule like `img{width:60px}`
+        // was ignored and every image rendered at full natural size, overflowing
+        // its intended box.
+        let cb_w = (self.right - self.left).max(1);
+        let css_w = node
+            .style
+            .width
+            .resolve_vp(cb_w, self.vw, self.vh)
+            .map(|v| v.max(0) as u32);
+        let css_h = node
+            .style
+            .height
+            .resolve_vp(cb_w, self.vw, self.vh)
+            .map(|v| v.max(0) as u32);
+        let spec_w = css_w.or(attr_w);
+        let spec_h = css_h.or(attr_h);
 
         if let Some(image) = self.images.get(src) {
-            let (mut w, mut h) = replaced_size(attr_w, attr_h, image.size);
+            let (mut w, mut h) = replaced_size(spec_w, spec_h, image.size);
             let max_w = (self.right - self.left).max(1) as u32;
             if w > max_w {
                 h = (h as f32 * max_w as f32 / w as f32).round() as u32;
@@ -1127,9 +1546,10 @@ impl<'a> Ctx<'a> {
                 image,
                 fit,
                 pos,
+                pos_px: Point::ZERO,
             });
             self.advance_box(w, h);
-        } else if let (Some(w), Some(h)) = (attr_w, attr_h) {
+        } else if let (Some(w), Some(h)) = (spec_w, spec_h) {
             // Not decoded yet: reserve the declared box so layout doesn't reflow.
             self.place_box(w, h.max(1));
             self.display.push(DisplayItem::Rect {
@@ -1182,9 +1602,34 @@ impl<'a> Ctx<'a> {
     }
 
     /// A `<button>`: a button box labelled with its text (or `value`).
+    ///
+    /// A button that contains child *elements* (icon `<i>`s, styled `<span>`s —
+    /// e.g. Wikipedia's "Read Wikipedia in your language" pill with a translate
+    /// icon + chevron) is a content container: lay its subtree as an inline-block
+    /// so those children render (and its CSS box/border paints), then record the
+    /// Button hit box over the result. A text-only button keeps the simple
+    /// labelled-box path.
     fn form_button(&mut self, node: &StyledNode) {
         let id = self.field_id;
         self.field_id += 1;
+        let has_elem_children = node
+            .children
+            .iter()
+            .any(|c| matches!(c, StyledChild::Element(_)));
+        if has_elem_children {
+            let (x0, y0) = (self.x, self.y);
+            self.add_inline_block(node, None);
+            let w = (self.x - x0).max(1) as u32;
+            let h = self.line_h.max(1) as u32;
+            // Registered after layout; the line's `text-align` shift (which moves
+            // fields added this line) then centers this hit box with its content.
+            self.fields.push(FormFieldBox {
+                rect: Rect::new(x0, y0, w, h),
+                id,
+                kind: FieldKind::Button,
+            });
+            return;
+        }
         let text = node.text();
         let label = if text.trim().is_empty() {
             node.attr("value").unwrap_or("Button")
@@ -1256,8 +1701,27 @@ impl<'a> Ctx<'a> {
     /// `placeholder` (greyed). Passwords are masked.
     fn text_field(&mut self, node: &StyledNode, id: u32, password: bool) {
         let px = node.style.font_size.max(1);
-        let cols = node.attr("size").and_then(parse_dim).unwrap_or(20).max(1);
-        let w = self.fit_width(cols as i32 * self.char_w(px) + 2 * FIELD_PAD);
+        // An explicit CSS `width` wins over the `size` attribute (CSS: a set width
+        // is the used width — e.g. a search box with `size="20"` but `width:100%`
+        // must fill its container, as Chrome renders it). Fall back to `size` cols.
+        let cb_w = (self.right - self.left).max(1);
+        if std::env::var("CERB_DBG_SI").is_ok() && node.attr("id") == Some("searchInput") {
+            eprintln!(
+                "DBG searchInput width={:?} cb_w={} left={} right={} resolved={:?}",
+                node.style.width,
+                cb_w,
+                self.left,
+                self.right,
+                node.style.width.resolve_vp(cb_w, self.vw, self.vh)
+            );
+        }
+        let w = match node.style.width.resolve_vp(cb_w, self.vw, self.vh) {
+            Some(css_w) => self.fit_width(css_w.max(1)),
+            None => {
+                let cols = node.attr("size").and_then(parse_dim).unwrap_or(20).max(1);
+                self.fit_width(cols as i32 * self.char_w(px) + 2 * FIELD_PAD)
+            }
+        };
         let h = px as i32 + 2 * FIELD_PAD;
         self.control_box(w, h as u32, &node.style, FIELD_BG);
         self.push_field(id, FieldKind::Text, w, h as u32);
@@ -1439,11 +1903,17 @@ impl<'a> Ctx<'a> {
         self.pending_indent = 0;
     }
 
+    /// Record the output-buffer lengths at the start of a line, so `commit_line`
+    /// can shift the atomic boxes added during it by the `text-align` offset.
+    fn mark_line_start(&mut self) {
+        self.line_disp0 = self.display.items.len();
+        self.line_links0 = self.links.len();
+        self.line_fields0 = self.fields.len();
+        self.line_elems0 = self.elements.len();
+    }
+
     /// Apply text-align to the buffered line, then emit it.
     fn commit_line(&mut self) {
-        if self.line.is_empty() {
-            return;
-        }
         let used = self.x - self.left;
         let available = ((self.right - self.left) - used).max(0);
         let offset = match self.line_align {
@@ -1451,6 +1921,25 @@ impl<'a> Ctx<'a> {
             TextAlign::Center => available / 2,
             TextAlign::Right => available,
         };
+        // Shift the atomic inline boxes added during this line (inline-blocks,
+        // form fields, buttons, inline images) — they went straight to the output
+        // buffers rather than the buffered text `line`, so `text-align` must move
+        // them by the same offset. Done before the text pieces are appended so the
+        // range covers only this line's boxes.
+        if offset != 0 {
+            for it in &mut self.display.items[self.line_disp0..] {
+                translate_item(it, offset, 0);
+            }
+            for l in &mut self.links[self.line_links0..] {
+                l.rect = offset_rect(l.rect, offset, 0);
+            }
+            for f in &mut self.fields[self.line_fields0..] {
+                f.rect = offset_rect(f.rect, offset, 0);
+            }
+            for e in &mut self.elements[self.line_elems0..] {
+                e.rect = offset_rect(e.rect, offset, 0);
+            }
+        }
         // Drain through a moved-out buffer so the line `Vec`'s capacity is kept
         // for the next line instead of being dropped each commit (`mem::take`
         // would leave a zero-capacity `Vec`).
@@ -1489,6 +1978,8 @@ impl<'a> Ctx<'a> {
             }
         }
         self.line = line;
+        // The next line's atomic boxes start after everything emitted here.
+        self.mark_line_start();
     }
 
     fn rule(&mut self) {
@@ -1548,8 +2039,11 @@ impl<'a> Ctx<'a> {
         });
         scratch.reset_for_measure(field_id);
         // Measure an inline-block by its block content (avoids re-routing into
-        // `add_inline_block`, which would recurse here) — ADR-0042.
-        scratch.as_block_once = matches!(node.style.display, Display::InlineBlock);
+        // `add_inline_block`, which would recurse here) — ADR-0042. An
+        // element-children `<button>` takes the same block path, else the walk
+        // re-dispatches to `form_button` and recurses back into measurement.
+        scratch.as_block_once =
+            matches!(node.style.display, Display::InlineBlock) || button_wants_block(node);
         scratch.walk(node, None);
         scratch.flush_line();
         let width = scratch.max_x.max(1);
@@ -1578,7 +2072,8 @@ impl<'a> Ctx<'a> {
         });
         scratch.reset_for_measure(field_id);
         scratch.right = 1; // force a wrap at every opportunity
-        scratch.as_block_once = matches!(node.style.display, Display::InlineBlock);
+        scratch.as_block_once =
+            matches!(node.style.display, Display::InlineBlock) || button_wants_block(node);
         scratch.walk(node, None);
         scratch.flush_line();
         let width = scratch.max_x.max(1);
@@ -1625,6 +2120,7 @@ impl<'a> Ctx<'a> {
                         image: img,
                         fit: style.background_size,
                         pos: style.background_position,
+                        pos_px: style.background_position_px,
                     },
                 );
                 idx += 1;
@@ -1744,8 +2240,14 @@ impl<'a> Ctx<'a> {
         let is_right = e.style.float == cerberus_style::Float::Right;
         let avail = (self.right - self.left).max(1);
         let explicit = resolve_block_width(&e.style, avail, self.vw, self.vh);
+        let floor = e
+            .style
+            .min_width
+            .resolve_vp(avail, self.vw, self.vh)
+            .unwrap_or(0);
         let w = explicit
             .unwrap_or_else(|| self.measure_intrinsic_width(e).min(avail))
+            .max(floor)
             .clamp(1, avail);
         if !fb.active {
             fb.active = true;
@@ -2353,6 +2855,40 @@ impl<'a> Ctx<'a> {
     /// Pragmatic, not spec-perfect: equal columns only (no content-based sizing),
     /// and colspan/rowspan are ignored — every cell is one column by one row.
     // TODO: honour colspan/rowspan and content-based column widths.
+    /// Intrinsic content width of a table cell: flow its children into a very
+    /// wide scratch (nothing wraps) and read the widest extent. This walks the
+    /// cell's *children*, not the cell node — `walk` returns early on a
+    /// `<td>`/`<tr>` (they are laid only by `table`), so measuring the cell node
+    /// directly reads nothing. Floated inline children (a common nav/link cell)
+    /// pack horizontally in the wide scratch, so their real row width is counted.
+    fn measure_cell_width(&mut self, cell: &StyledNode) -> i32 {
+        let mut sub = Ctx::sub(
+            0,
+            1_000_000,
+            0,
+            self.shaper,
+            self.images,
+            self.forms,
+            self.field_id,
+            self.vw,
+            self.vh,
+        );
+        sub.measuring = true;
+        let mut fb = FloatBand::new(sub.left, sub.right, sub.y);
+        for child in &cell.children {
+            match child {
+                StyledChild::Text(t) => sub.add_text(t, &cell.style, None),
+                StyledChild::Element(e) if e.style.float != cerberus_style::Float::None => {
+                    sub.place_float(e, None, &mut fb)
+                }
+                StyledChild::Element(e) => sub.walk(e, None),
+            }
+        }
+        sub.flush_floats(&mut fb);
+        sub.flush_line();
+        sub.max_x.max(1)
+    }
+
     fn table(&mut self, node: &StyledNode) {
         self.flush_line();
         let left = self.left;
@@ -2384,7 +2920,48 @@ impl<'a> Ctx<'a> {
             return;
         }
 
-        let col_w = ((right - left) / num_cols as i32).max(1);
+        // Content-proportional column widths (auto table layout) rather than an
+        // equal split: size each column to its widest cell's intrinsic content
+        // (plus padding). An auto-width table whose content fits shrinks to it
+        // (Chrome's footer nav: a narrow label column beside a wide links
+        // column); an explicit-width table — or content that overflows — fills
+        // the target width proportionally. `col_x` holds the column left edges;
+        // `col_x[num_cols]` is the table's right edge.
+        let avail = (right - left).max(num_cols as i32);
+        let mut col_max = vec![1i32; num_cols];
+        for row in &rows {
+            for (col, cell) in cell_children(row).enumerate() {
+                if col < num_cols {
+                    let w = (self.measure_cell_width(cell) + 2 * CELL_PAD).max(1);
+                    col_max[col] = col_max[col].max(w);
+                }
+            }
+        }
+        let total: i64 = col_max.iter().map(|&w| w as i64).sum();
+        let explicit = resolve_block_width(&node.style, avail, self.vw, self.vh);
+        let target = explicit.unwrap_or(avail).clamp(num_cols as i32, avail);
+        let col_widths: Vec<i32> = if explicit.is_some() || total > target as i64 {
+            col_max
+                .iter()
+                .map(|&c| ((c as i64 * target as i64) / total).max(1) as i32)
+                .collect()
+        } else {
+            col_max
+        };
+        let mut col_x = vec![left; num_cols + 1];
+        for col in 0..num_cols {
+            col_x[col + 1] = col_x[col] + col_widths[col];
+        }
+
+        // HTML `border` attribute: cells get 1px rules only when it is present and
+        // non-zero (HTML §15). Layout tables (`border="0"` or absent, as on Hacker
+        // News) draw no grid lines — matching Chrome, which otherwise diverges by a
+        // black line around every cell.
+        let draw_border = node
+            .attr("border")
+            .and_then(parse_dim)
+            .is_some_and(|b| b > 0);
+
         let mut row_y = self.y;
 
         for row in rows {
@@ -2397,13 +2974,8 @@ impl<'a> Ctx<'a> {
             let mut laid: Vec<CellLayout> = Vec::with_capacity(cells.len());
             let mut row_h = line_height(node.style.font_size.max(1));
             for (col, cell) in cells.iter().enumerate() {
-                let cell_x = left + col as i32 * col_w;
-                let cell_w = if col + 1 == num_cols {
-                    right - cell_x
-                } else {
-                    col_w
-                }
-                .max(1);
+                let cell_x = col_x[col.min(num_cols - 1)];
+                let cell_w = (col_x[(col + 1).min(num_cols)] - cell_x).max(1);
                 let (items, links, fields, h) =
                     self.flow_cell(cell, cell_x, cell_x + cell_w, row_y);
                 row_h = row_h.max(h);
@@ -2413,19 +2985,14 @@ impl<'a> Ctx<'a> {
 
             // Emit each cell's box (fill + border) under its content.
             for (col, cell) in cells.iter().enumerate() {
-                let cell_x = left + col as i32 * col_w;
-                let cell_w = if col + 1 == num_cols {
-                    right - cell_x
-                } else {
-                    col_w
-                }
-                .max(1) as u32;
+                let cell_x = col_x[col.min(num_cols - 1)];
+                let cell_w = (col_x[(col + 1).min(num_cols)] - cell_x).max(1) as u32;
                 let is_header = cell.tag == "th";
                 let fill = cell
                     .style
                     .background
                     .or(if is_header { Some(TH_BG) } else { None });
-                self.cell_box(cell_x, row_y, cell_w, row_h as u32, fill);
+                self.cell_box(cell_x, row_y, cell_w, row_h as u32, fill, draw_border);
             }
 
             // Then the captured cell content, on top of the boxes.
@@ -2504,8 +3071,9 @@ impl<'a> Ctx<'a> {
         (sub.display.items, sub.links, sub.fields, height)
     }
 
-    /// Draw a cell's optional background fill and its 1px border outline.
-    fn cell_box(&mut self, x: i32, y: i32, w: u32, h: u32, fill: Option<Color>) {
+    /// Draw a cell's optional background fill and, when the table requested a
+    /// border, its 1px outline.
+    fn cell_box(&mut self, x: i32, y: i32, w: u32, h: u32, fill: Option<Color>, border: bool) {
         if w == 0 || h == 0 {
             return;
         }
@@ -2514,6 +3082,9 @@ impl<'a> Ctx<'a> {
                 rect: Rect::new(x, y, w, h),
                 color,
             });
+        }
+        if !border {
+            return;
         }
         // Four thin rects form a hollow border (so a fill stays visible inside).
         let b = TABLE_BORDER;
@@ -2555,8 +3126,13 @@ fn capitalize_words(s: &str) -> String {
     out
 }
 
+/// The `line-height: normal` leading for text of `px` font size. Browsers derive
+/// this from the font's own metrics — typically ~1.15–1.2× the font size for the
+/// common sans/serif faces; we approximate it as 1.2×. (Was 1.5×, which inflated
+/// the vertical rhythm of every text block ~25% taller than Chrome, accumulating
+/// into large below-the-fold misalignment on text-heavy pages.)
 fn line_height(px: u32) -> i32 {
-    px as i32 + px as i32 / 2
+    (px as i32 * 6) / 5
 }
 
 /// Offset a rect by `(dx, dy)` (for translating positioned output).
@@ -2635,6 +3211,23 @@ fn resolve_border_box_width(
     })
 }
 
+/// The `min-width` floor as a **border-box** width (box-sizing aware), or 0 when
+/// unset. Applied by shrink-to-fit callers after measuring content, since
+/// `resolve_block_width` deliberately leaves an auto-width box unconstrained
+/// rather than pinning it to `min-width`.
+fn min_border_box_width(style: &ComputedStyle, avail: i32, h_extra: i32, vw: i32, vh: i32) -> i32 {
+    match style.min_width.resolve_vp(avail, vw, vh) {
+        Some(mw) => {
+            let mw = mw.max(0);
+            match style.box_sizing {
+                cerberus_style::BoxSizing::BorderBox => mw,
+                cerberus_style::BoxSizing::ContentBox => mw + h_extra,
+            }
+        }
+        None => 0,
+    }
+}
+
 /// State for packing a run of `float` siblings into rows (ADR-0039).
 struct FloatBand {
     /// The container's content-left (where each band row starts).
@@ -2678,8 +3271,19 @@ fn resolve_block_width(style: &ComputedStyle, avail: i32, vw: i32, vh: i32) -> O
     if let Some(mw) = res(style.max_width) {
         w = Some(w.unwrap_or(avail).min(mw));
     }
+    // `min-width` is a floor, not a definite width. It clamps a width already
+    // fixed by `width`/`max-width`; but with `width:auto` and no `max-width`
+    // the box is unconstrained (a block fills `avail`, an inline-block/float
+    // shrink-fits its content) — flooring against 0 here would collapse a
+    // shrink-to-fit box to `min-width` and suppress content measurement. Leave
+    // it unconstrained then, unless `min-width` exceeds `avail` (an overflow the
+    // floor genuinely widens); the shrink-to-fit caller re-applies the floor.
     if let Some(mw) = res(style.min_width) {
-        w = Some(w.unwrap_or(0).max(mw));
+        match w {
+            Some(cur) => w = Some(cur.max(mw)),
+            None if mw > avail => w = Some(mw),
+            None => {}
+        }
     }
     let w = w?;
     // Not a constraint if `width` is auto and it wouldn't narrow the box.
@@ -2700,11 +3304,13 @@ fn resolve_block_height(
     vw: i32,
     vh: i32,
 ) -> i32 {
-    // Only px / vw / vh count; `%`/`auto` leave the box content-sized.
+    // Only px / viewport units count; `%`/`auto` leave the box content-sized.
     let res = |len: Len| match len {
         Len::Px(p) => Some(p.max(0)),
         Len::Vw(f) => Some((f / 100.0 * vw as f32).round().max(0.0) as i32),
         Len::Vh(f) => Some((f / 100.0 * vh as f32).round().max(0.0) as i32),
+        Len::Vmin(f) => Some((f / 100.0 * vw.min(vh) as f32).round().max(0.0) as i32),
+        Len::Vmax(f) => Some((f / 100.0 * vw.max(vh) as f32).round().max(0.0) as i32),
         Len::Auto | Len::Pct(_) => None,
     };
     let adjust = |v: i32| match style.box_sizing {
@@ -2731,6 +3337,20 @@ fn is_flex_grid_item(e: &StyledNode) -> bool {
             e.style.position,
             cerberus_style::Position::Absolute | cerberus_style::Position::Fixed
         )
+}
+
+/// A `<button>` with element children (icon `<i>`/`<span>` sprites, not just a
+/// text label) is laid as an atomic block-model box so its children paint —
+/// `form_button` routes it through `add_inline_block`. During intrinsic-width
+/// measurement the button must take the same block path; otherwise the scratch
+/// walk re-dispatches to `form_button`, which re-enters measurement and
+/// overflows the stack.
+fn button_wants_block(node: &StyledNode) -> bool {
+    node.tag == "button"
+        && node
+            .children
+            .iter()
+            .any(|c| matches!(c, StyledChild::Element(_)))
 }
 
 /// One item's resolved grid placement: top-left cell + span (ADR-0038).
@@ -3098,7 +3718,7 @@ pub fn pick_img_url<'a>(attr: impl Fn(&str) -> Option<&'a str>, viewport_w: u32)
         return Some(d.to_string());
     }
     if let Some(ss) = attr("data-srcset").or_else(|| attr("srcset")) {
-        if let Some(u) = select_srcset(ss, attr("sizes"), viewport_w) {
+        if let Some(u) = select_srcset_with_src(ss, attr("sizes"), viewport_w, attr("src")) {
             return Some(u);
         }
     }
@@ -3168,6 +3788,22 @@ fn srcset_candidates(input: &str) -> Vec<(&str, Option<&str>)> {
 /// first, at device-pixel-ratio 1); density (`x`/bare) candidates pick `1x` (we
 /// render at 1x). `None` for an empty/unparseable list (caller falls back to `src`).
 pub fn select_srcset(srcset: &str, sizes: Option<&str>, viewport_w: u32) -> Option<String> {
+    select_srcset_with_src(srcset, sizes, viewport_w, None)
+}
+
+/// Like [`select_srcset`] but also considers the element's plain `src` as an
+/// implicit 1x density candidate. Per the HTML "update the source set" algorithm,
+/// when a `srcset` carries only density (`x`) descriptors, `src` participates as
+/// the 1x source — so at device-pixel-ratio 1 a `src="a.png" srcset="a@2x.png 2x"`
+/// resolves to `a.png`, not the 2x image (which a naive srcset-only pick returns
+/// as the smallest density ≥ 1). `src` is ignored when width (`w`) descriptors are
+/// present (the spec drops density selection entirely in that mode).
+pub fn select_srcset_with_src(
+    srcset: &str,
+    sizes: Option<&str>,
+    viewport_w: u32,
+    src: Option<&str>,
+) -> Option<String> {
     let mut width: Vec<(u32, &str)> = Vec::new();
     let mut density: Vec<(f32, &str)> = Vec::new();
     for (url, descriptor) in srcset_candidates(srcset) {
@@ -3184,6 +3820,15 @@ pub fn select_srcset(srcset: &str, sizes: Option<&str>, viewport_w: u32) -> Opti
             }
             Some(_) => continue,              // unknown descriptor
             None => density.push((1.0, url)), // a bare candidate is 1x
+        }
+    }
+    // A plain `src` joins the density pool as 1x, but only in density mode and
+    // only if it isn't already listed as a candidate.
+    if width.is_empty() {
+        if let Some(s) = src {
+            if !density.iter().any(|(_, u)| *u == s) {
+                density.push((1.0, s));
+            }
         }
     }
     if !width.is_empty() {
@@ -4118,6 +4763,74 @@ mod tests {
     }
 
     #[test]
+    fn table_columns_size_to_content_not_equal_split() {
+        // Auto table layout: a short label column stays narrow beside a wide
+        // content column, rather than each taking an equal half of the width.
+        let laid = lay(
+            "<table border=\"1\"><tr><td>Hi</td>\
+             <td>a considerably longer stretch of cell content goes here</td></tr></table>",
+            600,
+        );
+        // Cells draw horizontal border rects (height 1) spanning each column.
+        let mut widths: Vec<u32> = laid
+            .display
+            .items
+            .iter()
+            .filter_map(|it| match it {
+                DisplayItem::Rect { rect, .. } if rect.h == 1 && rect.w > 2 => Some(rect.w),
+                _ => None,
+            })
+            .collect();
+        widths.sort_unstable();
+        widths.dedup();
+        assert!(widths.len() >= 2, "two distinct column widths: {widths:?}");
+        // An equal split would make each column ~300px; the label shrinks well
+        // below that, and the content column is wider.
+        assert!(widths[0] < 200, "label column sized to content: {widths:?}");
+        assert!(
+            *widths.last().unwrap() > widths[0],
+            "content column is wider than the label: {widths:?}"
+        );
+    }
+
+    #[test]
+    fn percent_and_viewport_margins_resolve_at_layout() {
+        // `%` margins resolve against the containing-block width (all sides), and
+        // `vh`/`vw` against the viewport — both were dropped when margins were
+        // stored as parse-time px. A 10% top margin in a 400px-wide container is
+        // 40px; a following block sits that much lower.
+        let pct = lay("<div style='margin-top:10%'>x</div><div>y</div>", 400);
+        let plain = lay("<div>x</div><div>y</div>", 400);
+        let first_y = |l: &LaidOut| glyph_ys(l)[0];
+        assert!(
+            first_y(&pct) - first_y(&plain) >= 38,
+            "10% of 400px ~= 40px top margin: {} vs {}",
+            first_y(&pct),
+            first_y(&plain)
+        );
+    }
+
+    #[test]
+    fn normal_line_height_is_about_1_2x_font_size() {
+        // `line-height: normal` leads ~1.2x the font size (browser-like), not the
+        // old 1.5x that made every text block a quarter too tall.
+        let laid = lay(
+            "<p style='font-size:20px;margin:0'>one</p>\
+             <p style='font-size:20px;margin:0'>two</p>",
+            400,
+        );
+        let mut ys = glyph_ys(&laid);
+        ys.sort_unstable();
+        ys.dedup();
+        assert_eq!(ys.len(), 2, "two single-line paragraphs: {ys:?}");
+        let pitch = ys[1] - ys[0];
+        assert!(
+            (pitch - 24).abs() <= 1,
+            "row pitch ~= 1.2 * 20px = 24, got {pitch}"
+        );
+    }
+
+    #[test]
     fn line_height_controls_row_pitch() {
         let normal = lay("<p>one</p><p>two</p>", 400);
         let tall = lay(
@@ -4378,6 +5091,80 @@ mod tests {
     }
 
     #[test]
+    fn inline_block_in_absolute_cell_gets_the_cell_width() {
+        // An inline-block inside an absolute cell (only `right` set + explicit
+        // width) must see the cell's content width, not a collapsed ~1px box —
+        // else its text wraps though it fits. This is Wikipedia's count
+        // ("N articles", a `display:inline-block` <small>) in a 156px lang cell.
+        let laid = lay(
+            "<div style='position:relative;width:600px;height:300px;text-align:center'>\
+               <div style='position:absolute;right:60%;width:200px'>\
+                 <a style='display:block'>\
+                   <strong style='display:block'>Name</strong>\
+                   <span style='display:inline-block'>a b c</span>\
+                 </a>\
+               </div>\
+             </div>",
+            800,
+        );
+        // Two lines expected: the block <strong> and the inline-block below it —
+        // NOT a third line from the inline-block's text wrapping in a collapsed box.
+        let ys: std::collections::BTreeSet<i32> =
+            glyph_xy(&laid).into_iter().map(|(_, y)| y).collect();
+        assert_eq!(
+            ys.len(),
+            2,
+            "strong on line 1, inline-block text on one line below: {ys:?}"
+        );
+    }
+
+    #[test]
+    fn absolutely_positioned_img_resolves_against_its_ancestor() {
+        // An absolute <img> honors top/left against its positioned ancestor,
+        // instead of being laid in normal flow with its insets ignored (the
+        // Wikipedia-globe bug: position:absolute;top:158px inside a relative box).
+        let styled = CssEngine::new().style(&parse_html(
+            "<div style='height:100px'>spacer</div>\
+             <div style='position:relative'>\
+               <img src='g.png' style='position:absolute;top:40px;left:20px'>\
+             </div>",
+        ));
+        let img = Arc::new(DecodedImage {
+            size: Size::new(30, 30),
+            rgba: vec![255; 30 * 30 * 4],
+        });
+        let laid = BlockLayout::default().layout(
+            &styled,
+            Size::new(400, 2000),
+            &MonoShaper,
+            &OneImage(img),
+            &NoForms,
+        );
+        let rect = laid
+            .display
+            .items
+            .iter()
+            .find_map(|i| match i {
+                DisplayItem::Image { rect, .. } => Some(*rect),
+                _ => None,
+            })
+            .expect("image emitted");
+        // Relative container sits at y≈108 (100px spacer + body's 8px margin);
+        // top:40 → ~148, left:20 → ~28 (+8px body margin). Without the fix the
+        // image would land at the flow origin (~top of the relative box).
+        assert!(
+            (140..=156).contains(&rect.y),
+            "img at ancestor.y + top:40px, got y={}",
+            rect.y
+        );
+        assert!(
+            (24..=32).contains(&rect.x),
+            "img at left:20px (+ body margin), got x={}",
+            rect.x
+        );
+    }
+
+    #[test]
     fn img_with_provider_emits_image_item() {
         let styled = CssEngine::new().style(&parse_html("<img src='pic.png' alt='x'>"));
         let img = Arc::new(DecodedImage {
@@ -4486,6 +5273,20 @@ mod tests {
         assert_eq!(
             select_srcset("b.png 2x, c.png 3x", None, 1000).as_deref(),
             Some("b.png")
+        );
+        // `src` is the implicit 1x candidate when srcset lists only higher
+        // densities (Wikipedia's globe: src=v2.png srcset="v2@2x.png 2x").
+        assert_eq!(
+            select_srcset_with_src("v2@2x.png 2x", None, 1000, Some("v2.png")).as_deref(),
+            Some("v2.png"),
+            "at DPR 1, plain src (1x) beats the only srcset entry (2x)"
+        );
+        // `src` does not override width-descriptor selection.
+        assert_eq!(
+            select_srcset_with_src("s.png 480w, l.png 1200w", None, 400, Some("orig.png"))
+                .as_deref(),
+            Some("s.png"),
+            "width mode ignores src"
         );
         // Width: smallest candidate covering the sizes target.
         let ss = "s.png 480w, m.png 800w, l.png 1200w";
@@ -4637,6 +5438,47 @@ mod tests {
     }
 
     #[test]
+    fn css_width_height_size_the_image() {
+        // A stylesheet rule sizes a replaced element. Regression: this was
+        // ignored, so the image rendered at its full 400×300 intrinsic size.
+        assert_eq!(
+            img_box(
+                "<style>img{width:60px;height:40px}</style><img src='p.png'>",
+                Size::new(400, 300),
+                800
+            ),
+            (60, 40)
+        );
+    }
+
+    #[test]
+    fn css_width_only_derives_height_from_ratio() {
+        // CSS width alone → height follows the intrinsic 4:3 ratio.
+        assert_eq!(
+            img_box(
+                "<style>img{width:200px}</style><img src='p.png'>",
+                Size::new(400, 300),
+                800
+            ),
+            (200, 150)
+        );
+    }
+
+    #[test]
+    fn css_width_overrides_the_presentational_size_attribute() {
+        // CSS `width` (a real property) beats the `width` attribute (a
+        // presentational hint); the untouched `height` attribute still applies.
+        assert_eq!(
+            img_box(
+                "<style>img{width:100px}</style><img src='p.png' width='200' height='150'>",
+                Size::new(400, 300),
+                800
+            ),
+            (100, 150)
+        );
+    }
+
+    #[test]
     fn img_no_size_attrs_uses_intrinsic_size() {
         assert_eq!(
             img_box("<img src='p.png'>", Size::new(400, 300), 800),
@@ -4748,6 +5590,179 @@ mod tests {
         let laid = lay("<input type='submit' value='Send'>", 400);
         assert!(has_rect_color(&laid, BUTTON_BG));
         assert_eq!(total_glyphs(&laid), 4, "'Send' label");
+    }
+
+    #[test]
+    fn inline_horizontal_padding_spaces_surrounding_content() {
+        // A true inline element's horizontal padding (and margin) pushes the
+        // content after it rightward — the spacing that separates nav links like
+        // iana.org's `#header .navigation li a { padding:4px 6px }`. Without it,
+        // styled inline links render run-together.
+        let padded = lay("<p>A<a style='padding:0 10px;margin:0 5px'>B</a>C</p>", 400);
+        let plain = lay("<p>A<a>B</a>C</p>", 400);
+        let last_x = |l: &LaidOut| *glyph_xs(l).iter().max().unwrap();
+        // 'C' (the rightmost glyph) sits farther right with the inline box's
+        // 10px+10px padding and 5px+5px margins around 'B'.
+        assert!(
+            last_x(&padded) >= last_x(&plain) + 28,
+            "inline padding+margin pushed following content right: {} vs {}",
+            last_x(&padded),
+            last_x(&plain)
+        );
+    }
+
+    #[test]
+    fn inline_block_margins_advance_and_pull_back_the_cursor() {
+        // Rects (left edges), in document order, of two inline-block boxes.
+        fn rect_lefts(laid: &LaidOut) -> Vec<i32> {
+            laid.display
+                .items
+                .iter()
+                .filter_map(|i| match i {
+                    DisplayItem::Rect { rect, .. } => Some(rect.x),
+                    _ => None,
+                })
+                .collect()
+        }
+        // A positive right margin on the first box spaces the second box away.
+        let spaced = lay(
+            "<div><span style='display:inline-block;width:30px;height:10px;\
+background:#111;margin-right:40px'></span>\
+<span style='display:inline-block;width:30px;height:10px;background:#222'></span></div>",
+            400,
+        );
+        let l = rect_lefts(&spaced);
+        assert_eq!(l.len(), 2, "two inline-block backgrounds: {l:?}");
+        // second.left = first.left(0) + width(30) + margin-right(40) = 70.
+        assert_eq!(l[1] - l[0], 70, "positive right margin spaces the next box");
+
+        // A negative right margin pulls the following box back to overlap.
+        let overlap = lay(
+            "<div><span style='display:inline-block;width:30px;height:10px;\
+background:#111;margin-right:-10px'></span>\
+<span style='display:inline-block;width:30px;height:10px;background:#222'></span></div>",
+            400,
+        );
+        let o = rect_lefts(&overlap);
+        assert_eq!(
+            o[1] - o[0],
+            20,
+            "negative right margin overlaps the next box"
+        );
+    }
+
+    #[test]
+    fn text_indent_hides_a_nowrap_run_off_screen() {
+        // The image-replacement trick: `text-indent:-9999px` on a `white-space:
+        // nowrap` element (e.g. a `.pure-button` whose icon replaces its label)
+        // pushes the fallback text off-screen so only the sprite shows. A nowrap
+        // run is laid atomically, so it must honor text-indent like a wrapped
+        // word does — otherwise the label paints on top of the icon.
+        let hidden = lay(
+            "<div style='white-space:nowrap;text-indent:-9999px'>Search</div>",
+            400,
+        );
+        // Every glyph is shoved far to the left, off the visible canvas.
+        assert!(
+            glyph_xs(&hidden).iter().all(|&x| x < 0),
+            "nowrap run honors text-indent: {:?}",
+            glyph_xs(&hidden)
+        );
+        // Without the indent the same run sits at the content edge.
+        let shown = lay("<div style='white-space:nowrap'>Search</div>", 400);
+        assert!(glyph_xs(&shown).iter().all(|&x| x >= 0));
+    }
+
+    #[test]
+    fn absolute_child_positions_against_a_relative_inline_block() {
+        // An `absolute` element inside a `position:relative` inline-block uses
+        // that inline-block as its containing block (Wikipedia's language dropdown
+        // pinned to the right edge of the search input): a `right`-anchored child
+        // lands on the right side of the 200px box, not at the flow's left edge.
+        let laid = lay(
+            "<div style='display:inline-block;position:relative;width:200px'>\
+             <div style='position:absolute;top:0;right:4px;width:20px'>Z</div></div>",
+            400,
+        );
+        let z_x = *glyph_xs(&laid).iter().max().unwrap();
+        assert!(
+            z_x > 150,
+            "right-anchored absolute child sits near the box's right edge (~176), got x={z_x}"
+        );
+    }
+
+    #[test]
+    fn percent_width_inline_block_does_not_resolve_twice() {
+        // An inline-block `width:50%` in a 400px container is 200px, and a
+        // `width:100%` child fills that 200px — not 50%-of-50% (100px). Regression:
+        // the percentage was applied once to size the atom's sub and again inside
+        // it, collapsing Wikipedia's `.search-input{width:73%}` search field.
+        let laid = lay(
+            "<div style='width:400px'>\
+             <span style='display:inline-block;width:50%'>\
+             <div style='width:100%;background:#123456;height:10px'></div></span></div>",
+            400,
+        );
+        let filled = laid.display.items.iter().any(|it| {
+            matches!(
+                it,
+                DisplayItem::Rect { rect, color }
+                    if *color == Color::rgb(0x12, 0x34, 0x56) && (190..=210).contains(&rect.w)
+            )
+        });
+        assert!(
+            filled,
+            "inner width:100% fills the 200px atom, not 100px: {:?}",
+            laid.display
+                .items
+                .iter()
+                .filter_map(|it| match it {
+                    DisplayItem::Rect { rect, color } if *color == Color::rgb(0x12, 0x34, 0x56) =>
+                        Some(rect.w),
+                    _ => None,
+                })
+                .collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn min_width_floors_but_does_not_pin_a_shrink_to_fit_box() {
+        // An icon-only button (Wikipedia search) sizes to its content — an
+        // inline-block icon plus padding — even though `.pure-button` sets a
+        // small `min-width`. min-width is a floor, not a fixed width: it must
+        // not suppress content measurement and collapse the box.
+        let html = "<style>.ib{display:inline-block;width:22px;height:22px}\
+b{display:inline-block;min-width:16px;padding:8px 16px;box-sizing:border-box;\
+background-color:#0645ad}</style><b><i class=\"ib\">x</i></b>";
+        let laid = lay(html, 400);
+        // 22px icon + 2*16px padding = 54px, well above the 16px min-width.
+        let wide = laid.display.items.iter().any(|it| {
+            matches!(
+            it, DisplayItem::Rect { rect, .. } if rect.w >= 50 && rect.w <= 60)
+        });
+        assert!(
+            wide,
+            "shrink-to-fit box sizes to content (~54px), not min-width"
+        );
+    }
+
+    #[test]
+    fn button_with_element_children_lays_them_out_and_stays_a_button() {
+        // Wikipedia's language/search buttons wrap icon `<i>` sprites and a
+        // `<span>` label rather than bare text. Such a button is laid via the
+        // block box model so its children paint, and still registers as a
+        // clickable Button hit box. (Regression: routing the children through
+        // `add_inline_block` used to recurse back into `form_button` during
+        // intrinsic-width measurement and overflow the stack.)
+        let laid = lay("<button><i></i><span>Read this</span><i></i></button>", 400);
+        assert_eq!(total_glyphs(&laid), 8, "child span's 'Read this' laid out");
+        let buttons: Vec<_> = laid
+            .fields
+            .iter()
+            .filter(|f| f.kind == FieldKind::Button)
+            .collect();
+        assert_eq!(buttons.len(), 1, "one Button hit box registered");
+        assert!(buttons[0].rect.w > 1, "hit box spans the laid content");
     }
 
     #[test]
@@ -5081,12 +6096,12 @@ mod tests {
 
     #[test]
     fn table_draws_cell_borders_and_grids_text() {
-        // A 2x2 grid of <td> cells. Each cell draws a hollow 1px border made of
-        // four rects, so a table emits many more rects than the plain-text
-        // baseline (which emits none).
+        // A 2x2 grid of bordered <td> cells (border="1"). Each cell draws a hollow
+        // 1px border made of four rects, so a table emits many more rects than the
+        // plain-text baseline (which emits none).
         let baseline = lay("<p>aa bb cc dd</p>", 400);
         let laid = lay(
-            "<table><tr><td>aa</td><td>bb</td></tr>\
+            "<table border=\"1\"><tr><td>aa</td><td>bb</td></tr>\
              <tr><td>cc</td><td>dd</td></tr></table>",
             400,
         );
@@ -5157,9 +6172,23 @@ mod tests {
         // Sane result: the loose cell is dropped (no row), so nothing is painted.
         assert!(rect_count(&laid) == 0);
         // A row of one bare cell is also tolerated and produces a real grid.
-        let one = lay("<table><tr><td>x</td></tr></table>", 400);
+        let one = lay("<table border=\"1\"><tr><td>x</td></tr></table>", 400);
         assert_eq!(total_glyphs(&one), 1, "single-cell table lays out its text");
         assert!(rect_count(&one) >= 4, "single cell has a four-rect border");
+    }
+
+    #[test]
+    fn borderless_table_draws_no_grid_lines() {
+        // Without a `border` attribute (or `border="0"`) a table is a layout grid:
+        // no cell rules, matching Chrome. Only text (and any fills) are painted.
+        let none = lay("<table><tr><td>a</td><td>b</td></tr></table>", 400);
+        let zero = lay(
+            "<table border=\"0\"><tr><td>a</td><td>b</td></tr></table>",
+            400,
+        );
+        assert_eq!(rect_count(&none), 0, "no border attr → no grid rects");
+        assert_eq!(rect_count(&zero), 0, "border=0 → no grid rects");
+        assert_eq!(total_glyphs(&none), 2, "cell text still laid out");
     }
 
     // ---- CSS positioning (ADR-0034) ----
@@ -5214,6 +6243,15 @@ mod tests {
             40,
             "only the first line is indented; wrapped lines reset to the left"
         );
+
+        // A large negative text-indent (the image-replacement trick) is honored,
+        // pushing the text far off the left edge instead of being clamped to 0.
+        let hidden = lay("<p style='text-indent:-9999px'>hello world</p>", 400);
+        assert!(
+            min_x(&hidden) <= -9000,
+            "negative text-indent pushes text off-screen, got {}",
+            min_x(&hidden)
+        );
     }
 
     #[test]
@@ -5237,6 +6275,49 @@ mod tests {
         assert!(
             in_flow_max_y < 100,
             "in-flow content not pushed down by abs"
+        );
+    }
+
+    #[test]
+    fn absolute_element_honors_its_explicit_width() {
+        // An out-of-flow box with an explicit `width` uses it (not shrink-to-fit),
+        // even with only one inset set — so its text wraps at that width, not at
+        // its intrinsic content width. Wikipedia's `.central-featured-lang` sets
+        // width:15.6rem with only `right`, and its count line must not wrap.
+        let laid = lay(
+            "<div style='position:relative;height:300px'>\
+               <div style='position:absolute;top:0;right:0;width:250px'>\
+                 one two three four five six</div>\
+             </div>",
+            600,
+        );
+        // With a 250px box the phrase fits on one line; a shrunk box would wrap it.
+        let ys: std::collections::BTreeSet<i32> =
+            glyph_xy(&laid).into_iter().map(|(_, y)| y).collect();
+        assert_eq!(
+            ys.len(),
+            1,
+            "explicit-width box keeps the run on one line: {ys:?}"
+        );
+    }
+
+    #[test]
+    fn percent_top_resolves_against_the_containing_blocks_explicit_height() {
+        // A `top:%` absolute child resolves against its positioned ancestor's own
+        // height when that height is explicit — NOT the viewport height. This is
+        // Wikipedia's portal pattern (`.central-featured{height:32.5rem}` with
+        // languages at `top:20%…80%`). With a 200px-tall relative box, top:50%
+        // must land at ~100px, well short of the 600px viewport's 50% (=300px).
+        let laid = lay(
+            "<div style='position:relative;height:200px'>\
+               <div style='position:absolute;top:50%;left:0'>X</div>\
+             </div>",
+            400,
+        );
+        let (_, y) = *glyph_xy(&laid).last().unwrap();
+        assert!(
+            (80..=140).contains(&y),
+            "top:50% of the 200px container (~100px), not of the viewport: {y}"
         );
     }
 

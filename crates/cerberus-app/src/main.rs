@@ -7,6 +7,7 @@
 //! Subcommands (argument parsing is hand-rolled — no `clap` until approved):
 //!   run       Open the browser in a window (desktop build).
 //!   render    Render a page to a PPM file and print a summary (headless).
+//!   diff      Score a render against a headless-Chrome reference PNG.
 //!   mem-gate  Render, then assert resident memory is within budget (CI gate).
 //!   version   Print the version.
 //!   help      Print usage.
@@ -37,6 +38,7 @@ fn main() -> ExitCode {
     match command {
         "run" => cmd_run(rest),
         "render" => cmd_render(rest),
+        "diff" => cmd_diff(rest),
         "probe" => cmd_probe(rest),
         "mem-gate" => cmd_mem_gate(rest),
         "bench" => cmd_bench(rest),
@@ -122,6 +124,9 @@ fn cmd_render(args: &[String]) -> ExitCode {
     config.dump_text = has_flag(args, "--dump-text");
     config.proxy = flag(args, "--proxy");
     config.timers = has_flag(args, "--timers");
+    if let Some(engine) = flag(args, "--engine") {
+        config.layout_engine = cerberus_app::LayoutEngineKind::parse(&engine);
+    }
     config.background = Color::WHITE;
 
     let outcome = match render(&config) {
@@ -178,6 +183,87 @@ fn cmd_render(args: &[String]) -> ExitCode {
     if let Some(text) = &outcome.page_text {
         println!("--- page text ---");
         println!("{text}");
+    }
+    ExitCode::SUCCESS
+}
+
+/// `diff` — the parity yardstick (RENDERING_PARITY_PLAN.md, Workstream 0):
+/// score how far a Cerberus render is from a headless-Chrome reference so
+/// "closer to Chrome" is a number, not a vibe. Reads two PNGs, optionally crops
+/// the leading toolbar band off one (Cerberus draws a 36px toolbar Chrome's page
+/// screenshot lacks), compares over their overlap, and prints an RMSE score and
+/// mismatch fraction. `--fail-over <rmse>` turns it into a regression gate
+/// (nonzero exit when the score is worse than the threshold).
+///
+///   cerberus-app diff --ref chrome.png --cerb cerb.png [--crop-top 36]
+///                     [--tolerance 8] [--fail-over 0.15]
+fn cmd_diff(args: &[String]) -> ExitCode {
+    use cerberus_app::parity;
+    let (Some(ref_path), Some(cerb_path)) = (flag(args, "--ref"), flag(args, "--cerb")) else {
+        eprintln!("diff: --ref <chrome.png> and --cerb <cerb.png> are required");
+        return ExitCode::FAILURE;
+    };
+    let crop_top: u32 = flag(args, "--crop-top")
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(0);
+    let tolerance: u8 = flag(args, "--tolerance")
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(8);
+    let reference = match parity::load_png(&ref_path) {
+        Ok(i) => i,
+        Err(e) => {
+            eprintln!("diff: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let cerb = match parity::load_png(&cerb_path) {
+        Ok(i) => parity::crop_top(&i, crop_top),
+        Err(e) => {
+            eprintln!("diff: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let report = parity::diff(&reference, &cerb, tolerance);
+    println!("parity diff ({ref_path} vs {cerb_path}):");
+    println!(
+        "  reference       : {}x{}",
+        reference.size.w, reference.size.h
+    );
+    println!(
+        "  cerberus        : {}x{}{}",
+        cerb.size.w,
+        cerb.size.h,
+        if crop_top > 0 {
+            format!(" (top {crop_top}px cropped)")
+        } else {
+            String::new()
+        }
+    );
+    println!(
+        "  compared region : {}x{} ({} px)",
+        report.compared.w, report.compared.h, report.compared_px
+    );
+    println!(
+        "  mismatched      : {} px ({:.2}% over tolerance {tolerance})",
+        report.mismatched_px,
+        report.mismatch_fraction * 100.0
+    );
+    println!("  RMSE (0=match)  : {:.5}", report.rmse);
+    if report.is_perfect(&reference, &cerb) {
+        println!("  verdict         : PERFECT (byte-identical, same size)");
+    }
+    if let Some(threshold) = flag(args, "--fail-over").and_then(|s| s.parse::<f64>().ok()) {
+        if report.rmse > threshold {
+            eprintln!(
+                "diff FAIL: RMSE {:.5} > threshold {threshold:.5}",
+                report.rmse
+            );
+            return ExitCode::FAILURE;
+        }
+        println!(
+            "diff PASS: RMSE {:.5} <= threshold {threshold:.5}",
+            report.rmse
+        );
     }
     ExitCode::SUCCESS
 }
@@ -552,6 +638,7 @@ fn print_usage() {
          COMMANDS:\n\
          \x20 run        Open the browser in a window (needs a display)\n\
          \x20 render     Render a page to PPM and print a summary (headless)\n\
+         \x20 diff       Score a render vs a Chrome reference PNG (parity yardstick)\n\
          \x20 mem-gate   Render and assert resident memory within budget\n\
          \x20 bench      Time the render pipeline stages (see --assert-total-ms)\n\
          \x20 mirror-bench  Large-N mirror gate: focus-sweep N instances, assert RSS\n\
