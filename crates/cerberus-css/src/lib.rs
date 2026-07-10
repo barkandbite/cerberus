@@ -1810,7 +1810,12 @@ fn classify_font_family(name: &str) -> Option<GenericFamily> {
     }
     // Named faces, by keyword.
     let has = |kw: &str| n.contains(kw);
-    if has("mono")
+    if has("arial") || has("helvetica") || has("liberation sans") || has("arimo") {
+        // A page naming Arial/Helvetica specifically gets the bundled Arial-metric
+        // face; the generic `sans-serif` and every other sans name fall through to
+        // the Roboto default below (which matches the reference browser best).
+        Some(GenericFamily::SansArial)
+    } else if has("mono")
         || has("courier")
         || has("consol")
         || has("menlo")
@@ -2280,9 +2285,10 @@ mod tests {
     fn font_family_resolves_to_generic() {
         let dom = CssEngine::new().style(&parse_html(
             "<p id=a style='font-family:Georgia, serif'>a</p>\
-             <p id=b style=\"font-family:'Helvetica Neue', Arial, sans-serif\">b</p>\
+             <p id=b style='font-family:Arial, sans-serif'>b</p>\
              <p id=c style='font-family:Consolas, monospace'>c</p>\
-             <p id=d style='font-family:\"Brush Script MT\", cursive'>d</p>",
+             <p id=d style='font-family:\"Brush Script MT\", cursive'>d</p>\
+             <p id=e style='font-family:\"Segoe UI\", sans-serif'>e</p>",
         ));
         let fam = |id: &str| {
             fn by_id<'a>(n: &'a StyledNode, id: &str) -> Option<&'a StyledNode> {
@@ -2297,9 +2303,19 @@ mod tests {
             by_id(&dom.root, id).unwrap().style.font_family
         };
         assert_eq!(fam("a"), GenericFamily::Serif, "Georgia → serif");
-        assert_eq!(fam("b"), GenericFamily::SansSerif, "Arial → sans-serif");
+        assert_eq!(
+            fam("b"),
+            GenericFamily::SansArial,
+            "Arial → Arial-metric sans"
+        );
         assert_eq!(fam("c"), GenericFamily::Monospace, "Consolas → monospace");
         assert_eq!(fam("d"), GenericFamily::Cursive, "Brush Script → cursive");
+        // A non-Arial named sans (and the generic) fall to the Roboto default.
+        assert_eq!(
+            fam("e"),
+            GenericFamily::SansSerif,
+            "Segoe UI → default sans"
+        );
     }
 
     #[test]

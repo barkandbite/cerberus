@@ -36,6 +36,11 @@ const SERIF_FONT_BYTES: &[u8] = include_bytes!("../assets/LiberationSerif-Regula
 /// Courier New, so `<pre>`/`<code>` and `font-family: monospace` render fixed-
 /// pitch. See `assets/Liberation-LICENSE.txt`.
 const MONO_FONT_BYTES: &[u8] = include_bytes!("../assets/LiberationMono-Regular.ttf");
+/// Bundled Arial-metric sans face (Liberation Sans, SIL OFL 1.1) — metric-
+/// compatible with Arial, so `font-family: sans-serif` (and Arial/Helvetica) match
+/// what a Chrome-on-Windows persona renders. Roboto stays the UI/chrome face and
+/// serves a page that names Roboto specifically. See `assets/Liberation-LICENSE.txt`.
+const SANS_FONT_BYTES: &[u8] = include_bytes!("../assets/LiberationSans-Regular.ttf");
 
 /// A software text shaper + rasterizer over the bundled text, icon, and fallback
 /// fonts. Glyph **advances** come from rustybuzz (a HarfBuzz port) so run widths
@@ -56,8 +61,10 @@ pub struct TextEngine {
     /// class. ab_glyph outlines; rustybuzz shapes — same split as the text face.
     serif_font: FontRef<'static>,
     mono_font: FontRef<'static>,
+    sans_font: FontRef<'static>,
     rb_serif: rustybuzz::Face<'static>,
     rb_mono: rustybuzz::Face<'static>,
+    rb_sans: rustybuzz::Face<'static>,
 }
 
 impl TextEngine {
@@ -80,6 +87,10 @@ impl TextEngine {
             .expect("bundled Liberation Serif shapes");
         let rb_mono = rustybuzz::Face::from_slice(MONO_FONT_BYTES, 0)
             .expect("bundled Liberation Mono shapes");
+        let sans_font =
+            FontRef::try_from_slice(SANS_FONT_BYTES).expect("bundled Liberation Sans is valid");
+        let rb_sans = rustybuzz::Face::from_slice(SANS_FONT_BYTES, 0)
+            .expect("bundled Liberation Sans shapes");
         Self {
             font,
             icon_font,
@@ -88,18 +99,22 @@ impl TextEngine {
             rb_fallback,
             serif_font,
             mono_font,
+            sans_font,
             rb_serif,
             rb_mono,
+            rb_sans,
         }
     }
 
-    /// The bundled font slot a `GenericFamily` renders in. Serif → serif face,
-    /// monospace → mono face, cursive falls back to serif (script faces aren't
-    /// bundled) and fantasy to the sans text face; sans-serif is the text face.
+    /// The bundled font slot a `GenericFamily` renders in. `sans-serif` uses the
+    /// Arial-metric sans face (persona-correct); a page naming Roboto gets the
+    /// Roboto text face; serif → serif, monospace → mono; cursive falls back to
+    /// serif and fantasy to the Arial-metric sans (no script/display face bundled).
     fn slot_for_family(family: GenericFamily) -> FontSlot {
         match family {
             GenericFamily::Serif | GenericFamily::Cursive => FontSlot::Serif,
             GenericFamily::Monospace => FontSlot::Monospace,
+            GenericFamily::SansArial => FontSlot::Sans,
             GenericFamily::SansSerif | GenericFamily::Fantasy => FontSlot::Text,
         }
     }
@@ -111,6 +126,7 @@ impl TextEngine {
             FontSlot::Fallback => (&self.rb_fallback, self.fallback_font.height_unscaled()),
             FontSlot::Serif => (&self.rb_serif, self.serif_font.height_unscaled()),
             FontSlot::Monospace => (&self.rb_mono, self.mono_font.height_unscaled()),
+            FontSlot::Sans => (&self.rb_sans, self.sans_font.height_unscaled()),
             _ => (&self.rb_font, self.font.height_unscaled()),
         }
     }
@@ -179,6 +195,7 @@ impl TextEngine {
             FontSlot::Fallback => &self.fallback_font,
             FontSlot::Serif => &self.serif_font,
             FontSlot::Monospace => &self.mono_font,
+            FontSlot::Sans => &self.sans_font,
         }
     }
 
@@ -413,6 +430,8 @@ impl TextShaper for TextEngine {
     /// layout calls this once per word. A lone space carries no GPOS adjustment,
     /// so the plain glyph advance matches what rustybuzz would shape.
     fn space_advance(&self, px: u32) -> u32 {
+        // The family-less path is the Roboto text face (matching `shape`), used
+        // for the browser's own UI/chrome; the `SansSerif` default maps there.
         self.space_advance_with(px, GenericFamily::SansSerif)
     }
 
@@ -965,10 +984,13 @@ mod tests {
         // Each generic family shapes its text-covered glyphs from the matching
         // bundled face (so the rasterizer outlines the right shapes).
         let slot = |fam: GenericFamily| e.shape_with("Ag", 16, fam)[0].font;
+        // Generic sans-serif → Roboto (matches the reference default); Arial-named
+        // → the Arial-metric Liberation Sans face.
         assert_eq!(slot(GenericFamily::SansSerif), FontSlot::Text);
+        assert_eq!(slot(GenericFamily::SansArial), FontSlot::Sans);
         assert_eq!(slot(GenericFamily::Serif), FontSlot::Serif);
         assert_eq!(slot(GenericFamily::Monospace), FontSlot::Monospace);
-        // Cursive falls back to serif, fantasy to the sans text face.
+        // Cursive falls back to serif, fantasy to the default sans (Roboto).
         assert_eq!(slot(GenericFamily::Cursive), FontSlot::Serif);
         assert_eq!(slot(GenericFamily::Fantasy), FontSlot::Text);
         // The monospace space is wider than the proportional one (fixed pitch).

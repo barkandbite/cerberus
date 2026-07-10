@@ -223,7 +223,8 @@ impl DisplayList {
 /// fallback), so the face is tracked per glyph rather than per run.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
 pub enum FontSlot {
-    /// The primary text font (Roboto sans-serif).
+    /// The primary text font (Roboto) — the browser's own UI/chrome face, and the
+    /// page face when a page names Roboto specifically.
     #[default]
     Text,
     /// The bundled icon font (private-use icon glyphs).
@@ -235,6 +236,9 @@ pub enum FontSlot {
     Serif,
     /// The bundled monospace face (Liberation Mono ≈ Courier).
     Monospace,
+    /// The bundled Arial-metric sans face (Liberation Sans ≈ Arial) — the default
+    /// for page `sans-serif` content, matching the Chrome-on-Windows persona.
+    Sans,
 }
 
 /// A shaped glyph: enough for both the placeholder box rasterizer (uses `w`/`h`)

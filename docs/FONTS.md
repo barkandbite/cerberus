@@ -23,24 +23,28 @@ real names.
 literal named font is never shipped or read (a privacy property, ADR-0005), but
 because the bundled face is metric-compatible, widths and shapes match closely.
 
-| Generic       | Bundled face          | Metric-compatible with | License      | Status   |
-|---------------|-----------------------|------------------------|--------------|----------|
-| `sans-serif`  | Roboto                | (≈ Arial/Helvetica)    | Apache-2.0   | bundled  |
-| `serif`       | Liberation Serif      | Times New Roman        | SIL OFL 1.1  | bundled  |
-| `monospace`   | Liberation Mono       | Courier New            | SIL OFL 1.1  | bundled  |
-| `cursive`     | → Liberation Serif    | (no script face yet)   | —            | fallback |
-| `fantasy`     | → Roboto              | (no display face yet)  | —            | fallback |
+| `font-family`                | Bundled face          | Metric-compatible with | License      |
+|------------------------------|-----------------------|------------------------|--------------|
+| `sans-serif` (generic, default) | Roboto             | (reference default)    | Apache-2.0   |
+| `Arial` / `Helvetica`        | Liberation Sans       | Arial                  | SIL OFL 1.1  |
+| `serif`                      | Liberation Serif      | Times New Roman        | SIL OFL 1.1  |
+| `monospace`                  | Liberation Mono       | Courier New            | SIL OFL 1.1  |
+| `cursive`                    | → Liberation Serif    | (no script face yet)   | —            |
+| `fantasy`                    | → Roboto              | (no display face yet)  | —            |
 
 Notes:
 
-- **Liberation** (Red Hat, SIL OFL 1.1) is the ideal libre choice: it is
-  glyph-width-identical to Arial / Times New Roman / Courier New, so a page laid
-  out for those metrics wraps at the same points. Chrome OS uses the equivalent
-  Croscore family (Arimo/Tinos/Cousine) for exactly this reason.
-- **Sans default:** the default `font-family` is sans-serif → Roboto (unchanged
-  from before this work), so the corpus doesn't regress. Roboto is close to
-  Arial metrics; swapping it for Liberation Sans is a candidate follow-up,
-  measured on the corpus before flipping.
+- **Liberation** (Red Hat, SIL OFL 1.1) is glyph-width-identical to Arial /
+  Times New Roman / Courier New, so a page laid out for those metrics wraps at
+  the same points. Chrome OS uses the equivalent Croscore family
+  (Arimo/Tinos/Cousine) for exactly this reason.
+- **Two sans faces, selected by what the page names.** The generic `sans-serif`
+  (and non-Arial sans names) render in **Roboto** — measured to match the
+  reference browser's default sans best (flipping the generic default to
+  Liberation Sans regressed *every* sans page on the corpus). A page that names
+  **Arial/Helvetica** specifically renders in **Liberation Sans** (Arial metrics)
+  — what a real Chrome-on-Windows box shows for those, distinct from the generic
+  default. Roboto also remains the browser's own UI/chrome face.
 - **Monospace-size quirk:** Chrome resolves an unspecified (`medium`) font-size
   to **13px** for the monospace generic and 16px otherwise, so `<pre>`/`<code>`
   render smaller than surrounding text. The cascade reproduces this

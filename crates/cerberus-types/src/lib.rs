@@ -267,11 +267,17 @@ impl FontStyle {
 /// class without shipping — or fingerprinting against — the actual named fonts.
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Default, Hash)]
 pub enum GenericFamily {
-    /// Proportional serif (Times/Georgia class).
+    /// Proportional serif (Times/Georgia class) → the bundled serif face.
     Serif,
-    /// Proportional sans-serif (Arial/Helvetica class) — the default.
+    /// Generic `sans-serif` (and most named sans faces) — the default → the
+    /// bundled Roboto face, which empirically matches the reference browser's
+    /// default sans most closely.
     #[default]
     SansSerif,
+    /// A page that names Arial/Helvetica specifically → the bundled Arial-metric
+    /// sans face (Liberation Sans), what a Chrome-on-Windows box actually renders
+    /// for those, distinct from the generic default.
+    SansArial,
     /// Fixed-pitch (Courier/Consolas class); `<pre>`/`<code>` default here.
     Monospace,
     /// Handwriting/script; falls back to serif when no cursive face is bundled.
