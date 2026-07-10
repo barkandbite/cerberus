@@ -18,7 +18,7 @@ use cerberus_style::{
     Position, StyleEngine, StyledChild, StyledDom, StyledNode, TextAlign, TextTransform, Track,
     TrackMax, VerticalAlign, Visibility, WhiteSpace,
 };
-use cerberus_types::{Color, ImageFit, ImagePos, Point};
+use cerberus_types::{Color, GenericFamily, ImageFit, ImagePos, Point};
 use parser::{
     parse_declaration_block, parse_stylesheet, ElemRef, MediaContext, SiblingRef, Specificity,
     Stylesheet,
@@ -68,8 +68,8 @@ ul, ol { margin-top: 8px; margin-bottom: 8px; margin-left: 24px; }
 blockquote { margin-left: 24px; margin-top: 8px; margin-bottom: 8px; }
 figure { margin-top: 16px; margin-bottom: 16px; margin-left: 40px; margin-right: 40px; }
 dd { margin-left: 40px; }
-pre { white-space: pre; margin-top: 8px; margin-bottom: 8px; }
-code, kbd, samp { white-space: pre; }
+pre { white-space: pre; margin-top: 8px; margin-bottom: 8px; font-family: monospace; }
+code, kbd, samp, tt { white-space: pre; font-family: monospace; }
 /* Only anchors with an href are links (`:any-link`); a bare `<a name=…>`
    placeholder is not styled blue/underlined. */
 a[href] { color: #154fd2; text-decoration: underline; }
@@ -224,6 +224,19 @@ impl CssEngine {
                     true,
                 );
             }
+        }
+
+        // The monospace-size quirk: an unspecified (`medium`) font-size resolves
+        // to 13px for the monospace generic and 16px otherwise, matching Chrome —
+        // so `<pre>`/`<code>` render smaller than surrounding proportional text.
+        // Applied once here, after both font-size and font-family are known, so
+        // children inherit the resolved px.
+        if style.font_size_medium {
+            style.font_size = if style.font_family == GenericFamily::Monospace {
+                13
+            } else {
+                16
+            };
         }
 
         let child_root_font_size = if node.tag() == "html" {
@@ -804,6 +817,10 @@ fn apply_declarations(
             "font-size" => {
                 if let Some(px) = parse_size(v, parent_font_size) {
                     style.font_size = px;
+                    // Track whether the value is still the initial `medium` keyword
+                    // (vs an explicit length/keyword), for the monospace-size quirk
+                    // resolved post-cascade.
+                    style.font_size_medium = v.trim().eq_ignore_ascii_case("medium");
                 }
             }
             "font-weight" => style.font.bold = is_bold(v),
@@ -812,12 +829,17 @@ fn apply_declarations(
                 style.font.italic = low == "italic" || low == "oblique";
             }
             "font" => apply_font_shorthand(style, v, parent_font_size),
-            // `font-family` is intentionally not honored: the font set is fixed
-            // to the bundled face (a privacy/anti-fingerprinting property — no
-            // system or downloadable fonts are read), so families and `@font-face`
-            // text render in the bundled font. Consumed here so the decision is
-            // explicit rather than a silent fall-through (ADR-0038).
-            "font-family" => {}
+            // `font-family` resolves to a generic class (serif / sans-serif /
+            // monospace / …), which selects one of the bundled metric-compatible
+            // faces at rasterization. The *named* fonts are never shipped or read
+            // (a privacy/anti-fingerprinting property — no system or downloadable
+            // fonts), so e.g. `Georgia, serif` and `Consolas, monospace` render in
+            // the bundled serif/mono face rather than the literal named font.
+            "font-family" => {
+                if let Some(g) = parse_font_family(v) {
+                    style.font_family = g;
+                }
+            }
             "text-align" => {
                 style.text_align = match v.to_ascii_lowercase().as_str() {
                     "center" => TextAlign::Center,
@@ -1755,9 +1777,99 @@ fn apply_font_shorthand(style: &mut ComputedStyle, v: &str, parent_font_size: u3
         } else if t.chars().any(|c| c.is_ascii_digit()) {
             if let Some(px) = parse_size(&t, parent_font_size) {
                 style.font_size = px;
+                style.font_size_medium = false; // the shorthand set an explicit size
             }
         }
     }
+    // The trailing family list (best-effort: size/style tokens don't classify).
+    if let Some(g) = parse_font_family(v) {
+        style.font_family = g;
+    }
+}
+
+/// Classify one `font-family` entry into a generic class, or `None` if the name
+/// is unknown (so the caller falls through to the next family in the list). CSS
+/// generic keywords resolve directly; named faces resolve by well-known keywords
+/// in the name (`mono`, `serif`, script/handwriting cues), defaulting a plain
+/// named face to sans-serif only when nothing else matches.
+fn classify_font_family(name: &str) -> Option<GenericFamily> {
+    let n = name
+        .trim()
+        .trim_matches(['"', '\''])
+        .trim()
+        .to_ascii_lowercase();
+    match n.as_str() {
+        "serif" => return Some(GenericFamily::Serif),
+        "sans-serif" | "system-ui" | "ui-sans-serif" | "-apple-system" | "blinkmacsystemfont"
+        | "ui-rounded" => return Some(GenericFamily::SansSerif),
+        "monospace" | "ui-monospace" => return Some(GenericFamily::Monospace),
+        "cursive" => return Some(GenericFamily::Cursive),
+        "fantasy" => return Some(GenericFamily::Fantasy),
+        "" | "inherit" | "initial" | "unset" | "emoji" | "math" | "fangsong" => return None,
+        _ => {}
+    }
+    // Named faces, by keyword.
+    let has = |kw: &str| n.contains(kw);
+    if has("mono")
+        || has("courier")
+        || has("consol")
+        || has("menlo")
+        || has("monaco")
+        || has("inconsolata")
+        || has("code")
+        || has("terminal")
+    {
+        Some(GenericFamily::Monospace)
+    } else if has("script")
+        || has("comic")
+        || has("cursive")
+        || has("handwriting")
+        || has("brush")
+        || has("segoe print")
+        || has("dancing")
+    {
+        Some(GenericFamily::Cursive)
+    } else if has("impact") || has("papyrus") || has("luminari") || has("fantasy") {
+        Some(GenericFamily::Fantasy)
+    } else if (has("serif") && !has("sans"))
+        || has("times")
+        || has("georgia")
+        || has("garamond")
+        || has("cambria")
+        || has("palatino")
+        || has("baskerville")
+        || has("book antiqua")
+        || has("minion")
+        || has("didot")
+        || has("charter")
+        || has("constantia")
+    {
+        Some(GenericFamily::Serif)
+    } else if has("arial")
+        || has("helvetica")
+        || has("verdana")
+        || has("tahoma")
+        || has("segoe")
+        || has("roboto")
+        || has("calibri")
+        || has("sans")
+        || has("gothic")
+        || has("open ")
+        || has("lato")
+        || has("noto sans")
+    {
+        Some(GenericFamily::SansSerif)
+    } else {
+        None
+    }
+}
+
+/// Resolve a `font-family` value (a comma-separated list) to one generic class:
+/// the first entry that classifies wins (approximating "first available font"),
+/// so `"MyBrand", Georgia, serif` → serif via Georgia. `None` if nothing in the
+/// list classifies (the caller keeps the inherited family).
+fn parse_font_family(v: &str) -> Option<GenericFamily> {
+    v.split(',').find_map(classify_font_family)
 }
 
 fn apply_margin_shorthand(style: &mut ComputedStyle, v: &str, em_base: f32) {
@@ -2162,6 +2274,58 @@ mod tests {
             StyledChild::Element(e) => first(e, tag),
             StyledChild::Text(_) => None,
         })
+    }
+
+    #[test]
+    fn font_family_resolves_to_generic() {
+        let dom = CssEngine::new().style(&parse_html(
+            "<p id=a style='font-family:Georgia, serif'>a</p>\
+             <p id=b style=\"font-family:'Helvetica Neue', Arial, sans-serif\">b</p>\
+             <p id=c style='font-family:Consolas, monospace'>c</p>\
+             <p id=d style='font-family:\"Brush Script MT\", cursive'>d</p>",
+        ));
+        let fam = |id: &str| {
+            fn by_id<'a>(n: &'a StyledNode, id: &str) -> Option<&'a StyledNode> {
+                if n.attr("id") == Some(id) {
+                    return Some(n);
+                }
+                n.children.iter().find_map(|c| match c {
+                    StyledChild::Element(e) => by_id(e, id),
+                    StyledChild::Text(_) => None,
+                })
+            }
+            by_id(&dom.root, id).unwrap().style.font_family
+        };
+        assert_eq!(fam("a"), GenericFamily::Serif, "Georgia → serif");
+        assert_eq!(fam("b"), GenericFamily::SansSerif, "Arial → sans-serif");
+        assert_eq!(fam("c"), GenericFamily::Monospace, "Consolas → monospace");
+        assert_eq!(fam("d"), GenericFamily::Cursive, "Brush Script → cursive");
+    }
+
+    #[test]
+    fn monospace_uses_chrome_default_13px_size() {
+        // `<pre>`/`<code>` inherit the UA monospace family; with an unspecified
+        // (`medium`) size they resolve to 13px, matching Chrome's smaller default
+        // for the fixed font. Proportional text stays 16px. An explicit size wins.
+        let dom = CssEngine::new().style(&parse_html(
+            "<p>prose</p><pre>code block</pre>\
+             <code style='font-size:20px'>big</code>",
+        ));
+        assert_eq!(
+            first(&dom.root, "p").unwrap().style.font_size,
+            16,
+            "proportional medium → 16"
+        );
+        assert_eq!(
+            first(&dom.root, "pre").unwrap().style.font_size,
+            13,
+            "monospace medium → 13"
+        );
+        assert_eq!(
+            first(&dom.root, "code").unwrap().style.font_size,
+            20,
+            "explicit monospace size is honored"
+        );
     }
 
     #[test]

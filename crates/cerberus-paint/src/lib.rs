@@ -6,7 +6,7 @@
 //! approved crates land at M2; this crate ships only the traits plus deliberately
 //! trivial built-in stubs so the M0 render path is end-to-end.
 
-use cerberus_types::{Color, FontStyle, ImageFit, ImagePos, Point, Rect, Size};
+use cerberus_types::{Color, FontStyle, GenericFamily, ImageFit, ImagePos, Point, Rect, Size};
 use std::sync::Arc;
 
 /// One drawing primitive in a resolution-independent display list.
@@ -223,7 +223,7 @@ impl DisplayList {
 /// fallback), so the face is tracked per glyph rather than per run.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
 pub enum FontSlot {
-    /// The primary text font (Roboto).
+    /// The primary text font (Roboto sans-serif).
     #[default]
     Text,
     /// The bundled icon font (private-use icon glyphs).
@@ -231,6 +231,10 @@ pub enum FontSlot {
     /// The bundled fallback face for characters the text font can't render
     /// (CJK, etc.).
     Fallback,
+    /// The bundled serif face (Liberation Serif ≈ Times).
+    Serif,
+    /// The bundled monospace face (Liberation Mono ≈ Courier).
+    Monospace,
 }
 
 /// A shaped glyph: enough for both the placeholder box rasterizer (uses `w`/`h`)
@@ -422,6 +426,15 @@ pub trait TextShaper: Send + Sync {
     /// Shape `text` at the given pixel size into glyph boxes.
     fn shape(&self, text: &str, px: u32) -> Vec<GlyphBox>;
 
+    /// Shape `text` at `px` in the given generic family (serif/monospace/…). The
+    /// default ignores the family and shapes in the primary face, so shapers that
+    /// bundle only one face stay correct; a multi-face shaper overrides this to
+    /// pick the matching bundled face. Content layout calls this; UI/chrome text
+    /// uses the family-less [`shape`](Self::shape).
+    fn shape_with(&self, text: &str, px: u32, _family: GenericFamily) -> Vec<GlyphBox> {
+        self.shape(text, px)
+    }
+
     /// Shape a single icon glyph (a codepoint in the bundled icon font), to be
     /// painted in a run styled [`FontStyle::ICON`]. Default: no glyph (a shaper
     /// without an icon font draws nothing).
@@ -436,6 +449,13 @@ pub trait TextShaper: Send + Sync {
     /// Default: shape a single space and sum, so any shaper stays correct.
     fn space_advance(&self, px: u32) -> u32 {
         self.shape(" ", px).iter().map(|g| g.advance).sum()
+    }
+
+    /// The space advance in the given generic family — a monospace space is wider
+    /// than a proportional one, so word gaps in `<pre>`/`<code>` need the right
+    /// face. Default: ignore the family (single-face shapers).
+    fn space_advance_with(&self, px: u32, _family: GenericFamily) -> u32 {
+        self.space_advance(px)
     }
 }
 

@@ -6,7 +6,7 @@
 //! reimplemented without touching layout. Layout consumes only these types.
 
 use cerberus_dom::{Document, NodeId};
-use cerberus_types::{Color, FontStyle, ImageFit, ImagePos, Point};
+use cerberus_types::{Color, FontStyle, GenericFamily, ImageFit, ImagePos, Point};
 
 /// CSS `position`. `Static` is normal flow; the rest are positioned.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
@@ -340,6 +340,16 @@ pub struct ComputedStyle {
     pub background_image: Option<String>,
     pub font_size: u32,
     pub font: FontStyle,
+    /// Whether `font-size` is still the initial `medium` keyword (no explicit
+    /// length/keyword set on this element or an ancestor). Inherited. Chrome
+    /// resolves `medium` to 13px for the monospace generic and 16px otherwise
+    /// (the "monospace renders smaller" quirk), so the cascade applies that once
+    /// both `font-size` and `font-family` are known.
+    pub font_size_medium: bool,
+    /// The generic family this element's `font-family` resolves to (serif /
+    /// sans-serif / monospace / …). Inherited. Selects the bundled face at
+    /// rasterization; the named fonts themselves are never shipped.
+    pub font_family: GenericFamily,
     pub text_align: TextAlign,
     pub underline: bool,
     /// `text-decoration: line-through` (strikethrough). Inherited alongside
@@ -494,6 +504,8 @@ impl ComputedStyle {
             background_image: None,
             font_size: 16,
             font: FontStyle::REGULAR,
+            font_size_medium: true,
+            font_family: GenericFamily::SansSerif,
             text_align: TextAlign::Left,
             underline: false,
             line_through: false,
@@ -575,6 +587,8 @@ impl ComputedStyle {
             color: self.color,
             font_size: self.font_size,
             font: self.font,
+            font_size_medium: self.font_size_medium,
+            font_family: self.font_family,
             text_align: self.text_align,
             underline: self.underline,
             line_through: self.line_through,

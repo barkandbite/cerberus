@@ -17,7 +17,7 @@ use cerberus_style::{
     AlignItems, ComputedStyle, Display, FlexDirection, JustifyContent, Len, ListStyleType,
     StyledChild, StyledDom, StyledNode, TextAlign, TextTransform, Track, TrackMax, VerticalAlign,
 };
-use cerberus_types::{Color, FontStyle, Point, Rect, Size};
+use cerberus_types::{Color, FontStyle, GenericFamily, Point, Rect, Size};
 use std::sync::Arc;
 
 /// A clickable link region produced by layout (in layout-local coordinates).
@@ -918,7 +918,8 @@ impl<'a> Ctx<'a> {
             if visible && style.display == Display::ListItem {
                 if let Some(m) = list_marker(style.list_style_type, self.list_ordinal) {
                     self.add_run(&m, style, None);
-                    self.x += space_width(self.shaper, style.font_size.max(1)) as i32;
+                    self.x +=
+                        space_width(self.shaper, style.font_size.max(1), style.font_family) as i32;
                 }
             }
             // Arm `text-indent` for this block's first line: it is consumed as the
@@ -1221,7 +1222,7 @@ impl<'a> Ctx<'a> {
     /// Shape a run and apply `letter-spacing` (px, may be negative) to advances,
     /// returning the glyphs and their total width (ADR-0041).
     fn shape_run(&self, text: &str, px: u32, style: &ComputedStyle) -> (Vec<GlyphBox>, u32) {
-        let mut glyphs = self.shaper.shape(text, px);
+        let mut glyphs = self.shaper.shape_with(text, px, style.font_family);
         if style.letter_spacing != 0 {
             for g in &mut glyphs {
                 g.advance = (g.advance as i32 + style.letter_spacing).max(0) as u32;
@@ -1306,7 +1307,7 @@ impl<'a> Ctx<'a> {
     /// counted as one space each — a small simplification, noted here.
     fn add_pre_wrap_line(&mut self, line: &str, style: &ComputedStyle, href: Option<&str>) {
         let px = style.font_size.max(1);
-        let sw = space_width(self.shaper, px) as i32;
+        let sw = space_width(self.shaper, px, style.font_family) as i32;
         // Accumulated leading-whitespace width for the next word.
         let mut lead = 0i32;
         let mut chars = line.chars().peekable();
@@ -1358,7 +1359,7 @@ impl<'a> Ctx<'a> {
         let gap = if at_line_start {
             std::mem::take(&mut self.pending_indent)
         } else {
-            (space_width(self.shaper, px) as i32 + style.word_spacing).max(0)
+            (space_width(self.shaper, px, style.font_family) as i32 + style.word_spacing).max(0)
         };
         if !at_line_start && self.x + gap + w as i32 > self.right {
             self.newline();
@@ -3666,11 +3667,12 @@ fn roman_ordinal(n: u32, upper: bool) -> String {
     }
 }
 
-fn space_width(shaper: &dyn TextShaper, px: u32) -> u32 {
-    // Delegates to the shaper's `space_advance`, which real shapers implement
+fn space_width(shaper: &dyn TextShaper, px: u32, family: GenericFamily) -> u32 {
+    // Delegates to the shaper's `space_advance_with`, which real shapers implement
     // without the per-call `Vec` allocation `shape(" ", …)` would incur — this
-    // runs once per word in the inline loop.
-    shaper.space_advance(px)
+    // runs once per word in the inline loop. The family matters for `<pre>`/
+    // `<code>`: a monospace space is wider than a proportional one.
+    shaper.space_advance_with(px, family)
 }
 
 /// Parse an `<img width/height>` attribute (a bare number or `Npx`).

@@ -260,6 +260,26 @@ impl FontStyle {
     }
 }
 
+/// The CSS generic font family a run of text resolves to, after mapping the
+/// `font-family` list (named faces included) to one of the five generics. The
+/// renderer bundles one metric-compatible face per generic (a serif ≈ Times, a
+/// monospace ≈ Courier, a sans ≈ Arial/Roboto), so text presents the right shape
+/// class without shipping — or fingerprinting against — the actual named fonts.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default, Hash)]
+pub enum GenericFamily {
+    /// Proportional serif (Times/Georgia class).
+    Serif,
+    /// Proportional sans-serif (Arial/Helvetica class) — the default.
+    #[default]
+    SansSerif,
+    /// Fixed-pitch (Courier/Consolas class); `<pre>`/`<code>` default here.
+    Monospace,
+    /// Handwriting/script; falls back to serif when no cursive face is bundled.
+    Cursive,
+    /// Decorative/display; falls back to sans when no fantasy face is bundled.
+    Fantasy,
+}
+
 /// A web origin (scheme, host, optional port) used for site-boundary checks.
 #[derive(Clone, PartialEq, Eq, Hash, Debug)]
 pub struct Origin {

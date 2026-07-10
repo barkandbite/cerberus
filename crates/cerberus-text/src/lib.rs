@@ -16,7 +16,7 @@ use ab_glyph::{point, Font, FontRef, GlyphId, PxScale, ScaleFont};
 use cerberus_paint::{
     DecodedImage, DisplayItem, DisplayList, FontSlot, Framebuffer, GlyphBox, Rasterizer, TextShaper,
 };
-use cerberus_types::{Color, FontStyle, ImageFit, ImagePos, Point, Rect};
+use cerberus_types::{Color, FontStyle, GenericFamily, ImageFit, ImagePos, Point, Rect};
 
 /// The bundled font (Roboto Regular, Apache-2.0). See `assets/Roboto-LICENSE.txt`.
 const FONT_BYTES: &[u8] = include_bytes!("../assets/Roboto-Regular.ttf");
@@ -27,6 +27,15 @@ const ICON_FONT_BYTES: &[u8] = include_bytes!("../assets/icomoon.ttf");
 /// and — via shared Han — much Chinese) instead of tofu. Bundled, not read from
 /// the system, so the font set stays fixed and reproducible (ADR-0005).
 const FALLBACK_FONT_BYTES: &[u8] = include_bytes!("../assets/IPAGothic.ttf");
+/// Bundled serif face (Liberation Serif, SIL OFL 1.1) — metric-compatible with
+/// Times New Roman, so `font-family: serif` (and named serif faces) present the
+/// right shape/width class without shipping the proprietary font. See
+/// `assets/Liberation-LICENSE.txt`.
+const SERIF_FONT_BYTES: &[u8] = include_bytes!("../assets/LiberationSerif-Regular.ttf");
+/// Bundled monospace face (Liberation Mono, SIL OFL 1.1) — metric-compatible with
+/// Courier New, so `<pre>`/`<code>` and `font-family: monospace` render fixed-
+/// pitch. See `assets/Liberation-LICENSE.txt`.
+const MONO_FONT_BYTES: &[u8] = include_bytes!("../assets/LiberationMono-Regular.ttf");
 
 /// A software text shaper + rasterizer over the bundled text, icon, and fallback
 /// fonts. Glyph **advances** come from rustybuzz (a HarfBuzz port) so run widths
@@ -42,6 +51,13 @@ pub struct TextEngine {
     /// system fonts, no `fontdb`; ADR-0005).
     rb_font: rustybuzz::Face<'static>,
     rb_fallback: rustybuzz::Face<'static>,
+    /// Bundled serif + monospace faces (metric-compatible with Times / Courier),
+    /// selected per `GenericFamily` so `font-family` presents the right shape
+    /// class. ab_glyph outlines; rustybuzz shapes — same split as the text face.
+    serif_font: FontRef<'static>,
+    mono_font: FontRef<'static>,
+    rb_serif: rustybuzz::Face<'static>,
+    rb_mono: rustybuzz::Face<'static>,
 }
 
 impl TextEngine {
@@ -56,13 +72,67 @@ impl TextEngine {
             rustybuzz::Face::from_slice(FONT_BYTES, 0).expect("bundled Roboto font shapes");
         let rb_fallback = rustybuzz::Face::from_slice(FALLBACK_FONT_BYTES, 0)
             .expect("bundled IPAGothic fallback shapes");
+        let serif_font =
+            FontRef::try_from_slice(SERIF_FONT_BYTES).expect("bundled Liberation Serif is valid");
+        let mono_font =
+            FontRef::try_from_slice(MONO_FONT_BYTES).expect("bundled Liberation Mono is valid");
+        let rb_serif = rustybuzz::Face::from_slice(SERIF_FONT_BYTES, 0)
+            .expect("bundled Liberation Serif shapes");
+        let rb_mono = rustybuzz::Face::from_slice(MONO_FONT_BYTES, 0)
+            .expect("bundled Liberation Mono shapes");
         Self {
             font,
             icon_font,
             fallback_font,
             rb_font,
             rb_fallback,
+            serif_font,
+            mono_font,
+            rb_serif,
+            rb_mono,
         }
+    }
+
+    /// The bundled font slot a `GenericFamily` renders in. Serif → serif face,
+    /// monospace → mono face, cursive falls back to serif (script faces aren't
+    /// bundled) and fantasy to the sans text face; sans-serif is the text face.
+    fn slot_for_family(family: GenericFamily) -> FontSlot {
+        match family {
+            GenericFamily::Serif | GenericFamily::Cursive => FontSlot::Serif,
+            GenericFamily::Monospace => FontSlot::Monospace,
+            GenericFamily::SansSerif | GenericFamily::Fantasy => FontSlot::Text,
+        }
+    }
+
+    /// The rustybuzz shaping face and its ab_glyph height metric for a slot, so
+    /// advances scale to the face that will rasterize the run.
+    fn shaping_face(&self, slot: FontSlot) -> (&rustybuzz::Face<'static>, f32) {
+        match slot {
+            FontSlot::Fallback => (&self.rb_fallback, self.fallback_font.height_unscaled()),
+            FontSlot::Serif => (&self.rb_serif, self.serif_font.height_unscaled()),
+            FontSlot::Monospace => (&self.rb_mono, self.mono_font.height_unscaled()),
+            _ => (&self.rb_font, self.font.height_unscaled()),
+        }
+    }
+
+    /// Shape `text` at `px` with `primary` as the face for text-covered runs
+    /// (CJK still itemizes to the fallback face). `shape` is `primary = Text`.
+    fn shape_in(&self, text: &str, px: u32, primary: FontSlot) -> Vec<GlyphBox> {
+        let mut out = Vec::with_capacity(text.len());
+        let pxf = px.max(1) as f32;
+        for (slot, run) in self.itemize(text) {
+            // A text-covered run renders in the requested primary face; a fallback
+            // (CJK) run keeps the fallback face regardless of family.
+            let eff = if slot == FontSlot::Text {
+                primary
+            } else {
+                slot
+            };
+            let (face, ag_height) = self.shaping_face(eff);
+            let units_to_px = pxf / ag_height.max(1.0);
+            shape_run_rb(face, run, px, eff, units_to_px, &mut out);
+        }
+        out
     }
 
     /// Which bundled face covers `ch`: the primary text font if it has a glyph
@@ -107,6 +177,8 @@ impl TextEngine {
             FontSlot::Text => &self.font,
             FontSlot::Icon => &self.icon_font,
             FontSlot::Fallback => &self.fallback_font,
+            FontSlot::Serif => &self.serif_font,
+            FontSlot::Monospace => &self.mono_font,
         }
     }
 
@@ -314,20 +386,11 @@ fn shape_run_rb(
 
 impl TextShaper for TextEngine {
     fn shape(&self, text: &str, px: u32) -> Vec<GlyphBox> {
-        let mut out = Vec::with_capacity(text.len());
-        let pxf = px.max(1) as f32;
-        for (slot, run) in self.itemize(text) {
-            // rustybuzz shapes; the run is rasterized by the matching ab_glyph
-            // face, so scale font-unit advances by that face's ab_glyph factor
-            // (px / height_unscaled) to stay consistent with the outlining.
-            let (face, ag_height) = match slot {
-                FontSlot::Fallback => (&self.rb_fallback, self.fallback_font.height_unscaled()),
-                _ => (&self.rb_font, self.font.height_unscaled()),
-            };
-            let units_to_px = pxf / ag_height.max(1.0);
-            shape_run_rb(face, run, px, slot, units_to_px, &mut out);
-        }
-        out
+        self.shape_in(text, px, FontSlot::Text)
+    }
+
+    fn shape_with(&self, text: &str, px: u32, family: GenericFamily) -> Vec<GlyphBox> {
+        self.shape_in(text, px, Self::slot_for_family(family))
     }
 
     fn shape_icon(&self, ch: char, px: u32) -> Vec<GlyphBox> {
@@ -350,8 +413,16 @@ impl TextShaper for TextEngine {
     /// layout calls this once per word. A lone space carries no GPOS adjustment,
     /// so the plain glyph advance matches what rustybuzz would shape.
     fn space_advance(&self, px: u32) -> u32 {
-        let f = &self.rb_font;
-        let units_to_px = px.max(1) as f32 / self.font.height_unscaled().max(1.0);
+        self.space_advance_with(px, GenericFamily::SansSerif)
+    }
+
+    /// The space advance in the requested family's face — a monospace space is
+    /// wider than a proportional one, so `<pre>`/`<code>` word gaps use the mono
+    /// face's advance (keeping column alignment) rather than the sans space.
+    fn space_advance_with(&self, px: u32, family: GenericFamily) -> u32 {
+        let slot = Self::slot_for_family(family);
+        let (f, ag_height) = self.shaping_face(slot);
+        let units_to_px = px.max(1) as f32 / ag_height.max(1.0);
         f.glyph_index(' ')
             .and_then(|g| f.glyph_hor_advance(g))
             .map(|a| (a as f32 * units_to_px).round().max(0.0) as u32)
@@ -886,5 +957,25 @@ mod tests {
             assert_eq!(g.len(), 1);
             assert!(g[0].id != 0, "missing icon glyph U+{:04X}", cp as u32);
         }
+    }
+
+    #[test]
+    fn shape_with_selects_the_bundled_face_per_family() {
+        let e = TextEngine::new();
+        // Each generic family shapes its text-covered glyphs from the matching
+        // bundled face (so the rasterizer outlines the right shapes).
+        let slot = |fam: GenericFamily| e.shape_with("Ag", 16, fam)[0].font;
+        assert_eq!(slot(GenericFamily::SansSerif), FontSlot::Text);
+        assert_eq!(slot(GenericFamily::Serif), FontSlot::Serif);
+        assert_eq!(slot(GenericFamily::Monospace), FontSlot::Monospace);
+        // Cursive falls back to serif, fantasy to the sans text face.
+        assert_eq!(slot(GenericFamily::Cursive), FontSlot::Serif);
+        assert_eq!(slot(GenericFamily::Fantasy), FontSlot::Text);
+        // The monospace space is wider than the proportional one (fixed pitch).
+        assert!(
+            e.space_advance_with(16, GenericFamily::Monospace)
+                > e.space_advance_with(16, GenericFamily::SansSerif),
+            "monospace space is wider"
+        );
     }
 }
