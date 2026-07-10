@@ -116,9 +116,14 @@ impl FarblingProvider for SeededFarbling {
 ///   per-head seeded noise, so heads don't correlate on the pixel hash.
 /// - **audio**: analyser/offline-render readbacks return near-silence with
 ///   per-head noise in the low bits, deterministic per head.
-/// - **font metrics**: `measureText` widths get a bounded (≤2%) per-(head,
-///   font, text) jitter; metric probing of installed fonts is useless anyway
-///   since Cerberus only ships bundled fonts.
+/// - **font metrics + enumeration**: `measureText` resolves the requested family
+///   against this head's presented font set (`__CERBERUS_PROFILE__.fonts`). An
+///   *installed* family (a generic, or a name in the set) gets a stable
+///   per-(head, family) advance; a *non-installed* family measures identically to
+///   the generic fallback, so the classic width-comparison enumeration trick sees
+///   it as absent. This makes `measureText` and `document.fonts.check` agree on
+///   one per-head-random font list rather than exposing that only bundled faces
+///   exist (a headless tell).
 const FARBLING_SHIMS: &str = r##"
   function __fnv(s){var h=2166136261>>>0;for(var i=0;i<s.length;i++){h=Math.imul(h^s.charCodeAt(i),16777619)>>>0;}return h>>>0;}
   function __rng(ch,key){
@@ -194,13 +199,45 @@ const FARBLING_SHIMS: &str = r##"
     return out;
   }
 
-  // ---- font metrics ----
+  // ---- font metrics + enumeration defense ----
+  // The CSS generic families (and system aliases) always resolve, so they are
+  // "installed" for measurement purposes.
+  var __GENERIC={"serif":1,"sans-serif":1,"monospace":1,"cursive":1,"fantasy":1,
+    "system-ui":1,"ui-serif":1,"ui-sans-serif":1,"ui-monospace":1,"ui-rounded":1,
+    "math":1,"emoji":1,"-apple-system":1,"blinkmacsystemfont":1};
+  // The first family named in a CSS `font` shorthand (or bare family), unquoted
+  // and lowercased.
+  function __family(font){
+    var s=String(font);
+    var m=/(?:\d*\.?\d+)(?:px|pt|pc|em|rem|ex|ch|vw|vh|%)\s+(.+)$/.exec(s);
+    var fam=(m?m[1]:s).split(",")[0].trim().replace(/^["']|["']$/g,"");
+    return fam.toLowerCase();
+  }
+  // Whether the head presents `fam` as installed: a generic family, or a name in
+  // this head's per-head font set (globalThis.__CERBERUS_PROFILE__.fonts). The
+  // measureText enumeration trick and document.fonts.check both consult this same
+  // list, so they agree.
+  function __fontInstalled(fam){
+    if(__GENERIC[fam])return true;
+    var p=globalThis.__CERBERUS_PROFILE__;
+    var list=(p&&p.fonts)||null;
+    if(!list)return false;
+    for(var i=0;i<list.length;i++){if(String(list[i]).toLowerCase()===fam)return true;}
+    return false;
+  }
+  globalThis.__cerbFontInstalled=__fontInstalled;
   function __measure(t,font){
     var px=parseFloat(font)||10;
-    var base=0;for(var i=0;i<t.length;i++){base+=(t.charCodeAt(i)===32)?0.33:0.6;}
-    base*=px;
-    var r=__rng(4,String(font)+"|"+t);
-    var width=base+((r()%1000)/1000)*0.02*base;
+    var fam=__family(font);
+    // A non-installed family renders in the generic fallback, so it must measure
+    // IDENTICALLY to that fallback — otherwise the classic width-comparison trick
+    // detects it. Installed families get a stable per-(head, family) advance so
+    // real installed fonts still differ from each other and from the fallback.
+    var key=__fontInstalled(fam)?fam:"sans-serif";
+    var adv=0;for(var i=0;i<t.length;i++){adv+=(t.charCodeAt(i)===32)?0.33:0.6;}
+    var r=__rng(4,"fam|"+key);
+    var factor=0.90+((r()%2000)/2000)*0.22; // ~[0.90,1.12], stable per head+family
+    var width=adv*px*factor;
     return {width:width,
       actualBoundingBoxLeft:0,actualBoundingBoxRight:width,
       actualBoundingBoxAscent:px*0.8,actualBoundingBoxDescent:px*0.2,
