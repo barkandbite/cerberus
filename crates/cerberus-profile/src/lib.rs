@@ -26,6 +26,10 @@
 //! ([`Profile::profile_prologue`]) that a future prelude will read. It has no
 //! integration wiring yet.
 
+/// The font-enumeration surface: the catalog of font names a head can present
+/// and the per-head sampling that makes the report privacy-safe.
+pub mod fonts;
+
 // ---------------------------------------------------------------------------
 // Enums
 // ---------------------------------------------------------------------------
@@ -214,8 +218,6 @@ pub struct Archetype {
     pub gpu_unmasked_renderer: &'static str,
     /// Reported color depth (bits).
     pub color_depth: u32,
-    /// Presented font set.
-    pub fonts: &'static [&'static str],
     /// Whether UA client hints are exposed (Chromium only).
     pub has_ua_data: bool,
     /// Whether `navigator.deviceMemory` is exposed (Chromium only).
@@ -233,31 +235,6 @@ pub struct Archetype {
     /// Allowed `deviceMemory` values (GiB, already capped at 8).
     pub memory: &'static [u8],
 }
-
-/// Windows 10/11 default font set.
-const FONTS_WINDOWS: &[&str] = &[
-    "Segoe UI",
-    "Calibri",
-    "Cambria",
-    "Consolas",
-    "Arial",
-    "Times New Roman",
-    "Courier New",
-    "Verdana",
-    "Tahoma",
-    "Georgia",
-];
-
-/// macOS default font set.
-const FONTS_MACOS: &[&str] = &[
-    "Helvetica Neue",
-    "San Francisco",
-    "Menlo",
-    "Monaco",
-    "Geneva",
-    "Arial",
-    "Times New Roman",
-];
 
 /// The device-class table, market-share weighted (Windows Chrome dominates).
 ///
@@ -281,7 +258,6 @@ pub static ARCHETYPES: &[Archetype] = &[
         gpu_unmasked_renderer:
             "ANGLE (Intel, Intel(R) UHD Graphics 630 (0x00003E9B) Direct3D11 vs_5_0 ps_5_0, D3D11)",
         color_depth: 24,
-        fonts: FONTS_WINDOWS,
         has_ua_data: true,
         has_device_memory: true,
         max_touch_points: 0,
@@ -306,7 +282,6 @@ pub static ARCHETYPES: &[Archetype] = &[
         gpu_unmasked_renderer:
             "ANGLE (NVIDIA, NVIDIA GeForce RTX 3060 (0x00002504) Direct3D11 vs_5_0 ps_5_0, D3D11)",
         color_depth: 24,
-        fonts: FONTS_WINDOWS,
         has_ua_data: true,
         has_device_memory: true,
         max_touch_points: 0,
@@ -329,7 +304,6 @@ pub static ARCHETYPES: &[Archetype] = &[
         gpu_unmasked_vendor: "Google Inc. (AMD)",
         gpu_unmasked_renderer: "ANGLE (AMD, AMD Radeon RX 6600 Direct3D11 vs_5_0 ps_5_0, D3D11)",
         color_depth: 24,
-        fonts: FONTS_WINDOWS,
         has_ua_data: true,
         has_device_memory: true,
         max_touch_points: 0,
@@ -352,7 +326,6 @@ pub static ARCHETYPES: &[Archetype] = &[
         gpu_unmasked_vendor: "Google Inc. (Apple)",
         gpu_unmasked_renderer: "ANGLE (Apple, ANGLE Metal Renderer: Apple M2, Unspecified Version)",
         color_depth: 30,
-        fonts: FONTS_MACOS,
         has_ua_data: true,
         has_device_memory: true,
         max_touch_points: 0,
@@ -378,7 +351,6 @@ pub static ARCHETYPES: &[Archetype] = &[
         gpu_unmasked_renderer:
             "ANGLE (Intel, Intel(R) UHD Graphics 630 (0x00003E9B) Direct3D11 vs_5_0 ps_5_0, D3D11)",
         color_depth: 24,
-        fonts: FONTS_WINDOWS,
         has_ua_data: false,
         has_device_memory: false,
         max_touch_points: 0,
@@ -464,6 +436,7 @@ const TAG_MEM: u64 = 4;
 const TAG_OSVER: u64 = 5;
 const TAG_LOCALE: u64 = 6;
 const TAG_NOISE: u64 = 7;
+const TAG_FONTS: u64 = 8;
 
 /// Approximate pixels of OS chrome reserved at the bottom (Windows taskbar).
 const WINDOWS_TASKBAR: u32 = 40;
@@ -539,7 +512,10 @@ pub fn derive_profile(seed: u64, overrides: &ProfileOverrides) -> Profile {
         tz_offset_minutes: tz_off,
         languages,
         language,
-        fonts: arch.fonts.to_vec(),
+        // A per-head-random, OS-coherent font set drawn from the catalog, so the
+        // three heads present different enumerations and no stable cross-site
+        // font-fingerprint forms (see the `fonts` module).
+        fonts: fonts::derive_fonts(sub_stream(seed, TAG_FONTS), arch.os),
         plugins_has_pdf: arch.browser.is_chromium(),
         max_touch_points: arch.max_touch_points,
         noise_seed,
