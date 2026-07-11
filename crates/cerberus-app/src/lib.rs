@@ -42,11 +42,35 @@ use cerberus_js_dom::{
     FetchResponse, PageEnv, RebuiltDom,
 };
 use cerberus_js_quickjs::QuickJsEngineFactory;
-pub use cerberus_layout::LayoutEngineKind;
 use cerberus_layout::{
     pick_img_url, BlockLayout, ElementBox, FieldKind, FormFieldBox, FormState, ImageProvider,
     LayoutEngine, LinkBox, NoForms, NoImages,
 };
+pub use cerberus_layout::{ImageDisplayMode, LayoutEngineKind};
+
+/// Which images render as text (the resource-saving text-only option): a global
+/// default mode plus per-image overrides that flip it. `text_only(url)` is the
+/// single decision consulted by both the fetch skip and the render provider, so
+/// they always agree. An override is matched as a substring of the resolved URL,
+/// so a caller can name one image (its file name) or a whole path.
+#[derive(Clone, Debug, Default)]
+pub struct ImagePolicy {
+    /// The default when no override matches.
+    pub default: ImageDisplayMode,
+    /// Resolved-URL substrings whose match flips an image to the opposite of the
+    /// default (text-only in a graphical default, graphical in a text-only one).
+    pub overrides: Vec<String>,
+}
+
+impl ImagePolicy {
+    fn text_only(&self, url: &str) -> bool {
+        let flipped = self
+            .overrides
+            .iter()
+            .any(|o| !o.is_empty() && url.contains(o.as_str()));
+        (self.default == ImageDisplayMode::TextOnly) ^ flipped
+    }
+}
 
 /// Construct the selected layout engine, composing the two adapters here (in the
 /// app) so `cerberus-layout` need not depend on `cerberus-taffy` — the taffy
@@ -116,6 +140,14 @@ pub struct RenderConfig {
     /// comparison during the layout migration. Defaults to the `CERB_LAYOUT` env
     /// (else the block walker).
     pub layout_engine: LayoutEngineKind,
+    /// Image display default (`--images graphical|text-only`): text-only renders
+    /// each image's alt/caption instead of the graphic and never fetches its
+    /// bytes, saving memory/CPU/network. Defaults to the `CERB_IMAGES` env.
+    pub image_mode: ImageDisplayMode,
+    /// Per-image overrides that flip [`image_mode`](Self::image_mode) for the
+    /// images whose resolved URL contains one of these substrings — the
+    /// per-image granularity of the option.
+    pub text_only_images: Vec<String>,
 }
 
 impl Default for RenderConfig {
@@ -131,6 +163,8 @@ impl Default for RenderConfig {
             proxy: None,
             timers: false,
             layout_engine: LayoutEngineKind::from_env(),
+            image_mode: ImageDisplayMode::from_env(),
+            text_only_images: Vec::new(),
         }
     }
 }
@@ -1172,6 +1206,10 @@ pub fn render(config: &RenderConfig) -> Result<RenderOutcome, AppError> {
     // Fetch + decode this page's images up front (the one-shot path is
     // synchronous; the interactive browser fetches them on its worker). Built-in
     // pages reference no network images.
+    let image_policy = ImagePolicy {
+        default: config.image_mode,
+        overrides: config.text_only_images.clone(),
+    };
     let images = match &client {
         Some(client) => fetch_images_sync(
             &document,
@@ -1182,6 +1220,7 @@ pub fn render(config: &RenderConfig) -> Result<RenderOutcome, AppError> {
             &consent,
             &first_party,
             config.viewport.w,
+            &image_policy,
         ),
         None => HashMap::new(),
     };
@@ -1189,7 +1228,12 @@ pub fn render(config: &RenderConfig) -> Result<RenderOutcome, AppError> {
         .values()
         .filter(|s| matches!(s, ImageState::Blocked))
         .count();
-    let images_requested = images.len() - subresources_blocked;
+    let images_text_only = images
+        .values()
+        .filter(|s| matches!(s, ImageState::TextOnly))
+        .count();
+    // Text-only images were never requested, so they don't count as requested.
+    let images_requested = images.len() - subresources_blocked - images_text_only;
     let images_decoded = images
         .values()
         .filter(|s| matches!(s, ImageState::Ready(_)))
@@ -1197,6 +1241,7 @@ pub fn render(config: &RenderConfig) -> Result<RenderOutcome, AppError> {
     let provider = StoreImages {
         base: Some(&url),
         images: &images,
+        policy: &image_policy,
     };
 
     // Cookies now resident for this page's site — captured from the real
@@ -1717,6 +1762,7 @@ fn fetch_images_sync(
     policy: &Mutex<DefaultDenyPolicy>,
     first_party: &Origin,
     viewport_w: u32,
+    images: &ImagePolicy,
 ) -> HashMap<String, ImageState> {
     let mut srcs = Vec::new();
     collect_image_urls(document.root(), &mut srcs, viewport_w);
@@ -1737,6 +1783,13 @@ fn fetch_images_sync(
     let mut out = HashMap::with_capacity(urls.len());
     let mut decoded_bytes = 0usize;
     for url in urls {
+        // Text-only images render as their alt/caption and are never fetched or
+        // decoded — checked before the consent and decode-budget gates so they
+        // cost no network, memory, or budget.
+        if images.text_only(&url) {
+            out.insert(url, ImageState::TextOnly);
+            continue;
+        }
         // Consent gate: unruled third-party subresources never hit the network.
         let allowed = parse_url(&url)
             .ok()
@@ -1792,6 +1845,10 @@ enum ImageState {
     /// Refused by the consent policy (third-party, no Allow rule). Paints as
     /// the placeholder/alt box; an Allow rule un-blocks and re-requests.
     Blocked,
+    /// The user chose to render this image as text (the text-only option): its
+    /// bytes were never fetched or decoded. Layout draws its alt/caption chip.
+    /// Kept distinct from `Blocked` so the consent-blocked count stays honest.
+    TextOnly,
 }
 
 /// Image provider over the browser's per-page store. Resolves an element's
@@ -1799,6 +1856,9 @@ enum ImageState {
 struct StoreImages<'a> {
     base: Option<&'a Url>,
     images: &'a HashMap<String, ImageState>,
+    /// The text-only policy, consulted per resolved URL so the render decision
+    /// matches the fetch skip exactly (and works for `data:`/non-stored images).
+    policy: &'a ImagePolicy,
 }
 
 impl ImageProvider for StoreImages<'_> {
@@ -1807,6 +1867,10 @@ impl ImageProvider for StoreImages<'_> {
             Some(ImageState::Ready(img)) => Some(img.clone()),
             _ => None,
         }
+    }
+
+    fn render_as_text(&self, src: &str) -> bool {
+        self.policy.text_only(&resolve_subresource(self.base, src))
     }
 }
 
@@ -2278,6 +2342,9 @@ pub struct BrowserApp {
     style_engine: CssEngine,
     image_codec: ImageCodec,
     images: HashMap<String, ImageState>,
+    /// The text-only image policy (global default + per-image overrides), used
+    /// both to skip fetching text-only images and to render them as text.
+    image_policy: ImagePolicy,
     /// Fetched external `<link>` stylesheets, keyed by the link's raw `href`
     /// (what the cascade looks up). Re-styled into `styled` as sheets arrive
     /// (ADR-0037).
@@ -2505,6 +2572,10 @@ impl BrowserApp {
             style_engine,
             image_codec: ImageCodec::new(),
             images: HashMap::new(),
+            image_policy: ImagePolicy {
+                default: ImageDisplayMode::from_env(),
+                overrides: Vec::new(),
+            },
             sheets: ExternalSheets::new(),
             pending_sheets: HashMap::new(),
             pending_scripts: std::collections::HashSet::new(),
@@ -3297,6 +3368,11 @@ impl BrowserApp {
             }
             // One fetch per distinct URL per page.
             if self.images.contains_key(&abs) {
+                continue;
+            }
+            // Text-only images render as their alt/caption; never fetch them.
+            if self.image_policy.text_only(&abs) {
+                self.images.insert(abs, ImageState::TextOnly);
                 continue;
             }
             let Some(first_party) = first_party.clone() else {
@@ -4476,6 +4552,7 @@ impl FrameApp for BrowserApp {
             let provider = StoreImages {
                 base: self.current_url.as_ref(),
                 images: &self.images,
+                policy: &self.image_policy,
             };
             let mut layout = BlockLayout::default();
             let laid = layout.layout(&self.styled, content, &self.text, &provider, &self.forms);
@@ -5831,6 +5908,56 @@ pub use cerberus_sysmem::resident_set_kb;
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn image_policy_default_and_per_image_overrides() {
+        // Default graphical: nothing is text-only until an override matches.
+        let g = ImagePolicy {
+            default: ImageDisplayMode::Graphical,
+            overrides: vec!["logo".into()],
+        };
+        assert!(!g.text_only("https://x.test/photo.jpg"));
+        assert!(
+            g.text_only("https://x.test/logo-v2.png"),
+            "override forces text-only"
+        );
+
+        // Default text-only: everything is text-only unless an override flips it
+        // back to graphical.
+        let t = ImagePolicy {
+            default: ImageDisplayMode::TextOnly,
+            overrides: vec!["hero".into()],
+        };
+        assert!(t.text_only("https://x.test/photo.jpg"));
+        assert!(
+            !t.text_only("https://x.test/hero-banner.jpg"),
+            "override flips to graphical"
+        );
+
+        // Empty override strings never match (would otherwise flip everything).
+        let e = ImagePolicy {
+            default: ImageDisplayMode::Graphical,
+            overrides: vec![String::new()],
+        };
+        assert!(!e.text_only("https://x.test/anything.png"));
+    }
+
+    #[test]
+    fn image_display_mode_parses() {
+        assert_eq!(
+            ImageDisplayMode::parse("text-only"),
+            ImageDisplayMode::TextOnly
+        );
+        assert_eq!(ImageDisplayMode::parse("text"), ImageDisplayMode::TextOnly);
+        assert_eq!(
+            ImageDisplayMode::parse("graphical"),
+            ImageDisplayMode::Graphical
+        );
+        assert_eq!(
+            ImageDisplayMode::parse("nonsense"),
+            ImageDisplayMode::Graphical
+        );
+    }
 
     #[test]
     fn mirror_bench_drives_many_instances_within_budget() {
@@ -7310,9 +7437,11 @@ mod tests {
 
         // The provider the renderer builds resolves the element's `src` against
         // the page URL and hands layout the decoded image.
+        let policy = ImagePolicy::default();
         let provider = StoreImages {
             base: b.current_url.as_ref(),
             images: &b.images,
+            policy: &policy,
         };
         assert!(
             provider.get("/pic.png").is_some(),

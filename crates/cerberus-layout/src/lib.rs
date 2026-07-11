@@ -281,11 +281,51 @@ impl FormState for NoForms {
     }
 }
 
+/// How an `<img>` is presented: as its decoded graphic, or as its text
+/// alternative (alt/title/caption). Text-only saves memory, CPU, and network —
+/// the bytes are never fetched or decoded — and is a per-image user option (the
+/// app maps a global default plus per-image overrides onto the provider).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub enum ImageDisplayMode {
+    /// Decode and paint the image (the browser default).
+    #[default]
+    Graphical,
+    /// Render the image's text alternative instead of the graphic.
+    TextOnly,
+}
+
+impl ImageDisplayMode {
+    /// Parse a mode name (`graphical` / `text-only`, `text` accepted); unknown
+    /// names fall back to `Graphical`.
+    pub fn parse(s: &str) -> Self {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "text-only" | "text" | "textonly" | "caption" => ImageDisplayMode::TextOnly,
+            _ => ImageDisplayMode::Graphical,
+        }
+    }
+
+    /// Read the default from the `CERB_IMAGES` env var (default `Graphical`), so
+    /// a session can run text-only without a rebuild.
+    pub fn from_env() -> Self {
+        std::env::var("CERB_IMAGES")
+            .map(|v| Self::parse(&v))
+            .unwrap_or_default()
+    }
+}
+
 /// Supplies decoded images to layout, keyed by an element's `src`/`data-src`.
 /// Resolution/fetching/decoding all happen inside the implementation.
 pub trait ImageProvider {
     /// The decoded image for `src`, if available.
     fn get(&self, src: &str) -> Option<Arc<DecodedImage>>;
+
+    /// Whether this image should render as its text alternative (alt/caption)
+    /// instead of the graphic — the resource-saving text-only option. Default
+    /// `false` (always graphical). When `true`, layout draws the text chip and
+    /// never asks for the decoded bytes.
+    fn render_as_text(&self, _src: &str) -> bool {
+        false
+    }
 }
 
 /// An image provider with nothing (placeholders / alt text only).
@@ -1509,6 +1549,13 @@ impl<'a> Ctx<'a> {
             return;
         };
         let src = src.as_str();
+        // Text-only option: render the image's text alternative instead of the
+        // graphic (its bytes were never fetched). Checked before any decoded-byte
+        // lookup so it needs none.
+        if self.images.render_as_text(src) {
+            self.image_text_chip(node, in_link);
+            return;
+        }
         let attr_w = node.attr("width").and_then(parse_dim);
         let attr_h = node.attr("height").and_then(parse_dim);
         // CSS `width`/`height` (px, %, vw/vh) override the presentational
@@ -1569,6 +1616,16 @@ impl<'a> Ctx<'a> {
                 self.add_text(&format!("[{alt}]"), &node.style, in_link);
             }
         }
+    }
+
+    /// Render the text-only substitute for an image: its `alt` caption, else its
+    /// `title` tooltip, else a label derived from the file name — bracketed as
+    /// inline text so it flows, wraps, aligns, and positions like the surrounding
+    /// content. Always emits something (never vanishes on an empty `alt`), so the
+    /// user sees what the suppressed image was.
+    fn image_text_chip(&mut self, node: &StyledNode, in_link: Option<&str>) {
+        let label = image_text_label(node, self.vw.max(0) as u32);
+        self.add_text(&format!("[{label}]"), &node.style, in_link);
     }
 
     /// Lay out an `<input>` as the right inline-block control for its `type`.
@@ -3711,6 +3768,40 @@ fn replaced_size(attr_w: Option<u32>, attr_h: Option<u32>, intrinsic: Size) -> (
     }
 }
 
+/// The label for an image rendered as text (the text-only option): its `alt`
+/// caption, else its `title` tooltip, else the file name from its `src`, else the
+/// generic word "image". Never empty, so a suppressed image is always visible as
+/// text.
+fn image_text_label(node: &StyledNode, viewport_w: u32) -> String {
+    let attr_nonempty = |name: &str| node.attr(name).map(str::trim).filter(|s| !s.is_empty());
+    if let Some(alt) = attr_nonempty("alt") {
+        return alt.to_string();
+    }
+    if let Some(title) = attr_nonempty("title") {
+        return title.to_string();
+    }
+    if let Some(src) = pick_img_url(|n| node.attr(n), viewport_w) {
+        if let Some(name) = image_file_name(&src) {
+            return name;
+        }
+    }
+    "image".to_string()
+}
+
+/// The trailing file-name segment of an image URL (minus query/fragment), for a
+/// text-only label. `None` for a `data:` URI or an implausible name.
+fn image_file_name(src: &str) -> Option<String> {
+    if src.starts_with("data:") {
+        return None;
+    }
+    let path = src.split(['?', '#']).next().unwrap_or(src);
+    let seg = path.rsplit('/').next().unwrap_or(path).trim();
+    if seg.is_empty() || seg.len() > 64 {
+        return None;
+    }
+    Some(seg.to_string())
+}
+
 /// Choose the URL to fetch and draw for an `<img>` (ADR-0046): the explicit
 /// `data-src` lazy alias wins; otherwise the best `srcset` candidate (honoring
 /// `sizes`); otherwise plain `src`. Both the fetch-time collector and layout call
@@ -4035,6 +4126,59 @@ mod tests {
             &NoImages,
             &NoForms,
         )
+    }
+
+    fn img_node(attrs: &[(&str, &str)]) -> StyledNode {
+        StyledNode {
+            tag: "img".into(),
+            attrs: attrs
+                .iter()
+                .map(|(k, v)| (k.to_string(), v.to_string()))
+                .collect(),
+            style: ComputedStyle::initial(),
+            children: Vec::new(),
+            node_id: 0,
+        }
+    }
+
+    #[test]
+    fn image_text_label_prefers_alt_then_title_then_filename() {
+        // alt wins.
+        assert_eq!(
+            image_text_label(
+                &img_node(&[("alt", "a lake"), ("title", "tip"), ("src", "/p.png")]),
+                1000
+            ),
+            "a lake"
+        );
+        // title when alt is empty/missing.
+        assert_eq!(
+            image_text_label(&img_node(&[("title", "tip"), ("src", "/p.png")]), 1000),
+            "tip"
+        );
+        // file name when neither alt nor title.
+        assert_eq!(
+            image_text_label(
+                &img_node(&[("src", "https://x.test/a/b/logo-v2.png?q=1")]),
+                1000
+            ),
+            "logo-v2.png"
+        );
+        // generic word when nothing usable.
+        assert_eq!(image_text_label(&img_node(&[]), 1000), "image");
+    }
+
+    #[test]
+    fn image_file_name_extracts_the_segment() {
+        assert_eq!(
+            image_file_name("https://x/a/b/pic.jpg").as_deref(),
+            Some("pic.jpg")
+        );
+        assert_eq!(
+            image_file_name("/logo.png?v=2#x").as_deref(),
+            Some("logo.png")
+        );
+        assert_eq!(image_file_name("data:image/png;base64,AAAA"), None);
     }
 
     /// Wraps `MonoShaper` but counts how many times a bare `" "` is shaped, and

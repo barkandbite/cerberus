@@ -127,6 +127,12 @@ fn cmd_render(args: &[String]) -> ExitCode {
     if let Some(engine) = flag(args, "--engine") {
         config.layout_engine = cerberus_app::LayoutEngineKind::parse(&engine);
     }
+    if let Some(mode) = flag(args, "--images") {
+        config.image_mode = cerberus_app::ImageDisplayMode::parse(&mode);
+    }
+    // Per-image text-only overrides: `--text-only-image <substr>` (repeatable),
+    // matched against each resolved image URL.
+    config.text_only_images = flags(args, "--text-only-image");
     config.background = Color::WHITE;
 
     let outcome = match render(&config) {
@@ -669,6 +675,11 @@ fn print_usage() {
          \x20 --dump-text         print the page's text content (automation)\n\
          \x20 --timers            collect + print per-stage performance timings\n\
          \x20 --proxy <HOST:PORT> single egress proxy (CONNECT tunnel, no DNS leak)\n\
+         \x20 --engine <ENGINE>   layout engine: block (default) | taffy\n\
+         \x20 --images <MODE>     image display: graphical (default) | text-only\n\
+         \x20                     (text-only renders alt/caption, skips the fetch)\n\
+         \x20 --text-only-image <SUBSTR>  force just images whose URL contains\n\
+         \x20                     SUBSTR to text-only (repeatable; per-image option)\n\
          \x20 (--out extension selects the format: .ppm, .png, or .pdf)\n\n\
          MEM-GATE OPTIONS:\n\
          \x20 --budget-mb <MB>     default: 64\n\
@@ -703,4 +714,13 @@ fn flag(args: &[String], key: &str) -> Option<String> {
 /// Whether a boolean `--flag` is present.
 fn has_flag(args: &[String], key: &str) -> bool {
     args.iter().any(|a| a == key)
+}
+
+/// Read every `--key value` occurrence (a repeatable flag).
+fn flags(args: &[String], key: &str) -> Vec<String> {
+    args.iter()
+        .enumerate()
+        .filter(|(_, a)| a.as_str() == key)
+        .filter_map(|(i, _)| args.get(i + 1).cloned())
+        .collect()
 }
