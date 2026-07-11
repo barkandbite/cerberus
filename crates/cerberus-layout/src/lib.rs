@@ -2114,7 +2114,7 @@ impl<'a> Ctx<'a> {
         let available = ((self.right - self.left) - used).max(0);
         let offset = match self.line_align {
             TextAlign::Left => 0,
-            TextAlign::Center => available / 2,
+            TextAlign::Center | TextAlign::WebkitCenter => available / 2,
             TextAlign::Right => available,
         };
         // Shift the atomic inline boxes added during this line (inline-blocks,
@@ -3129,11 +3129,18 @@ impl<'a> Ctx<'a> {
         // the target width proportionally. `col_x` holds the column left edges;
         // `col_x[num_cols]` is the table's right edge.
         let avail = (right - left).max(num_cols as i32);
+        // `cellpadding` (HTML presentational) sets every cell's padding; the
+        // engine default stands in for the UA's when absent.
+        let pad = node
+            .attr("cellpadding")
+            .and_then(parse_dim)
+            .map(|v| (v as i32).clamp(0, 40))
+            .unwrap_or(CELL_PAD);
         let mut col_max = vec![1i32; num_cols];
         for row in &rows {
             for (col, cell) in cell_children(row).enumerate() {
                 if col < num_cols {
-                    let w = (self.measure_cell_width(cell) + 2 * CELL_PAD).max(1);
+                    let w = (self.measure_cell_width(cell) + 2 * pad).max(1);
                     col_max[col] = col_max[col].max(w);
                 }
             }
@@ -3149,7 +3156,19 @@ impl<'a> Ctx<'a> {
         } else {
             col_max
         };
-        let mut col_x = vec![left; num_cols + 1];
+        // A table narrower than its containing block centers when the legacy
+        // `<center>` (`-webkit-center`) is in effect or `align=center` set auto
+        // margins — the HN shell pattern (`<center><table width=85%>`): the
+        // BOX centers while cell text stays left (see flow_cell).
+        let table_w: i32 = col_widths.iter().sum();
+        let centered = matches!(node.style.text_align, TextAlign::WebkitCenter)
+            || (node.style.margin_left_auto && node.style.margin_right_auto);
+        let x0 = if centered {
+            left + ((avail - table_w) / 2).max(0)
+        } else {
+            left
+        };
+        let mut col_x = vec![x0; num_cols + 1];
         for col in 0..num_cols {
             col_x[col + 1] = col_x[col] + col_widths[col];
         }
@@ -3163,6 +3182,11 @@ impl<'a> Ctx<'a> {
             .and_then(parse_dim)
             .is_some_and(|b| b > 0);
 
+        // The table's own background (e.g. `<table bgcolor=…>`, the HN beige)
+        // paints under all rows: reserve its display slot now, fill it once the
+        // total height is known.
+        let table_top = self.y;
+        let table_bg_index = self.display.items.len();
         let mut row_y = self.y;
 
         for row in rows {
@@ -3178,11 +3202,11 @@ impl<'a> Ctx<'a> {
                 let cell_x = col_x[col.min(num_cols - 1)];
                 let cell_w = (col_x[(col + 1).min(num_cols)] - cell_x).max(1);
                 let (items, links, fields, h) =
-                    self.flow_cell(cell, cell_x, cell_x + cell_w, row_y);
+                    self.flow_cell(cell, cell_x, cell_x + cell_w, row_y, pad);
                 row_h = row_h.max(h);
                 laid.push((items, links, fields, h));
             }
-            row_h = (row_h + 2 * CELL_PAD).max(1);
+            row_h = (row_h + 2 * pad).max(1);
 
             // Emit each cell's box (fill + border) under its content.
             for (col, cell) in cells.iter().enumerate() {
@@ -3206,6 +3230,18 @@ impl<'a> Ctx<'a> {
             row_y += row_h;
         }
 
+        if let Some(bg) = node.style.background {
+            let h = (row_y - table_top).max(0) as u32;
+            if h > 0 && bg.a > 0 {
+                self.display.items.insert(
+                    table_bg_index,
+                    DisplayItem::Rect {
+                        rect: Rect::new(x0, table_top, table_w.max(0) as u32, h),
+                        color: bg,
+                    },
+                );
+            }
+        }
         self.y = row_y + TABLE_MARGIN;
         self.x = self.left;
     }
@@ -3225,10 +3261,11 @@ impl<'a> Ctx<'a> {
         cell_x: i32,
         cell_right: i32,
         cell_y: i32,
+        pad: i32,
     ) -> CellLayout {
-        let content_left = cell_x + CELL_PAD;
-        let content_right = (cell_right - CELL_PAD).max(content_left + 1);
-        let content_top = cell_y + CELL_PAD;
+        let content_left = cell_x + pad;
+        let content_right = (cell_right - pad).max(content_left + 1);
+        let content_top = cell_y + pad;
         let mut sub = Ctx::sub(
             content_left,
             content_right,
@@ -3242,9 +3279,14 @@ impl<'a> Ctx<'a> {
         );
 
         let is_header = cell.tag == "th";
-        // Headers centre their text; cells inherit the cell's own alignment.
+        // Headers centre their text; cells take their own alignment — except
+        // the legacy `<center>` value, which centers the TABLE BOX but not the
+        // text inside its cells (measured against the reference: HN's titles
+        // are left-aligned inside a `<center>`ed table).
         sub.line_align = if is_header {
             TextAlign::Center
+        } else if cell.style.text_align == TextAlign::WebkitCenter {
+            TextAlign::Left
         } else {
             cell.style.text_align
         };
@@ -4509,6 +4551,63 @@ mod tests {
             (wy[1] - wy[0]) - (ny[1] - ny[0]),
             24,
             "the full 24px margin separates block from following text"
+        );
+    }
+
+    #[test]
+    fn center_centers_a_narrow_table_box_but_not_its_cell_text() {
+        // The HN shell: <center><table width=50%> — the table BOX centers in
+        // the containing block, while text inside cells stays left-aligned
+        // (measured against the reference).
+        let laid = lay(
+            "<center><table width='50%' bgcolor='#ffdddd' cellpadding='0'>             <tr><td>x</td></tr></table></center>",
+            600,
+        );
+        let bg = laid
+            .display
+            .items
+            .iter()
+            .find_map(|i| match i {
+                DisplayItem::Rect { rect, color } if color.r > 240 && color.g < 240 => Some(*rect),
+                _ => None,
+            })
+            .expect("table background painted");
+        // 50% of 600 = 300 wide, centered → x ≈ 150.
+        assert!(
+            (bg.x - 150).abs() <= 8 && (bg.w as i32 - 300).abs() <= 8,
+            "table box centered at ~150 width ~300, got x={} w={}",
+            bg.x,
+            bg.w
+        );
+        // The cell text is LEFT inside the box (near the box's left edge, not
+        // centered within the 300px cell).
+        let gx = glyph_xs(&laid);
+        assert!(!gx.is_empty());
+        assert!(
+            gx[0] <= bg.x + 12,
+            "cell text left-aligned at the cell edge, got x={} (box x={})",
+            gx[0],
+            bg.x
+        );
+    }
+
+    #[test]
+    fn table_cellpadding_zero_tightens_rows() {
+        // cellpadding=0 rows are tighter than the engine-default padding.
+        let padded = lay("<table><tr><td>a</td></tr><tr><td>b</td></tr></table>", 400);
+        let tight = lay(
+            "<table cellpadding='0'><tr><td>a</td></tr><tr><td>b</td></tr></table>",
+            400,
+        );
+        let py = glyph_ys(&padded);
+        let ty = glyph_ys(&tight);
+        assert_eq!(py.len(), 2);
+        assert_eq!(ty.len(), 2);
+        assert!(
+            ty[1] - ty[0] < py[1] - py[0],
+            "cellpadding=0 row pitch {} < default {}",
+            ty[1] - ty[0],
+            py[1] - py[0]
         );
     }
 

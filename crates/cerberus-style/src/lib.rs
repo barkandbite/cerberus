@@ -250,6 +250,11 @@ pub enum TextAlign {
     Left,
     Center,
     Right,
+    /// The legacy `<center>` value (`-webkit-center`): centers inline content
+    /// like `center` AND centers child table boxes — but does NOT survive into
+    /// table cells (their text stays left unless the cell sets its own
+    /// alignment), matching how the reference renders `<center><table>`.
+    WebkitCenter,
 }
 
 /// CSS `flex-direction` (v1: the two main axes).

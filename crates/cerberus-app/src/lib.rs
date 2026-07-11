@@ -4471,6 +4471,7 @@ fn computed_css(s: &cerberus_style::ComputedStyle) -> Vec<(String, String)> {
     let text_align = match s.text_align {
         cerberus_style::TextAlign::Left => "left",
         cerberus_style::TextAlign::Center => "center",
+        cerberus_style::TextAlign::WebkitCenter => "-webkit-center",
         cerberus_style::TextAlign::Right => "right",
     };
     let visibility = match s.visibility {

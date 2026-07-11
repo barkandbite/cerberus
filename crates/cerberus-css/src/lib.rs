@@ -42,7 +42,7 @@ header, footer, nav, main, aside, blockquote, pre, figure, figcaption, form,
 table, tr, hr, dl, dt, dd, fieldset, address, center,
 details, summary { display: block; }
 /* Legacy presentational elements still seen on older pages. */
-center { text-align: center; }
+center { text-align: -webkit-center; }
 nobr { white-space: nowrap; }
 head, title, meta, link, style, script, base, template { display: none; }
 /* We don't paint SVG graphics; hiding it avoids flowing its <text>/markup as
@@ -852,6 +852,7 @@ fn apply_declarations(
             "text-align" => {
                 style.text_align = match v.to_ascii_lowercase().as_str() {
                     "center" => TextAlign::Center,
+                    "-webkit-center" | "-moz-center" => TextAlign::WebkitCenter,
                     "right" | "end" => TextAlign::Right,
                     "left" | "start" => TextAlign::Left,
                     _ => style.text_align,
@@ -2401,11 +2402,13 @@ mod tests {
 
     #[test]
     fn ua_styles_legacy_center_and_nobr() {
-        // `<center>` is a centered block; `<nobr>` prevents wrapping.
+        // `<center>` is a centered block carrying the legacy `-webkit-center`
+        // value (centers child table boxes, not table-cell text); `<nobr>`
+        // prevents wrapping.
         let dom = CssEngine::new().style(&parse_html("<center>c</center><nobr>n</nobr>"));
         let c = first(&dom.root, "center").unwrap();
         assert_eq!(c.style.display, Display::Block);
-        assert_eq!(c.style.text_align, TextAlign::Center);
+        assert_eq!(c.style.text_align, TextAlign::WebkitCenter);
         assert_eq!(
             first(&dom.root, "nobr").unwrap().style.white_space,
             cerberus_style::WhiteSpace::Nowrap
