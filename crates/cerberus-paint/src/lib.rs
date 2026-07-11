@@ -232,12 +232,14 @@ pub enum FontSlot {
     /// The bundled fallback face for characters the text font can't render
     /// (CJK, etc.).
     Fallback,
-    /// The bundled serif face (Liberation Serif ≈ Times).
+    /// The bundled serif face (Liberation Serif ≈ Times — what the reference
+    /// Chrome's generic `serif` resolves to via fontconfig).
     Serif,
-    /// The bundled monospace face (Liberation Mono ≈ Courier).
+    /// The bundled monospace face (Liberation Mono ≈ Courier — the reference's
+    /// generic `monospace`).
     Monospace,
-    /// The bundled Arial-metric sans face (Liberation Sans ≈ Arial) — the default
-    /// for page `sans-serif` content, matching the Chrome-on-Windows persona.
+    /// The bundled Arial-metric sans face (Liberation Sans ≈ Arial) — the
+    /// reference's generic `sans-serif` AND its named-Arial substitution.
     Sans,
 }
 
@@ -460,6 +462,16 @@ pub trait TextShaper: Send + Sync {
     /// face. Default: ignore the family (single-face shapers).
     fn space_advance_with(&self, px: u32, _family: GenericFamily) -> u32 {
         self.space_advance(px)
+    }
+
+    /// The `line-height: normal` pitch for `px`-sized text in `family`. Browsers
+    /// derive this from the face's own vertical metrics (ascent + descent +
+    /// line gap): ~1.15× for the Times/Arial-metric faces, ~1.17× for Roboto —
+    /// a flat 1.2 drifts one pixel every couple of lines and accumulates into
+    /// visible below-the-fold misalignment on text-heavy pages. Default keeps
+    /// the 1.2 approximation for shapers without real metrics.
+    fn natural_leading(&self, px: u32, _family: GenericFamily) -> i32 {
+        (px as i32 * 6) / 5
     }
 }
 

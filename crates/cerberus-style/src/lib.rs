@@ -509,7 +509,10 @@ impl ComputedStyle {
             font_size: 16,
             font: FontStyle::REGULAR,
             font_size_medium: true,
-            font_family: GenericFamily::SansSerif,
+            // Chrome's UA default for a page that never sets `font-family` is a
+            // serif (Times), not a sans — an unstyled page must render serif or
+            // every wrap point and heading drifts from the reference.
+            font_family: GenericFamily::Serif,
             text_align: TextAlign::Left,
             underline: false,
             line_through: false,

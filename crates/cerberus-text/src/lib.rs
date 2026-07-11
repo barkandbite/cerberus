@@ -27,19 +27,21 @@ const ICON_FONT_BYTES: &[u8] = include_bytes!("../assets/icomoon.ttf");
 /// and — via shared Han — much Chinese) instead of tofu. Bundled, not read from
 /// the system, so the font set stays fixed and reproducible (ADR-0005).
 const FALLBACK_FONT_BYTES: &[u8] = include_bytes!("../assets/IPAGothic.ttf");
-/// Bundled serif face (Liberation Serif, SIL OFL 1.1) — metric-compatible with
-/// Times New Roman, so `font-family: serif` (and named serif faces) present the
-/// right shape/width class without shipping the proprietary font. See
+/// Bundled serif face (Liberation Serif, SIL OFL 1.1 — Times-metric). Chrome's
+/// generic `serif` requests "Times New Roman", which fontconfig substitutes with
+/// Liberation Serif — measured directly against the reference (a 100px `H` run
+/// advances 72.3px/em ≈ Times' 0.722em, not DejaVu Serif's 0.872em). See
 /// `assets/Liberation-LICENSE.txt`.
 const SERIF_FONT_BYTES: &[u8] = include_bytes!("../assets/LiberationSerif-Regular.ttf");
-/// Bundled monospace face (Liberation Mono, SIL OFL 1.1) — metric-compatible with
-/// Courier New, so `<pre>`/`<code>` and `font-family: monospace` render fixed-
-/// pitch. See `assets/Liberation-LICENSE.txt`.
+/// Bundled monospace face (Liberation Mono, SIL OFL 1.1 — Courier-metric, the
+/// 0.60em pitch Chrome's generic `monospace` ("Courier New") resolves to). See
+/// `assets/Liberation-LICENSE.txt`.
 const MONO_FONT_BYTES: &[u8] = include_bytes!("../assets/LiberationMono-Regular.ttf");
-/// Bundled Arial-metric sans face (Liberation Sans, SIL OFL 1.1) — metric-
-/// compatible with Arial, so `font-family: sans-serif` (and Arial/Helvetica) match
-/// what a Chrome-on-Windows persona renders. Roboto stays the UI/chrome face and
-/// serves a page that names Roboto specifically. See `assets/Liberation-LICENSE.txt`.
+/// Bundled Arial-metric sans face (Liberation Sans, SIL OFL 1.1). Chrome's
+/// generic `sans-serif` requests "Arial" → fontconfig → Liberation Sans, so this
+/// face serves BOTH the generic and named-Arial routes (measured: 72.0px/em `H`
+/// at 100px ≈ Arial's 0.722em). Roboto stays the UI/chrome face. See
+/// `assets/Liberation-LICENSE.txt`.
 const SANS_FONT_BYTES: &[u8] = include_bytes!("../assets/LiberationSans-Regular.ttf");
 
 /// A software text shaper + rasterizer over the bundled text, icon, and fallback
@@ -106,29 +108,62 @@ impl TextEngine {
         }
     }
 
-    /// The bundled font slot a `GenericFamily` renders in. `sans-serif` uses the
-    /// Arial-metric sans face (persona-correct); a page naming Roboto gets the
-    /// Roboto text face; serif → serif, monospace → mono; cursive falls back to
-    /// serif and fantasy to the Arial-metric sans (no script/display face bundled).
+    /// The bundled font slot a `GenericFamily` renders in — mirroring what the
+    /// reference Chrome resolves: its generic `serif`/`sans-serif`/`monospace`
+    /// request Times/Arial/Courier, which fontconfig substitutes with the
+    /// metric-compatible Liberation faces (measured against the reference —
+    /// see the byte consts above). Generic and named-Arial sans therefore share
+    /// one face; `cursive`/`fantasy` fall back to it too (no script/display
+    /// face bundled). A page naming Roboto gets the Roboto text face.
     fn slot_for_family(family: GenericFamily) -> FontSlot {
         match family {
-            GenericFamily::Serif | GenericFamily::Cursive => FontSlot::Serif,
+            GenericFamily::Serif => FontSlot::Serif,
             GenericFamily::Monospace => FontSlot::Monospace,
-            GenericFamily::SansArial => FontSlot::Sans,
-            GenericFamily::SansSerif | GenericFamily::Fantasy => FontSlot::Text,
+            GenericFamily::SansArial
+            | GenericFamily::SansSerif
+            | GenericFamily::Cursive
+            | GenericFamily::Fantasy => FontSlot::Sans,
         }
     }
 
-    /// The rustybuzz shaping face and its ab_glyph height metric for a slot, so
-    /// advances scale to the face that will rasterize the run.
+    /// The rustybuzz face for a slot, plus its units-per-em. Scaling glyph
+    /// advances by `px / upem` is the CSS convention (`font-size` is the em
+    /// size): Chrome/FreeType scale exactly this way. (Scaling by ab_glyph's
+    /// height metric — ascent−descent — rendered every face at `upem/height`
+    /// of its CSS size: ~85% for Roboto, ~89% for the Liberation faces, so all
+    /// content text was uniformly smaller and narrower than the reference and
+    /// every wrap point drifted.)
     fn shaping_face(&self, slot: FontSlot) -> (&rustybuzz::Face<'static>, f32) {
-        match slot {
-            FontSlot::Fallback => (&self.rb_fallback, self.fallback_font.height_unscaled()),
-            FontSlot::Serif => (&self.rb_serif, self.serif_font.height_unscaled()),
-            FontSlot::Monospace => (&self.rb_mono, self.mono_font.height_unscaled()),
-            FontSlot::Sans => (&self.rb_sans, self.sans_font.height_unscaled()),
-            _ => (&self.rb_font, self.font.height_unscaled()),
-        }
+        let face = match slot {
+            FontSlot::Fallback => &self.rb_fallback,
+            FontSlot::Serif => &self.rb_serif,
+            FontSlot::Monospace => &self.rb_mono,
+            FontSlot::Sans => &self.rb_sans,
+            _ => &self.rb_font,
+        };
+        (face, face.units_per_em() as f32)
+    }
+
+    /// The ab_glyph scale that rasterizes a `px` CSS font size: ab_glyph's
+    /// `PxScale` divides by the face height (ascent−descent), so multiply it
+    /// back out to net the CSS `px / upem` — keeping painted glyphs the same
+    /// size the shaped advances promise.
+    fn px_scale(&self, slot: FontSlot, px: u32) -> PxScale {
+        let f = self.face_for(slot);
+        let h = f.height_unscaled();
+        let upem = f.units_per_em().unwrap_or(h);
+        PxScale::from(px.max(1) as f32 * h / upem.max(1.0))
+    }
+
+    /// The space glyph's advance in a slot's face, scaled `px / upem` — shared
+    /// by the family-less UI path (Text/Roboto) and the per-family content path.
+    fn space_advance_in(&self, px: u32, slot: FontSlot) -> u32 {
+        let (f, upem) = self.shaping_face(slot);
+        let units_to_px = px.max(1) as f32 / upem.max(1.0);
+        f.glyph_index(' ')
+            .and_then(|g| f.glyph_hor_advance(g))
+            .map(|a| (a as f32 * units_to_px).round().max(0.0) as u32)
+            .unwrap_or_else(|| px.max(2) / 2)
     }
 
     /// Shape `text` at `px` with `primary` as the face for text-covered runs
@@ -144,8 +179,8 @@ impl TextEngine {
             } else {
                 slot
             };
-            let (face, ag_height) = self.shaping_face(eff);
-            let units_to_px = pxf / ag_height.max(1.0);
+            let (face, upem) = self.shaping_face(eff);
+            let units_to_px = pxf / upem.max(1.0);
             shape_run_rb(face, run, px, eff, units_to_px, &mut out);
         }
         out
@@ -217,7 +252,7 @@ impl TextEngine {
             // Each glyph names its own face (a run can mix Roboto + CJK fallback);
             // the baseline uses that face's ascent so mixed scripts share a line.
             let font = self.face_for(g.font);
-            let scale = PxScale::from(g.px.max(1) as f32);
+            let scale = self.px_scale(g.font, g.px);
             let scaled = font.as_scaled(scale);
             let baseline = origin.y as f32 + scaled.ascent();
 
@@ -359,13 +394,13 @@ impl Default for TextEngine {
 
 /// Shape one same-face run with rustybuzz and append its glyphs to `out`.
 /// Advances are HarfBuzz-accurate (kerning/ligatures/GPOS). `units_to_px` is the
-/// **ab_glyph** scale factor (`px / height_unscaled`, NOT `px / units_per_em`):
-/// the run is rasterized by ab_glyph at `PxScale::from(px)`, which scales by the
-/// font's height metric, so advances must use that same factor or the run width
-/// and its painted glyphs disagree (letters spread out). Rounding is
-/// **run-accurate**: fractional advances accumulate and the running sum is
-/// rounded, so each glyph's integer advance sums to the true run width — a
-/// per-glyph round would drift wrap points from Chrome.
+/// CSS scale factor `px / units_per_em` (`font-size` is the em size — Chrome
+/// scales this way); rasterization matches through `px_scale`, which converts
+/// the same net scale into ab_glyph's height-based `PxScale`, so run widths and
+/// painted glyphs agree. Rounding is **run-accurate**: fractional advances
+/// accumulate and the running sum is rounded, so each glyph's integer advance
+/// sums to the true run width — a per-glyph round would drift wrap points from
+/// Chrome.
 fn shape_run_rb(
     face: &rustybuzz::Face<'_>,
     text: &str,
@@ -411,7 +446,7 @@ impl TextShaper for TextEngine {
     }
 
     fn shape_icon(&self, ch: char, px: u32) -> Vec<GlyphBox> {
-        let scale = PxScale::from(px.max(1) as f32);
+        let scale = self.px_scale(FontSlot::Icon, px);
         let scaled = self.icon_font.as_scaled(scale);
         let id = self.icon_font.glyph_id(ch);
         let advance = scaled.h_advance(id).round().max(0.0) as u32;
@@ -431,21 +466,25 @@ impl TextShaper for TextEngine {
     /// so the plain glyph advance matches what rustybuzz would shape.
     fn space_advance(&self, px: u32) -> u32 {
         // The family-less path is the Roboto text face (matching `shape`), used
-        // for the browser's own UI/chrome; the `SansSerif` default maps there.
-        self.space_advance_with(px, GenericFamily::SansSerif)
+        // for the browser's own UI/chrome.
+        self.space_advance_in(px, FontSlot::Text)
     }
 
     /// The space advance in the requested family's face — a monospace space is
     /// wider than a proportional one, so `<pre>`/`<code>` word gaps use the mono
     /// face's advance (keeping column alignment) rather than the sans space.
     fn space_advance_with(&self, px: u32, family: GenericFamily) -> u32 {
-        let slot = Self::slot_for_family(family);
-        let (f, ag_height) = self.shaping_face(slot);
-        let units_to_px = px.max(1) as f32 / ag_height.max(1.0);
-        f.glyph_index(' ')
-            .and_then(|g| f.glyph_hor_advance(g))
-            .map(|a| (a as f32 * units_to_px).round().max(0.0) as u32)
-            .unwrap_or_else(|| px.max(2) / 2)
+        self.space_advance_in(px, Self::slot_for_family(family))
+    }
+
+    /// `line-height: normal` from the face's real vertical metrics —
+    /// (ascent − descent + line gap) / upem, exactly what Chrome derives:
+    /// ~1.15× for the Times/Arial-metric Liberation faces, ~1.17× for Roboto.
+    fn natural_leading(&self, px: u32, family: GenericFamily) -> i32 {
+        let f = self.face_for(Self::slot_for_family(family));
+        let h = f.height_unscaled() + f.line_gap_unscaled();
+        let upem = f.units_per_em().unwrap_or_else(|| f.height_unscaled());
+        (px.max(1) as f32 * h / upem.max(1.0)).round() as i32
     }
 }
 
@@ -984,15 +1023,15 @@ mod tests {
         // Each generic family shapes its text-covered glyphs from the matching
         // bundled face (so the rasterizer outlines the right shapes).
         let slot = |fam: GenericFamily| e.shape_with("Ag", 16, fam)[0].font;
-        // Generic sans-serif → Roboto (matches the reference default); Arial-named
-        // → the Arial-metric Liberation Sans face.
-        assert_eq!(slot(GenericFamily::SansSerif), FontSlot::Text);
+        // Generic and named-Arial sans share the Arial-metric Liberation Sans
+        // (Chrome's generic sans-serif requests Arial → fontconfig → Liberation).
+        assert_eq!(slot(GenericFamily::SansSerif), FontSlot::Sans);
         assert_eq!(slot(GenericFamily::SansArial), FontSlot::Sans);
         assert_eq!(slot(GenericFamily::Serif), FontSlot::Serif);
         assert_eq!(slot(GenericFamily::Monospace), FontSlot::Monospace);
-        // Cursive falls back to serif, fantasy to the default sans (Roboto).
-        assert_eq!(slot(GenericFamily::Cursive), FontSlot::Serif);
-        assert_eq!(slot(GenericFamily::Fantasy), FontSlot::Text);
+        // Cursive and fantasy fall back to the same sans (no bundled face).
+        assert_eq!(slot(GenericFamily::Cursive), FontSlot::Sans);
+        assert_eq!(slot(GenericFamily::Fantasy), FontSlot::Sans);
         // The monospace space is wider than the proportional one (fixed pitch).
         assert!(
             e.space_advance_with(16, GenericFamily::Monospace)

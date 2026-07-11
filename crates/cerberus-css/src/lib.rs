@@ -57,18 +57,27 @@ ol[type="A"] { list-style-type: upper-alpha; }
 ol[type="i"] { list-style-type: lower-roman; }
 ol[type="I"] { list-style-type: upper-roman; }
 ol[type="1"] { list-style-type: decimal; }
-h1 { font-size: 32px; font-weight: bold; margin-top: 16px; margin-bottom: 16px; }
-h2 { font-size: 24px; font-weight: bold; margin-top: 14px; margin-bottom: 14px; }
-h3 { font-size: 20px; font-weight: bold; margin-top: 12px; margin-bottom: 12px; }
-h4 { font-size: 17px; font-weight: bold; margin-top: 10px; margin-bottom: 10px; }
-h5 { font-size: 15px; font-weight: bold; margin-top: 10px; margin-bottom: 10px; }
-h6 { font-size: 13px; font-weight: bold; margin-top: 10px; margin-bottom: 10px; }
-p { margin-top: 8px; margin-bottom: 8px; }
-ul, ol { margin-top: 8px; margin-bottom: 8px; margin-left: 24px; }
-blockquote { margin-left: 24px; margin-top: 8px; margin-bottom: 8px; }
+/* The page inset is the BODY's margin (Chrome UA: body{margin:8px}), not an
+   engine constant — so `body{margin:0}` pages (most modern sites) really start
+   at the edge, and the body margin collapses with its first child's like any
+   other margin. */
+body { margin: 8px; }
+/* Heading sizes and margins mirror Chrome's UA sheet (em values computed
+   against each heading's own size: h1 0.67em of 32px = 21px, h4 1.33em of
+   16px = 21px, …) so unstyled pages keep Chrome's vertical rhythm. */
+h1 { font-size: 32px; font-weight: bold; margin-top: 21px; margin-bottom: 21px; }
+h2 { font-size: 24px; font-weight: bold; margin-top: 20px; margin-bottom: 20px; }
+h3 { font-size: 19px; font-weight: bold; margin-top: 19px; margin-bottom: 19px; }
+h4 { font-size: 16px; font-weight: bold; margin-top: 21px; margin-bottom: 21px; }
+h5 { font-size: 13px; font-weight: bold; margin-top: 22px; margin-bottom: 22px; }
+h6 { font-size: 11px; font-weight: bold; margin-top: 25px; margin-bottom: 25px; }
+p { margin-top: 16px; margin-bottom: 16px; }
+/* Chrome indents lists with 40px of padding (marker outside), not margin. */
+ul, ol { margin-top: 16px; margin-bottom: 16px; padding-left: 40px; }
+blockquote { margin-top: 16px; margin-bottom: 16px; margin-left: 40px; margin-right: 40px; }
 figure { margin-top: 16px; margin-bottom: 16px; margin-left: 40px; margin-right: 40px; }
 dd { margin-left: 40px; }
-pre { white-space: pre; margin-top: 8px; margin-bottom: 8px; font-family: monospace; }
+pre { white-space: pre; margin-top: 16px; margin-bottom: 16px; font-family: monospace; }
 code, kbd, samp, tt { white-space: pre; font-family: monospace; }
 /* Only anchors with an href are links (`:any-link`); a bare `<a name=…>`
    placeholder is not styled blue/underlined. */

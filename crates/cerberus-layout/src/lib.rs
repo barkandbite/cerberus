@@ -395,13 +395,16 @@ pub trait LayoutEngine: Send {
 /// comes from the cascade.
 #[derive(Clone, Copy, Debug)]
 pub struct BlockLayout {
-    /// Page margin in pixels.
+    /// Extra page margin in pixels. Defaults to 0: the page inset is the UA
+    /// stylesheet's `body { margin: 8px }` (as in Chrome), so a page that sets
+    /// `body{margin:0}` really reaches the viewport edge — a fixed engine inset
+    /// shifted every such page by 8px on both axes.
     pub margin: i32,
 }
 
 impl Default for BlockLayout {
     fn default() -> Self {
-        Self { margin: 8 }
+        Self { margin: 0 }
     }
 }
 
@@ -700,7 +703,7 @@ impl<'a> Ctx<'a> {
         let visible = !subtree_hidden && style.visibility == cerberus_style::Visibility::Visible;
         match node.tag.as_str() {
             "br" => {
-                self.line_break(style.font_size.max(1));
+                self.line_break(style.font_size.max(1), style.font_family);
                 return;
             }
             "hr" => {
@@ -943,7 +946,18 @@ impl<'a> Ctx<'a> {
             // join as max(positives) + min(negatives), not their sum.
             let mt = self.resolve_margin(style.margin_top, avail);
             let prev = std::mem::take(&mut self.pending_vmargin);
-            self.y += prev.max(mt).max(0) + prev.min(mt).min(0);
+            let joined = prev.max(mt).max(0) + prev.min(mt).min(0);
+            if style.border_top + style.padding_top == 0 {
+                // Parent/first-child collapse-through (§8.3.1): with no top
+                // border/padding, this box's top margin keeps collapsing with
+                // its first block child's — so DEFER it (the border-box top
+                // below projects the gap known so far; a deeper child margin
+                // that enlarges it shifts content but not this box's painted
+                // top, an accepted v1 approximation).
+                self.pending_vmargin = joined;
+            } else {
+                self.y += joined;
+            }
             let (pl, pr) = (style.padding_left, style.padding_right);
             let (bl, br) = (style.border_left, style.border_right);
             let h_extra = pl + pr + bl + br;
@@ -985,7 +999,9 @@ impl<'a> Ctx<'a> {
             bbox = Some(BorderBox {
                 left: box_left,
                 right: box_left + box_w,
-                top: self.y,
+                // Projected top: any still-deferred margin sits ABOVE this box
+                // (it collapses through), so the painted box starts below it.
+                top: self.y + self.pending_vmargin,
                 bt: style.border_top,
                 br,
                 bb: style.border_bottom,
@@ -1007,7 +1023,7 @@ impl<'a> Ctx<'a> {
                     .unwrap_or(self.vh);
                 self.cb_stack.push(ContainingBlock {
                     x: box_left,
-                    y: self.y,
+                    y: self.y + self.pending_vmargin,
                     w: box_w,
                     h: cb_h,
                 });
@@ -1377,7 +1393,7 @@ impl<'a> Ctx<'a> {
             let mut first = true;
             for line in text.split('\n') {
                 if !first {
-                    self.line_break(style.font_size.max(1));
+                    self.line_break(style.font_size.max(1), style.font_family);
                 }
                 first = false;
                 if line.is_empty() {
@@ -1638,8 +1654,12 @@ impl<'a> Ctx<'a> {
         self.max_x = self.max_x.max(self.x);
         // Resolve `line-height` against this piece's own font size, so a unitless
         // factor inherited from an ancestor scales to this element (not the
-        // ancestor's font size). `Normal` falls back to the font's natural leading.
-        let lh = style.line_height.resolve(px, line_height(px));
+        // ancestor's font size). `Normal` uses the face's real vertical metrics
+        // via the shaper (~1.15× for the Times/Arial-metric faces, ~1.17× for
+        // Roboto) — the flat 1.2 drifted a pixel every couple of lines.
+        let lh = style
+            .line_height
+            .resolve(px, self.shaper.natural_leading(px, style.font_family));
         self.line_h = self.line_h.max(lh);
     }
 
@@ -2070,8 +2090,8 @@ impl<'a> Ctx<'a> {
         }
     }
 
-    fn line_break(&mut self, px: u32) {
-        self.line_h = self.line_h.max(line_height(px));
+    fn line_break(&mut self, px: u32, family: GenericFamily) {
+        self.line_h = self.line_h.max(self.shaper.natural_leading(px, family));
         self.newline();
     }
 
@@ -4721,7 +4741,7 @@ mod tests {
             "equal grow -> equal widths: {w0} vs {w1}"
         );
         assert!(
-            (w0 + w1 - 784).abs() <= 4,
+            (w0 + w1 - 800).abs() <= 4,
             "items fill the container: {}",
             w0 + w1
         );
@@ -4757,7 +4777,7 @@ mod tests {
         let r = fill_rects(&laid);
         assert_eq!(r.len(), 2);
         let total = r[0].w as i32 + r[1].w as i32;
-        assert!(total <= 788, "shrunk to fit the container: total {total}");
+        assert!(total <= 804, "shrunk to fit the container: total {total}");
         assert!((r[0].w as i32 - r[1].w as i32).abs() <= 3, "equal shrink");
     }
 
@@ -4772,13 +4792,13 @@ mod tests {
         let r = fill_rects(&laid);
         assert_eq!(r.len(), 2);
         assert!(
-            (r[0].w as i32 - 196).abs() <= 3,
-            "25% of 784 ~ 196: {}",
+            (r[0].w as i32 - 200).abs() <= 3,
+            "25% of 800 ~ 200: {}",
             r[0].w
         );
         assert!(
-            (r[1].w as i32 - 392).abs() <= 3,
-            "50% of 784 ~ 392: {}",
+            (r[1].w as i32 - 400).abs() <= 3,
+            "50% of 800 ~ 400: {}",
             r[1].w
         );
     }
@@ -4903,8 +4923,7 @@ mod tests {
 
     #[test]
     fn grid_auto_fill_minmax_derives_column_count_from_width() {
-        // avail 784 with minmax(200px, 1fr) auto-fill -> 3 columns; the 4th item
-        // wraps to a second row.
+        // avail 800 with minmax(200px, 1fr) auto-fill -> 4 columns fit exactly.
         let laid = lay(
             "<div style='display:grid;grid-template-columns:repeat(auto-fill, minmax(200px, 1fr))'>\
              <div style='background:#ff0000'>A</div><div style='background:#00ff00'>B</div>\
@@ -4914,13 +4933,11 @@ mod tests {
         let r = fill_rects(&laid);
         assert_eq!(r.len(), 4);
         let xs: Vec<i32> = r.iter().map(|rc| rc.x).collect();
-        assert_eq!(distinct(&xs), 3, "three columns at 800px wide");
-        let ys: Vec<i32> = r.iter().map(|rc| rc.y).collect();
-        assert!(distinct(&ys) >= 2, "the 4th item wraps to a second row");
+        assert_eq!(distinct(&xs), 4, "four columns fit at 800px content width");
         for rc in &r {
             assert!(
-                (rc.w as i32 - 261).abs() <= 4,
-                "column width ~261: {}",
+                (rc.w as i32 - 195).abs() <= 6,
+                "column width ~195: {}",
                 rc.w
             );
         }
@@ -4938,17 +4955,17 @@ mod tests {
         let r = fill_rects(&laid);
         assert_eq!(r.len(), 2);
         assert!(
-            (r[0].w as i32 - 392).abs() <= 6,
-            "span-2 cell ~392: {}",
+            (r[0].w as i32 - 400).abs() <= 6,
+            "span-2 cell ~400: {}",
             r[0].w
         );
         assert!(
-            (r[1].w as i32 - 196).abs() <= 4,
-            "single cell ~196: {}",
+            (r[1].w as i32 - 200).abs() <= 4,
+            "single cell ~200: {}",
             r[1].w
         );
         // B is placed in the third column (after the 2-col span), not overlapping.
-        assert!(r[1].x >= r[0].x + 380, "B starts after the spanned cell");
+        assert!(r[1].x >= r[0].x + 388, "B starts after the spanned cell");
     }
 
     #[test]
@@ -4964,7 +4981,7 @@ mod tests {
         let r = fill_rects(&laid);
         assert_eq!(r.len(), 1, "only the in-flow item paints a background");
         assert!(
-            (r[0].w as i32 - 384).abs() <= 4,
+            (r[0].w as i32 - 400).abs() <= 4,
             "flex:1 item fills the row despite the absolute sibling: {}",
             r[0].w
         );
@@ -5022,7 +5039,7 @@ mod tests {
         let r = fill_rects(&laid);
         assert_eq!(r.len(), 2);
         assert!(
-            (r[0].w as i32 - 292).abs() <= 4,
+            (r[0].w as i32 - 300).abs() <= 4,
             "first column ~50%: {}",
             r[0].w
         );
@@ -5671,17 +5688,18 @@ mod tests {
                 _ => None,
             })
             .expect("image emitted");
-        // Relative container sits at y≈108 (100px spacer + body's 8px margin);
-        // top:40 → ~148, left:20 → ~28 (+8px body margin). Without the fix the
-        // image would land at the flow origin (~top of the relative box).
+        // Relative container sits at y≈100 (100px spacer; the fragment has no
+        // <body>, so no UA body margin applies); top:40 → ~140, left:20 → ~20.
+        // Without the fix the image would land at the flow origin (~top of the
+        // relative box).
         assert!(
-            (140..=156).contains(&rect.y),
+            (132..=150).contains(&rect.y),
             "img at ancestor.y + top:40px, got y={}",
             rect.y
         );
         assert!(
-            (24..=32).contains(&rect.x),
-            "img at left:20px (+ body margin), got x={}",
+            (16..=26).contains(&rect.x),
+            "img at left:20px, got x={}",
             rect.x
         );
     }
@@ -6225,9 +6243,9 @@ mod tests {
         // width=600 on a 400×300 image derives height 450; a container whose content
         // area is 500px then clamps width→500 and scales height proportionally
         // (450 * 500/600 = 375). Proves the overflow clamp runs AFTER the ratio
-        // derivation. Content area = container - 2*8px page margin, so 516 → 500.
+        // derivation. (No engine page margin: the content area IS the container.)
         assert_eq!(
-            img_box("<img src='p.png' width='600'>", Size::new(400, 300), 516),
+            img_box("<img src='p.png' width='600'>", Size::new(400, 300), 500),
             (500, 375)
         );
     }
@@ -6284,7 +6302,7 @@ mod tests {
             .expect("background image emitted");
         // The background fills the block width (here the full content area).
         assert!(bg.w >= 300, "bg image stretched to the box: {}", bg.w);
-        assert_eq!(bg.x, 8, "bg starts at the page margin");
+        assert_eq!(bg.x, 0, "bg starts at the content edge (no engine margin)");
     }
 
     #[test]
