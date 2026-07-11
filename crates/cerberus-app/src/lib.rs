@@ -1963,13 +1963,12 @@ fn visible_text(root: &StyledNode) -> String {
 /// are the ones the page looks up. `viewport_w` is the layout viewport width.
 fn collect_image_urls(node: NodeRef<'_>, out: &mut Vec<String>, viewport_w: u32, viewport_h: u32) {
     if node.tag() == "picture" {
-        // Resolve the <picture> to the one URL its <img> will actually load
-        // (type/media selection), matching what layout draws (ADR-0046). Don't
-        // descend: the inner <img>'s own src is subsumed by this choice.
-        //
-        // A <picture> with no <img> child renders nothing (layout's picture arm
-        // returns early), so collect nothing either — otherwise a matching
-        // <source> would be fetched for an image that is never painted.
+        // Resolve the <picture> to the one URL its direct <img> will actually
+        // load (type/media selection), matching what layout draws (ADR-0046).
+        // With a direct <img>, don't descend: its <source>/other children are
+        // subsumed by this choice. With NO direct <img> (invalid, but possible)
+        // fall through to normal recursion so nested content is still collected —
+        // exactly as layout falls through to render it.
         if let Some(img) = node.children().find(|c| c.tag() == "img") {
             let sources: Vec<PictureSource<'_>> = node
                 .children()
@@ -1984,8 +1983,8 @@ fn collect_image_urls(node: NodeRef<'_>, out: &mut Vec<String>, viewport_w: u32,
             if let Some(src) = pick_picture_url(&sources, |n| img.attr(n), viewport_w, viewport_h) {
                 out.push(src);
             }
+            return;
         }
-        return;
     }
     if node.tag() == "img" {
         if let Some(src) = pick_img_url(|n| node.attr(n), viewport_w) {
@@ -6119,21 +6118,26 @@ mod tests {
     }
 
     #[test]
-    fn collect_image_urls_skips_a_picture_with_no_img_child() {
-        // Layout draws nothing for a <picture> with no <img>, so the fetch list
-        // must stay empty — a matching <source> is never painted, so fetching it
-        // would waste network/decode budget (fetch/draw divergence).
-        let doc = parse_html(
+    fn collect_image_urls_picture_without_a_direct_img() {
+        // A <source>-only <picture> selects nothing: with no <img> to paint, a
+        // matching <source> must not be fetched (it would waste network/decode
+        // budget on bytes layout never draws).
+        let only_source = parse_html(
             "<picture>\
                <source media='(max-width: 600px)' srcset='mobile.png'>\
              </picture>",
         );
         let mut out = Vec::new();
-        collect_image_urls(doc.root(), &mut out, 500, 800);
-        assert!(
-            out.is_empty(),
-            "no <img> child ⇒ nothing to fetch, got {out:?}"
-        );
+        collect_image_urls(only_source.root(), &mut out, 500, 800);
+        assert!(out.is_empty(), "no <img> ⇒ nothing to fetch, got {out:?}");
+
+        // But an <img> nested (invalidly) below another element still renders in
+        // browsers, so the collector must fall through and reach it — matching
+        // layout, which also falls through to lay it out.
+        let nested = parse_html("<picture><figure><img src='/nested.png'></figure></picture>");
+        let mut out2 = Vec::new();
+        collect_image_urls(nested.root(), &mut out2, 500, 800);
+        assert_eq!(out2, vec!["/nested.png".to_string()]);
     }
 
     #[test]

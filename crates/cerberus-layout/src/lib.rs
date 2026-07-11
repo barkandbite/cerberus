@@ -715,28 +715,25 @@ impl<'a> Ctx<'a> {
                 return;
             }
             "picture" => {
-                // A <picture> selects one URL from its <source> children (by
-                // `type`/`media`), then renders its single <img> with that URL
-                // (WHATWG "select an image source"). The <source> elements paint
-                // nothing; the <img> carries the box, alt, and dimensions. Lay
-                // the <img> out exactly as a bare <img> would, but with the
-                // sources in scope so `image` resolves through them.
-                if visible {
-                    if let Some(img) = node.children.iter().find_map(|c| match c {
-                        StyledChild::Element(e) if e.tag == "img" => Some(e.as_ref()),
-                        _ => None,
-                    }) {
-                        // Honor the <img>'s OWN box-suppression, exactly as the
-                        // bare "img" arm does: `display:none`, `visibility:hidden`,
-                        // or an `opacity:0` (here or via the group) draws nothing.
-                        let img_style = &img.style;
-                        let img_hidden = self.opacity_hidden || img_style.opacity == 0.0;
-                        let img_visible = !img_hidden
-                            && img_style.visibility == cerberus_style::Visibility::Visible
-                            && img_style.display != Display::None;
-                        if !img_visible {
-                            return;
-                        }
+                // A <picture> with a direct <img> selects one URL from its
+                // <source> children (by `type`/`media`) and renders that <img>
+                // with it (WHATWG "select an image source"); its <source>/other
+                // children paint nothing. With NO direct <img> (invalid, but
+                // possible) fall through to normal container layout so any nested
+                // content still renders — matching the fetch collector.
+                if let Some(img) = node.children.iter().find_map(|c| match c {
+                    StyledChild::Element(e) if e.tag == "img" => Some(e.as_ref()),
+                    _ => None,
+                }) {
+                    // Honor the <img>'s OWN box-suppression, exactly as the bare
+                    // "img" arm does: `display:none`, `visibility:hidden`, or an
+                    // `opacity:0` (here or via the group) draws nothing.
+                    let img_style = &img.style;
+                    let img_hidden = self.opacity_hidden || img_style.opacity == 0.0;
+                    let img_visible = !img_hidden
+                        && img_style.visibility == cerberus_style::Visibility::Visible
+                        && img_style.display != Display::None;
+                    if visible && img_visible {
                         // Honor a block-level <picture> (e.g. `picture{display:block}`)
                         // by breaking the line around its image.
                         let block = style.display == Display::Block;
@@ -754,8 +751,9 @@ impl<'a> Ctx<'a> {
                             self.flush_line();
                         }
                     }
+                    return;
                 }
-                return;
+                // No direct <img>: fall through to the generic container path.
             }
             "input" => {
                 if visible {
@@ -5965,6 +5963,35 @@ mod tests {
                 .iter()
                 .any(|i| matches!(i, DisplayItem::Image { .. })),
             "a display:none <img> in a <picture> draws nothing"
+        );
+    }
+
+    #[test]
+    fn picture_without_a_direct_img_still_renders_nested_content() {
+        // Invalid nesting (<img> under a <figure> inside <picture>): with no
+        // direct <img>, the picture arm falls through to normal container layout
+        // so the nested image still draws, matching browsers (and the fetch
+        // collector, which likewise falls through to collect it).
+        let styled = CssEngine::new().style(&parse_html(
+            "<picture><figure><img src='nested.png' alt='x'></figure></picture>",
+        ));
+        let img = Arc::new(DecodedImage {
+            size: Size::new(20, 10),
+            rgba: vec![255; 20 * 10 * 4],
+        });
+        let laid = BlockLayout::default().layout(
+            &styled,
+            Size::new(800, 2000),
+            &MonoShaper,
+            &KeyedImage("nested.png", img),
+            &NoForms,
+        );
+        assert!(
+            laid.display
+                .items
+                .iter()
+                .any(|i| matches!(i, DisplayItem::Image { .. })),
+            "the nested <img> renders even though it is not a direct <picture> child"
         );
     }
 
