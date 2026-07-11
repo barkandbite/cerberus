@@ -393,19 +393,13 @@ pub trait LayoutEngine: Send {
 
 /// Block/inline flow layout. The only knob is the page margin; everything else
 /// comes from the cascade.
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, Default)]
 pub struct BlockLayout {
     /// Extra page margin in pixels. Defaults to 0: the page inset is the UA
     /// stylesheet's `body { margin: 8px }` (as in Chrome), so a page that sets
     /// `body{margin:0}` really reaches the viewport edge — a fixed engine inset
     /// shifted every such page by 8px on both axes.
     pub margin: i32,
-}
-
-impl Default for BlockLayout {
-    fn default() -> Self {
-        Self { margin: 0 }
-    }
 }
 
 impl LayoutEngine for BlockLayout {
