@@ -71,13 +71,20 @@ PNGs, crops Cerberus's 36px toolbar (`--crop-top 36`), compares over the overlap
 and prints an **RMSE** (`0.0` = identical) plus a mismatch fraction; `--fail-over
 <rmse>` makes it a regression gate. `docs/parity-corpus.txt` holds the corpus and
 `scripts/parity.sh` runs the whole loop (mirror → Chrome + Cerberus render →
-diff) emitting a `parity.csv`. **Current baselines** (toolbar cropped, tolerance 8): `example` RMSE **0.068**
-(1.6% — was 0.095 / 89% before the canvas-background fix below), `iana` RMSE
-**0.131** (16.3% — was 22.6%; inline spacing + line-height + table columns fixed,
-remainder is font-face/wrap-point drift), `wikipedia` RMSE **0.143** (9.05% — was
-9.19%; search field now fills its container and its language dropdown is pinned
-out of flow, remainder is the JS-built footer + font drift). Drive these down; a
-rise is a regression.
+diff) emitting a `parity.csv`. **Current baselines** (toolbar cropped, tolerance 8, block engine —
+2026-07-11, after the Chrome-exact font-metric + UA-margin + table-model
+batch): `example` **0.075**/1.8%, `iana` **0.149**/25.2% (the page was
+REDESIGNED upstream — modern oklch palette + `a:link` styling, both now
+supported; not comparable to the old 0.131), `mfws` **0.207**/15.4% (best
+recorded; was stuck at 0.240 before the metric work), `rfc1` **0.134**/5.1%,
+`wikipedia` **0.154**/11.1%, `hn` **0.171**/19.3% (was 77.8%% mismatched
+before the `<center>`-table/bgcolor/cellpadding fixes). Font metrics are
+now measured pixel-identical to the reference on a 100px calibration page
+(see `docs/FONTS.md`). Known next levers: table `colspan`/`rowspan` (HN's
+rank/title interleave), fractional line pitch (Chrome advances lines at
+e.g. 18.4px, we round to 18 — ~0.4px/line cumulative), a wikipedia-specific
+dive, and inline whitespace at element boundaries (#137: `byPublic`,
+`6761 , a`). Drive these down; a rise is a regression.
 
 **Search-widget layout** (W-C): two general inline-block fixes closed most of it.
 (1) An inline-block's percentage `width` was resolved twice — once to size its
