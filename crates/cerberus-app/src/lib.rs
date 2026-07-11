@@ -43,8 +43,8 @@ use cerberus_js_dom::{
 };
 use cerberus_js_quickjs::QuickJsEngineFactory;
 use cerberus_layout::{
-    pick_img_url, BlockLayout, ElementBox, FieldKind, FormFieldBox, FormState, ImageProvider,
-    LayoutEngine, LinkBox, NoForms, NoImages,
+    pick_img_url, pick_picture_url, BlockLayout, ElementBox, FieldKind, FormFieldBox, FormState,
+    ImageProvider, LayoutEngine, LinkBox, NoForms, NoImages, PictureSource,
 };
 pub use cerberus_layout::{ImageDisplayMode, LayoutEngineKind};
 
@@ -1220,6 +1220,7 @@ pub fn render(config: &RenderConfig) -> Result<RenderOutcome, AppError> {
             &consent,
             &first_party,
             config.viewport.w,
+            config.viewport.h,
             &image_policy,
         ),
         None => HashMap::new(),
@@ -1762,6 +1763,7 @@ fn fetch_images_sync(
     policy: &Mutex<DefaultDenyPolicy>,
     first_party: &Origin,
     viewport_w: u32,
+    viewport_h: u32,
     images: &ImagePolicy,
 ) -> HashMap<String, ImageState> {
     // Collect <img> srcs and CSS background-image srcs separately: the text-only
@@ -1769,7 +1771,7 @@ fn fetch_images_sync(
     // policy-matched *background* must still fetch and paint — a CSS background
     // has no text substitute and would otherwise vanish silently.
     let mut img_srcs = Vec::new();
-    collect_image_urls(document.root(), &mut img_srcs, viewport_w);
+    collect_image_urls(document.root(), &mut img_srcs, viewport_w, viewport_h);
     let img_urls: std::collections::HashSet<String> = img_srcs
         .iter()
         .map(|s| resolve_subresource(Some(base), s))
@@ -1950,7 +1952,33 @@ fn visible_text(root: &StyledNode) -> String {
 /// Collect `<img>` sources from an element subtree, resolving `srcset`/`sizes`/
 /// `data-src` to the same URL layout will draw (ADR-0046), so the fetched bytes
 /// are the ones the page looks up. `viewport_w` is the layout viewport width.
-fn collect_image_urls(node: NodeRef<'_>, out: &mut Vec<String>, viewport_w: u32) {
+fn collect_image_urls(node: NodeRef<'_>, out: &mut Vec<String>, viewport_w: u32, viewport_h: u32) {
+    if node.tag() == "picture" {
+        // Resolve the <picture> to the one URL its <img> will actually load
+        // (type/media selection), matching what layout draws (ADR-0046). Don't
+        // descend: the inner <img>'s own src is subsumed by this choice.
+        let sources: Vec<PictureSource<'_>> = node
+            .children()
+            .filter(|c| c.tag() == "source")
+            .map(|s| PictureSource {
+                type_: s.attr("type"),
+                media: s.attr("media"),
+                srcset: s.attr("srcset"),
+                sizes: s.attr("sizes"),
+            })
+            .collect();
+        let img = node.children().find(|c| c.tag() == "img");
+        let picked = pick_picture_url(
+            &sources,
+            |n| img.as_ref().and_then(|i| i.attr(n)),
+            viewport_w,
+            viewport_h,
+        );
+        if let Some(src) = picked {
+            out.push(src);
+        }
+        return;
+    }
     if node.tag() == "img" {
         if let Some(src) = pick_img_url(|n| node.attr(n), viewport_w) {
             out.push(src);
@@ -1958,7 +1986,7 @@ fn collect_image_urls(node: NodeRef<'_>, out: &mut Vec<String>, viewport_w: u32)
     }
     for child in node.children() {
         if child.is_element() {
-            collect_image_urls(child, out, viewport_w);
+            collect_image_urls(child, out, viewport_w, viewport_h);
         }
     }
 }
@@ -3371,10 +3399,11 @@ impl BrowserApp {
         // matching the policy must still fetch and paint — it has no text
         // substitute and would otherwise vanish silently.
         let mut img_srcs = Vec::new();
-        // The same viewport width layout uses (ADR-0046), so srcset selection at
-        // fetch time and at draw time agree.
-        let viewport_w = self.toolbar.content_size(self.last_size).w;
-        collect_image_urls(self.document.root(), &mut img_srcs, viewport_w);
+        // The same viewport layout uses (ADR-0046), so srcset and <picture>
+        // selection at fetch time and at draw time agree.
+        let viewport = self.toolbar.content_size(self.last_size);
+        let viewport_w = viewport.w;
+        collect_image_urls(self.document.root(), &mut img_srcs, viewport_w, viewport.h);
         let img_urls: std::collections::HashSet<String> = img_srcs
             .iter()
             .map(|s| resolve_subresource(self.current_url.as_ref(), s))
@@ -6021,6 +6050,7 @@ mod tests {
             &policy,
             &first_party,
             800,
+            600,
             &images,
         );
 
@@ -6042,6 +6072,33 @@ mod tests {
             ),
             "the CSS background must reach the network path, not be dropped as TextOnly"
         );
+    }
+
+    #[test]
+    fn collect_image_urls_resolves_a_picture_to_its_selected_source() {
+        // On a narrow (500px) viewport the mobile source wins; the fetch list
+        // must carry exactly that URL — not the desktop source, and not also the
+        // <img> fallback (which would double-fetch).
+        let doc = parse_html(
+            "<picture>\
+               <source media='(min-width: 900px)' srcset='desktop.png'>\
+               <source media='(max-width: 600px)' srcset='mobile.png'>\
+               <img src='fallback.png' alt='hero'>\
+             </picture>",
+        );
+        let mut out = Vec::new();
+        collect_image_urls(doc.root(), &mut out, 500, 800);
+        assert_eq!(out, vec!["mobile.png".to_string()]);
+
+        // A wide viewport matches the (min-width: 900px) desktop source.
+        let mut wide = Vec::new();
+        collect_image_urls(doc.root(), &mut wide, 1000, 800);
+        assert_eq!(wide, vec!["desktop.png".to_string()]);
+
+        // A mid viewport matches neither source → the <img> fallback is used.
+        let mut mid = Vec::new();
+        collect_image_urls(doc.root(), &mut mid, 700, 800);
+        assert_eq!(mid, vec!["fallback.png".to_string()]);
     }
 
     #[test]

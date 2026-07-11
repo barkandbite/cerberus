@@ -556,6 +556,12 @@ struct Ctx<'a> {
     /// Pending `text-indent` (px) for the current block's first line, consumed as
     /// the leading offset of the first word placed and then zeroed.
     pending_indent: i32,
+    /// The `<source>` candidates of the `<picture>` currently being laid out, so
+    /// its child `<img>` resolves its URL through them (type/media selection)
+    /// rather than through its own `src`/`srcset` alone. Set while walking a
+    /// `<picture>`, cleared immediately after its `<img>` — never leaks to a
+    /// sibling image (ADR-0046: fetch and paint pick the same candidate).
+    cur_picture: Option<Vec<OwnedPictureSource>>,
 }
 
 impl<'a> Ctx<'a> {
@@ -602,6 +608,7 @@ impl<'a> Ctx<'a> {
             as_block_once: false,
             list_ordinal: 0,
             pending_indent: 0,
+            cur_picture: None,
         }
     }
 
@@ -665,6 +672,7 @@ impl<'a> Ctx<'a> {
             as_block_once: false,
             list_ordinal: 0,
             pending_indent: 0,
+            cur_picture: None,
         }
     }
 
@@ -702,6 +710,38 @@ impl<'a> Ctx<'a> {
                     self.image(node, in_link);
                     if let Some(base) = base {
                         self.apply_positioning(style, base);
+                    }
+                }
+                return;
+            }
+            "picture" => {
+                // A <picture> selects one URL from its <source> children (by
+                // `type`/`media`), then renders its single <img> with that URL
+                // (WHATWG "select an image source"). The <source> elements paint
+                // nothing; the <img> carries the box, alt, and dimensions. Lay
+                // the <img> out exactly as a bare <img> would, but with the
+                // sources in scope so `image` resolves through them.
+                if visible {
+                    if let Some(img) = node.children.iter().find_map(|c| match c {
+                        StyledChild::Element(e) if e.tag == "img" => Some(e.as_ref()),
+                        _ => None,
+                    }) {
+                        // Honor a block-level <picture> (e.g. `picture{display:block}`)
+                        // by breaking the line around its image.
+                        let block = style.display == Display::Block;
+                        if block {
+                            self.flush_line();
+                        }
+                        self.cur_picture = Some(collect_picture_sources(node));
+                        let base = self.positioned_base(&img.style);
+                        self.image(img, in_link);
+                        if let Some(base) = base {
+                            self.apply_positioning(&img.style, base);
+                        }
+                        self.cur_picture = None;
+                        if block {
+                            self.flush_line();
+                        }
                     }
                 }
                 return;
@@ -1566,8 +1606,20 @@ impl<'a> Ctx<'a> {
     /// placeholder, else the alt text. Lazy-loading is ignored (raw render).
     fn image(&mut self, node: &StyledNode, in_link: Option<&str>) {
         // Resolve srcset/sizes/data-src to one URL (ADR-0046), using the same
-        // viewport width the fetch-time collector used, so the lookup hits.
-        let Some(src) = pick_img_url(|n| node.attr(n), self.vw.max(0) as u32) else {
+        // viewport width the fetch-time collector used, so the lookup hits. Inside
+        // a <picture>, resolve through its <source> candidates first (type/media),
+        // falling back to this <img>'s own src.
+        let vw = self.vw.max(0) as u32;
+        let vh = self.vh.max(0) as u32;
+        let picked = match &self.cur_picture {
+            Some(sources) => {
+                let borrowed: Vec<PictureSource<'_>> =
+                    sources.iter().map(OwnedPictureSource::borrow).collect();
+                pick_picture_url(&borrowed, |n| node.attr(n), vw, vh)
+            }
+            None => pick_img_url(|n| node.attr(n), vw),
+        };
+        let Some(src) = picked else {
             self.image_alt(node, in_link);
             return;
         };
@@ -3841,6 +3893,161 @@ pub fn pick_img_url<'a>(attr: impl Fn(&str) -> Option<&'a str>, viewport_w: u32)
     attr("src").map(str::to_string)
 }
 
+/// A `<source>` candidate inside a `<picture>`, borrowed from the DOM/styled
+/// tree: its optional `type` (MIME) and `media` query, plus `srcset`/`sizes`. A
+/// `<source>` without a `srcset` is invalid and never contributes a URL.
+pub struct PictureSource<'a> {
+    pub type_: Option<&'a str>,
+    pub media: Option<&'a str>,
+    pub srcset: Option<&'a str>,
+    pub sizes: Option<&'a str>,
+}
+
+/// An owned [`PictureSource`], so the layout walker can stash a `<picture>`'s
+/// candidates on the context across the recursion into its `<img>` child.
+#[derive(Clone, Debug)]
+pub struct OwnedPictureSource {
+    pub type_: Option<String>,
+    pub media: Option<String>,
+    pub srcset: Option<String>,
+    pub sizes: Option<String>,
+}
+
+impl OwnedPictureSource {
+    fn borrow(&self) -> PictureSource<'_> {
+        PictureSource {
+            type_: self.type_.as_deref(),
+            media: self.media.as_deref(),
+            srcset: self.srcset.as_deref(),
+            sizes: self.sizes.as_deref(),
+        }
+    }
+}
+
+/// Collect the `<source>` candidates of a `<picture>` in document order.
+fn collect_picture_sources(picture: &StyledNode) -> Vec<OwnedPictureSource> {
+    picture
+        .children
+        .iter()
+        .filter_map(|c| match c {
+            StyledChild::Element(e) if e.tag == "source" => Some(OwnedPictureSource {
+                type_: e.attr("type").map(str::to_string),
+                media: e.attr("media").map(str::to_string),
+                srcset: e.attr("srcset").map(str::to_string),
+                sizes: e.attr("sizes").map(str::to_string),
+            }),
+            _ => None,
+        })
+        .collect()
+}
+
+/// Whether the bundled image codec can decode `mime`. Mirrors the formats
+/// enabled on the `image` crate in cerberus-image (png/jpeg/gif/webp/bmp) plus
+/// SVG via resvg — a `<source type=...>` naming anything else (e.g. AVIF) is
+/// skipped so selection falls through to a format we can actually paint, per the
+/// WHATWG "picture" source-selection steps.
+pub fn image_type_supported(mime: &str) -> bool {
+    matches!(
+        mime.trim().to_ascii_lowercase().as_str(),
+        "image/png"
+            | "image/jpeg"
+            | "image/jpg"
+            | "image/gif"
+            | "image/webp"
+            | "image/bmp"
+            | "image/svg+xml"
+    )
+}
+
+/// Evaluate a `<source media>` query against a `vw`×`vh` viewport. Supports the
+/// dimension/orientation features responsive `<picture>` art direction uses
+/// (`min/max-width`, `min/max-height`, `orientation`) and the `screen`/`all`
+/// media types; every other type or feature (`print`, `prefers-*`, …) does not
+/// match, so that `<source>` is skipped and selection falls through to the next
+/// candidate (ultimately the `<img>`). This tracks the CSS engine's fixed
+/// desktop-screen persona: a `<source>` gated on a preference we don't advertise
+/// simply yields to the plain `<img>`, which is the safe, visible default.
+pub fn picture_media_matches(query: &str, vw: u32, vh: u32) -> bool {
+    // OR over comma-separated queries; AND over ` and `-separated parts.
+    query.split(',').any(|branch| {
+        branch.split(" and ").all(|part| {
+            let part = part.trim().trim_start_matches("only ").trim();
+            if part.is_empty() {
+                // An empty media attribute (or branch) matches everything.
+                return true;
+            }
+            if let Some(inner) = part.strip_prefix('(').and_then(|p| p.strip_suffix(')')) {
+                picture_media_feature(inner.trim(), vw, vh)
+            } else {
+                // A bare media type, optionally negated. Only screen/all match.
+                let (ty, negated) = match part.strip_prefix("not ") {
+                    Some(rest) => (rest.trim(), true),
+                    None => (part, false),
+                };
+                let is_screen = ty.eq_ignore_ascii_case("screen") || ty.eq_ignore_ascii_case("all");
+                is_screen != negated
+            }
+        })
+    })
+}
+
+/// Evaluate one `(feature: value)` from a `<source media>` query. An unknown or
+/// malformed feature is false (spec: it makes the query fail), so the candidate
+/// is skipped rather than matched by accident.
+fn picture_media_feature(feat: &str, vw: u32, vh: u32) -> bool {
+    let (name, value) = match feat.split_once(':') {
+        Some((n, v)) => (n.trim().to_ascii_lowercase(), v.trim().to_ascii_lowercase()),
+        None => (feat.trim().to_ascii_lowercase(), String::new()),
+    };
+    let px = || -> Option<u32> {
+        value
+            .chars()
+            .take_while(|c| c.is_ascii_digit())
+            .collect::<String>()
+            .parse()
+            .ok()
+    };
+    match name.as_str() {
+        "min-width" => px().is_some_and(|p| vw >= p),
+        "max-width" => px().is_some_and(|p| vw <= p),
+        "min-height" => px().is_some_and(|p| vh >= p),
+        "max-height" => px().is_some_and(|p| vh <= p),
+        "orientation" => match value.as_str() {
+            "portrait" => vh >= vw,
+            "landscape" => vw > vh,
+            _ => false,
+        },
+        _ => false,
+    }
+}
+
+/// Choose the URL a `<picture>`'s `<img>` should load (WHATWG "select an image
+/// source"): the first `<source>`, in document order, whose `type` we can decode
+/// and whose `media` matches, resolved through its `srcset`/`sizes`; otherwise
+/// the `<img>`'s own [`pick_img_url`]. The fetch-time collector and layout both
+/// call this with the same viewport, so they agree on the chosen candidate.
+pub fn pick_picture_url<'a>(
+    sources: &[PictureSource<'_>],
+    img_attr: impl Fn(&str) -> Option<&'a str>,
+    vw: u32,
+    vh: u32,
+) -> Option<String> {
+    for s in sources {
+        if s.type_.is_some_and(|t| !image_type_supported(t)) {
+            continue;
+        }
+        if s.media.is_some_and(|m| !picture_media_matches(m, vw, vh)) {
+            continue;
+        }
+        // A <source> must carry a srcset; without one it contributes nothing.
+        let Some(ss) = s.srcset else { continue };
+        if let Some(u) = select_srcset(ss, s.sizes, vw) {
+            return Some(u);
+        }
+    }
+    pick_img_url(img_attr, vw)
+}
+
 /// Tokenize a `srcset` attribute value into `(url, descriptor)` candidates per the
 /// WHATWG "parse a srcset attribute" algorithm. A bare `,` only separates candidates
 /// when it terminates the URL or descriptor, not when it appears inside a URL (a
@@ -5564,6 +5771,157 @@ mod tests {
                 .iter()
                 .any(|i| matches!(i, DisplayItem::Image { .. })),
             "srcset selected small.png (the only key the provider serves)"
+        );
+    }
+
+    #[test]
+    fn image_type_supported_matches_bundled_codecs() {
+        for ok in [
+            "image/png",
+            "image/jpeg",
+            "image/gif",
+            "image/webp",
+            "image/bmp",
+            "image/svg+xml",
+            "IMAGE/PNG",
+        ] {
+            assert!(image_type_supported(ok), "{ok} should decode");
+        }
+        for no in ["image/avif", "image/jxl", "image/tiff", "video/mp4", ""] {
+            assert!(!image_type_supported(no), "{no} should not decode");
+        }
+    }
+
+    #[test]
+    fn picture_media_matches_dimensions_and_orientation() {
+        // width features against a 500-wide viewport
+        assert!(picture_media_matches("(max-width: 600px)", 500, 800));
+        assert!(!picture_media_matches("(max-width: 400px)", 500, 800));
+        assert!(picture_media_matches("(min-width: 500px)", 500, 800));
+        // AND / OR, media type, and orientation
+        assert!(picture_media_matches(
+            "screen and (min-width: 400px)",
+            500,
+            800
+        ));
+        assert!(!picture_media_matches(
+            "print and (min-width: 400px)",
+            500,
+            800
+        ));
+        assert!(picture_media_matches(
+            "(max-width: 100px), (min-width: 400px)",
+            500,
+            800
+        ));
+        assert!(picture_media_matches("(orientation: portrait)", 500, 800));
+        assert!(!picture_media_matches("(orientation: landscape)", 500, 800));
+        // Empty query matches everything; unknown/preference features don't.
+        assert!(picture_media_matches("", 500, 800));
+        assert!(!picture_media_matches(
+            "(prefers-color-scheme: dark)",
+            500,
+            800
+        ));
+    }
+
+    #[test]
+    fn pick_picture_url_skips_undecodable_types_then_falls_back() {
+        let img = |n: &str| match n {
+            "src" => Some("fallback.jpg"),
+            _ => None,
+        };
+        // AVIF can't decode → skip; WebP can → win.
+        let sources = [
+            PictureSource {
+                type_: Some("image/avif"),
+                media: None,
+                srcset: Some("a.avif"),
+                sizes: None,
+            },
+            PictureSource {
+                type_: Some("image/webp"),
+                media: None,
+                srcset: Some("a.webp"),
+                sizes: None,
+            },
+        ];
+        assert_eq!(
+            pick_picture_url(&sources, img, 800, 600).as_deref(),
+            Some("a.webp")
+        );
+        // Only an undecodable source → fall back to the <img>.
+        let only_avif = [PictureSource {
+            type_: Some("image/avif"),
+            media: None,
+            srcset: Some("a.avif"),
+            sizes: None,
+        }];
+        assert_eq!(
+            pick_picture_url(&only_avif, img, 800, 600).as_deref(),
+            Some("fallback.jpg")
+        );
+    }
+
+    #[test]
+    fn picture_source_selected_by_media_is_drawn() {
+        // A narrow (500px) viewport → the (max-width:600px) mobile source wins;
+        // the provider serves only that key, so an Image item proves selection.
+        let styled = CssEngine::new().style(&parse_html(
+            "<picture>\
+               <source media='(min-width: 900px)' srcset='desktop.png'>\
+               <source media='(max-width: 600px)' srcset='mobile.png'>\
+               <img src='fallback.png' alt='hero'>\
+             </picture>",
+        ));
+        let img = Arc::new(DecodedImage {
+            size: Size::new(20, 10),
+            rgba: vec![255; 20 * 10 * 4],
+        });
+        let laid = BlockLayout::default().layout(
+            &styled,
+            Size::new(500, 2000),
+            &MonoShaper,
+            &KeyedImage("mobile.png", img),
+            &NoForms,
+        );
+        assert!(
+            laid.display
+                .items
+                .iter()
+                .any(|i| matches!(i, DisplayItem::Image { .. })),
+            "the (max-width:600px) source (mobile.png) was selected and drawn"
+        );
+    }
+
+    #[test]
+    fn picture_falls_back_to_img_when_no_source_matches() {
+        // A wide (1000px) viewport: neither the undecodable AVIF nor the
+        // max-width:600 source qualifies → the <img> fallback is drawn.
+        let styled = CssEngine::new().style(&parse_html(
+            "<picture>\
+               <source type='image/avif' srcset='a.avif'>\
+               <source media='(max-width: 600px)' srcset='mobile.png'>\
+               <img src='fallback.png' alt='hero'>\
+             </picture>",
+        ));
+        let img = Arc::new(DecodedImage {
+            size: Size::new(20, 10),
+            rgba: vec![255; 20 * 10 * 4],
+        });
+        let laid = BlockLayout::default().layout(
+            &styled,
+            Size::new(1000, 2000),
+            &MonoShaper,
+            &KeyedImage("fallback.png", img),
+            &NoForms,
+        );
+        assert!(
+            laid.display
+                .items
+                .iter()
+                .any(|i| matches!(i, DisplayItem::Image { .. })),
+            "no source qualified, so the <img> fallback (fallback.png) was drawn"
         );
     }
 
