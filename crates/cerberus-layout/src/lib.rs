@@ -3110,7 +3110,7 @@ impl<'a> Ctx<'a> {
         let rows = collect_rows(node);
         let num_cols = rows
             .iter()
-            .map(|r| cell_children(r).count())
+            .map(|r| cell_children(r).map(cell_colspan).sum::<usize>())
             .max()
             .unwrap_or(0);
 
@@ -3138,11 +3138,21 @@ impl<'a> Ctx<'a> {
             .unwrap_or(CELL_PAD);
         let mut col_max = vec![1i32; num_cols];
         for row in &rows {
-            for (col, cell) in cell_children(row).enumerate() {
-                if col < num_cols {
-                    let w = (self.measure_cell_width(cell) + 2 * pad).max(1);
-                    col_max[col] = col_max[col].max(w);
+            let mut col = 0usize;
+            for cell in cell_children(row) {
+                if col >= num_cols {
+                    break;
                 }
+                let span = cell_colspan(cell).min(num_cols - col);
+                let w = (self.measure_cell_width(cell) + 2 * pad).max(1);
+                // A spanning cell contributes its width divided across its
+                // columns (adequate stand-in for the spec's proportional
+                // distribution).
+                let per = (w / span as i32).max(1);
+                for m in col_max.iter_mut().skip(col).take(span) {
+                    *m = (*m).max(per);
+                }
+                col += span;
             }
         }
         let total: i64 = col_max.iter().map(|&w| w as i64).sum();
@@ -3190,17 +3200,30 @@ impl<'a> Ctx<'a> {
         let mut row_y = self.y;
 
         for row in rows {
-            let cells: Vec<&StyledNode> = cell_children(row).collect();
-            if cells.is_empty() {
+            // Resolve each cell's column start + span once (colspan-aware), so
+            // laying, box-painting, and advancing all agree — a `colspan=2`
+            // title cell (the HN pattern) spans its columns instead of pushing
+            // later cells into the wrong ones.
+            let mut placed: Vec<(&StyledNode, usize, usize)> = Vec::new();
+            let mut col = 0usize;
+            for cell in cell_children(row) {
+                if col >= num_cols {
+                    break;
+                }
+                let span = cell_colspan(cell).min(num_cols - col);
+                placed.push((cell, col, span));
+                col += span;
+            }
+            if placed.is_empty() {
                 continue;
             }
 
             // Sub-lay every cell, capturing its items/links/fields and height.
-            let mut laid: Vec<CellLayout> = Vec::with_capacity(cells.len());
+            let mut laid: Vec<CellLayout> = Vec::with_capacity(placed.len());
             let mut row_h = line_height(node.style.font_size.max(1));
-            for (col, cell) in cells.iter().enumerate() {
-                let cell_x = col_x[col.min(num_cols - 1)];
-                let cell_w = (col_x[(col + 1).min(num_cols)] - cell_x).max(1);
+            for &(cell, col, span) in &placed {
+                let cell_x = col_x[col];
+                let cell_w = (col_x[(col + span).min(num_cols)] - cell_x).max(1);
                 let (items, links, fields, h) =
                     self.flow_cell(cell, cell_x, cell_x + cell_w, row_y, pad);
                 row_h = row_h.max(h);
@@ -3209,9 +3232,9 @@ impl<'a> Ctx<'a> {
             row_h = (row_h + 2 * pad).max(1);
 
             // Emit each cell's box (fill + border) under its content.
-            for (col, cell) in cells.iter().enumerate() {
-                let cell_x = col_x[col.min(num_cols - 1)];
-                let cell_w = (col_x[(col + 1).min(num_cols)] - cell_x).max(1) as u32;
+            for &(cell, col, span) in &placed {
+                let cell_x = col_x[col];
+                let cell_w = (col_x[(col + span).min(num_cols)] - cell_x).max(1) as u32;
                 let is_header = cell.tag == "th";
                 let fill = cell
                     .style
@@ -4410,6 +4433,15 @@ fn cell_children(row: &StyledNode) -> impl Iterator<Item = &StyledNode> {
     })
 }
 
+/// A cell's `colspan` (1 when absent/invalid; capped to keep col math sane).
+fn cell_colspan(cell: &StyledNode) -> usize {
+    cell.attr("colspan")
+        .and_then(|v| v.trim().parse::<usize>().ok())
+        .filter(|&s| s >= 1)
+        .unwrap_or(1)
+        .min(64)
+}
+
 /// The first direct element child of `node` whose tag is `tag`.
 fn find_child<'a>(node: &'a StyledNode, tag: &str) -> Option<&'a StyledNode> {
     node.children.iter().find_map(|c| match c {
@@ -4589,6 +4621,38 @@ mod tests {
             gx[0],
             bg.x
         );
+    }
+
+    #[test]
+    fn table_colspan_spans_columns_and_keeps_later_rows_aligned() {
+        // Row 1: a colspan=2 cell + one cell (3 columns total). Row 2: three
+        // cells. The colspan cell must span columns 0-1, and row 2's cells must
+        // land in columns 0/1/2 — not shifted (the HN rank/title interleave).
+        let laid = lay(
+            "<table cellpadding='0'>\
+             <tr><td colspan='2' style='background:#ff0000'>wide</td>\
+                 <td style='background:#00ff00'>c</td></tr>\
+             <tr><td style='background:#0000ff'>a</td>\
+                 <td style='background:#ffff00'>b</td>\
+                 <td style='background:#ff00ff'>c</td></tr>\
+             </table>",
+            600,
+        );
+        let r = fill_rects(&laid);
+        assert_eq!(r.len(), 5, "five cell boxes painted");
+        // The spanning cell covers exactly the width of columns 0+1, from col 0.
+        let wide = r.iter().find(|rc| rc.w >= 30).expect("span box");
+        let narrow: Vec<_> = r.iter().filter(|rc| rc.w < 30 && rc.x < 30).collect();
+        assert_eq!(wide.x, 0, "span starts at column 0");
+        assert_eq!(
+            wide.w,
+            narrow.iter().map(|rc| rc.w).sum::<u32>(),
+            "span width = col0 + col1"
+        );
+        // Both rows' third-column cells share one x — later rows aren't shifted.
+        let col2: Vec<_> = r.iter().filter(|rc| rc.x as u32 == wide.w).collect();
+        assert_eq!(col2.len(), 2, "one column-2 cell per row");
+        assert_ne!(col2[0].y, col2[1].y, "one per row");
     }
 
     #[test]
