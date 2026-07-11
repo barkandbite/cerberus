@@ -7,8 +7,12 @@
 //! `:last-of-type`, `:only-of-type`, `:nth-of-type(an+b)`,
 //! `:nth-last-of-type(an+b)`), `:not(…)`,
 //! `:root`), grouping `,`, and the descendant / child (`>`) / adjacent-sibling
-//! (`+`) / general-sibling (`~`) combinators. State pseudo-classes (`:hover`,
-//! `:focus`, `:active`, `:visited`, `:link`) parse but never match in the static
+//! (`+`) / general-sibling (`~`) combinators. Statically answerable state
+//! pseudo-classes match from attributes: `:link`/`:any-link` (an `<a>`/`<area>`
+//! with `href` — nothing is visited in a fresh head), `:disabled`/`:enabled`
+//! (the `disabled` attribute on a form control), `:checked` (`input[checked]`,
+//! `option[selected]`). Interaction pseudo-classes (`:hover`, `:focus`,
+//! `:active`, `:visited`) parse but never match in the static
 //! cascade. `@media` blocks are parsed and gated on the viewport plus the fixed
 //! desktop persona (`prefers-color-scheme: light`, no reduced-motion/contrast,
 //! `hover`/`pointer: fine`, no forced colors) — matching what JS `matchMedia`
@@ -88,7 +92,18 @@ enum Pseudo {
     NthOfType(i32, i32),
     NthLastOfType(i32, i32), // an+b among same-tag siblings, counting from the end
     Root,
-    Never, // :hover/:focus/:active/:visited/:link — no static match
+    /// `:link` / `:any-link` — an `<a>`/`<area>` carrying `href`. Nothing is
+    /// ever visited in a fresh sealed head, so `:link` covers every hyperlink,
+    /// exactly like Chrome with empty history (and `a:link{…}` is how a large
+    /// share of sites style their links — dropping it left them UA blue).
+    Link,
+    /// `:disabled` / `:enabled` — a form control with/without the `disabled`
+    /// attribute (rest state; fieldset inheritance not modelled).
+    Disabled,
+    Enabled,
+    /// `:checked` — `input[checked]` / `option[selected]` (rest state).
+    Checked,
+    Never, // :hover/:focus/:active/:visited — no static match
 }
 
 #[derive(Clone, Debug, Default)]
@@ -205,8 +220,27 @@ fn pseudo_matches(
         Pseudo::NthOfType(a, b) => nth_matches(*a, *b, type_pos()),
         Pseudo::NthLastOfType(a, b) => nth_matches(*a, *b, type_total() as i32 - type_pos() + 1),
         Pseudo::Root => el.tag == "html",
+        Pseudo::Link => (el.tag == "a" || el.tag == "area") && has_attr(el, "href"),
+        Pseudo::Disabled => is_form_control(&el.tag) && has_attr(el, "disabled"),
+        Pseudo::Enabled => is_form_control(&el.tag) && !has_attr(el, "disabled"),
+        Pseudo::Checked => {
+            (el.tag == "input" && has_attr(el, "checked"))
+                || (el.tag == "option" && has_attr(el, "selected"))
+        }
         Pseudo::Never => false,
     }
+}
+
+fn has_attr(el: &SiblingRef, name: &str) -> bool {
+    el.attrs.iter().any(|(k, _)| k == name)
+}
+
+/// The tags `:enabled`/`:disabled` apply to (form-associated elements).
+fn is_form_control(tag: &str) -> bool {
+    matches!(
+        tag,
+        "button" | "input" | "select" | "textarea" | "option" | "optgroup" | "fieldset"
+    )
 }
 
 /// Whether `pos` (1-based) satisfies `an + b` for some integer n ≥ 0.
@@ -739,10 +773,19 @@ fn apply_pseudo(c: &mut Compound, name: &str, arg: &str) {
                 c.not.push(inner);
             }
         }
-        // State pseudo-classes have no static answer; force a non-match so we
-        // never wrongly apply (e.g.) :hover styles at rest.
-        "hover" | "focus" | "active" | "visited" | "link" | "focus-within" | "focus-visible"
-        | "checked" | "disabled" | "enabled" => c.pseudos.push(Pseudo::Never),
+        // Statically answerable state: every hyperlink is unvisited in a fresh
+        // sealed head, so `:link`/`:any-link` = "an <a>/<area> with href", and
+        // disabled/checked read straight off the attributes (rest state).
+        "link" | "any-link" => c.pseudos.push(Pseudo::Link),
+        "disabled" => c.pseudos.push(Pseudo::Disabled),
+        "enabled" => c.pseudos.push(Pseudo::Enabled),
+        "checked" => c.pseudos.push(Pseudo::Checked),
+        // Interaction state has no static answer; force a non-match so we never
+        // wrongly apply (e.g.) :hover styles at rest. `:visited` is genuinely
+        // empty (fresh profile), matching Chrome with no history.
+        "hover" | "focus" | "active" | "visited" | "focus-within" | "focus-visible" => {
+            c.pseudos.push(Pseudo::Never)
+        }
         _ => {} // unknown pseudo — ignore (matches nothing extra)
     }
 }
@@ -1013,8 +1056,50 @@ mod tests {
 
     #[test]
     fn state_pseudos_never_match_statically() {
-        let path = chain(vec![sref("a", None, &[], &[])]);
+        let path = chain(vec![sref("a", None, &[], &[("href", "/x")])]);
         assert!(!matches("a:hover { a: b }", &path));
+        assert!(!matches("a:visited { a: b }", &path));
+        assert!(!matches("a:focus { a: b }", &path));
+    }
+
+    #[test]
+    fn link_pseudo_matches_hyperlinks_with_href() {
+        // Every hyperlink is unvisited in a fresh head, so `a:link` (how a large
+        // share of sites style links) must match an <a href> — dropping it left
+        // links UA-blue on styled pages (the iana regression).
+        let with_href = chain(vec![sref("a", None, &[], &[("href", "/x")])]);
+        let no_href = chain(vec![sref("a", None, &[], &[])]);
+        assert!(matches("a:link { color: green }", &with_href));
+        assert!(matches("a:any-link { color: green }", &with_href));
+        assert!(
+            !matches("a:link { color: green }", &no_href),
+            "a placeholder <a> without href is not a link"
+        );
+        // The classic pair applies through its :link branch.
+        assert!(matches("a:link, a:visited { color: green }", &with_href));
+        // A non-anchor with href is not a hyperlink.
+        let div = chain(vec![sref("div", None, &[], &[("href", "/x")])]);
+        assert!(!matches("div:link { color: green }", &div));
+    }
+
+    #[test]
+    fn form_state_pseudos_read_attributes() {
+        let disabled = chain(vec![sref("button", None, &[], &[("disabled", "")])]);
+        let enabled = chain(vec![sref("button", None, &[], &[])]);
+        assert!(matches("button:disabled { opacity: 0.5 }", &disabled));
+        assert!(!matches("button:disabled { opacity: 0.5 }", &enabled));
+        assert!(matches("button:enabled { color: red }", &enabled));
+        assert!(!matches("button:enabled { color: red }", &disabled));
+        // :enabled applies only to form controls, not arbitrary elements.
+        let div = chain(vec![sref("div", None, &[], &[])]);
+        assert!(!matches("div:enabled { color: red }", &div));
+
+        let checked = chain(vec![sref("input", None, &[], &[("checked", "")])]);
+        let unchecked = chain(vec![sref("input", None, &[], &[])]);
+        assert!(matches("input:checked { outline: x }", &checked));
+        assert!(!matches("input:checked { outline: x }", &unchecked));
+        let selected = chain(vec![sref("option", None, &[], &[("selected", "")])]);
+        assert!(matches("option:checked { font-weight: bold }", &selected));
     }
 
     #[test]

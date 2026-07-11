@@ -1,5 +1,5 @@
 //! CSS color parsing: `#hex` (3/4/6/8-digit), `rgb()/rgba()`, `hsl()/hsla()`,
-//! and named colors.
+//! `oklch()`/`oklab()`, and named colors.
 
 use cerberus_types::Color;
 
@@ -29,6 +29,21 @@ pub fn parse_color(input: &str) -> Option<Color> {
         .and_then(|x| x.strip_suffix(')'))
     {
         return parse_hsl(inner);
+    }
+    // Modern-toolchain default (Tailwind v4-era design systems emit whole
+    // palettes in OKLCH); without these an entire site's colors silently drop
+    // to UA defaults — measured as the iana grey-band regression.
+    if let Some(inner) = lower
+        .strip_prefix("oklch(")
+        .and_then(|x| x.strip_suffix(')'))
+    {
+        return parse_oklch(inner);
+    }
+    if let Some(inner) = lower
+        .strip_prefix("oklab(")
+        .and_then(|x| x.strip_suffix(')'))
+    {
+        return parse_oklab(inner);
     }
     named(&lower)
 }
@@ -153,6 +168,94 @@ fn hsl_to_rgb(h: f32, s: f32, l: f32) -> (u8, u8, u8) {
         (c * 255.0).round() as u8
     };
     (hue(h + 1.0 / 3.0), hue(h), hue(h - 1.0 / 3.0))
+}
+
+/// `oklch(L C H [/ A])` (CSS Color 4, modern space syntax only). `L` is a
+/// 0..1 number or percentage; `C` a non-negative number or a percentage of 0.4;
+/// `H` degrees (optional `deg`); each may be the keyword `none` (= 0).
+fn parse_oklch(inner: &str) -> Option<Color> {
+    let (parts, alpha) = split_modern3(inner)?;
+    let l = num_or_pct(parts[0], 1.0)?;
+    let c = num_or_pct(parts[1], 0.4)?.max(0.0);
+    let h = parts[2]
+        .trim_end_matches("deg")
+        .trim()
+        .parse::<f32>()
+        .ok()
+        .or_else(|| (parts[2] == "none").then_some(0.0))?;
+    let a = match alpha.map(str::trim).filter(|s| !s.is_empty()) {
+        Some(a) => parse_alpha(a)?,
+        None => 255,
+    };
+    let hr = h.to_radians();
+    let (r, g, b) = oklab_to_srgb(l, c * hr.cos(), c * hr.sin());
+    Some(Color::rgba(r, g, b, a))
+}
+
+/// `oklab(L a b [/ A])`: `L` as in `oklch`; `a`/`b` are signed numbers or
+/// percentages of ±0.4.
+fn parse_oklab(inner: &str) -> Option<Color> {
+    let (parts, alpha) = split_modern3(inner)?;
+    let l = num_or_pct(parts[0], 1.0)?;
+    let a_ax = num_or_pct(parts[1], 0.4)?;
+    let b_ax = num_or_pct(parts[2], 0.4)?;
+    let a = match alpha.map(str::trim).filter(|s| !s.is_empty()) {
+        Some(a) => parse_alpha(a)?,
+        None => 255,
+    };
+    let (r, g, b) = oklab_to_srgb(l, a_ax, b_ax);
+    Some(Color::rgba(r, g, b, a))
+}
+
+/// Split a modern space-syntax function body into exactly three components and
+/// an optional `/ alpha` tail.
+fn split_modern3(inner: &str) -> Option<([&str; 3], Option<&str>)> {
+    let (body, alpha) = match inner.split_once('/') {
+        Some((b, a)) => (b, Some(a)),
+        None => (inner, None),
+    };
+    let n: Vec<&str> = body.split_whitespace().collect();
+    if n.len() != 3 {
+        return None;
+    }
+    Some(([n[0], n[1], n[2]], alpha))
+}
+
+/// A signed number, a percentage of `scale` (100% ⇒ `scale`), or `none` (0).
+fn num_or_pct(s: &str, scale: f32) -> Option<f32> {
+    let s = s.trim();
+    if s == "none" {
+        return Some(0.0);
+    }
+    if let Some(p) = s.strip_suffix('%') {
+        return Some(p.trim().parse::<f32>().ok()? / 100.0 * scale);
+    }
+    s.parse::<f32>().ok()
+}
+
+/// OKLab → sRGB (Björn Ottosson's reference matrices), gamut-clipped per
+/// channel — matching how Chromium renders out-of-gamut OKLCH in an sRGB
+/// context closely enough for the parity tolerance.
+fn oklab_to_srgb(l: f32, a: f32, b: f32) -> (u8, u8, u8) {
+    let l_ = l + 0.396_337_78 * a + 0.215_803_76 * b;
+    let m_ = l - 0.105_561_346 * a - 0.063_854_17 * b;
+    let s_ = l - 0.089_484_18 * a - 1.291_485_5 * b;
+    let (l3, m3, s3) = (l_ * l_ * l_, m_ * m_ * m_, s_ * s_ * s_);
+    let r = 4.076_741_7 * l3 - 3.307_711_6 * m3 + 0.230_969_93 * s3;
+    let g = -1.268_438 * l3 + 2.609_757_4 * m3 - 0.341_319_38 * s3;
+    let b = -0.004_196_086_3 * l3 - 0.703_418_6 * m3 + 1.707_614_7 * s3;
+    (srgb_encode(r), srgb_encode(g), srgb_encode(b))
+}
+
+/// Linear-light component → gamma-encoded 8-bit sRGB (clamped).
+fn srgb_encode(c: f32) -> u8 {
+    let c = c.clamp(0.0, 1.0);
+    let e = if c <= 0.003_130_8 {
+        12.92 * c
+    } else {
+        1.055 * c.powf(1.0 / 2.4) - 0.055
+    };
+    (e * 255.0).round() as u8
 }
 
 /// Parse the inside of `rgb(...)`/`rgba(...)` in either syntax:
@@ -478,6 +581,41 @@ mod tests {
         );
         // Malformed (missing % units) is rejected, not mis-parsed.
         assert_eq!(parse_color("hsl(120, 100, 50)"), None);
+    }
+
+    /// Channel-wise closeness for the float conversions (rounding drift ≤ 2).
+    fn close(got: Option<Color>, want: (u8, u8, u8, u8)) -> bool {
+        let Some(c) = got else { return false };
+        (c.r as i32 - want.0 as i32).abs() <= 2
+            && (c.g as i32 - want.1 as i32).abs() <= 2
+            && (c.b as i32 - want.2 as i32).abs() <= 2
+            && (c.a as i32 - want.3 as i32).abs() <= 2
+    }
+
+    #[test]
+    fn parses_oklch_and_oklab() {
+        // Ottosson's reference: sRGB red = oklab(0.62796, 0.22486, 0.12585),
+        // i.e. oklch(0.62796 0.25768 29.234).
+        assert!(close(
+            parse_color("oklch(0.62796 0.25768 29.234)"),
+            (255, 0, 0, 255)
+        ));
+        assert!(close(
+            parse_color("oklab(0.62796 0.22486 0.12585)"),
+            (255, 0, 0, 255)
+        ));
+        // Extremes and greys (chroma 0 ⇒ pure grey ramp).
+        assert!(close(parse_color("oklch(1 0 0)"), (255, 255, 255, 255)));
+        assert!(close(parse_color("oklch(0 0 0)"), (0, 0, 0, 255)));
+        // Percentage L and C, `deg` hue, slash alpha.
+        assert!(close(
+            parse_color("oklch(62.796% 64.42% 29.234deg / 0.5)"),
+            (255, 0, 0, 128)
+        ));
+        // `none` components are zero.
+        assert!(close(parse_color("oklch(none 0 none)"), (0, 0, 0, 255)));
+        // Wrong arity is rejected, not guessed.
+        assert_eq!(parse_color("oklch(0.5 0.1)"), None);
     }
 
     #[test]
