@@ -990,6 +990,11 @@ fn apply_declarations(
                     style.overflow_clip = false;
                 }
             }
+            "text-overflow" => {
+                // `ellipsis` truncates a clipped non-wrapping line with `…`;
+                // `clip` (the default) hard-cuts.
+                style.text_overflow_ellipsis = v.trim().eq_ignore_ascii_case("ellipsis");
+            }
             "padding" => apply_box_shorthand(
                 v,
                 style.font_size as f32,

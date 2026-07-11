@@ -418,6 +418,10 @@ pub struct ComputedStyle {
     /// (`hidden`/`clip`/`scroll`/`auto` — we clip rather than scroll) — ADR-0043.
     /// Not inherited.
     pub overflow_clip: bool,
+    /// `text-overflow: ellipsis`: when a non-wrapping line is clipped by the box,
+    /// truncate it and append an ellipsis (`…`) instead of a hard cut. Applies
+    /// with `overflow` clipping and `white-space: nowrap`. Not inherited.
+    pub text_overflow_ellipsis: bool,
     /// `border-radius` (px, uniform), `background: linear-gradient(...)`, and
     /// `box-shadow` (ADR-0041). The rare gradient/shadow are boxed so the common
     /// element (neither) pays only a null pointer. Not inherited.
@@ -541,6 +545,7 @@ impl ComputedStyle {
             border_color: Color::BLACK,
             box_sizing: BoxSizing::ContentBox,
             overflow_clip: false,
+            text_overflow_ellipsis: false,
             border_radius: 0,
             background_gradient: None,
             box_shadow: None,
@@ -631,6 +636,7 @@ impl ComputedStyle {
             border_color: Color::BLACK,
             box_sizing: BoxSizing::ContentBox,
             overflow_clip: false,
+            text_overflow_ellipsis: false,
             border_radius: 0,
             background_gradient: None,
             box_shadow: None,

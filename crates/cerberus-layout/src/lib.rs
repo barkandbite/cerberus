@@ -1420,6 +1420,29 @@ impl<'a> Ctx<'a> {
         if self.x == self.left {
             self.x += std::mem::take(&mut self.pending_indent);
         }
+        // `text-overflow: ellipsis`: when this clipped, non-wrapping run would
+        // overflow the box, drop the tail glyphs and append `…` so the visible
+        // text ends within the box.
+        if style.text_overflow_ellipsis && style.overflow_clip {
+            let avail = self.right - self.x;
+            if avail > 0 && w as i32 > avail {
+                let (ell, ell_w) = self.shape_run("\u{2026}", px, style);
+                let target = (avail - ell_w as i32).max(0);
+                let mut acc = 0i32;
+                let mut kept: Vec<GlyphBox> = Vec::with_capacity(glyphs.len());
+                for g in glyphs {
+                    if acc + g.advance as i32 > target {
+                        break;
+                    }
+                    acc += g.advance as i32;
+                    kept.push(g);
+                }
+                kept.extend(ell);
+                let total = (acc + ell_w as i32).max(0) as u32;
+                self.push_piece(px, total, kept, style, href);
+                return;
+            }
+        }
         self.push_piece(px, w, glyphs, style, href);
     }
 
@@ -4166,6 +4189,25 @@ mod tests {
         );
         // generic word when nothing usable.
         assert_eq!(image_text_label(&img_node(&[]), 1000), "image");
+    }
+
+    #[test]
+    fn text_overflow_ellipsis_truncates_a_clipped_nowrap_line() {
+        let long = "the quick brown fox jumps over the lazy dog again and again";
+        let base = "<div style='width:120px;white-space:nowrap;overflow:hidden";
+        let ellip = lay(&format!("{base};text-overflow:ellipsis'>{long}</div>"), 400);
+        let clip = lay(&format!("{base}'>{long}</div>"), 400);
+        // The clipped line keeps every glyph (clipping happens in paint); the
+        // ellipsis line drops the overflowing tail, so it has strictly fewer.
+        assert!(
+            total_glyphs(&ellip) < total_glyphs(&clip),
+            "ellipsis truncates: {} vs {}",
+            total_glyphs(&ellip),
+            total_glyphs(&clip)
+        );
+        // A short line that fits is untouched (no truncation).
+        let short = lay(&format!("{base};text-overflow:ellipsis'>hi</div>"), 400);
+        assert_eq!(total_glyphs(&short), 2, "short line keeps all glyphs");
     }
 
     #[test]
