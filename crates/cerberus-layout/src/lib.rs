@@ -726,6 +726,17 @@ impl<'a> Ctx<'a> {
                         StyledChild::Element(e) if e.tag == "img" => Some(e.as_ref()),
                         _ => None,
                     }) {
+                        // Honor the <img>'s OWN box-suppression, exactly as the
+                        // bare "img" arm does: `display:none`, `visibility:hidden`,
+                        // or an `opacity:0` (here or via the group) draws nothing.
+                        let img_style = &img.style;
+                        let img_hidden = self.opacity_hidden || img_style.opacity == 0.0;
+                        let img_visible = !img_hidden
+                            && img_style.visibility == cerberus_style::Visibility::Visible
+                            && img_style.display != Display::None;
+                        if !img_visible {
+                            return;
+                        }
                         // Honor a block-level <picture> (e.g. `picture{display:block}`)
                         // by breaking the line around its image.
                         let block = style.display == Display::Block;
@@ -5922,6 +5933,38 @@ mod tests {
                 .iter()
                 .any(|i| matches!(i, DisplayItem::Image { .. })),
             "no source qualified, so the <img> fallback (fallback.png) was drawn"
+        );
+    }
+
+    #[test]
+    fn picture_honors_the_inner_img_display_none() {
+        // A display:none <img> inside a <picture> paints nothing, exactly as a
+        // bare display:none <img> would (the picture arm must not override the
+        // image's own box suppression).
+        let styled = CssEngine::new().style(&parse_html(
+            "<picture>\
+               <source srcset='mobile.png'>\
+               <img src='fallback.png' style='display:none' alt='hero'>\
+             </picture>",
+        ));
+        let img = Arc::new(DecodedImage {
+            size: Size::new(20, 10),
+            rgba: vec![255; 20 * 10 * 4],
+        });
+        let laid = BlockLayout::default().layout(
+            &styled,
+            Size::new(500, 2000),
+            &MonoShaper,
+            &OneImage(img),
+            &NoForms,
+        );
+        assert!(
+            !laid
+                .display
+                .items
+                .iter()
+                .any(|i| matches!(i, DisplayItem::Image { .. })),
+            "a display:none <img> in a <picture> draws nothing"
         );
     }
 

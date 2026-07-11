@@ -1203,6 +1203,14 @@ pub fn render(config: &RenderConfig) -> Result<RenderOutcome, AppError> {
         .style_with_sheets(&document, &sheets);
     timings.record("style", style_t.elapsed());
 
+    // The page content area (below the toolbar) is the viewport layout runs at.
+    // The image fetch must resolve srcset/<picture> against this SAME viewport so
+    // the fetched candidate is the one drawn (ADR-0046): `content_size` keeps the
+    // width but shrinks the height by the toolbar, and <picture> `media` can key
+    // on height/orientation — so passing the full window height here would let a
+    // height/orientation <source> be fetched that layout never selects.
+    let content = Toolbar::new(active_label.clone()).content_size(config.viewport);
+
     // Fetch + decode this page's images up front (the one-shot path is
     // synchronous; the interactive browser fetches them on its worker). Built-in
     // pages reference no network images.
@@ -1219,8 +1227,8 @@ pub fn render(config: &RenderConfig) -> Result<RenderOutcome, AppError> {
             &sub_ctx,
             &consent,
             &first_party,
-            config.viewport.w,
-            config.viewport.h,
+            content.w,
+            content.h,
             &image_policy,
         ),
         None => HashMap::new(),
@@ -1264,7 +1272,8 @@ pub fn render(config: &RenderConfig) -> Result<RenderOutcome, AppError> {
     let text = TextEngine::new();
     let mut toolbar = Toolbar::new(active_label.clone());
     toolbar.url_text = config.url.clone();
-    let content = toolbar.content_size(config.viewport);
+    // `content` (the page viewport below the toolbar) was computed above and used
+    // for the image fetch; layout reuses it so fetch and draw share one viewport.
 
     // Lay out + paint the page into the content area only. The canvas background
     // is the root/body background propagated to the viewport (CSS), not just the
@@ -1957,25 +1966,24 @@ fn collect_image_urls(node: NodeRef<'_>, out: &mut Vec<String>, viewport_w: u32,
         // Resolve the <picture> to the one URL its <img> will actually load
         // (type/media selection), matching what layout draws (ADR-0046). Don't
         // descend: the inner <img>'s own src is subsumed by this choice.
-        let sources: Vec<PictureSource<'_>> = node
-            .children()
-            .filter(|c| c.tag() == "source")
-            .map(|s| PictureSource {
-                type_: s.attr("type"),
-                media: s.attr("media"),
-                srcset: s.attr("srcset"),
-                sizes: s.attr("sizes"),
-            })
-            .collect();
-        let img = node.children().find(|c| c.tag() == "img");
-        let picked = pick_picture_url(
-            &sources,
-            |n| img.as_ref().and_then(|i| i.attr(n)),
-            viewport_w,
-            viewport_h,
-        );
-        if let Some(src) = picked {
-            out.push(src);
+        //
+        // A <picture> with no <img> child renders nothing (layout's picture arm
+        // returns early), so collect nothing either — otherwise a matching
+        // <source> would be fetched for an image that is never painted.
+        if let Some(img) = node.children().find(|c| c.tag() == "img") {
+            let sources: Vec<PictureSource<'_>> = node
+                .children()
+                .filter(|c| c.tag() == "source")
+                .map(|s| PictureSource {
+                    type_: s.attr("type"),
+                    media: s.attr("media"),
+                    srcset: s.attr("srcset"),
+                    sizes: s.attr("sizes"),
+                })
+                .collect();
+            if let Some(src) = pick_picture_url(&sources, |n| img.attr(n), viewport_w, viewport_h) {
+                out.push(src);
+            }
         }
         return;
     }
@@ -3400,8 +3408,17 @@ impl BrowserApp {
         // substitute and would otherwise vanish silently.
         let mut img_srcs = Vec::new();
         // The same viewport layout uses (ADR-0046), so srcset and <picture>
-        // selection at fetch time and at draw time agree.
-        let viewport = self.toolbar.content_size(self.last_size);
+        // selection at fetch time and at draw time agree — including the
+        // consent-banner strip `render_frame` subtracts from the content height,
+        // so a <picture> `media` keyed on height/orientation resolves the same
+        // candidate at fetch and draw while a banner is up.
+        let banner_h = if self.consent_prompts.is_empty() {
+            0
+        } else {
+            BANNER_HEIGHT
+        };
+        let mut viewport = self.toolbar.content_size(self.last_size);
+        viewport.h = viewport.h.saturating_sub(banner_h);
         let viewport_w = viewport.w;
         collect_image_urls(self.document.root(), &mut img_srcs, viewport_w, viewport.h);
         let img_urls: std::collections::HashSet<String> = img_srcs
@@ -6099,6 +6116,24 @@ mod tests {
         let mut mid = Vec::new();
         collect_image_urls(doc.root(), &mut mid, 700, 800);
         assert_eq!(mid, vec!["fallback.png".to_string()]);
+    }
+
+    #[test]
+    fn collect_image_urls_skips_a_picture_with_no_img_child() {
+        // Layout draws nothing for a <picture> with no <img>, so the fetch list
+        // must stay empty — a matching <source> is never painted, so fetching it
+        // would waste network/decode budget (fetch/draw divergence).
+        let doc = parse_html(
+            "<picture>\
+               <source media='(max-width: 600px)' srcset='mobile.png'>\
+             </picture>",
+        );
+        let mut out = Vec::new();
+        collect_image_urls(doc.root(), &mut out, 500, 800);
+        assert!(
+            out.is_empty(),
+            "no <img> child ⇒ nothing to fetch, got {out:?}"
+        );
     }
 
     #[test]
