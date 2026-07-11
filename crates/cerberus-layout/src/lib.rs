@@ -421,6 +421,9 @@ impl LayoutEngine for BlockLayout {
         let mut ctx = Ctx::new(self.margin, max_width, viewport, shaper, images, forms);
         ctx.walk(&styled.root, None);
         ctx.flush_line();
+        // Realize the last block's deferred bottom margin so the document height
+        // still includes a trailing margin, as before collapsing was deferred.
+        ctx.flush_vmargin();
         ctx.finish_positioned();
         LaidOut {
             display: ctx.display,
@@ -562,6 +565,12 @@ struct Ctx<'a> {
     /// `<picture>`, cleared immediately after its `<img>` — never leaks to a
     /// sibling image (ADR-0046: fetch and paint pick the same candidate).
     cur_picture: Option<Vec<OwnedPictureSource>>,
+    /// The bottom margin of the most recently closed block, deferred so it can
+    /// collapse with the NEXT block sibling's top margin (CSS 2.1 §8.3.1: the
+    /// separation is max(positives)+min(negatives), not the sum — without this
+    /// every `p+p` gap doubled and text pages drifted ever farther down).
+    /// Realized as-is by `flush_vmargin` when non-block content follows.
+    pending_vmargin: i32,
 }
 
 impl<'a> Ctx<'a> {
@@ -609,6 +618,7 @@ impl<'a> Ctx<'a> {
             list_ordinal: 0,
             pending_indent: 0,
             cur_picture: None,
+            pending_vmargin: 0,
         }
     }
 
@@ -673,6 +683,7 @@ impl<'a> Ctx<'a> {
             list_ordinal: 0,
             pending_indent: 0,
             cur_picture: None,
+            pending_vmargin: 0,
         }
     }
 
@@ -927,7 +938,12 @@ impl<'a> Ctx<'a> {
             self.flush_line();
             self.line_align = style.text_align;
             let avail = (self.right - self.left).max(1);
-            self.y += self.resolve_margin(style.margin_top, avail);
+            // Adjacent-sibling margin collapsing (CSS 2.1 §8.3.1): this block's
+            // top margin and the previous block sibling's deferred bottom margin
+            // join as max(positives) + min(negatives), not their sum.
+            let mt = self.resolve_margin(style.margin_top, avail);
+            let prev = std::mem::take(&mut self.pending_vmargin);
+            self.y += prev.max(mt).max(0) + prev.min(mt).min(0);
             let (pl, pr) = (style.padding_left, style.padding_right);
             let (bl, br) = (style.border_left, style.border_right);
             let h_extra = pl + pr + bl + br;
@@ -1087,6 +1103,17 @@ impl<'a> Ctx<'a> {
 
         if is_block {
             self.flush_line();
+            // A bottom margin still pending from our LAST block child is
+            // contained by our bottom padding/border (it adds to our height);
+            // with neither, it escapes and collapses with our own bottom margin
+            // instead (CSS 2.1 §8.3.1 parent/last-child), contributing nothing
+            // to this box's auto height.
+            let escaped = if style.padding_bottom + style.border_bottom > 0 {
+                self.flush_vmargin();
+                0
+            } else {
+                std::mem::take(&mut self.pending_vmargin)
+            };
             // Close the box: bottom padding + border, then apply height/min-height/
             // max-height (ADR-0042) before painting the border box (ADR-0040).
             self.y += style.padding_bottom + style.border_bottom;
@@ -1116,7 +1143,10 @@ impl<'a> Ctx<'a> {
             if self.measuring {
                 self.max_x += style.padding_right + style.border_right;
             }
-            self.y += self.resolve_margin(style.margin_bottom, (saved_right0 - saved_left).max(1));
+            // Defer our bottom margin (joined with any escaped last-child
+            // margin) so it can collapse with the next sibling's top margin.
+            let mb = self.resolve_margin(style.margin_bottom, (saved_right0 - saved_left).max(1));
+            self.pending_vmargin = escaped.max(mb).max(0) + escaped.min(mb).min(0);
             self.left = saved_left;
             self.right = saved_right0;
             self.x = self.left;
@@ -1436,6 +1466,7 @@ impl<'a> Ctx<'a> {
     }
 
     fn add_word(&mut self, word: &str, style: &ComputedStyle, href: Option<&str>) {
+        self.flush_vmargin();
         let px = style.font_size.max(1);
         let (glyphs, w) = self.shape_run(word, px, style);
         let at_line_start = self.x == self.left;
@@ -1459,6 +1490,7 @@ impl<'a> Ctx<'a> {
     }
 
     fn add_run(&mut self, text: &str, style: &ComputedStyle, href: Option<&str>) {
+        self.flush_vmargin();
         let px = style.font_size.max(1);
         let (glyphs, w) = self.shape_run(text, px, style);
         // Consume this block's one-shot `text-indent` at the start of a line, as
@@ -2012,7 +2044,15 @@ impl<'a> Ctx<'a> {
     }
 
     /// Wrap to a new line if a `w`-wide box wouldn't fit on the current one.
+    /// Realize a block bottom margin still pending from a previous sibling,
+    /// as-is: non-block content (text, atoms, rules, floats, tables, flex/grid)
+    /// has no top margin for it to collapse with.
+    fn flush_vmargin(&mut self) {
+        self.y += std::mem::take(&mut self.pending_vmargin);
+    }
+
     fn place_box(&mut self, w: u32, _h: u32) {
+        self.flush_vmargin();
         if self.x != self.left && self.x + w as i32 > self.right {
             self.newline();
         }
@@ -2125,6 +2165,7 @@ impl<'a> Ctx<'a> {
     }
 
     fn rule(&mut self) {
+        self.flush_vmargin();
         self.display.push(DisplayItem::Rect {
             rect: Rect::new(self.left, self.y, (self.right - self.left).max(0) as u32, 1),
             color: Color::rgb(0xCC, 0xCC, 0xCC),
@@ -2379,6 +2420,7 @@ impl<'a> Ctx<'a> {
     /// packs from the left, `float:right` from the right; text wrap-around is not
     /// modeled (following in-flow content drops below the band).
     fn place_float(&mut self, e: &StyledNode, in_link: Option<&str>, fb: &mut FloatBand) {
+        self.flush_vmargin();
         let is_right = e.style.float == cerberus_style::Float::Right;
         let avail = (self.right - self.left).max(1);
         let explicit = resolve_block_width(&e.style, avail, self.vw, self.vh);
@@ -2484,6 +2526,7 @@ impl<'a> Ctx<'a> {
     /// shrink (floored at each item's min-content); the cross axis aligns/stretches.
     fn flex_layout(&mut self, node: &StyledNode) {
         self.flush_line();
+        self.flush_vmargin();
         let s = &node.style;
         // The container border box; items lay inside it inset by border + padding
         // (ADR-0040).
@@ -2819,6 +2862,7 @@ impl<'a> Ctx<'a> {
     /// (spanning the union of its tracks).
     fn grid_layout(&mut self, node: &StyledNode) {
         self.flush_line();
+        self.flush_vmargin();
         let s = &node.style;
         // Container border box; cells lay inside it inset by border+padding (0040).
         let box_left = self.left;
@@ -3033,6 +3077,7 @@ impl<'a> Ctx<'a> {
 
     fn table(&mut self, node: &StyledNode) {
         self.flush_line();
+        self.flush_vmargin();
         let left = self.left;
         let right = self.right.max(left + 1);
         self.line_align = node.style.text_align;
@@ -4378,6 +4423,79 @@ mod tests {
             children: Vec::new(),
             node_id: 0,
         }
+    }
+
+    #[test]
+    fn adjacent_sibling_margins_collapse_to_the_larger() {
+        // Two paragraphs with explicit 20px margins: the gap between their glyph
+        // baselines must reflect ONE 20px margin (collapsed), not 40px stacked.
+        // The control pair uses margin-bottom only, so its gap is the yardstick.
+        let collapsed = lay(
+            "<p style='margin:20px 0'>a</p><p style='margin:20px 0'>b</p>",
+            600,
+        );
+        let control = lay(
+            "<p style='margin:0 0 20px 0'>a</p><p style='margin:0'>b</p>",
+            600,
+        );
+        let cy = glyph_ys(&collapsed);
+        let ky = glyph_ys(&control);
+        assert_eq!(cy.len(), 2);
+        assert_eq!(ky.len(), 2);
+        assert_eq!(
+            cy[1] - cy[0],
+            ky[1] - ky[0],
+            "20/20 collapses to the same separation as a lone 20"
+        );
+
+        // Unequal margins: max(30, 10) = 30 — same separation as a lone 30.
+        let unequal = lay(
+            "<p style='margin:0 0 30px 0'>a</p><p style='margin:10px 0 0 0'>b</p>",
+            600,
+        );
+        let lone30 = lay(
+            "<p style='margin:0 0 30px 0'>a</p><p style='margin:0'>b</p>",
+            600,
+        );
+        assert_eq!(
+            glyph_ys(&unequal)[1] - glyph_ys(&unequal)[0],
+            glyph_ys(&lone30)[1] - glyph_ys(&lone30)[0],
+            "max(30,10) = 30"
+        );
+    }
+
+    #[test]
+    fn negative_margins_collapse_as_most_positive_plus_most_negative() {
+        // 30px bottom then -10px top: separation = 30 + (-10) = 20 — identical
+        // to a lone 20px margin between the same two paragraphs.
+        let mixed = lay(
+            "<p style='margin:0 0 30px 0'>a</p><p style='margin:-10px 0 0 0'>b</p>",
+            600,
+        );
+        let lone20 = lay(
+            "<p style='margin:0 0 20px 0'>a</p><p style='margin:0'>b</p>",
+            600,
+        );
+        assert_eq!(
+            glyph_ys(&mixed)[1] - glyph_ys(&mixed)[0],
+            glyph_ys(&lone20)[1] - glyph_ys(&lone20)[0],
+            "30 + (-10) = 20"
+        );
+    }
+
+    #[test]
+    fn block_then_text_realizes_the_pending_margin() {
+        // A block followed by bare inline text at the same level: the block's
+        // bottom margin has nothing to collapse with and applies in full.
+        let with_margin = lay("<div><p style='margin:0 0 24px 0'>a</p>text</div>", 600);
+        let without = lay("<div><p style='margin:0'>a</p>text</div>", 600);
+        let wy = glyph_ys(&with_margin);
+        let ny = glyph_ys(&without);
+        assert_eq!(
+            (wy[1] - wy[0]) - (ny[1] - ny[0]),
+            24,
+            "the full 24px margin separates block from following text"
+        );
     }
 
     #[test]
