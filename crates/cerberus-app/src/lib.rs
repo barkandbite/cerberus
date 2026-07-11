@@ -1764,8 +1764,18 @@ fn fetch_images_sync(
     viewport_w: u32,
     images: &ImagePolicy,
 ) -> HashMap<String, ImageState> {
-    let mut srcs = Vec::new();
-    collect_image_urls(document.root(), &mut srcs, viewport_w);
+    // Collect <img> srcs and CSS background-image srcs separately: the text-only
+    // option is an <img> feature (it has an alt/caption to show as text), so a
+    // policy-matched *background* must still fetch and paint — a CSS background
+    // has no text substitute and would otherwise vanish silently.
+    let mut img_srcs = Vec::new();
+    collect_image_urls(document.root(), &mut img_srcs, viewport_w);
+    let img_urls: std::collections::HashSet<String> = img_srcs
+        .iter()
+        .map(|s| resolve_subresource(Some(base), s))
+        .collect();
+
+    let mut srcs = img_srcs;
     collect_bg_image_urls(&styled.root, &mut srcs);
 
     let mut urls: Vec<String> = Vec::new();
@@ -1785,8 +1795,10 @@ fn fetch_images_sync(
     for url in urls {
         // Text-only images render as their alt/caption and are never fetched or
         // decoded — checked before the consent and decode-budget gates so they
-        // cost no network, memory, or budget.
-        if images.text_only(&url) {
+        // cost no network, memory, or budget. Scoped to <img> URLs: a CSS
+        // background that happens to match the policy has no text substitute and
+        // must still fetch and paint (see the collector comment above).
+        if img_urls.contains(&url) && images.text_only(&url) {
             out.insert(url, ImageState::TextOnly);
             continue;
         }
@@ -3354,11 +3366,20 @@ impl BrowserApp {
     fn request_page_images(&mut self) {
         let first_party = self.current_url.as_ref().and_then(first_party_of);
         let instance = self.heads.active().instance;
-        let mut srcs = Vec::new();
+        // Collect <img> srcs and CSS background-image srcs separately: text-only
+        // is an <img> feature (it has alt/caption text to show), so a background
+        // matching the policy must still fetch and paint — it has no text
+        // substitute and would otherwise vanish silently.
+        let mut img_srcs = Vec::new();
         // The same viewport width layout uses (ADR-0046), so srcset selection at
         // fetch time and at draw time agree.
         let viewport_w = self.toolbar.content_size(self.last_size).w;
-        collect_image_urls(self.document.root(), &mut srcs, viewport_w);
+        collect_image_urls(self.document.root(), &mut img_srcs, viewport_w);
+        let img_urls: std::collections::HashSet<String> = img_srcs
+            .iter()
+            .map(|s| resolve_subresource(self.current_url.as_ref(), s))
+            .collect();
+        let mut srcs = img_srcs;
         collect_bg_image_urls(&self.styled.root, &mut srcs);
         for src in srcs {
             let abs = resolve_subresource(self.current_url.as_ref(), &src);
@@ -3371,7 +3392,8 @@ impl BrowserApp {
                 continue;
             }
             // Text-only images render as their alt/caption; never fetch them.
-            if self.image_policy.text_only(&abs) {
+            // Scoped to <img> URLs so a policy-matched CSS background still paints.
+            if img_urls.contains(&abs) && self.image_policy.text_only(&abs) {
                 self.images.insert(abs, ImageState::TextOnly);
                 continue;
             }
@@ -5956,6 +5978,69 @@ mod tests {
         assert_eq!(
             ImageDisplayMode::parse("nonsense"),
             ImageDisplayMode::Graphical
+        );
+    }
+
+    #[test]
+    fn text_only_mode_skips_img_but_still_fetches_css_backgrounds() {
+        // Regression: under a text-only default, an <img> renders as its
+        // alt/caption and is never fetched, but a CSS `background-image` has no
+        // text substitute — it must still go to the network (and, absent an
+        // Allow rule, be consent-*Blocked*, not silently dropped as TextOnly).
+        let doc = parse_html(
+            "<html><body>\
+               <img src='http://x.test/logo.png' alt='Logo'>\
+               <div style='background-image:url(http://other.test/bg.png)'>x</div>\
+             </body></html>",
+        );
+        let styled = CssEngine::new().style(&doc);
+        let base = parse_url("http://x.test/").unwrap();
+        let client = network_client(false, None, None);
+        let first_party = Origin::new("http", "x.test", None);
+        let instance = InstanceId::from_u64_pair(0, 0x10);
+        let ctx = FetchContext {
+            instance,
+            kind: FetchKind::Subresource {
+                first_party: first_party.clone(),
+            },
+        };
+        // Headless so the consent gate denies the third-party background
+        // silently — no network is touched by either code path.
+        let policy = Mutex::new(DefaultDenyPolicy::new(false));
+        let images = ImagePolicy {
+            default: ImageDisplayMode::TextOnly,
+            overrides: Vec::new(),
+        };
+
+        let out = fetch_images_sync(
+            &doc,
+            &styled,
+            &base,
+            &client,
+            &ctx,
+            &policy,
+            &first_party,
+            800,
+            &images,
+        );
+
+        // The <img> short-circuits to a text chip before any fetch.
+        assert!(
+            matches!(
+                out.get("http://x.test/logo.png"),
+                Some(ImageState::TextOnly)
+            ),
+            "the <img> should render as a text chip"
+        );
+        // The background is NOT text-only: it reaches the consent gate and, as an
+        // unruled third party, is Blocked — the point is it is not swallowed as
+        // TextOnly (which would erase it from the page with no text fallback).
+        assert!(
+            matches!(
+                out.get("http://other.test/bg.png"),
+                Some(ImageState::Blocked)
+            ),
+            "the CSS background must reach the network path, not be dropped as TextOnly"
         );
     }
 
