@@ -267,22 +267,31 @@ impl FontStyle {
 /// class without shipping — or fingerprinting against — the actual named fonts.
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Default, Hash)]
 pub enum GenericFamily {
-    /// Proportional serif (Times/Georgia class) → the bundled serif face.
+    /// Times-class serif: generic `serif`, named Times New Roman (and its
+    /// metric aliases) → the bundled Liberation Serif. Also the reference
+    /// browser's STANDARD font — the fallback for a wholly unresolvable
+    /// `font-family` stack.
     Serif,
-    /// Generic `sans-serif` (and most named sans faces) — the default → the
-    /// bundled Roboto face, which empirically matches the reference browser's
-    /// default sans most closely.
+    /// Generic `sans-serif` → the Arial-metric bundled sans (the reference's
+    /// generic sans requests Arial, substituted with Liberation Sans).
     #[default]
     SansSerif,
-    /// A page that names Arial/Helvetica specifically → the bundled Arial-metric
-    /// sans face (Liberation Sans), what a Chrome-on-Windows box actually renders
-    /// for those, distinct from the generic default.
+    /// Named Arial/Helvetica (and metric aliases) — same face as the generic
+    /// sans on this persona, kept distinct for farbling and future personas.
     SansArial,
-    /// Fixed-pitch (Courier/Consolas class); `<pre>`/`<code>` default here.
+    /// The `system-ui` UI-font class → the bundled DejaVu Sans (what the
+    /// reference resolves its system font to).
+    SansSystem,
+    /// Generic `monospace` (`<pre>`/`<code>` default) → the bundled
+    /// DejaVu Sans Mono, the reference's fixed-font resolution.
     Monospace,
-    /// Handwriting/script; falls back to serif when no cursive face is bundled.
+    /// Named Courier New (and metric aliases) → the bundled Liberation Mono —
+    /// distinct from the generic monospace face.
+    MonoCourier,
+    /// Handwriting/script; the reference's cursive preference is uninstalled,
+    /// so it falls back to the standard (serif) face.
     Cursive,
-    /// Decorative/display; falls back to sans when no fantasy face is bundled.
+    /// Decorative/display; falls back to the standard (serif) face likewise.
     Fantasy,
 }
 

@@ -33,10 +33,17 @@ const FALLBACK_FONT_BYTES: &[u8] = include_bytes!("../assets/IPAGothic.ttf");
 /// advances 72.3px/em ≈ Times' 0.722em, not DejaVu Serif's 0.872em). See
 /// `assets/Liberation-LICENSE.txt`.
 const SERIF_FONT_BYTES: &[u8] = include_bytes!("../assets/LiberationSerif-Regular.ttf");
-/// Bundled monospace face (Liberation Mono, SIL OFL 1.1 — Courier-metric, the
-/// 0.60em pitch Chrome's generic `monospace` ("Courier New") resolves to). See
-/// `assets/Liberation-LICENSE.txt`.
-const MONO_FONT_BYTES: &[u8] = include_bytes!("../assets/LiberationMono-Regular.ttf");
+/// Bundled generic-monospace face (DejaVu Sans Mono, Bitstream Vera license) —
+/// measured as what the reference Chrome's generic `monospace` (`<pre>`/`<code>`)
+/// actually renders. See `assets/DejaVu-LICENSE.txt`.
+const MONO_FONT_BYTES: &[u8] = include_bytes!("../assets/DejaVuSansMono.ttf");
+/// Bundled Courier-metric mono face (Liberation Mono, SIL OFL 1.1) — what a page
+/// that names Courier New specifically renders (fontconfig metric alias),
+/// distinct from the generic monospace. See `assets/Liberation-LICENSE.txt`.
+const COURIER_FONT_BYTES: &[u8] = include_bytes!("../assets/LiberationMono-Regular.ttf");
+/// Bundled system-UI sans (DejaVu Sans, Bitstream Vera license) — what the
+/// reference resolves `system-ui` to. See `assets/DejaVu-LICENSE.txt`.
+const SYSTEM_SANS_FONT_BYTES: &[u8] = include_bytes!("../assets/DejaVuSans.ttf");
 /// Bundled Arial-metric sans face (Liberation Sans, SIL OFL 1.1). Chrome's
 /// generic `sans-serif` requests "Arial" → fontconfig → Liberation Sans, so this
 /// face serves BOTH the generic and named-Arial routes (measured: 72.0px/em `H`
@@ -64,9 +71,13 @@ pub struct TextEngine {
     serif_font: FontRef<'static>,
     mono_font: FontRef<'static>,
     sans_font: FontRef<'static>,
+    courier_font: FontRef<'static>,
+    system_sans_font: FontRef<'static>,
     rb_serif: rustybuzz::Face<'static>,
     rb_mono: rustybuzz::Face<'static>,
     rb_sans: rustybuzz::Face<'static>,
+    rb_courier: rustybuzz::Face<'static>,
+    rb_system_sans: rustybuzz::Face<'static>,
 }
 
 impl TextEngine {
@@ -84,15 +95,23 @@ impl TextEngine {
         let serif_font =
             FontRef::try_from_slice(SERIF_FONT_BYTES).expect("bundled Liberation Serif is valid");
         let mono_font =
-            FontRef::try_from_slice(MONO_FONT_BYTES).expect("bundled Liberation Mono is valid");
+            FontRef::try_from_slice(MONO_FONT_BYTES).expect("bundled DejaVu Sans Mono is valid");
         let rb_serif = rustybuzz::Face::from_slice(SERIF_FONT_BYTES, 0)
             .expect("bundled Liberation Serif shapes");
         let rb_mono = rustybuzz::Face::from_slice(MONO_FONT_BYTES, 0)
-            .expect("bundled Liberation Mono shapes");
+            .expect("bundled DejaVu Sans Mono shapes");
         let sans_font =
             FontRef::try_from_slice(SANS_FONT_BYTES).expect("bundled Liberation Sans is valid");
         let rb_sans = rustybuzz::Face::from_slice(SANS_FONT_BYTES, 0)
             .expect("bundled Liberation Sans shapes");
+        let courier_font =
+            FontRef::try_from_slice(COURIER_FONT_BYTES).expect("bundled Liberation Mono is valid");
+        let rb_courier = rustybuzz::Face::from_slice(COURIER_FONT_BYTES, 0)
+            .expect("bundled Liberation Mono shapes");
+        let system_sans_font =
+            FontRef::try_from_slice(SYSTEM_SANS_FONT_BYTES).expect("bundled DejaVu Sans is valid");
+        let rb_system_sans = rustybuzz::Face::from_slice(SYSTEM_SANS_FONT_BYTES, 0)
+            .expect("bundled DejaVu Sans shapes");
         Self {
             font,
             icon_font,
@@ -102,27 +121,32 @@ impl TextEngine {
             serif_font,
             mono_font,
             sans_font,
+            courier_font,
+            system_sans_font,
             rb_serif,
             rb_mono,
             rb_sans,
+            rb_courier,
+            rb_system_sans,
         }
     }
 
-    /// The bundled font slot a `GenericFamily` renders in — mirroring what the
-    /// reference Chrome resolves: its generic `serif`/`sans-serif`/`monospace`
-    /// request Times/Arial/Courier, which fontconfig substitutes with the
-    /// metric-compatible Liberation faces (measured against the reference —
-    /// see the byte consts above). Generic and named-Arial sans therefore share
-    /// one face; `cursive`/`fantasy` fall back to it too (no script/display
-    /// face bundled). A page naming Roboto gets the Roboto text face.
+    /// The bundled font slot a `GenericFamily` renders in — each mapping
+    /// measured against the reference Chrome: generic serif/sans request
+    /// Times/Arial (→ the Liberation faces); generic monospace resolves to
+    /// DejaVu Sans Mono while a named Courier gets Liberation Mono;
+    /// `system-ui` is DejaVu Sans; and cursive/fantasy fall back to the
+    /// STANDARD (serif) face, exactly as the reference does when their
+    /// preferred faces are uninstalled.
     fn slot_for_family(family: GenericFamily) -> FontSlot {
         match family {
-            GenericFamily::Serif => FontSlot::Serif,
+            GenericFamily::Serif | GenericFamily::Cursive | GenericFamily::Fantasy => {
+                FontSlot::Serif
+            }
             GenericFamily::Monospace => FontSlot::Monospace,
-            GenericFamily::SansArial
-            | GenericFamily::SansSerif
-            | GenericFamily::Cursive
-            | GenericFamily::Fantasy => FontSlot::Sans,
+            GenericFamily::MonoCourier => FontSlot::CourierMono,
+            GenericFamily::SansArial | GenericFamily::SansSerif => FontSlot::Sans,
+            GenericFamily::SansSystem => FontSlot::SansSystem,
         }
     }
 
@@ -139,6 +163,8 @@ impl TextEngine {
             FontSlot::Serif => &self.rb_serif,
             FontSlot::Monospace => &self.rb_mono,
             FontSlot::Sans => &self.rb_sans,
+            FontSlot::CourierMono => &self.rb_courier,
+            FontSlot::SansSystem => &self.rb_system_sans,
             _ => &self.rb_font,
         };
         (face, face.units_per_em() as f32)
@@ -231,6 +257,8 @@ impl TextEngine {
             FontSlot::Serif => &self.serif_font,
             FontSlot::Monospace => &self.mono_font,
             FontSlot::Sans => &self.sans_font,
+            FontSlot::CourierMono => &self.courier_font,
+            FontSlot::SansSystem => &self.system_sans_font,
         }
     }
 
@@ -1028,10 +1056,15 @@ mod tests {
         assert_eq!(slot(GenericFamily::SansSerif), FontSlot::Sans);
         assert_eq!(slot(GenericFamily::SansArial), FontSlot::Sans);
         assert_eq!(slot(GenericFamily::Serif), FontSlot::Serif);
+        // Generic monospace is DejaVu Sans Mono; a named Courier is the
+        // Courier-metric Liberation Mono; system-ui is DejaVu Sans (measured).
         assert_eq!(slot(GenericFamily::Monospace), FontSlot::Monospace);
-        // Cursive and fantasy fall back to the same sans (no bundled face).
-        assert_eq!(slot(GenericFamily::Cursive), FontSlot::Sans);
-        assert_eq!(slot(GenericFamily::Fantasy), FontSlot::Sans);
+        assert_eq!(slot(GenericFamily::MonoCourier), FontSlot::CourierMono);
+        assert_eq!(slot(GenericFamily::SansSystem), FontSlot::SansSystem);
+        // Cursive and fantasy fall back to the STANDARD serif, as the
+        // reference does when their preferred faces are uninstalled.
+        assert_eq!(slot(GenericFamily::Cursive), FontSlot::Serif);
+        assert_eq!(slot(GenericFamily::Fantasy), FontSlot::Serif);
         // The monospace space is wider than the proportional one (fixed pitch).
         assert!(
             e.space_advance_with(16, GenericFamily::Monospace)

@@ -1812,81 +1812,49 @@ fn classify_font_family(name: &str) -> Option<GenericFamily> {
         .trim_matches(['"', '\''])
         .trim()
         .to_ascii_lowercase();
+    // Generic keywords resolve directly. `cursive`/`fantasy` render the
+    // standard (serif) face: the reference browser's preferences for them are
+    // uninstalled fonts, so it falls back to its standard font (measured).
     match n.as_str() {
         "serif" => return Some(GenericFamily::Serif),
-        "sans-serif" | "system-ui" | "ui-sans-serif" | "-apple-system" | "blinkmacsystemfont"
-        | "ui-rounded" => return Some(GenericFamily::SansSerif),
+        "sans-serif" => return Some(GenericFamily::SansSerif),
+        "system-ui" | "ui-sans-serif" | "ui-rounded" => return Some(GenericFamily::SansSystem),
         "monospace" | "ui-monospace" => return Some(GenericFamily::Monospace),
         "cursive" => return Some(GenericFamily::Cursive),
         "fantasy" => return Some(GenericFamily::Fantasy),
-        "" | "inherit" | "initial" | "unset" | "emoji" | "math" | "fangsong" => return None,
         _ => {}
     }
-    // Named faces, by keyword.
+    // Named faces resolve ONLY when the reference actually resolves them — the
+    // fontconfig strong (metric) aliases and the faces installed there. Any
+    // other name returns None so the stack falls through to its next entry
+    // (measured: Chrome renders uninstalled names — Verdana, Georgia, Menlo,
+    // Roboto, Segoe UI — as the NEXT resolvable entry, or as the standard
+    // serif when nothing in the stack resolves; fontconfig's weak best-match
+    // is not used).
     let has = |kw: &str| n.contains(kw);
     if has("arial") || has("helvetica") || has("liberation sans") || has("arimo") {
-        // A page naming Arial/Helvetica specifically gets the bundled Arial-metric
-        // face; the generic `sans-serif` and every other sans name fall through to
-        // the Roboto default below (which matches the reference browser best).
         Some(GenericFamily::SansArial)
-    } else if has("mono")
-        || has("courier")
-        || has("consol")
-        || has("menlo")
-        || has("monaco")
-        || has("inconsolata")
-        || has("code")
-        || has("terminal")
-    {
-        Some(GenericFamily::Monospace)
-    } else if has("script")
-        || has("comic")
-        || has("cursive")
-        || has("handwriting")
-        || has("brush")
-        || has("segoe print")
-        || has("dancing")
-    {
-        Some(GenericFamily::Cursive)
-    } else if has("impact") || has("papyrus") || has("luminari") || has("fantasy") {
-        Some(GenericFamily::Fantasy)
-    } else if (has("serif") && !has("sans"))
-        || has("times")
-        || has("georgia")
-        || has("garamond")
-        || has("cambria")
-        || has("palatino")
-        || has("baskerville")
-        || has("book antiqua")
-        || has("minion")
-        || has("didot")
-        || has("charter")
-        || has("constantia")
-    {
+    } else if has("times") || has("tinos") || has("liberation serif") || has("nimbus roman") {
         Some(GenericFamily::Serif)
-    } else if has("arial")
-        || has("helvetica")
-        || has("verdana")
-        || has("tahoma")
-        || has("segoe")
-        || has("roboto")
-        || has("calibri")
-        || has("sans")
-        || has("gothic")
-        || has("open ")
-        || has("lato")
-        || has("noto sans")
-    {
-        Some(GenericFamily::SansSerif)
+    } else if has("courier") || has("cousine") || has("liberation mono") || has("nimbus mono") {
+        Some(GenericFamily::MonoCourier)
+    } else if n == "dejavu sans mono" {
+        Some(GenericFamily::Monospace)
+    } else if n == "dejavu sans" {
+        Some(GenericFamily::SansSystem)
+    } else if n == "dejavu serif" {
+        Some(GenericFamily::Serif)
     } else {
         None
     }
 }
 
 /// Resolve a `font-family` value (a comma-separated list) to one generic class:
-/// the first entry that classifies wins (approximating "first available font"),
-/// so `"MyBrand", Georgia, serif` → serif via Georgia. `None` if nothing in the
-/// list classifies (the caller keeps the inherited family).
+/// the first entry that resolves on the reference persona wins (real "first
+/// available font" behavior), so `"MyBrand", Georgia, sans-serif` → sans-serif
+/// (neither named face is installed). `None` if nothing in the list resolves
+/// (the caller keeps the inherited family, whose root default is the standard
+/// serif — the reference's unresolvable-stack fallback).
 fn parse_font_family(v: &str) -> Option<GenericFamily> {
     v.split(',').find_map(classify_font_family)
 }

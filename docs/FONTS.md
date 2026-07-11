@@ -23,36 +23,46 @@ real names.
 literal named font is never shipped or read (a privacy property, ADR-0005), but
 because the bundled face is metric-compatible, widths and shapes match closely.
 
-| `font-family`                | Bundled face          | Metric-compatible with | License      |
-|------------------------------|-----------------------|------------------------|--------------|
-| `sans-serif` (generic, default) | Roboto             | (reference default)    | Apache-2.0   |
-| `Arial` / `Helvetica`        | Liberation Sans       | Arial                  | SIL OFL 1.1  |
-| `serif`                      | Liberation Serif      | Times New Roman        | SIL OFL 1.1  |
-| `monospace`                  | Liberation Mono       | Courier New            | SIL OFL 1.1  |
-| `cursive`                    | → Liberation Serif    | (no script face yet)   | —            |
-| `fantasy`                    | → Roboto              | (no display face yet)  | —            |
+| `font-family`                | Bundled face          | Why (measured)                          | License      |
+|------------------------------|-----------------------|-----------------------------------------|--------------|
+| `serif` (generic, **standard/default**) | Liberation Serif | Chrome's serif pref is Times New Roman → fontconfig metric alias | SIL OFL 1.1 |
+| `sans-serif` (generic)       | Liberation Sans       | Chrome's sans pref is Arial → alias      | SIL OFL 1.1  |
+| `Arial` / `Helvetica` (named)| Liberation Sans       | fontconfig metric alias                  | SIL OFL 1.1  |
+| `Times New Roman` (named)    | Liberation Serif      | fontconfig metric alias                  | SIL OFL 1.1  |
+| `monospace` (generic)        | DejaVu Sans Mono      | Chrome's fixed pref resolves here        | Bitstream Vera |
+| `Courier New` (named)        | Liberation Mono       | fontconfig metric alias                  | SIL OFL 1.1  |
+| `system-ui`                  | DejaVu Sans           | the reference's system font              | Bitstream Vera |
+| `cursive` / `fantasy`        | → Liberation Serif    | prefs uninstalled → standard-font fallback | —          |
+| *any other named face*       | *(falls through)*     | uninstalled names skip to the stack's next entry; a wholly unresolvable stack → standard serif | — |
 
 Notes:
 
+- **Every mapping above is measured, not assumed**: a 100px `H`-run calibration
+  page rendered in the reference Chrome and in Cerberus produces identical ink
+  extents per family. Two traps the measurements caught: `fc-match` on a bare
+  generic reports DejaVu, but Chrome asks for its *preference font* (Times/
+  Arial) and gets the Liberation alias instead; and uninstalled named faces
+  (Verdana, Georgia, Menlo, Roboto, Segoe UI…) do **not** take fontconfig's
+  weak best-match — Chrome skips them, so the *stack* decides
+  (`Verdana, Geneva, sans-serif` renders as the generic sans).
 - **Liberation** (Red Hat, SIL OFL 1.1) is glyph-width-identical to Arial /
   Times New Roman / Courier New, so a page laid out for those metrics wraps at
   the same points. Chrome OS uses the equivalent Croscore family
   (Arimo/Tinos/Cousine) for exactly this reason.
-- **Two sans faces, selected by what the page names.** The generic `sans-serif`
-  (and non-Arial sans names) render in **Roboto** — measured to match the
-  reference browser's default sans best (flipping the generic default to
-  Liberation Sans regressed *every* sans page on the corpus). A page that names
-  **Arial/Helvetica** specifically renders in **Liberation Sans** (Arial metrics)
-  — what a real Chrome-on-Windows box shows for those, distinct from the generic
-  default. Roboto also remains the browser's own UI/chrome face.
+- **Scaling is `px / units_per_em`** (the CSS convention) for both advances and
+  rasterization, and `line-height: normal` derives from each face's real
+  vertical metrics — both verified against the calibration page.
+- Roboto remains the browser's own UI/chrome face (and serves a page that
+  names Roboto only if it ends up the resolved stack entry — on this persona it
+  is uninstalled, so it falls through like any other name).
 - **Monospace-size quirk:** Chrome resolves an unspecified (`medium`) font-size
   to **13px** for the monospace generic and 16px otherwise, so `<pre>`/`<code>`
   render smaller than surrounding text. The cascade reproduces this
   (`font_size_medium`), which is what makes an RFC (`rfc1`) match Chrome's line
   count and rhythm rather than rendering ~23% too large.
-- **Cursive/fantasy** are unmapped for now (no bundled script/display face);
-  they fall back to serif/sans. Adding `cursive` (e.g. a libre "Comic Neue" or a
-  handwriting face) and `fantasy` later is data + one match arm.
+- **Cursive/fantasy** fall back to the standard serif — matching the reference,
+  whose Comic Sans/Impact preferences are uninstalled there. Bundling a libre
+  script/display face later is data + one match arm.
 
 Candidate faces for the unmapped generics and future swaps, if we bundle more
 (all libre, redistributable):

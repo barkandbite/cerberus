@@ -235,12 +235,17 @@ pub enum FontSlot {
     /// The bundled serif face (Liberation Serif ≈ Times — what the reference
     /// Chrome's generic `serif` resolves to via fontconfig).
     Serif,
-    /// The bundled monospace face (Liberation Mono ≈ Courier — the reference's
-    /// generic `monospace`).
+    /// The bundled generic-monospace face (DejaVu Sans Mono — the reference's
+    /// measured `monospace` resolution).
     Monospace,
     /// The bundled Arial-metric sans face (Liberation Sans ≈ Arial) — the
     /// reference's generic `sans-serif` AND its named-Arial substitution.
     Sans,
+    /// The bundled Courier-metric mono face (Liberation Mono) — a page naming
+    /// Courier New specifically (fontconfig metric alias).
+    CourierMono,
+    /// The bundled system-UI sans (DejaVu Sans) — the `system-ui` resolution.
+    SansSystem,
 }
 
 /// A shaped glyph: enough for both the placeholder box rasterizer (uses `w`/`h`)
