@@ -98,6 +98,11 @@ pub enum VerticalAlign {
     Baseline,
     Sub,
     Super,
+    /// `top` / `middle` / `bottom` / `text-top` / `text-bottom` — alignments
+    /// that take a replaced box OFF the baseline. Not positioned distinctly
+    /// (boxes stay top-aligned), but they must suppress the baseline strut
+    /// descent an inline image otherwise reserves below itself.
+    OffBaseline,
 }
 
 /// CSS `white-space`: how whitespace and newlines in inline content collapse,

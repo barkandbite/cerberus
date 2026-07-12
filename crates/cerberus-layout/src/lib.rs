@@ -1668,7 +1668,7 @@ impl<'a> Ctx<'a> {
         let voffset = match style.vertical_align {
             VerticalAlign::Super => -(px as i32 / 3),
             VerticalAlign::Sub => px as i32 / 3,
-            VerticalAlign::Baseline => 0,
+            VerticalAlign::Baseline | VerticalAlign::OffBaseline => 0,
         };
         self.line.push(LinePiece {
             x: self.x,
@@ -1767,7 +1767,10 @@ impl<'a> Ctx<'a> {
                 pos_px: Point::ZERO,
             });
             self.link_image_box(rect, in_link);
-            self.advance_box(w, h);
+            // The line box reserves the strut descent below a baseline-aligned
+            // image; the painted rect stays `h`.
+            let below = self.strut_descent_below(&node.style);
+            self.advance_box(w, h.saturating_add(below.max(0) as u32));
         } else if let (Some(w), Some(h)) = (spec_w, spec_h) {
             // Not decoded yet: reserve the declared box so layout doesn't reflow.
             self.place_box(w, h.max(1));
@@ -1777,10 +1780,37 @@ impl<'a> Ctx<'a> {
                 color: Color::rgb(0xDD, 0xDD, 0xDD),
             });
             self.link_image_box(rect, in_link);
-            self.advance_box(w, h);
+            let below = self.strut_descent_below(&node.style);
+            self.advance_box(w, h.saturating_add(below.max(0) as u32));
         } else {
             self.image_alt(node, in_link);
         }
+    }
+
+    /// How far the line box extends BELOW a baseline-aligned inline replaced
+    /// box: the image's bottom edge sits on the text baseline, so the strut's
+    /// descent plus the below-baseline share of the leading is reserved under
+    /// it (the classic "gap below image"). Measured against Chrome: a 72px
+    /// image in a 16px-Arial div makes a 76px line box (descent 3 + gap-share
+    /// 1), 82px with `line-height:30px` (descent 3 + 7 of the 13px leading —
+    /// the below share is the leading minus the floored above share). Zero for
+    /// `display:block` images (no line box) and for `vertical-align:
+    /// top/middle/bottom` (off the baseline — Chrome reports exactly 72px).
+    fn strut_descent_below(&self, style: &ComputedStyle) -> i32 {
+        if style.vertical_align != VerticalAlign::Baseline
+            || matches!(style.display, Display::Block | Display::ListItem)
+        {
+            return 0;
+        }
+        let px = style.font_size.max(1);
+        let (a, d) = self.shaper.ascent_descent(px, style.font_family);
+        let lh = style
+            .line_height
+            .resolve_f(px, self.shaper.natural_leading_f(px, style.font_family));
+        let leading = lh - (a + d) as f32;
+        let above = (leading / 2.0).floor();
+        let below = leading - above;
+        ((d as f32 + below).round() as i32).max(0)
     }
 
     /// An image inside an `<a>` is itself the click target (logo links, product
@@ -5753,6 +5783,45 @@ mod tests {
             2,
             "fractional gaps (320.9px total) must wrap the third word: {ys:?}"
         );
+    }
+
+    #[test]
+    fn inline_image_line_box_reserves_strut_descent() {
+        // A baseline-aligned inline image sits with its bottom ON the text
+        // baseline, so the line box extends descent + below-leading past it
+        // (Chrome: 72px img in a 16px-Arial div → 76px box; 82px with
+        // line-height:30px). The stub shaper's rounded metrics at 16px are
+        // ascent 13 / descent 3; with line-height:30px the leading is
+        // 30 − 16 = 14, splitting 7 above / 7 below → 3 + 7 = 10px under the
+        // image: the box must be 82px tall.
+        let with_lh = lay(
+            "<div style='background:#ff0000;font-size:16px;line-height:30px;margin:0'>\
+             <img src='x.png' width=72 height=72></div>",
+            400,
+        );
+        let box_h = |laid: &LaidOut| {
+            fill_rects(laid)
+                .iter()
+                .map(|r| r.h)
+                .max()
+                .expect("div paints a background")
+        };
+        assert_eq!(box_h(&with_lh), 82, "descent 3 + below-leading 7");
+        // vertical-align: middle takes the image off the baseline — no strut
+        // descent (Chrome reports exactly the image height).
+        let middle = lay(
+            "<div style='background:#ff0000;font-size:16px;line-height:30px;margin:0'>\
+             <img src='x.png' width=72 height=72 style='vertical-align:middle'></div>",
+            400,
+        );
+        assert_eq!(box_h(&middle), 72, "off-baseline image: no descent");
+        // display:block has no line box at all.
+        let block = lay(
+            "<div style='background:#ff0000;font-size:16px;line-height:30px;margin:0'>\
+             <img src='x.png' width=72 height=72 style='display:block'></div>",
+            400,
+        );
+        assert_eq!(box_h(&block), 72, "block image: no strut");
     }
 
     #[test]

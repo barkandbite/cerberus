@@ -1067,6 +1067,9 @@ fn apply_declarations(
                 style.vertical_align = match v.trim().to_ascii_lowercase().as_str() {
                     "sub" => VerticalAlign::Sub,
                     "super" => VerticalAlign::Super,
+                    "top" | "middle" | "bottom" | "text-top" | "text-bottom" => {
+                        VerticalAlign::OffBaseline
+                    }
                     _ => VerticalAlign::Baseline,
                 };
             }

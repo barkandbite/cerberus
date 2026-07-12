@@ -512,16 +512,41 @@ impl TextShaper for TextEngine {
         self.space_advance_in_f(px, Self::slot_for_family(family))
     }
 
-    /// `line-height: normal` from the face's real vertical metrics —
-    /// (ascent − descent + line gap) / upem, exactly what Chrome derives:
-    /// ~1.15× for the Times/Arial-metric Liberation faces, ~1.17× for Roboto.
-    /// Kept fractional (16px Arial-metric → 18.398): layout accumulates the
-    /// exact pitch and rounds per line, matching Chrome's baseline positions.
+    /// `line-height: normal` exactly as Blink derives it: ascent, descent, and
+    /// line gap are each scaled to px and rounded to integers INDIVIDUALLY,
+    /// then summed — measured against this exact Chromium (Arial-metric 16px →
+    /// 14+3+1 = 18, 13px → 12+3+0 = 15, 20px → 18+4+1 = 23, DejaVu Mono 16px →
+    /// 15+4+0 = 19; a 20-line block's height is exactly 20× these). The result
+    /// is a whole number of px — only *explicit* fractional line-heights
+    /// (`line-height: 1.15`) accumulate sub-pixel pitch in Chrome, which is why
+    /// this returns f32 through the same fractional plumbing.
     fn natural_leading_f(&self, px: u32, family: GenericFamily) -> f32 {
         let f = self.face_for(Self::slot_for_family(family));
-        let h = f.height_unscaled() + f.line_gap_unscaled();
-        let upem = f.units_per_em().unwrap_or_else(|| f.height_unscaled());
-        px.max(1) as f32 * h / upem.max(1.0)
+        let upem = f
+            .units_per_em()
+            .unwrap_or_else(|| f.height_unscaled())
+            .max(1.0);
+        let s = px.max(1) as f32 / upem;
+        let asc = (f.ascent_unscaled() * s).round();
+        let desc = (-f.descent_unscaled() * s).round();
+        let gap = (f.line_gap_unscaled() * s).round();
+        asc + desc + gap
+    }
+
+    /// Ascent/descent with Blink's per-component rounding (the same components
+    /// `natural_leading_f` sums) — the line box under a baseline-aligned inline
+    /// image extends `descent + half-leading` below it.
+    fn ascent_descent(&self, px: u32, family: GenericFamily) -> (i32, i32) {
+        let f = self.face_for(Self::slot_for_family(family));
+        let upem = f
+            .units_per_em()
+            .unwrap_or_else(|| f.height_unscaled())
+            .max(1.0);
+        let s = px.max(1) as f32 / upem;
+        (
+            (f.ascent_unscaled() * s).round() as i32,
+            (-f.descent_unscaled() * s).round() as i32,
+        )
     }
 }
 

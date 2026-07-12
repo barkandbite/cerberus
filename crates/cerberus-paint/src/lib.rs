@@ -489,12 +489,24 @@ pub trait TextShaper: Send + Sync {
         self.natural_leading_f(px, family).round() as i32
     }
 
-    /// [`natural_leading`](Self::natural_leading) without the rounding. Chrome
-    /// keeps line pitch fractional (16px Arial-metric text advances 18.398px per
-    /// line, not 18): layout accumulates the exact pitch and rounds only when a
-    /// line is painted, so line N sits at `round(N × pitch)`. Integer-rounding
-    /// the pitch itself instead drifts ~0.4px per line — a whole line's offset
-    /// forty lines down a text-heavy page.
+    /// The face's ascent and descent at `px`, each rounded to whole px exactly
+    /// as Blink rounds font metrics (individually, before any use). Layout
+    /// needs them to size the line box under a baseline-aligned inline image:
+    /// the image's bottom sits ON the baseline, so the box extends
+    /// `descent + half-leading` below it. Default approximates the common
+    /// ~80/20 ascent/descent split for shapers without real metrics.
+    fn ascent_descent(&self, px: u32, _family: GenericFamily) -> (i32, i32) {
+        let p = px.max(1) as f32;
+        ((p * 0.8).round() as i32, (p * 0.2).round() as i32)
+    }
+
+    /// [`natural_leading`](Self::natural_leading) as the f32 the inline flow
+    /// accumulates. For `normal`, Blink's value is a whole number of px (it
+    /// rounds ascent/descent/gap individually, then sums — see the TextEngine
+    /// impl), so real shapers return an integer-valued f32 here; only explicit
+    /// fractional `line-height`s (e.g. `1.15`) produce sub-pixel pitch, which
+    /// layout accumulates and rounds per line so line N sits at
+    /// `round(N × pitch)` exactly as Chrome places it.
     fn natural_leading_f(&self, px: u32, _family: GenericFamily) -> f32 {
         px.max(1) as f32 * 1.2
     }
