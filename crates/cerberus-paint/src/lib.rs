@@ -465,8 +465,18 @@ pub trait TextShaper: Send + Sync {
     /// The space advance in the given generic family — a monospace space is wider
     /// than a proportional one, so word gaps in `<pre>`/`<code>` need the right
     /// face. Default: ignore the family (single-face shapers).
-    fn space_advance_with(&self, px: u32, _family: GenericFamily) -> u32 {
-        self.space_advance(px)
+    fn space_advance_with(&self, px: u32, family: GenericFamily) -> u32 {
+        self.space_advance_with_f(px, family).round().max(0.0) as u32
+    }
+
+    /// [`space_advance_with`](Self::space_advance_with) without the rounding.
+    /// Chrome accumulates fractional advances across a line: a Liberation Sans
+    /// space at 16px is 4.453px, and rounding it to 4 starves a 20-space line
+    /// of ~9px — enough to fit one more word and flip the wrap point, which
+    /// cascades into a vertical shift of everything below. The inline flow
+    /// carries the sub-pixel remainder across gaps and rounds per placement.
+    fn space_advance_with_f(&self, px: u32, _family: GenericFamily) -> f32 {
+        self.space_advance(px) as f32
     }
 
     /// The `line-height: normal` pitch for `px`-sized text in `family`. Browsers

@@ -511,6 +511,14 @@ struct Ctx<'a> {
     line_hf: f32,
     /// Sub-pixel line-pitch debt carried across `newline`s (see `line_hf`).
     line_frac: f32,
+    /// Sub-pixel inline-cursor debt within the current line. Inter-word gaps
+    /// are fractional (a Liberation Sans space at 16px advances 4.453px, not
+    /// 4); the flow carries the remainder across gaps and rounds per
+    /// placement, and the wrap test compares the fractional total — otherwise
+    /// a 20-space line runs ~9px narrow, fits one extra word, and flips the
+    /// wrap point Chrome takes (shifting everything below). Reset at each
+    /// line start; glyph runs already carry their own remainder internally.
+    x_frac: f32,
     line: Vec<LinePiece>,
     line_align: TextAlign,
     /// Output-buffer lengths at the start of the current line, so `text-align`
@@ -605,6 +613,7 @@ impl<'a> Ctx<'a> {
             line_h: 0,
             line_hf: 0.0,
             line_frac: 0.0,
+            x_frac: 0.0,
             line: Vec::new(),
             line_align: TextAlign::Left,
             line_disp0: 0,
@@ -672,6 +681,7 @@ impl<'a> Ctx<'a> {
             line_h: 0,
             line_hf: 0.0,
             line_frac: 0.0,
+            x_frac: 0.0,
             line: Vec::new(),
             line_align: TextAlign::Left,
             line_disp0: 0,
@@ -1451,9 +1461,11 @@ impl<'a> Ctx<'a> {
     /// counted as one space each — a small simplification, noted here.
     fn add_pre_wrap_line(&mut self, line: &str, style: &ComputedStyle, href: Option<&str>) {
         let px = style.font_size.max(1);
-        let sw = space_width(self.shaper, px, style.font_family) as i32;
-        // Accumulated leading-whitespace width for the next word.
-        let mut lead = 0i32;
+        let sw = space_width_f(self.shaper, px, style.font_family);
+        // Accumulated leading-whitespace width for the next word (fractional —
+        // a preserved space run's width is `count × exact advance`; see
+        // `x_frac`).
+        let mut lead = 0.0f32;
         let mut chars = line.chars().peekable();
         while let Some(&c) = chars.peek() {
             // Only ASCII whitespace is a break opportunity / collapsible gap; a
@@ -1474,18 +1486,18 @@ impl<'a> Ctx<'a> {
             }
             let (glyphs, w) = self.shape_run(&word, px, style);
             let at_line_start = self.x == self.left;
-            if !at_line_start && self.x + lead + w as i32 > self.right {
+            if !at_line_start && self.x as f32 + self.x_frac + lead + w as f32 > self.right as f32 {
                 // Wrap: the pending space run hangs at the end of the old line.
                 self.newline();
             } else {
-                self.x += lead;
+                self.advance_x_f(lead);
             }
-            lead = 0;
+            lead = 0.0;
             self.push_piece(px, w, glyphs, style, href);
         }
         // Trailing spaces hang past the last word (kept for width fidelity).
-        if lead > 0 {
-            self.x += lead;
+        if lead > 0.0 {
+            self.advance_x_f(lead);
             self.max_x = self.max_x.max(self.x);
         }
     }
@@ -1501,17 +1513,29 @@ impl<'a> Ctx<'a> {
         // reverse the cursor). A negative `text-indent` is honored (it is the
         // classic image-replacement trick — `text-indent:-9999px` pushes the
         // fallback text off-screen so only the background sprite shows).
-        let gap = if at_line_start {
-            std::mem::take(&mut self.pending_indent)
+        // The gap is FRACTIONAL (`x_frac` carries the sub-pixel remainder) and
+        // the wrap test compares the fractional total, matching how Chrome
+        // accumulates advances across the line.
+        let gap_f = if at_line_start {
+            std::mem::take(&mut self.pending_indent) as f32
         } else {
-            (space_width(self.shaper, px, style.font_family) as i32 + style.word_spacing).max(0)
+            (space_width_f(self.shaper, px, style.font_family) + style.word_spacing as f32).max(0.0)
         };
-        if !at_line_start && self.x + gap + w as i32 > self.right {
+        if !at_line_start && self.x as f32 + self.x_frac + gap_f + w as f32 > self.right as f32 {
             self.newline();
         } else {
-            self.x += gap;
+            self.advance_x_f(gap_f);
         }
         self.push_piece(px, w, glyphs, style, href);
+    }
+
+    /// Advance the inline cursor by a fractional width: `x` gets the rounded
+    /// position and `x_frac` keeps the sub-pixel remainder for the next gap.
+    fn advance_x_f(&mut self, w: f32) {
+        let t = self.x as f32 + self.x_frac + w;
+        let xi = t.round();
+        self.x = xi as i32;
+        self.x_frac = t - xi;
     }
 
     fn add_run(&mut self, text: &str, style: &ComputedStyle, href: Option<&str>) {
@@ -2138,6 +2162,7 @@ impl<'a> Ctx<'a> {
         self.line_frac = (adv_f - adv as f32).clamp(-1.0, 1.0);
         self.y += adv;
         self.x = self.left;
+        self.x_frac = 0.0;
         self.line_h = 0;
         self.line_hf = 0.0;
         // text-indent is a first-line-only effect; once we wrap it no longer
@@ -2152,6 +2177,9 @@ impl<'a> Ctx<'a> {
         self.line_links0 = self.links.len();
         self.line_fields0 = self.fields.len();
         self.line_elems0 = self.elements.len();
+        // A fresh line starts at an integer x; sub-pixel debt never crosses
+        // lines (each line accumulates its own, as Chrome does).
+        self.x_frac = 0.0;
     }
 
     /// Apply text-align to the buffered line, then emit it.
@@ -2252,6 +2280,7 @@ impl<'a> Ctx<'a> {
         self.line_h = 0;
         self.line_hf = 0.0;
         self.line_frac = 0.0;
+        self.x_frac = 0.0;
         self.line.clear();
         self.line_align = TextAlign::Left;
         self.cur_link_node = None;
@@ -3994,6 +4023,12 @@ fn space_width(shaper: &dyn TextShaper, px: u32, family: GenericFamily) -> u32 {
     shaper.space_advance_with(px, family)
 }
 
+/// [`space_width`] without the rounding — inter-word gaps accumulate
+/// fractionally along a line (see `Ctx::x_frac`).
+fn space_width_f(shaper: &dyn TextShaper, px: u32, family: GenericFamily) -> f32 {
+    shaper.space_advance_with_f(px, family)
+}
+
 /// Parse an `<img width/height>` attribute (a bare number or `Npx`).
 fn parse_dim(v: &str) -> Option<u32> {
     v.trim().trim_end_matches("px").trim().parse().ok()
@@ -5680,6 +5715,44 @@ mod tests {
         let rel: Vec<i32> = ys.iter().map(|y| y - ys[0]).collect();
         let want: Vec<i32> = (0..5).map(|n| (n as f32 * 18.4).round() as i32).collect();
         assert_eq!(rel, want, "lines land at round(N × 18.4)");
+    }
+
+    #[test]
+    fn fractional_space_advance_flips_wrap_point_like_chrome() {
+        // Real faces have fractional space advances (Liberation Sans @16px is
+        // 4.453px). Chrome accumulates them across the line, so a line that
+        // fits with integer-rounded gaps can overflow with the true widths and
+        // wrap a word earlier. Three 50px words + two 10.45px gaps = 170.9px
+        // in a 170px box: integer gaps (10px → 170 total) kept it on one line;
+        // the fractional total must wrap.
+        struct FracSpaceShaper;
+        impl TextShaper for FracSpaceShaper {
+            fn shape(&self, text: &str, px: u32) -> Vec<GlyphBox> {
+                MonoShaper.shape(text, px)
+            }
+            fn space_advance_with_f(&self, px: u32, _family: GenericFamily) -> f32 {
+                px.max(2) as f32 + 0.45
+            }
+        }
+        let styled = CssEngine::new().style(&parse_html(
+            "<body style='margin:0'><p style='margin:0;font-size:10px'>\
+             aaaaaaaaaa bbbbbbbbbb cccccccccc</p></body>",
+        ));
+        let laid = BlockLayout::default().layout(
+            &styled,
+            Size::new(170, 500),
+            &FracSpaceShaper,
+            &NoImages,
+            &NoForms,
+        );
+        let mut ys = glyph_ys(&laid);
+        ys.sort_unstable();
+        ys.dedup();
+        assert_eq!(
+            ys.len(),
+            2,
+            "fractional gaps (320.9px total) must wrap the third word: {ys:?}"
+        );
     }
 
     #[test]

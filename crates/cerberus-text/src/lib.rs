@@ -183,13 +183,19 @@ impl TextEngine {
 
     /// The space glyph's advance in a slot's face, scaled `px / upem` — shared
     /// by the family-less UI path (Text/Roboto) and the per-family content path.
-    fn space_advance_in(&self, px: u32, slot: FontSlot) -> u32 {
+    /// Fractional (Liberation Sans @16px is 4.453px): the inline flow carries
+    /// the sub-pixel remainder across gaps so wrap points match Chrome's.
+    fn space_advance_in_f(&self, px: u32, slot: FontSlot) -> f32 {
         let (f, upem) = self.shaping_face(slot);
         let units_to_px = px.max(1) as f32 / upem.max(1.0);
         f.glyph_index(' ')
             .and_then(|g| f.glyph_hor_advance(g))
-            .map(|a| (a as f32 * units_to_px).round().max(0.0) as u32)
-            .unwrap_or_else(|| px.max(2) / 2)
+            .map(|a| (a as f32 * units_to_px).max(0.0))
+            .unwrap_or_else(|| (px.max(2) / 2) as f32)
+    }
+
+    fn space_advance_in(&self, px: u32, slot: FontSlot) -> u32 {
+        self.space_advance_in_f(px, slot).round() as u32
     }
 
     /// Shape `text` at `px` with `primary` as the face for text-covered runs
@@ -501,8 +507,9 @@ impl TextShaper for TextEngine {
     /// The space advance in the requested family's face — a monospace space is
     /// wider than a proportional one, so `<pre>`/`<code>` word gaps use the mono
     /// face's advance (keeping column alignment) rather than the sans space.
-    fn space_advance_with(&self, px: u32, family: GenericFamily) -> u32 {
-        self.space_advance_in(px, Self::slot_for_family(family))
+    /// Fractional; the trait's `space_advance_with` default rounds this.
+    fn space_advance_with_f(&self, px: u32, family: GenericFamily) -> f32 {
+        self.space_advance_in_f(px, Self::slot_for_family(family))
     }
 
     /// `line-height: normal` from the face's real vertical metrics —
