@@ -31,7 +31,7 @@ use cerberus_crypto_rustcrypto::{Argon2idKdf, XChaCha20Poly1305Aead};
 use cerberus_css::CssEngine;
 use cerberus_dns_doh::DohResolver;
 use cerberus_dom::{parse_html, Document, DocumentBuilder, NodeId, NodeRef};
-use cerberus_headless::render_document;
+use cerberus_headless::{render_document, render_document_laid};
 use cerberus_identity::{Head, HeadManager};
 use cerberus_image::ImageCodec;
 use cerberus_js::JsEngineFactory;
@@ -203,6 +203,12 @@ pub struct RenderOutcome {
     pub subresources_blocked: usize,
     /// The page's text content, when [`RenderConfig::dump_text`] asked for it.
     pub page_text: Option<String>,
+    /// Link hit-boxes the layout produced (href + rect in content coordinates)
+    /// — the clickability surface, for auditing that every visible anchor is
+    /// dispatchable.
+    pub links: Vec<cerberus_layout::LinkBox>,
+    /// Form-control hit-boxes (buttons, fields) the layout produced.
+    pub fields: Vec<cerberus_layout::FormFieldBox>,
     /// Per-stage `(label, milliseconds)` timings, when `--timers` is set (M11).
     pub timings: Vec<(String, f64)>,
     pub framebuffer: Framebuffer,
@@ -1282,7 +1288,7 @@ pub fn render(config: &RenderConfig) -> Result<RenderOutcome, AppError> {
     let canvas_bg = canvas_background(&styled, config.background);
     let layout_t = Instant::now();
     let mut layout = make_layout(config.layout_engine);
-    let page = render_document(
+    let (page, laid) = render_document_laid(
         &styled,
         content,
         canvas_bg,
@@ -1323,6 +1329,8 @@ pub fn render(config: &RenderConfig) -> Result<RenderOutcome, AppError> {
         third_party_decision,
         subresources_blocked,
         page_text: config.dump_text.then(|| visible_text(&styled.root)),
+        links: laid.links,
+        fields: laid.fields,
         timings: if config.timers {
             timings.as_pairs()
         } else {
@@ -1929,23 +1937,36 @@ fn visible_text(root: &StyledNode) -> String {
             out.push('\n');
         }
     }
-    fn walk(node: &StyledNode, out: &mut String) {
-        if node.style.display == Display::None || matches!(node.tag.as_str(), "script" | "style") {
+    fn walk(node: &StyledNode, out: &mut String, opacity_hidden: bool) {
+        // A <select>'s options render as the control's value, not page text —
+        // dumping every option's label made hidden choices read as visible.
+        if node.style.display == Display::None
+            || matches!(node.tag.as_str(), "script" | "style" | "select")
+        {
             return;
         }
+        // Paint-faithful visibility, mirroring layout: an `opacity:0` subtree is
+        // gone entirely; `visibility:hidden` hides THIS node's text while a
+        // descendant may still revert to visible.
+        let hidden = opacity_hidden || node.style.opacity == 0.0;
+        let text_visible = !hidden && node.style.visibility == cerberus_style::Visibility::Visible;
         if node.tag == "br" {
             out.push('\n');
             return;
         }
         for child in &node.children {
             match child {
-                StyledChild::Text(t) => out.push_str(t),
+                StyledChild::Text(t) => {
+                    if text_visible {
+                        out.push_str(t)
+                    }
+                }
                 StyledChild::Element(e) => {
                     let block = is_block(e);
                     if block {
                         separate(out);
                     }
-                    walk(e, out);
+                    walk(e, out, hidden);
                     if block {
                         separate(out);
                     }
@@ -1954,7 +1975,7 @@ fn visible_text(root: &StyledNode) -> String {
         }
     }
     let mut out = String::new();
-    walk(root, &mut out);
+    walk(root, &mut out, false);
     out.trim().to_string()
 }
 

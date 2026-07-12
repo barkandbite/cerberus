@@ -80,6 +80,23 @@ html = html.replace("</head>", css + "</head>", 1)
 open(path, "w", encoding="utf-8").write(html)
 PYHIDE
   fi
+  # Self-contain the mirror: drop cross-origin scripts/styles/frames (the
+  # sandbox can't reach them — Chrome otherwise stalls on their loads until the
+  # kill timeout). Both browsers then render the SAME self-contained bytes,
+  # which is the yardstick's contract.
+  python3 - "$mir/index.html" <<'PYSTRIP'
+import re, sys
+path = sys.argv[1]
+html = open(path, encoding="utf-8", errors="replace").read()
+html = re.sub(r'<script\s[^>]*src\s*=\s*["\'](?:https?:)?//[^"\']*["\'][^>]*>\s*</script>', '', html, flags=re.I)
+html = re.sub(r'<link\s[^>]*href\s*=\s*["\'](?:https?:)?//[^"\']*["\'][^>]*>', '', html, flags=re.I)
+html = re.sub(r'<iframe\s[^>]*src\s*=\s*["\'](?:https?:)?//[^"\']*["\'][^>]*>\s*</iframe>', '', html, flags=re.I)
+# Cross-origin images (CDNs) hang Chrome's load event in the sandbox; drop the
+# elements so both browsers lay out the same imageless document.
+html = re.sub(r'<img\s[^>]*src\s*=\s*["\'](?:https?:)?//[^"\']*["\'][^>]*>', '', html, flags=re.I)
+open(path, "w", encoding="utf-8").write(html)
+PYSTRIP
+
   # Mirror same-origin relative assets referenced in the HTML (best-effort). The
   # `|| true` keeps a no-match `grep` (a page with no assets, e.g. example.com)
   # from tripping `pipefail` and aborting the run.

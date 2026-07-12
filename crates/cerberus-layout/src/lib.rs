@@ -893,12 +893,15 @@ impl<'a> Ctx<'a> {
         // falls through to block/inline flow.
         match style.display {
             Display::Flex => {
-                self.flex_layout(node);
+                // `href` (not the raw in_link): an <a> wrapping the container
+                // keeps its links clickable inside the items — the common
+                // brand-page card pattern (<a><div class=grid>headline…).
+                self.flex_layout(node, href);
                 self.cur_link_node = saved_link_node;
                 return;
             }
             Display::Grid => {
-                self.grid_layout(node);
+                self.grid_layout(node, href);
                 self.cur_link_node = saved_link_node;
                 return;
             }
@@ -1726,17 +1729,35 @@ impl<'a> Ctx<'a> {
                 pos,
                 pos_px: Point::ZERO,
             });
+            self.link_image_box(rect, in_link);
             self.advance_box(w, h);
         } else if let (Some(w), Some(h)) = (spec_w, spec_h) {
             // Not decoded yet: reserve the declared box so layout doesn't reflow.
             self.place_box(w, h.max(1));
+            let rect = Rect::new(self.x, self.y, w, h.max(1));
             self.display.push(DisplayItem::Rect {
-                rect: Rect::new(self.x, self.y, w, h.max(1)),
+                rect,
                 color: Color::rgb(0xDD, 0xDD, 0xDD),
             });
+            self.link_image_box(rect, in_link);
             self.advance_box(w, h);
         } else {
             self.image_alt(node, in_link);
+        }
+    }
+
+    /// An image inside an `<a>` is itself the click target (logo links, product
+    /// cards): emit a link hit box over the image rect — text pieces are boxed
+    /// at line commit, but a replaced box never flows through that path.
+    fn link_image_box(&mut self, rect: Rect, in_link: Option<&str>) {
+        if let Some(href) = in_link {
+            if let Some(node) = self.cur_link_node {
+                self.elements.push(ElementBox { rect, node });
+            }
+            self.links.push(LinkBox {
+                rect,
+                href: href.to_string(),
+            });
         }
     }
 
@@ -2538,7 +2559,7 @@ impl<'a> Ctx<'a> {
     /// `order`, wrap, and flexible item sizing (`flex-grow`/`-shrink`/`-basis`).
     /// Free space along a row is distributed by grow; overflow is taken back by
     /// shrink (floored at each item's min-content); the cross axis aligns/stretches.
-    fn flex_layout(&mut self, node: &StyledNode) {
+    fn flex_layout(&mut self, node: &StyledNode, in_link: Option<&str>) {
         self.flush_line();
         self.flush_vmargin();
         let s = &node.style;
@@ -2573,9 +2594,11 @@ impl<'a> Ctx<'a> {
         );
         if !items.is_empty() {
             match node.style.flex_direction {
-                FlexDirection::Row => self.flex_row(&items, left, right, gap, start_y, &node.style),
+                FlexDirection::Row => {
+                    self.flex_row(&items, left, right, gap, start_y, &node.style, in_link)
+                }
                 FlexDirection::Column => {
-                    self.flex_column(&items, left, right, gap, start_y, &node.style)
+                    self.flex_column(&items, left, right, gap, start_y, &node.style, in_link)
                 }
             }
         }
@@ -2656,6 +2679,7 @@ impl<'a> Ctx<'a> {
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn flex_row(
         &mut self,
         items: &[&StyledNode],
@@ -2664,6 +2688,7 @@ impl<'a> Ctx<'a> {
         gap: i32,
         start_y: i32,
         style: &ComputedStyle,
+        in_link: Option<&str>,
     ) {
         let avail = (right - left).max(1);
         let basis: Vec<i32> = items
@@ -2774,7 +2799,7 @@ impl<'a> Ctx<'a> {
                     self.vh,
                 );
                 sub.measuring = self.measuring;
-                sub.walk(items[i], None);
+                sub.walk(items[i], in_link);
                 sub.flush_line();
                 self.field_id = sub.field_id;
                 let h = (sub.y - y).max(1);
@@ -2803,6 +2828,7 @@ impl<'a> Ctx<'a> {
         self.y = (y - gap).max(start_y);
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn flex_column(
         &mut self,
         items: &[&StyledNode],
@@ -2811,6 +2837,7 @@ impl<'a> Ctx<'a> {
         gap: i32,
         start_y: i32,
         style: &ComputedStyle,
+        in_link: Option<&str>,
     ) {
         // The main axis (height) is content-sized (the container has no definite
         // height), so grow/shrink along it are no-ops; we stack items and align /
@@ -2858,7 +2885,7 @@ impl<'a> Ctx<'a> {
                 self.vh,
             );
             sub.measuring = self.measuring;
-            sub.walk(it, None);
+            sub.walk(it, in_link);
             sub.flush_line();
             self.field_id = sub.field_id;
             let h = (sub.y - y).max(1);
@@ -2874,7 +2901,7 @@ impl<'a> Ctx<'a> {
     /// honoring `grid-column`/`grid-row` spans, size rows from
     /// `grid-template-rows`/`grid-auto-rows` or content, and place each item
     /// (spanning the union of its tracks).
-    fn grid_layout(&mut self, node: &StyledNode) {
+    fn grid_layout(&mut self, node: &StyledNode, in_link: Option<&str>) {
         self.flush_line();
         self.flush_vmargin();
         let s = &node.style;
@@ -2971,7 +2998,7 @@ impl<'a> Ctx<'a> {
                 self.vh,
             );
             sub.measuring = self.measuring;
-            sub.walk(it, None);
+            sub.walk(it, in_link);
             sub.flush_line();
             self.field_id = sub.field_id;
             let h = (sub.y - start_y).max(1);
@@ -4653,6 +4680,61 @@ mod tests {
         let col2: Vec<_> = r.iter().filter(|rc| rc.x as u32 == wide.w).collect();
         assert_eq!(col2.len(), 2, "one column-2 cell per row");
         assert_ne!(col2[0].y, col2[1].y, "one per row");
+    }
+
+    #[test]
+    fn links_inside_flex_and_grid_containers_keep_hit_boxes() {
+        // The brand-page card pattern: an <a> WRAPPING a flex/grid container
+        // (and links nested in items) must still emit link hit boxes — flex/
+        // grid item sub-layouts previously dropped the enclosing href.
+        let laid = lay(
+            "<a href='/card'><div style='display:flex'>\
+               <div>Headline</div><div>Blurb</div>\
+             </div></a>\
+             <div style='display:grid;grid-template-columns:1fr 1fr'>\
+               <div><a href='/g1'>One</a></div><div><a href='/g2'>Two</a></div>\
+             </div>",
+            600,
+        );
+        let hrefs: Vec<&str> = laid.links.iter().map(|l| l.href.as_str()).collect();
+        assert!(
+            hrefs.contains(&"/card"),
+            "anchor wrapping a flex container is clickable: {hrefs:?}"
+        );
+        assert!(hrefs.contains(&"/g1") && hrefs.contains(&"/g2"));
+        assert!(
+            laid.links.iter().all(|l| l.rect.w > 0 && l.rect.h > 0),
+            "no degenerate link boxes"
+        );
+    }
+
+    #[test]
+    fn image_only_anchor_is_clickable() {
+        // A logo link (<a> wrapping only an <img>) must emit a link hit box
+        // over the image rect — there is no text piece to box at line commit.
+        let styled = CssEngine::new().style(&parse_html(
+            "<a href='/home'><img src='logo.png' alt='logo'></a>",
+        ));
+        let img = Arc::new(DecodedImage {
+            size: Size::new(40, 20),
+            rgba: vec![255; 40 * 20 * 4],
+        });
+        let laid = BlockLayout::default().layout(
+            &styled,
+            Size::new(600, 400),
+            &MonoShaper,
+            &OneImage(img),
+            &NoForms,
+        );
+        let link = laid
+            .links
+            .iter()
+            .find(|l| l.href == "/home")
+            .expect("image link boxed");
+        assert!(
+            link.rect.w >= 40 && link.rect.h >= 20,
+            "box covers the image"
+        );
     }
 
     #[test]

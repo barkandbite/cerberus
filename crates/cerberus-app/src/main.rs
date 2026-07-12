@@ -143,6 +143,32 @@ fn cmd_render(args: &[String]) -> ExitCode {
         }
     };
 
+    // Clickability audit: dump the link + form-control hit boxes as JSON lines
+    // (one object per box, content coordinates), for scripts/clickcheck.sh.
+    if let Some(path) = flag(args, "--dump-links") {
+        let mut buf = String::new();
+        for l in &outcome.links {
+            buf.push_str(&format!(
+                "{{\"kind\":\"link\",\"href\":{},\"x\":{},\"y\":{},\"w\":{},\"h\":{}}}\n",
+                json_str(&l.href),
+                l.rect.x,
+                l.rect.y,
+                l.rect.w,
+                l.rect.h
+            ));
+        }
+        for f in &outcome.fields {
+            buf.push_str(&format!(
+                "{{\"kind\":\"field\",\"field\":\"{:?}\",\"x\":{},\"y\":{},\"w\":{},\"h\":{}}}\n",
+                f.kind, f.rect.x, f.rect.y, f.rect.w, f.rect.h
+            ));
+        }
+        if let Err(e) = std::fs::write(&path, buf) {
+            eprintln!("could not write {path}: {e}");
+            return ExitCode::FAILURE;
+        }
+    }
+
     // Output format follows the file extension: .png / .pdf / anything-else=PPM.
     let write_result = match out.rsplit('.').next() {
         Some("png") => cerberus_headless::write_png(&out, &outcome.framebuffer),
@@ -673,6 +699,7 @@ fn print_usage() {
          \x20 --system-roots      trust the OS cert store (TLS-inspecting proxies)\n\
          \x20 --data-dir <DIR>    persistent profile (cookies survive runs)\n\
          \x20 --dump-text         print the page's text content (automation)\n\
+         \x20 --dump-links FILE   write link/control hit-boxes as JSON lines (audit)\n\
          \x20 --timers            collect + print per-stage performance timings\n\
          \x20 --proxy <HOST:PORT> single egress proxy (CONNECT tunnel, no DNS leak)\n\
          \x20 --engine <ENGINE>   layout engine: block (default) | taffy\n\
@@ -704,6 +731,22 @@ const fn default_command() -> &'static str {
 }
 
 /// Read `--key value` from args.
+/// Minimal JSON string escaping for hrefs (quotes, backslashes, control chars).
+fn json_str(s: &str) -> String {
+    let mut out = String::with_capacity(s.len() + 2);
+    out.push('"');
+    for c in s.chars() {
+        match c {
+            '"' => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            c if (c as u32) < 0x20 => out.push_str(&format!("\\u{:04x}", c as u32)),
+            c => out.push(c),
+        }
+    }
+    out.push('"');
+    out
+}
+
 fn flag(args: &[String], key: &str) -> Option<String> {
     args.iter()
         .position(|a| a == key)
