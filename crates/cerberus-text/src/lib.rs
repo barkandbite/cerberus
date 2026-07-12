@@ -508,11 +508,13 @@ impl TextShaper for TextEngine {
     /// `line-height: normal` from the face's real vertical metrics —
     /// (ascent − descent + line gap) / upem, exactly what Chrome derives:
     /// ~1.15× for the Times/Arial-metric Liberation faces, ~1.17× for Roboto.
-    fn natural_leading(&self, px: u32, family: GenericFamily) -> i32 {
+    /// Kept fractional (16px Arial-metric → 18.398): layout accumulates the
+    /// exact pitch and rounds per line, matching Chrome's baseline positions.
+    fn natural_leading_f(&self, px: u32, family: GenericFamily) -> f32 {
         let f = self.face_for(Self::slot_for_family(family));
         let h = f.height_unscaled() + f.line_gap_unscaled();
         let upem = f.units_per_em().unwrap_or_else(|| f.height_unscaled());
-        (px.max(1) as f32 * h / upem.max(1.0)).round() as i32
+        px.max(1) as f32 * h / upem.max(1.0)
     }
 }
 

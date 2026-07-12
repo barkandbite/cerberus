@@ -503,6 +503,14 @@ struct Ctx<'a> {
     max_x: i32,
     /// Tallest content on the current line (text or image), in pixels.
     line_h: i32,
+    /// The current line's tallest *fractional* line-height. Chrome keeps used
+    /// line-height fractional (16px Arial-metric `normal` is 18.398px, not 18)
+    /// and rounds only where each line lands, so line N sits at
+    /// `round(N × pitch)`. `newline` advances by this, carrying the sub-pixel
+    /// remainder in `line_frac`; `line_h` (its rounding) still sizes boxes.
+    line_hf: f32,
+    /// Sub-pixel line-pitch debt carried across `newline`s (see `line_hf`).
+    line_frac: f32,
     line: Vec<LinePiece>,
     line_align: TextAlign,
     /// Output-buffer lengths at the start of the current line, so `text-align`
@@ -595,6 +603,8 @@ impl<'a> Ctx<'a> {
             y: margin,
             max_x: margin,
             line_h: 0,
+            line_hf: 0.0,
+            line_frac: 0.0,
             line: Vec::new(),
             line_align: TextAlign::Left,
             line_disp0: 0,
@@ -660,6 +670,8 @@ impl<'a> Ctx<'a> {
             y,
             max_x: left,
             line_h: 0,
+            line_hf: 0.0,
+            line_frac: 0.0,
             line: Vec::new(),
             line_align: TextAlign::Left,
             line_disp0: 0,
@@ -1654,10 +1666,11 @@ impl<'a> Ctx<'a> {
         // ancestor's font size). `Normal` uses the face's real vertical metrics
         // via the shaper (~1.15× for the Times/Arial-metric faces, ~1.17× for
         // Roboto) — the flat 1.2 drifted a pixel every couple of lines.
-        let lh = style
+        let lhf = style
             .line_height
-            .resolve(px, self.shaper.natural_leading(px, style.font_family));
-        self.line_h = self.line_h.max(lh);
+            .resolve_f(px, self.shaper.natural_leading_f(px, style.font_family));
+        self.line_hf = self.line_hf.max(lhf);
+        self.line_h = self.line_h.max(lhf.round() as i32);
     }
 
     /// Lay out an `<img>`: draw the decoded image if ready, else a sized
@@ -2106,15 +2119,27 @@ impl<'a> Ctx<'a> {
     }
 
     fn line_break(&mut self, px: u32, family: GenericFamily) {
-        self.line_h = self.line_h.max(self.shaper.natural_leading(px, family));
+        let lf = self.shaper.natural_leading_f(px, family);
+        self.line_hf = self.line_hf.max(lf);
+        self.line_h = self.line_h.max(lf.round() as i32);
         self.newline();
     }
 
     fn newline(&mut self) {
         self.commit_line();
-        self.y += self.line_h.max(1);
+        // Advance by the *fractional* line pitch, carrying the sub-pixel
+        // remainder into the next line — so line N lands at `round(N × pitch)`
+        // exactly as Chrome places it, instead of drifting by the per-line
+        // rounding error (0.4px/line ≈ a full line's offset 40 lines down).
+        // Atomic boxes (images, inline-blocks) only feed integer `line_h`, so
+        // the max with `line_hf` keeps them exact.
+        let adv_f = self.line_hf.max(self.line_h as f32).max(1.0) + self.line_frac;
+        let adv = (adv_f.round() as i32).max(1);
+        self.line_frac = (adv_f - adv as f32).clamp(-1.0, 1.0);
+        self.y += adv;
         self.x = self.left;
         self.line_h = 0;
+        self.line_hf = 0.0;
         // text-indent is a first-line-only effect; once we wrap it no longer
         // applies (it is normally already consumed by the first word).
         self.pending_indent = 0;
@@ -2225,6 +2250,8 @@ impl<'a> Ctx<'a> {
         self.y = 0;
         self.max_x = 0;
         self.line_h = 0;
+        self.line_hf = 0.0;
+        self.line_frac = 0.0;
         self.line.clear();
         self.line_align = TextAlign::Left;
         self.cur_link_node = None;
@@ -5619,6 +5646,40 @@ mod tests {
             *glyph_ys(&tall).iter().max().unwrap() > *glyph_ys(&normal).iter().max().unwrap(),
             "larger line-height increases row pitch"
         );
+    }
+
+    #[test]
+    fn fractional_line_pitch_accumulates_like_chrome() {
+        // Chrome keeps line pitch fractional: 16px Arial-metric text advances
+        // 18.398px per line, and line N is painted at round(N × pitch). A shaper
+        // with 1.15× leading (18.4 @ 16px) must place five lines at cumulative
+        // offsets 18, 37, 55, 74 — not the drifting 18, 36, 54, 72 an
+        // integer-rounded pitch produces.
+        struct FractionalShaper;
+        impl TextShaper for FractionalShaper {
+            fn shape(&self, text: &str, px: u32) -> Vec<GlyphBox> {
+                MonoShaper.shape(text, px)
+            }
+            fn natural_leading_f(&self, px: u32, _family: GenericFamily) -> f32 {
+                px.max(1) as f32 * 1.15
+            }
+        }
+        let styled =
+            CssEngine::new().style(&parse_html("<p style='margin:0'>a<br>b<br>c<br>d<br>e</p>"));
+        let laid = BlockLayout::default().layout(
+            &styled,
+            Size::new(400, 2000),
+            &FractionalShaper,
+            &NoImages,
+            &NoForms,
+        );
+        let mut ys = glyph_ys(&laid);
+        ys.sort_unstable();
+        ys.dedup();
+        assert_eq!(ys.len(), 5, "five lines: {ys:?}");
+        let rel: Vec<i32> = ys.iter().map(|y| y - ys[0]).collect();
+        let want: Vec<i32> = (0..5).map(|n| (n as f32 * 18.4).round() as i32).collect();
+        assert_eq!(rel, want, "lines land at round(N × 18.4)");
     }
 
     #[test]

@@ -475,8 +475,18 @@ pub trait TextShaper: Send + Sync {
     /// a flat 1.2 drifts one pixel every couple of lines and accumulates into
     /// visible below-the-fold misalignment on text-heavy pages. Default keeps
     /// the 1.2 approximation for shapers without real metrics.
-    fn natural_leading(&self, px: u32, _family: GenericFamily) -> i32 {
-        (px as i32 * 6) / 5
+    fn natural_leading(&self, px: u32, family: GenericFamily) -> i32 {
+        self.natural_leading_f(px, family).round() as i32
+    }
+
+    /// [`natural_leading`](Self::natural_leading) without the rounding. Chrome
+    /// keeps line pitch fractional (16px Arial-metric text advances 18.398px per
+    /// line, not 18): layout accumulates the exact pitch and rounds only when a
+    /// line is painted, so line N sits at `round(N × pitch)`. Integer-rounding
+    /// the pitch itself instead drifts ~0.4px per line — a whole line's offset
+    /// forty lines down a text-heavy page.
+    fn natural_leading_f(&self, px: u32, _family: GenericFamily) -> f32 {
+        px.max(1) as f32 * 1.2
     }
 }
 

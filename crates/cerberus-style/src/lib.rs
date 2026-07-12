@@ -166,6 +166,19 @@ impl LineHeight {
             LineHeight::Px(px) => px,
         }
     }
+
+    /// [`resolve`](Self::resolve) without the rounding. Chrome keeps used
+    /// line-height fractional (`line-height: 1.15` on 16px text is 18.4px, and
+    /// `normal` is the face's exact metric ratio); the inline flow accumulates
+    /// this and rounds per line, so line N lands at `round(N × pitch)` instead
+    /// of drifting by the rounding error each line.
+    pub fn resolve_f(self, font_size: u32, default: f32) -> f32 {
+        match self {
+            LineHeight::Normal => default,
+            LineHeight::Factor(f) => (f * font_size as f32).max(0.0),
+            LineHeight::Px(px) => px as f32,
+        }
+    }
 }
 
 /// CSS `list-style-type`: the marker drawn before a `display: list-item`. A
