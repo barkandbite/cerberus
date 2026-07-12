@@ -84,10 +84,15 @@ PYHIDE
   # sandbox can't reach them — Chrome otherwise stalls on their loads until the
   # kill timeout). Both browsers then render the SAME self-contained bytes,
   # which is the yardstick's contract.
-  python3 - "$mir/index.html" <<'PYSTRIP'
+  python3 - "$mir/index.html" "$origin" <<'PYSTRIP'
 import re, sys
-path = sys.argv[1]
+path, origin = sys.argv[1], sys.argv[2]
 html = open(path, encoding="utf-8", errors="replace").read()
+# Absolute SAME-origin asset URLs become relative, so the mirror step below
+# fetches them and both browsers load the styled page (mozilla.org's CSS links
+# are absolute; without this the page compared unstyled).
+host = origin.split('//', 1)[1]
+html = re.sub(r'(src|href)\s*=\s*(["\'])(?:https?:)?//' + re.escape(host) + r'/', r'\1=\2/', html, flags=re.I)
 html = re.sub(r'<script\s[^>]*src\s*=\s*["\'](?:https?:)?//[^"\']*["\'][^>]*>\s*</script>', '', html, flags=re.I)
 html = re.sub(r'<link\s[^>]*href\s*=\s*["\'](?:https?:)?//[^"\']*["\'][^>]*>', '', html, flags=re.I)
 html = re.sub(r'<iframe\s[^>]*src\s*=\s*["\'](?:https?:)?//[^"\']*["\'][^>]*>\s*</iframe>', '', html, flags=re.I)
@@ -107,7 +112,8 @@ PYSTRIP
       curl -fsSL -A "Mozilla/5.0" "$origin/$p" -o "$mir/$p" 2>/dev/null || true
     done
 
-  local port; port=$(( (RANDOM % 2000) + 8300 ))
+  # 8300-9799: stays clear of Chrome's unsafe-port list (10080 = ERR_UNSAFE_PORT).
+  local port; port=$(( (RANDOM % 1500) + 8300 ))
   ( cd "$mir" && python3 -m http.server "$port" --bind 127.0.0.1 >/dev/null 2>&1 ) &
   local srv=$!
   trap 'kill "$srv" 2>/dev/null || true' RETURN

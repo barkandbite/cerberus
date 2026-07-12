@@ -81,8 +81,12 @@ recorded; was stuck at 0.240 before the metric work), `rfc1` **0.134**/5.1%,
 before the `<center>`-table/bgcolor/cellpadding fixes). Font metrics are
 now measured pixel-identical to the reference on a 100px calibration page
 (see `docs/FONTS.md`); `colspan` landed (hn 19.3%% mismatched).
-**Major-brand pages** (self-contained mirrors): `mozilla` **0.126**/6.0%,
-`apple` **0.131**/12.0%, `bbc` **0.160**/14.8%. **Clickability**
+**Major-brand pages** (self-contained mirrors; same-origin absolute asset
+URLs are rewritten relative so the STYLED page is compared): `mozilla`
+**0.415**/35.0% (fully styled — header nav hidden behind a band, hero
+inset, right-rail squeeze are the identified deltas), `apple`
+**0.131**/12.0%, `bbc` **0.160**/14.8% (its CSS is cross-origin, so the
+comparison is partially styled). **Clickability**
 (`scripts/clickcheck.sh`: every visible navigable href must have a
 non-degenerate hit box): 100% on example/iana/mfws/rfc1/wikipedia/hn/
 mozilla, 95% apple, 82% bbc (residue: its JS-hydrated nav drawer).

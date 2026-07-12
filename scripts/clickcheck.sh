@@ -44,7 +44,8 @@ check_one() {
       curl -fsSL -A "Mozilla/5.0" "$origin/$p" -o "$mir/$p" 2>/dev/null || true
     done
 
-  local port; port=$(( (RANDOM % 2000) + 8300 ))
+  # 8300-9799: stays clear of Chrome's unsafe-port list (10080 = ERR_UNSAFE_PORT).
+  local port; port=$(( (RANDOM % 1500) + 8300 ))
   ( cd "$mir" && python3 -m http.server "$port" --bind 127.0.0.1 >/dev/null 2>&1 ) &
   local srv=$!
   trap 'kill "$srv" 2>/dev/null || true' RETURN
