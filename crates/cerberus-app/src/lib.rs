@@ -7985,6 +7985,143 @@ mod tests {
     }
 
     #[test]
+    fn shopping_flow_browse_add_to_cart_and_checkout() {
+        // The e-commerce mechanics end-to-end, as a user drives them: browse a
+        // storefront, click through to a product (a card link — an <a> wrapping
+        // block content), submit the add-to-cart POST form, see the cart
+        // reflect the item, then fill and submit the checkout form. Every hop
+        // is a real click/keystroke against rendered hit boxes.
+        let responses = vec![
+            (
+                "https://shop.test/",
+                Ok(page(
+                    "https://shop.test/",
+                    200,
+                    None,
+                    "<h1>Shop</h1>\
+                     <a href='/p/42'><div><h2>Ultra Widget</h2><p>$19</p></div></a>",
+                )),
+            ),
+            (
+                "https://shop.test/p/42",
+                Ok(page(
+                    "https://shop.test/p/42",
+                    200,
+                    None,
+                    "<h1>Ultra Widget</h1><p>$19</p>\
+                     <form action='/cart/add' method='POST'>\
+                       <input type='hidden' name='sku' value='42'>\
+                       Qty: <input name='qty'>\
+                       <input type='submit' value='Add to cart'>\
+                     </form>",
+                )),
+            ),
+            (
+                "https://shop.test/cart/add",
+                Ok(page(
+                    "https://shop.test/cart/add",
+                    200,
+                    None,
+                    "<h1>Cart (1)</h1><p>2 x Ultra Widget</p>\
+                     <form action='/checkout' method='POST'>\
+                       Name: <input name='name'>\
+                       <input type='submit' value='Place order'>\
+                     </form>",
+                )),
+            ),
+            (
+                "https://shop.test/checkout",
+                Ok(page(
+                    "https://shop.test/checkout",
+                    200,
+                    None,
+                    "<h1>Order placed</h1><p>Thank you.</p>",
+                )),
+            ),
+        ];
+        let loader = FakeLoader::new(responses);
+        let seen = loader.seen_requests.clone();
+        let mut b = BrowserApp::with_loader(Box::new(loader));
+        b.navigate("https://shop.test/");
+        assert!(b.poll(), "storefront loaded");
+        b.render_frame(Size::new(800, 600));
+
+        // 1. Click the product card (block content inside the anchor).
+        let card = b
+            .links
+            .iter()
+            .find(|l| l.href == "/p/42")
+            .expect("product card link boxed")
+            .rect;
+        assert!(
+            b.pointer_down(card.x + 1, card.y + 1),
+            "card click consumed"
+        );
+        assert!(b.poll(), "product page loaded");
+        assert_eq!(b.toolbar.url_text, "https://shop.test/p/42");
+        assert!(b.page_text().contains("Ultra Widget"));
+        b.render_frame(Size::new(800, 600));
+
+        // 2. Type a quantity and add to cart (POST form).
+        let qty = b
+            .form_fields
+            .iter()
+            .find(|f| matches!(f.kind, FieldKind::Text))
+            .expect("qty field box")
+            .rect;
+        assert!(b.pointer_down(qty.x + 1, qty.y + 1), "focus qty");
+        assert!(b.text_input('2'));
+        let add = b
+            .form_fields
+            .iter()
+            .find(|f| matches!(f.kind, FieldKind::Button))
+            .expect("add-to-cart button box")
+            .rect;
+        assert!(b.pointer_down(add.x + 1, add.y + 1), "add-to-cart click");
+        assert_eq!(b.toolbar.url_text, "https://shop.test/cart/add");
+        let reqs = seen.locked().clone();
+        let (url, post) = reqs.last().expect("cart request seen");
+        assert_eq!(url, "https://shop.test/cart/add");
+        let post = post.as_ref().expect("add-to-cart is a POST");
+        assert_eq!(
+            String::from_utf8_lossy(&post.body),
+            "sku=42&qty=2",
+            "hidden sku + typed qty ride in the body"
+        );
+        assert!(b.poll(), "cart page loaded");
+        assert!(b.page_text().contains("Cart (1)"), "cart shows the item");
+        b.render_frame(Size::new(800, 600));
+
+        // 3. Fill the checkout form and place the order.
+        let name = b
+            .form_fields
+            .iter()
+            .find(|f| matches!(f.kind, FieldKind::Text))
+            .expect("name field box")
+            .rect;
+        assert!(b.pointer_down(name.x + 1, name.y + 1), "focus name");
+        for c in "ada".chars() {
+            assert!(b.text_input(c));
+        }
+        let order = b
+            .form_fields
+            .iter()
+            .find(|f| matches!(f.kind, FieldKind::Button))
+            .expect("place-order button box")
+            .rect;
+        assert!(b.pointer_down(order.x + 1, order.y + 1), "place order");
+        let reqs = seen.locked().clone();
+        let (url, post) = reqs.last().expect("checkout request seen");
+        assert_eq!(url, "https://shop.test/checkout");
+        assert_eq!(
+            String::from_utf8_lossy(&post.as_ref().expect("checkout is a POST").body),
+            "name=ada"
+        );
+        assert!(b.poll(), "confirmation loaded");
+        assert!(b.page_text().contains("Order placed"));
+    }
+
+    #[test]
     fn collect_controls_skips_display_none_but_keeps_type_hidden() {
         // A `display:none` control (or one inside a display:none subtree) must not
         // consume a field id, because layout skips it too — otherwise every later
