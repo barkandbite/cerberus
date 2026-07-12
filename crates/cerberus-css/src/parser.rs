@@ -77,6 +77,13 @@ enum AttrOp {
     Substr,  // *=
 }
 
+/// A renderable pseudo-element (`::before`/`::after`, either colon form).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PseudoElement {
+    Before,
+    After,
+}
+
 #[derive(Clone, Debug)]
 enum Pseudo {
     FirstChild,
@@ -116,6 +123,11 @@ struct Compound {
     attrs: Vec<AttrSel>,
     pseudos: Vec<Pseudo>,
     not: Vec<Compound>,
+    /// `::before`/`::after` on this compound. Only meaningful on a selector's
+    /// LAST compound: the selector then targets the generated box, never the
+    /// real element ([`Selector::matches`] refuses it; the cascade queries it
+    /// through [`Rule::matches_pseudo`]).
+    pseudo_element: Option<PseudoElement>,
 }
 
 impl Compound {
@@ -123,7 +135,8 @@ impl Compound {
         let mut s = (
             u32::from(self.id.is_some()),
             self.classes.len() as u32 + self.attrs.len() as u32 + self.pseudos.len() as u32,
-            u32::from(self.tag.is_some()),
+            // A pseudo-element counts at type level (CSS 2.1 §6.4.3).
+            u32::from(self.tag.is_some()) + u32::from(self.pseudo_element.is_some()),
         );
         for n in &self.not {
             let inner = n.specificity();
@@ -267,8 +280,30 @@ impl Selector {
     }
 
     /// Match against an ancestor path (root … element); the element is last.
+    /// A selector targeting a pseudo-element never matches the element itself.
     fn matches(&self, path: &[ElemRef]) -> bool {
-        if self.compounds.is_empty() || path.is_empty() {
+        if self.compounds.is_empty()
+            || path.is_empty()
+            || self.compounds.iter().any(|c| c.pseudo_element.is_some())
+        {
+            return false;
+        }
+        let last = path.len() - 1;
+        self.match_at(self.compounds.len() - 1, path, last, path[last].index)
+    }
+
+    /// Match this selector's BASE (originating-element part) against `path`,
+    /// for a selector whose last compound targets the given pseudo-element.
+    fn matches_pseudo(&self, path: &[ElemRef], which: PseudoElement) -> bool {
+        let Some(last_c) = self.compounds.last() else {
+            return false;
+        };
+        if last_c.pseudo_element != Some(which)
+            || path.is_empty()
+            || self.compounds[..self.compounds.len() - 1]
+                .iter()
+                .any(|c| c.pseudo_element.is_some())
+        {
             return false;
         }
         let last = path.len() - 1;
@@ -378,6 +413,17 @@ impl Rule {
     /// Whether this rule applies under `ctx` (no `@media`, or it matches).
     pub fn applies(&self, ctx: MediaContext) -> bool {
         self.media.as_ref().is_none_or(|m| m.matches(ctx))
+    }
+
+    /// The highest specificity among this rule's selectors that target the
+    /// given pseudo-element of the element at `path`, if any — how the cascade
+    /// finds the declarations for a generated `::before`/`::after` box.
+    pub fn matches_pseudo(&self, path: &[ElemRef], which: PseudoElement) -> Option<Specificity> {
+        self.selectors
+            .iter()
+            .filter(|s| s.matches_pseudo(path, which))
+            .map(Selector::specificity)
+            .max()
     }
 }
 
@@ -734,7 +780,8 @@ fn parse_compound(token: &str) -> Option<Compound> {
         || !c.classes.is_empty()
         || !c.attrs.is_empty()
         || !c.pseudos.is_empty()
-        || !c.not.is_empty();
+        || !c.not.is_empty()
+        || c.pseudo_element.is_some();
     any.then_some(c)
 }
 
@@ -786,9 +833,14 @@ fn apply_pseudo(c: &mut Compound, name: &str, arg: &str) {
         "hover" | "focus" | "active" | "visited" | "focus-within" | "focus-visible" => {
             c.pseudos.push(Pseudo::Never)
         }
-        // Any OTHER pseudo — a pseudo-element (`:before`/`:after` in their
-        // legacy single-colon form, `:marker`, …) or an unrecognized class —
-        // must make the selector match NOTHING. Ignoring it instead degraded
+        // The renderable pseudo-elements (either colon form): mark the
+        // compound so the cascade can generate the box; Selector::matches
+        // refuses these for the real element.
+        "before" => c.pseudo_element = Some(PseudoElement::Before),
+        "after" => c.pseudo_element = Some(PseudoElement::After),
+        // Any OTHER pseudo — an unrendered pseudo-element (`:marker`,
+        // `:placeholder`, …) or an unrecognized class — must make the selector
+        // match NOTHING. Ignoring it instead degraded
         // `.x:before{position:absolute;top:-1px;background:…}` to `.x{…}`,
         // absolutely positioning the real element to the viewport top and
         // painting the pseudo's decoration band across the page (measured on

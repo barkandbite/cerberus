@@ -20,8 +20,8 @@ use cerberus_style::{
 };
 use cerberus_types::{Color, GenericFamily, ImageFit, ImagePos, Point};
 use parser::{
-    parse_declaration_block, parse_stylesheet, ElemRef, MediaContext, SiblingRef, Specificity,
-    Stylesheet,
+    parse_declaration_block, parse_stylesheet, ElemRef, MediaContext, PseudoElement, SiblingRef,
+    Specificity, Stylesheet,
 };
 use std::collections::HashMap;
 use std::rc::Rc;
@@ -263,7 +263,7 @@ impl CssEngine {
             .collect::<Vec<_>>()
             .into();
         let mut elem_index = 0usize;
-        let children = node
+        let mut children: Vec<StyledChild> = node
             .children()
             .map(|child| match child.text() {
                 Some(t) => StyledChild::Text(t.to_string()),
@@ -284,6 +284,35 @@ impl CssEngine {
             })
             .collect();
 
+        // Generated content (`::before`/`::after`): a matching pseudo rule with
+        // a real `content` value synthesizes a styled child at the front/back —
+        // the box then flows, paints, and inherits exactly like markup. This is
+        // how sites draw icons, decorative bands, and clearfix spacers.
+        if !is_root {
+            if let Some(b) = self.pseudo_child(
+                PseudoElement::Before,
+                path,
+                author,
+                &style,
+                &vars,
+                child_root_font_size,
+                node,
+            ) {
+                children.insert(0, StyledChild::Element(Box::new(b)));
+            }
+            if let Some(a) = self.pseudo_child(
+                PseudoElement::After,
+                path,
+                author,
+                &style,
+                &vars,
+                child_root_font_size,
+                node,
+            ) {
+                children.push(StyledChild::Element(Box::new(a)));
+            }
+        }
+
         path.pop();
         StyledNode {
             tag: node.tag().to_string(),
@@ -292,6 +321,98 @@ impl CssEngine {
             children,
             node_id: node.id(),
         }
+    }
+
+    /// Build the `::before`/`::after` box for the element at `path`, if any
+    /// rule targets it with a renderable `content`. The pseudo inherits from
+    /// its originating element and its declarations cascade in the usual
+    /// (origin, specificity, order) sequence; `content: none|normal` (or no
+    /// content declaration at all) generates nothing.
+    #[allow(clippy::too_many_arguments)]
+    fn pseudo_child(
+        &self,
+        which: PseudoElement,
+        path: &[ElemRef],
+        author: &Stylesheet,
+        elem_style: &ComputedStyle,
+        vars: &Vars,
+        root_font_size: u32,
+        node: NodeRef<'_>,
+    ) -> Option<StyledNode> {
+        let mut matched: Vec<MatchedRule<'_>> = Vec::new();
+        for (order, rule) in self.ua.rules.iter().enumerate() {
+            if rule.applies(self.media) {
+                if let Some(spec) = rule.matches_pseudo(path, which) {
+                    matched.push((0, spec, order, &rule.declarations));
+                }
+            }
+        }
+        for (order, rule) in author.rules.iter().enumerate() {
+            if rule.applies(self.media) {
+                if let Some(spec) = rule.matches_pseudo(path, which) {
+                    matched.push((1, spec, order, &rule.declarations));
+                }
+            }
+        }
+        if matched.is_empty() {
+            return None;
+        }
+        matched.sort_by(|a, b| (a.0, a.1, a.2).cmp(&(b.0, b.1, b.2)));
+
+        // The winning `content` (last in cascade order; important simplified to
+        // last-wins alongside — content is rarely !important-fought).
+        let mut content_raw: Option<String> = None;
+        for (_, _, _, decls) in &matched {
+            for (prop, value, _) in decls.iter() {
+                if prop == "content" {
+                    content_raw = Some(value.clone());
+                }
+            }
+        }
+        let resolved = resolve_value(&content_raw?, vars, elem_style.font_size as f32);
+        let text = parse_content_value(&resolved, node)?;
+
+        let mut style = elem_style.inherit();
+        for (_, _, _, decls) in &matched {
+            apply_declarations(
+                &mut style,
+                decls,
+                elem_style.font_size,
+                root_font_size,
+                vars,
+                false,
+            );
+        }
+        for (_, _, _, decls) in &matched {
+            apply_declarations(
+                &mut style,
+                decls,
+                elem_style.font_size,
+                root_font_size,
+                vars,
+                true,
+            );
+        }
+        if style.display == Display::None {
+            return None;
+        }
+        let children = if text.is_empty() {
+            Vec::new()
+        } else {
+            vec![StyledChild::Text(text)]
+        };
+        Some(StyledNode {
+            tag: match which {
+                PseudoElement::Before => "::before".to_string(),
+                PseudoElement::After => "::after".to_string(),
+            },
+            attrs: Vec::new(),
+            style,
+            children,
+            // The generated box belongs to its originating element for
+            // hit-testing/dispatch purposes.
+            node_id: node.id(),
+        })
     }
 }
 
@@ -727,6 +848,62 @@ impl CalcParser<'_> {
 
 /// Initial root font-size in px (the base for `rem` before any `html {font-size}`).
 const INITIAL_ROOT_FONT_PX: u32 = 16;
+
+/// Resolve a `content` value to the text the generated box carries:
+/// `none`/`normal` → no box (`None`); quoted strings concatenate; `attr(x)`
+/// reads the originating element; `counter()`/`url()`/unknown functions
+/// contribute nothing but still allow an (empty) box, which is how decorative
+/// bands and clearfix spacers render.
+fn parse_content_value(v: &str, node: NodeRef<'_>) -> Option<String> {
+    let t = v.trim();
+    if t.is_empty() || t.eq_ignore_ascii_case("none") || t.eq_ignore_ascii_case("normal") {
+        return None;
+    }
+    let mut out = String::new();
+    let mut rest = t;
+    while !rest.is_empty() {
+        rest = rest.trim_start();
+        if rest.is_empty() {
+            break;
+        }
+        let c = rest.chars().next().unwrap();
+        if c == '"' || c == '\'' {
+            // A quoted string piece (no escape handling — content strings on
+            // real pages are plain glyph runs).
+            if let Some(end) = rest[1..].find(c) {
+                out.push_str(&rest[1..1 + end]);
+                rest = &rest[end + 2..];
+                continue;
+            }
+            break;
+        }
+        // A function or keyword token up to whitespace (tracking parens so
+        // `attr(data-x)` stays one token).
+        let mut depth = 0i32;
+        let mut split = rest.len();
+        for (i, ch) in rest.char_indices() {
+            match ch {
+                '(' => depth += 1,
+                ')' => depth -= 1,
+                ch if ch.is_whitespace() && depth == 0 => {
+                    split = i;
+                    break;
+                }
+                _ => {}
+            }
+        }
+        let tok = &rest[..split];
+        rest = &rest[split..];
+        let low = tok.to_ascii_lowercase();
+        if let Some(name) = low.strip_prefix("attr(").and_then(|x| x.strip_suffix(')')) {
+            if let Some(val) = node.attr(name.trim()) {
+                out.push_str(val);
+            }
+        }
+        // counter()/url()/open-quote/… contribute nothing (box still forms).
+    }
+    Some(out)
+}
 
 fn apply_declarations(
     style: &mut ComputedStyle,
@@ -2684,6 +2861,71 @@ mod tests {
         assert_eq!(lis[0].style.color, Color::BLACK, "first li unaffected");
         assert_eq!(lis[1].style.color, Color::rgb(0, 0xff, 0), "2nd-from-last");
         assert_eq!(lis[2].style.color, Color::rgb(0xff, 0, 0), "last");
+    }
+
+    #[test]
+    fn generated_content_builds_before_and_after_boxes() {
+        // ::before prepends, ::after appends; the box inherits from its
+        // originating element and carries the content text; attr() reads the
+        // element; content:none (or no content) generates nothing.
+        let dom = CssEngine::new().style(&parse_html(
+            "<style>               .x::before { content: '-> '; color: #ff0000 }               .x:after { content: attr(data-n) '!'; }               .y::before { content: none; background: #00ff00 }               .z::before { background: #0000ff }             </style>             <p class='x' data-n='42'>mid</p><p class='y'>y</p><p class='z'>z</p>",
+        ));
+        fn by_class<'a>(n: &'a StyledNode, class: &str) -> Option<&'a StyledNode> {
+            if n.attr("class") == Some(class) {
+                return Some(n);
+            }
+            n.children.iter().find_map(|c| match c {
+                StyledChild::Element(e) => by_class(e, class),
+                _ => None,
+            })
+        }
+        let x = by_class(&dom.root, "x").unwrap();
+        let ps = [
+            x,
+            by_class(&dom.root, "y").unwrap(),
+            by_class(&dom.root, "z").unwrap(),
+        ];
+        let first = match &x.children[0] {
+            StyledChild::Element(e) => e,
+            other => panic!("expected ::before element, got {other:?}"),
+        };
+        assert_eq!(first.tag, "::before");
+        assert_eq!(first.text(), "-> ");
+        assert_eq!(first.style.color, Color::rgb(0xff, 0, 0));
+        assert_eq!(first.node_id, x.node_id, "pseudo belongs to its element");
+        let last = match x.children.last().unwrap() {
+            StyledChild::Element(e) => e,
+            other => panic!("expected ::after element, got {other:?}"),
+        };
+        assert_eq!(last.tag, "::after");
+        assert_eq!(last.text(), "42!", "attr() + string concatenation");
+        // content:none and MISSING content both suppress the box.
+        assert!(ps[1]
+            .children
+            .iter()
+            .all(|c| !matches!(c, StyledChild::Element(e) if e.tag.starts_with("::"))));
+        assert!(ps[2]
+            .children
+            .iter()
+            .all(|c| !matches!(c, StyledChild::Element(e) if e.tag.starts_with("::"))));
+    }
+
+    #[test]
+    fn generated_content_empty_string_still_makes_a_box() {
+        // content:"" + a background is the decorative-band/clearfix pattern:
+        // the box exists (and its styles apply) with no text.
+        let dom = CssEngine::new().style(&parse_html(
+            "<style>.band::before { content: ''; background: #112233 }</style>             <div class='band'>t</div>",
+        ));
+        let d = first(&dom.root, "div").unwrap();
+        let b = match &d.children[0] {
+            StyledChild::Element(e) => e,
+            other => panic!("expected ::before, got {other:?}"),
+        };
+        assert_eq!(b.tag, "::before");
+        assert!(b.children.is_empty(), "empty content, no text child");
+        assert_eq!(b.style.background, Some(Color::rgb(0x11, 0x22, 0x33)));
     }
 
     #[test]
