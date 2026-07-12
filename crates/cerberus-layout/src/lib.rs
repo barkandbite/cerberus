@@ -2661,15 +2661,10 @@ impl<'a> Ctx<'a> {
         let gap = s.gap as i32;
         let bg_index = self.display.items.len();
 
-        // Flex items in `order` (stable sort keeps document order within a group).
-        let mut items: Vec<&StyledNode> = node
-            .children
-            .iter()
-            .filter_map(|c| match c {
-                StyledChild::Element(e) if is_flex_grid_item(e) => Some(e.as_ref()),
-                _ => None,
-            })
-            .collect();
+        // Flex items in `order` (stable sort keeps document order within a
+        // group); bare text children become anonymous items (Flexbox §4).
+        let anon = anon_text_items(node);
+        let mut items = collect_flex_grid_items(node, &anon);
         items.sort_by_key(|e| e.style.order);
 
         let (ds, ls, fs, es) = (
@@ -3002,14 +2997,9 @@ impl<'a> Ctx<'a> {
         let bg_index = self.display.items.len();
         let avail = (right - left).max(1);
 
-        let items: Vec<&StyledNode> = node
-            .children
-            .iter()
-            .filter_map(|c| match c {
-                StyledChild::Element(e) if is_flex_grid_item(e) => Some(e.as_ref()),
-                _ => None,
-            })
-            .collect();
+        // Element items plus anonymous items for bare text children (Grid §6.1).
+        let anon = anon_text_items(node);
+        let items = collect_flex_grid_items(node, &anon);
 
         // While measuring (huge probe width), don't expand the template (auto-fill
         // would create thousands of columns); use one content-wide column so the
@@ -3716,6 +3706,62 @@ fn is_flex_grid_item(e: &StyledNode) -> bool {
             e.style.position,
             cerberus_style::Position::Absolute | cerberus_style::Position::Fixed
         )
+}
+
+/// Bare text children of a flex/grid container form ANONYMOUS items (CSS
+/// Flexbox §4 / Grid §6.1) — `<div style="display:flex">Products<span>…`
+/// must lay "Products" out as its own item, not drop it. Each non-whitespace
+/// text run is wrapped in a synthesized block inheriting the container's text
+/// style; returns `(child_index, node)` storage that
+/// [`collect_flex_grid_items`] interleaves back in document order.
+fn anon_text_items(node: &StyledNode) -> Vec<(usize, StyledNode)> {
+    node.children
+        .iter()
+        .enumerate()
+        .filter_map(|(i, c)| match c {
+            StyledChild::Text(t) if !t.trim().is_empty() => {
+                let mut style = node.style.inherit();
+                style.display = Display::Block;
+                Some((
+                    i,
+                    StyledNode {
+                        tag: String::new(),
+                        attrs: Vec::new(),
+                        style,
+                        children: vec![StyledChild::Text(t.clone())],
+                        node_id: node.node_id,
+                    },
+                ))
+            }
+            _ => None,
+        })
+        .collect()
+}
+
+/// The flex/grid items of `node` in document order: element children that are
+/// in-flow items, with the anonymous text items from [`anon_text_items`]
+/// spliced back at their original child positions.
+fn collect_flex_grid_items<'n>(
+    node: &'n StyledNode,
+    anon: &'n [(usize, StyledNode)],
+) -> Vec<&'n StyledNode> {
+    let mut ai = anon.iter().peekable();
+    let mut items = Vec::new();
+    for (i, c) in node.children.iter().enumerate() {
+        if let Some((j, n)) = ai.peek() {
+            if *j == i {
+                items.push(n);
+                ai.next();
+                continue;
+            }
+        }
+        if let StyledChild::Element(e) = c {
+            if is_flex_grid_item(e) {
+                items.push(e.as_ref());
+            }
+        }
+    }
+    items
 }
 
 /// A `<button>` with element children (icon `<i>`/`<span>` sprites, not just a
@@ -5822,6 +5868,38 @@ mod tests {
             400,
         );
         assert_eq!(box_h(&block), 72, "block image: no strut");
+    }
+
+    #[test]
+    fn flex_and_grid_lay_out_bare_text_children_as_anonymous_items() {
+        // CSS Flexbox §4 / Grid §6.1: contiguous text directly inside a flex or
+        // grid container wraps in an anonymous item. These were silently
+        // dropped (mozilla.org's nav menu titles are `<div
+        // style=display:flex>Products<svg…>` — the word vanished).
+        let count_glyph_items = |laid: &LaidOut| {
+            laid.display
+                .items
+                .iter()
+                .filter(|i| matches!(i, DisplayItem::Glyphs { .. }))
+                .count()
+        };
+        let flex = lay(
+            "<div style='display:flex'>Products<span>About</span></div>",
+            400,
+        );
+        assert!(
+            count_glyph_items(&flex) >= 2,
+            "flex: both the bare text and the span render"
+        );
+        let grid = lay(
+            "<div style='display:grid;grid-template-columns:1fr 1fr'>\
+             Cell-text<span>Elem</span></div>",
+            400,
+        );
+        assert!(
+            count_glyph_items(&grid) >= 2,
+            "grid: both the bare text and the span render"
+        );
     }
 
     #[test]
