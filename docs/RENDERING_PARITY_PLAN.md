@@ -80,11 +80,17 @@ recorded; was stuck at 0.240 before the metric work), `rfc1` **0.134**/5.1%,
 `wikipedia` **0.154**/11.1%, `hn` **0.171**/19.3% (was 77.8%% mismatched
 before the `<center>`-table/bgcolor/cellpadding fixes). Font metrics are
 now measured pixel-identical to the reference on a 100px calibration page
-(see `docs/FONTS.md`). Known next levers: table `colspan`/`rowspan` (HN's
-rank/title interleave), fractional line pitch (Chrome advances lines at
-e.g. 18.4px, we round to 18 — ~0.4px/line cumulative), a wikipedia-specific
-dive, and inline whitespace at element boundaries (#137: `byPublic`,
-`6761 , a`). Drive these down; a rise is a regression.
+(see `docs/FONTS.md`); `colspan` landed (hn 19.3%% mismatched).
+**Major-brand pages** (self-contained mirrors): `mozilla` **0.126**/6.0%,
+`apple` **0.131**/12.0%, `bbc` **0.160**/14.8%. **Clickability**
+(`scripts/clickcheck.sh`: every visible navigable href must have a
+non-degenerate hit box): 100% on example/iana/mfws/rfc1/wikipedia/hn/
+mozilla, 95% apple, 82% bbc (residue: its JS-hydrated nav drawer).
+Known next levers: fractional line pitch (Chrome advances lines at e.g.
+18.4px, we round to 18 — ~0.4px/line cumulative), a wikipedia-specific
+dive, inline whitespace at element boundaries (#137: `byPublic`,
+`6761 , a`), and table `rowspan`. Drive these down; a rise is a
+regression.
 
 **Search-widget layout** (W-C): two general inline-block fixes closed most of it.
 (1) An inline-block's percentage `width` was resolved twice — once to size its
