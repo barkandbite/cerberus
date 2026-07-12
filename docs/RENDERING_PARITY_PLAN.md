@@ -415,3 +415,52 @@ track).
   extend these.
 - Keep the fingerprint-persona work (`cerberus-profile`, farbling, reese84) as a
   separate track from rendering; don't entangle them.
+
+---
+
+## 14. Parity gap rubric (2026-07-12 enumeration — 5-agent diagnostic sweep)
+
+Scoreboard before this round (styled brand mirrors, RMSE / % pixels off):
+example 0.075/1.8, iana 0.149/25.2, mfws 0.207/15.4, rfc1 0.134/5.1,
+wikipedia 0.136/10.3, hn 0.157/17.8, mozilla 0.320/15.8, apple 0.137/12.2,
+bbc 0.160/15.0.
+
+Ranked movers (impact × breadth ÷ effort). Status updates in-place as fixes land.
+
+| # | Gap | Impact | Pages | Status |
+|---|-----|--------|-------|--------|
+| 1 | MQ4 range syntax `(width <= N)` → AlwaysFalse | HIGH | iana (−11pts alone), any modern site | **DONE** |
+| 2 | Integer space advances flip wrap points (4 vs 4.453px) | HIGH | every text page | **DONE** |
+| 3 | line-height:normal must be Blink's per-component-rounded INTEGER (14+3+1=18@16px); explicit fractional lh accumulates | HIGH | every text page | **DONE** |
+| 4 | Flex/grid drop bare text children (anonymous items) | HIGH | mozilla nav, apple, bbc | **DONE** |
+| 5 | Only Regular faces bundled; faux bold/italic mis-measure every bold run | HIGH | all 9 pages | delegated |
+| 6 | Inline `<svg>` display:none'd (resvg already rasterizes for `<img>`) | HIGH | bbc(99), apple(64), mozilla, wikipedia | delegated |
+| 7 | Grid explicit line placement (`grid-column: 2/9`, `1/-1`) ignored | HIGH | mozilla hero | me |
+| 8 | `<center>`/-webkit-center leaks across table-cell boundary | HIGH | hn (~187px shift) | me |
+| 9 | Table row-height trio: cell-less `<tr height>`, line floor on table font, lost trailing cell margin | HIGH | hn, wikipedia, iana | me |
+| 10 | Glyph AA raster differs from FreeType (parity FLOOR ~80% of ink on aligned lines) | HIGH-floor | all | measure-only for now |
+| 11 | Inline-image strut descent missing from line box | MED | iana, bbc, apple | **DONE** |
+| 12 | Whitespace at inline boundaries (#137): phantom space before punctuation, eaten space before nowrap, per-word underline | MED | every prose page | me |
+| 13 | calc() resolves % against font-size (wrong, often negative) | MED | iana, apple, mozilla, bbc | delegated |
+| 14 | clip:rect/clip-path sr-only pattern → stray visible text | MED | bbc, mozilla, iana, apple | delegated |
+| 15 | :has() (and :is/:where) drop whole rules | MED | apple, mozilla, iana | delegated |
+| 16 | transform:translate static subset (centering, offscreen parking) | MED | apple, bbc, mozilla | backlog |
+| 17 | inline-flex/inline-grid break the inline context; CSS tables flattened | MED | iana, bbc, apple | backlog |
+| 18 | List markers placed inside (Chrome: outside) | MED | all list pages | me |
+| 19 | min()/max()/clamp() unparsed | LOW | apple, bbc, mozilla | delegated |
+| 20 | letter/word-spacing quantized to i32 px | LOW | apple, bbc | backlog |
+| 21 | vertical-align top/middle/bottom positioning (suppression done) | LOW | iana, apple | partial |
+| 22 | box-shadow inset/multi/spread | LOW | wikipedia, mozilla | backlog |
+| 23 | aspect-ratio | LOW | bbc | backlog |
+| 24 | filter/backdrop-filter | LOW | apple, wikipedia | backlog |
+| 25 | em-margin/geometry i32 truncation drift | LOW | long pages | backlog |
+
+Verified NON-issues (measured, do not chase): @font-face (mirrors ship no
+reachable webfonts — Chrome falls back to the same fontconfig faces);
+Verdana→DejaVu metric alias (measured 722.2px = Arial-metric in the reference,
+the existing fall-through is correct).
+
+Execution: items 5/6/13/14/15/19 delegated to parallel worktree subagents
+(fonts / inline-svg / css-values); items 7/8/9/12/18 handled inline on the main
+branch (all in cerberus-layout, avoiding merge conflicts). Re-run
+`scripts/parity.sh` after each merge; the table's Status column is the ledger.
