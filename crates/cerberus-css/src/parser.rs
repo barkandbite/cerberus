@@ -599,7 +599,10 @@ fn parse_media_query(text: &str) -> MediaQuery {
             for part in branch.split(" and ") {
                 let part = part.trim().trim_start_matches("only ").trim();
                 if let Some(inner) = part.strip_prefix('(').and_then(|p| p.strip_suffix(')')) {
-                    if let Some(f) = parse_media_feature(inner.trim()) {
+                    let inner = inner.trim();
+                    if let Some(fs) = parse_range_media_feature(inner) {
+                        feats.extend(fs);
+                    } else if let Some(f) = parse_media_feature(inner) {
                         feats.push(f);
                     }
                 } else if !part.is_empty() {
@@ -620,6 +623,117 @@ fn parse_media_query(text: &str) -> MediaQuery {
         })
         .collect();
     MediaQuery { branches }
+}
+
+/// Media Queries Level 4 range syntax: `(width <= 1000px)`, `(width < 1200px)`,
+/// the reversed `(1000px >= width)`, and the double-bounded
+/// `(400px <= width <= 1000px)`. Standard on newly-built sites — iana.org alone
+/// has 64 such blocks; treating them as unrecognized (AlwaysFalse) silently
+/// dropped every responsive tier, so pages rendered their desktop-widest CSS
+/// at every viewport. Returns `None` when `text` isn't range syntax (so the
+/// plain `name: value` path runs), and `[AlwaysFalse]` for range syntax over a
+/// feature we can't evaluate (per spec: unknown → not matching).
+fn parse_range_media_feature(text: &str) -> Option<Vec<MediaFeature>> {
+    if text.contains(':') || !text.contains(['<', '>', '=']) {
+        return None;
+    }
+    // Tokenize into operands separated by comparison operators.
+    let mut ops: Vec<&str> = Vec::new();
+    let mut operands: Vec<&str> = Vec::new();
+    let mut rest = text;
+    while let Some(i) = rest.find(['<', '>', '=']) {
+        operands.push(rest[..i].trim());
+        let len = if rest.as_bytes()[i] != b'=' && rest.as_bytes().get(i + 1) == Some(&b'=') {
+            2
+        } else {
+            1
+        };
+        ops.push(&rest[i..i + len]);
+        rest = &rest[i + len..];
+    }
+    operands.push(rest.trim());
+
+    // `500px <= width` reads as `width >= 500px`: normalize name-on-left.
+    fn flip(op: &str) -> &str {
+        match op {
+            "<=" => ">=",
+            ">=" => "<=",
+            "<" => ">",
+            ">" => "<",
+            other => other,
+        }
+    }
+    // One comparison as Min/Max features (`=` pins both bounds). `<`/`>` are
+    // exclusive; the viewport is integer px, so ±1 is exact.
+    fn feats(name: &str, op: &str, value: &str) -> Option<Vec<MediaFeature>> {
+        let px = media_len_px(value)?;
+        let width = match name.trim().to_ascii_lowercase().as_str() {
+            "width" => true,
+            "height" => false,
+            _ => return None,
+        };
+        let min = |px: u32| {
+            if width {
+                MediaFeature::MinWidth(px)
+            } else {
+                MediaFeature::MinHeight(px)
+            }
+        };
+        let max = |px: u32| {
+            if width {
+                MediaFeature::MaxWidth(px)
+            } else {
+                MediaFeature::MaxHeight(px)
+            }
+        };
+        Some(match op {
+            "<=" => vec![max(px)],
+            "<" => vec![max(px.saturating_sub(1))],
+            ">=" => vec![min(px)],
+            ">" => vec![min(px.saturating_add(1))],
+            "=" => vec![min(px), max(px)],
+            _ => return None,
+        })
+    }
+    let parsed = match (operands.as_slice(), ops.as_slice()) {
+        // `width <= 1000px` / `1000px >= width`
+        ([a, b], [op]) => {
+            if a.eq_ignore_ascii_case("width") || a.eq_ignore_ascii_case("height") {
+                feats(a, op, b)
+            } else {
+                feats(b, flip(op), a)
+            }
+        }
+        // `400px <= width <= 1000px` (each bound normalized name-on-left).
+        ([lo, name, hi], [op1, op2]) => match (feats(name, flip(op1), lo), feats(name, op2, hi)) {
+            (Some(mut a), Some(b)) => {
+                a.extend(b);
+                Some(a)
+            }
+            _ => None,
+        },
+        _ => None,
+    };
+    // Range syntax we couldn't evaluate (unknown feature/unit) is still range
+    // syntax: unknown → false, not a fall-through to the `name: value` parser.
+    Some(parsed.unwrap_or_else(|| vec![MediaFeature::AlwaysFalse]))
+}
+
+/// A `<length>` in a media-feature range, in px. Media-query `em`/`rem` resolve
+/// against the initial font size (16px), never the element's.
+fn media_len_px(v: &str) -> Option<u32> {
+    let v = v.trim().to_ascii_lowercase();
+    let num_end = v
+        .find(|c: char| !c.is_ascii_digit() && c != '.')
+        .unwrap_or(v.len());
+    let n: f32 = v[..num_end].parse().ok()?;
+    let px = match v[num_end..].trim() {
+        "px" => n,
+        "em" | "rem" => n * 16.0,
+        "" if n == 0.0 => 0.0,
+        _ => return None,
+    };
+    Some(px.round().max(0.0) as u32)
 }
 
 fn parse_media_feature(text: &str) -> Option<MediaFeature> {
@@ -1192,6 +1306,41 @@ mod tests {
             width: 1200,
             height: 800
         }));
+    }
+
+    #[test]
+    fn media_query_range_syntax() {
+        // MQ4 range syntax — iana.org alone has 64 such blocks; treating them
+        // as unrecognized dropped every responsive tier, so pages rendered
+        // their desktop-widest CSS at every viewport.
+        let at = |css: &str, width: u32| {
+            parse_stylesheet(css).rules[0].applies(MediaContext { width, height: 700 })
+        };
+        let css = "@media (width <= 1000px) { p { color: red } }";
+        assert!(at(css, 1000), "inclusive bound");
+        assert!(!at(css, 1001));
+        let css = "@media (width < 1200px) { p { color: red } }";
+        assert!(at(css, 1199), "exclusive bound");
+        assert!(!at(css, 1200));
+        let css = "@media (width >= 800px) { p { color: red } }";
+        assert!(at(css, 800));
+        assert!(!at(css, 799));
+        // Reversed operand order.
+        let css = "@media (1000px >= width) { p { color: red } }";
+        assert!(at(css, 1000));
+        assert!(!at(css, 1001));
+        // Double-bounded.
+        let css = "@media (400px <= width <= 1000px) { p { color: red } }";
+        assert!(at(css, 400));
+        assert!(at(css, 1000));
+        assert!(!at(css, 399));
+        assert!(!at(css, 1001));
+        // Range syntax over a feature we can't evaluate: false, not vacuous.
+        assert!(!at("@media (aspect-ratio > 1) { p { color: red } }", 1000));
+        // Combined with `screen and`.
+        let css = "@media screen and (width <= 1000px) { p { color: red } }";
+        assert!(at(css, 900));
+        assert!(!at(css, 1100));
     }
 
     #[test]
