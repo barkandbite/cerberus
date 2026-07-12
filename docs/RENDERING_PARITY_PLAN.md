@@ -83,10 +83,13 @@ now measured pixel-identical to the reference on a 100px calibration page
 (see `docs/FONTS.md`); `colspan` landed (hn 19.3%% mismatched).
 **Major-brand pages** (self-contained mirrors; same-origin absolute asset
 URLs are rewritten relative so the STYLED page is compared): `mozilla`
-**0.415**/35.0% (fully styled — header nav hidden behind a band, hero
-inset, right-rail squeeze are the identified deltas), `apple`
-**0.131**/12.0%, `bbc` **0.160**/14.8% (its CSS is cross-origin, so the
-comparison is partially styled). **Clickability**
+**0.320**/15.8% fully styled (was 0.415/35.0%: the unknown-pseudo
+selector fix removed phantom top bands + the right-rail squeeze, and
+`::before`/`::after` generated content now paints its staircase
+transitions; remaining: nav menu row, hero x-inset, SVG flag), `apple`
+**0.137**/12.2%, `bbc` **0.160**/15.0% (its CSS is cross-origin, so the
+comparison is partially styled). The pseudo work also moved `wikipedia`
+0.154→**0.136**/10.3% and `hn`→**0.157**/17.8%. **Clickability**
 (`scripts/clickcheck.sh`: every visible navigable href must have a
 non-degenerate hit box): 100% on example/iana/mfws/rfc1/wikipedia/hn/
 mozilla, 95% apple, 82% bbc (residue: its JS-hydrated nav drawer).
