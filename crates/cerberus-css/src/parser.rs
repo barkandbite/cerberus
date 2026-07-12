@@ -786,7 +786,14 @@ fn apply_pseudo(c: &mut Compound, name: &str, arg: &str) {
         "hover" | "focus" | "active" | "visited" | "focus-within" | "focus-visible" => {
             c.pseudos.push(Pseudo::Never)
         }
-        _ => {} // unknown pseudo — ignore (matches nothing extra)
+        // Any OTHER pseudo — a pseudo-element (`:before`/`:after` in their
+        // legacy single-colon form, `:marker`, …) or an unrecognized class —
+        // must make the selector match NOTHING. Ignoring it instead degraded
+        // `.x:before{position:absolute;top:-1px;background:…}` to `.x{…}`,
+        // absolutely positioning the real element to the viewport top and
+        // painting the pseudo's decoration band across the page (measured on
+        // mozilla.org's `.m24-c-transition:before` staircase bands).
+        _ => c.pseudos.push(Pseudo::Never),
     }
 }
 
@@ -1100,6 +1107,25 @@ mod tests {
         assert!(!matches("input:checked { outline: x }", &unchecked));
         let selected = chain(vec![sref("option", None, &[], &[("selected", "")])]);
         assert!(matches("option:checked { font-weight: bold }", &selected));
+    }
+
+    #[test]
+    fn pseudo_element_selectors_never_match_the_real_element() {
+        // `.x:before { position:absolute; background:… }` styles a PSEUDO
+        // element we don't render. Ignoring the `:before` degraded the selector
+        // to `.x{…}` — absolutely positioning the real element to the viewport
+        // top and painting its decoration band across the page (measured on
+        // mozilla.org's `.m24-c-transition:before`). Both colon forms must
+        // match nothing, as must unrecognized pseudo-classes.
+        let div = chain(vec![sref("div", None, &["x"], &[])]);
+        assert!(!matches(".x:before { background: red }", &div));
+        assert!(!matches(".x::before { background: red }", &div));
+        assert!(!matches(".x::after { background: red }", &div));
+        assert!(!matches(".x:some-future-pseudo { color: red }", &div));
+        // The plain selector still matches, and a GROUP still applies through
+        // its valid member.
+        assert!(matches(".x { background: red }", &div));
+        assert!(matches(".y:before, .x { background: red }", &div));
     }
 
     #[test]

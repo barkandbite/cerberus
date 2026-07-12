@@ -1301,6 +1301,41 @@ pub fn render(config: &RenderConfig) -> Result<RenderOutcome, AppError> {
     timings.record("layout+paint", layout_t.elapsed());
     timings.record_page_load();
 
+    // Paint forensics: CERB_PAINT_PROBE=x,y prints every display item whose
+    // rect covers that content-coordinate pixel, in paint order — the fastest
+    // way to answer "what painted this wrong pixel" on a live page.
+    if let Ok(probe) = std::env::var("CERB_PAINT_PROBE") {
+        if let Some((px, py)) = probe
+            .split_once(',')
+            .and_then(|(a, b)| Some((a.trim().parse::<i32>().ok()?, b.trim().parse::<i32>().ok()?)))
+        {
+            eprintln!("paint probe at ({px},{py}), canvas_bg {canvas_bg:?}:");
+            for (i, item) in laid.display.items.iter().enumerate() {
+                let hit = |r: &cerberus_types::Rect| {
+                    px >= r.x
+                        && py >= r.y
+                        && px < r.x + r.w.max(1) as i32
+                        && py < r.y + r.h.max(1) as i32
+                };
+                use cerberus_paint::DisplayItem as D;
+                match item {
+                    D::Rect { rect, color } if hit(rect) => {
+                        eprintln!("  [{i}] Rect {rect:?} {color:?}")
+                    }
+                    D::RoundRect { rect, color, .. } if hit(rect) => {
+                        eprintln!("  [{i}] RoundRect {rect:?} {color:?}")
+                    }
+                    D::Gradient { rect, start, .. } if hit(rect) => {
+                        eprintln!("  [{i}] Gradient {rect:?} start {start:?}")
+                    }
+                    D::Image { rect, .. } if hit(rect) => eprintln!("  [{i}] Image {rect:?}"),
+                    D::ClipPush { rect } if hit(rect) => eprintln!("  [{i}] ClipPush {rect:?}"),
+                    _ => {}
+                }
+            }
+        }
+    }
+
     // Compose: page under the toolbar, toolbar painted on top.
     let mut framebuffer = Framebuffer::new(config.viewport);
     framebuffer.clear(canvas_bg);
