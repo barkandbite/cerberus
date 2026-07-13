@@ -50,6 +50,107 @@ const SYSTEM_SANS_FONT_BYTES: &[u8] = include_bytes!("../assets/DejaVuSans.ttf")
 /// at 100px ≈ Arial's 0.722em). Roboto stays the UI/chrome face. See
 /// `assets/Liberation-LICENSE.txt`.
 const SANS_FONT_BYTES: &[u8] = include_bytes!("../assets/LiberationSans-Regular.ttf");
+// Real bold/italic variants per slot (same upstream releases as the regular
+// faces above, taken from the system fontconfig dirs; covered by the bundled
+// Liberation/DejaVu license texts). The rasterizer's faux-bold smear and
+// faux-italic shear remain only as fallbacks for slots without a real variant
+// (Roboto UI text, DejaVu Sans italic, icon/CJK-fallback faces).
+const SANS_BOLD_BYTES: &[u8] = include_bytes!("../assets/LiberationSans-Bold.ttf");
+const SANS_ITALIC_BYTES: &[u8] = include_bytes!("../assets/LiberationSans-Italic.ttf");
+const SANS_BOLD_ITALIC_BYTES: &[u8] = include_bytes!("../assets/LiberationSans-BoldItalic.ttf");
+const SERIF_BOLD_BYTES: &[u8] = include_bytes!("../assets/LiberationSerif-Bold.ttf");
+const SERIF_ITALIC_BYTES: &[u8] = include_bytes!("../assets/LiberationSerif-Italic.ttf");
+const SERIF_BOLD_ITALIC_BYTES: &[u8] = include_bytes!("../assets/LiberationSerif-BoldItalic.ttf");
+const COURIER_BOLD_BYTES: &[u8] = include_bytes!("../assets/LiberationMono-Bold.ttf");
+const COURIER_ITALIC_BYTES: &[u8] = include_bytes!("../assets/LiberationMono-Italic.ttf");
+const COURIER_BOLD_ITALIC_BYTES: &[u8] = include_bytes!("../assets/LiberationMono-BoldItalic.ttf");
+const MONO_BOLD_BYTES: &[u8] = include_bytes!("../assets/DejaVuSansMono-Bold.ttf");
+const MONO_ITALIC_BYTES: &[u8] = include_bytes!("../assets/DejaVuSansMono-Oblique.ttf");
+const MONO_BOLD_ITALIC_BYTES: &[u8] = include_bytes!("../assets/DejaVuSansMono-BoldOblique.ttf");
+/// DejaVu Sans ships no italic in the reference set — `system-ui` italic stays
+/// synthetic (residual), exactly as the reference Chrome obliques it (measured:
+/// italic advances equal regular's).
+const SYSTEM_SANS_BOLD_BYTES: &[u8] = include_bytes!("../assets/DejaVuSans-Bold.ttf");
+
+/// One bundled face: `ab_glyph` outlines + a `rustybuzz` shaping face over the
+/// same static bytes, so metrics and rasterization can never disagree about
+/// which font they describe (ADR-0005 — no system fonts, no `fontdb`).
+struct Face {
+    ab: FontRef<'static>,
+    rb: rustybuzz::Face<'static>,
+}
+
+impl Face {
+    fn new(bytes: &'static [u8], what: &str) -> Self {
+        let ab =
+            FontRef::try_from_slice(bytes).unwrap_or_else(|_| panic!("bundled {what} is valid"));
+        let rb = rustybuzz::Face::from_slice(bytes, 0)
+            .unwrap_or_else(|| panic!("bundled {what} shapes"));
+        Self { ab, rb }
+    }
+
+    /// Units-per-em. Scaling glyph advances by `px / upem` is the CSS
+    /// convention (`font-size` is the em size): Chrome/FreeType scale exactly
+    /// this way. (Scaling by ab_glyph's height metric — ascent−descent —
+    /// rendered every face at `upem/height` of its CSS size: ~85% for Roboto,
+    /// ~89% for the Liberation faces, so all content text was uniformly
+    /// smaller and narrower than the reference and every wrap point drifted.)
+    fn upem(&self) -> f32 {
+        self.rb.units_per_em() as f32
+    }
+}
+
+/// The style variants bundled for one font slot. Slots whose upstream ships
+/// bold/italic files carry real variants; `styled` picks the closest real face
+/// and reports the *residual* style — the bold/italic bits no bundled variant
+/// covers — for the rasterizer to synthesize (smear/shear).
+struct FaceSet {
+    regular: Face,
+    bold: Option<Face>,
+    italic: Option<Face>,
+    bold_italic: Option<Face>,
+}
+
+impl FaceSet {
+    /// A slot with no style variants (Roboto UI text): every requested style is
+    /// residual, preserving the previous all-synthetic behavior.
+    fn regular_only(regular: Face) -> Self {
+        Self {
+            regular,
+            bold: None,
+            italic: None,
+            bold_italic: None,
+        }
+    }
+
+    /// The best bundled face for `style`, plus the residual style bits it could
+    /// not satisfy (wanted bold+italic with only a bold face → residual italic;
+    /// no variants at all → residual = requested).
+    fn styled(&self, style: FontStyle) -> (&Face, FontStyle) {
+        let residual = |bold: bool, italic: bool| FontStyle {
+            bold,
+            italic,
+            icon: style.icon,
+        };
+        match (style.bold, style.italic) {
+            (false, false) => (&self.regular, residual(false, false)),
+            (true, false) => match &self.bold {
+                Some(f) => (f, residual(false, false)),
+                None => (&self.regular, residual(true, false)),
+            },
+            (false, true) => match &self.italic {
+                Some(f) => (f, residual(false, false)),
+                None => (&self.regular, residual(false, true)),
+            },
+            (true, true) => match (&self.bold_italic, &self.bold, &self.italic) {
+                (Some(f), _, _) => (f, residual(false, false)),
+                (None, Some(f), _) => (f, residual(false, true)),
+                (None, None, Some(f)) => (f, residual(true, false)),
+                (None, None, None) => (&self.regular, residual(true, true)),
+            },
+        }
+    }
+}
 
 /// A software text shaper + rasterizer over the bundled text, icon, and fallback
 /// fonts. Glyph **advances** come from rustybuzz (a HarfBuzz port) so run widths
@@ -58,77 +159,100 @@ const SANS_FONT_BYTES: &[u8] = include_bytes!("../assets/LiberationSans-Regular.
 /// **outlining** stays on `ab_glyph`: rustybuzz returns font glyph indices, which
 /// `ab_glyph` rasterizes by the same id, so shaping and rasterization decouple.
 pub struct TextEngine {
-    font: FontRef<'static>,
-    icon_font: FontRef<'static>,
-    fallback_font: FontRef<'static>,
-    /// rustybuzz shaping faces over the same bundled bytes (deterministic — no
-    /// system fonts, no `fontdb`; ADR-0005).
-    rb_font: rustybuzz::Face<'static>,
-    rb_fallback: rustybuzz::Face<'static>,
-    /// Bundled serif + monospace faces (metric-compatible with Times / Courier),
-    /// selected per `GenericFamily` so `font-family` presents the right shape
-    /// class. ab_glyph outlines; rustybuzz shapes — same split as the text face.
-    serif_font: FontRef<'static>,
-    mono_font: FontRef<'static>,
-    sans_font: FontRef<'static>,
-    courier_font: FontRef<'static>,
-    system_sans_font: FontRef<'static>,
-    rb_serif: rustybuzz::Face<'static>,
-    rb_mono: rustybuzz::Face<'static>,
-    rb_sans: rustybuzz::Face<'static>,
-    rb_courier: rustybuzz::Face<'static>,
-    rb_system_sans: rustybuzz::Face<'static>,
+    /// UI/chrome face (Roboto) — regular only; bold/italic stay synthetic.
+    text: FaceSet,
+    /// Per-`GenericFamily` content faces (metric-compatible with Times / Arial /
+    /// Courier — see the byte constants above), each with the real bold/italic
+    /// variants its upstream ships. ab_glyph outlines; rustybuzz shapes.
+    serif: FaceSet,
+    sans: FaceSet,
+    mono: FaceSet,
+    courier: FaceSet,
+    system_sans: FaceSet,
+    /// Single style-less faces: private-use icon glyphs and the CJK fallback.
+    icon: Face,
+    fallback: Face,
 }
 
 impl TextEngine {
     /// Load the bundled text + icon + fallback fonts.
     pub fn new() -> Self {
-        let font = FontRef::try_from_slice(FONT_BYTES).expect("bundled Roboto font is valid");
-        let icon_font =
-            FontRef::try_from_slice(ICON_FONT_BYTES).expect("bundled icon font is valid");
-        let fallback_font = FontRef::try_from_slice(FALLBACK_FONT_BYTES)
-            .expect("bundled IPAGothic fallback font is valid");
-        let rb_font =
-            rustybuzz::Face::from_slice(FONT_BYTES, 0).expect("bundled Roboto font shapes");
-        let rb_fallback = rustybuzz::Face::from_slice(FALLBACK_FONT_BYTES, 0)
-            .expect("bundled IPAGothic fallback shapes");
-        let serif_font =
-            FontRef::try_from_slice(SERIF_FONT_BYTES).expect("bundled Liberation Serif is valid");
-        let mono_font =
-            FontRef::try_from_slice(MONO_FONT_BYTES).expect("bundled DejaVu Sans Mono is valid");
-        let rb_serif = rustybuzz::Face::from_slice(SERIF_FONT_BYTES, 0)
-            .expect("bundled Liberation Serif shapes");
-        let rb_mono = rustybuzz::Face::from_slice(MONO_FONT_BYTES, 0)
-            .expect("bundled DejaVu Sans Mono shapes");
-        let sans_font =
-            FontRef::try_from_slice(SANS_FONT_BYTES).expect("bundled Liberation Sans is valid");
-        let rb_sans = rustybuzz::Face::from_slice(SANS_FONT_BYTES, 0)
-            .expect("bundled Liberation Sans shapes");
-        let courier_font =
-            FontRef::try_from_slice(COURIER_FONT_BYTES).expect("bundled Liberation Mono is valid");
-        let rb_courier = rustybuzz::Face::from_slice(COURIER_FONT_BYTES, 0)
-            .expect("bundled Liberation Mono shapes");
-        let system_sans_font =
-            FontRef::try_from_slice(SYSTEM_SANS_FONT_BYTES).expect("bundled DejaVu Sans is valid");
-        let rb_system_sans = rustybuzz::Face::from_slice(SYSTEM_SANS_FONT_BYTES, 0)
-            .expect("bundled DejaVu Sans shapes");
         Self {
-            font,
-            icon_font,
-            fallback_font,
-            rb_font,
-            rb_fallback,
-            serif_font,
-            mono_font,
-            sans_font,
-            courier_font,
-            system_sans_font,
-            rb_serif,
-            rb_mono,
-            rb_sans,
-            rb_courier,
-            rb_system_sans,
+            text: FaceSet::regular_only(Face::new(FONT_BYTES, "Roboto")),
+            serif: FaceSet {
+                regular: Face::new(SERIF_FONT_BYTES, "Liberation Serif"),
+                bold: Some(Face::new(SERIF_BOLD_BYTES, "Liberation Serif Bold")),
+                italic: Some(Face::new(SERIF_ITALIC_BYTES, "Liberation Serif Italic")),
+                bold_italic: Some(Face::new(
+                    SERIF_BOLD_ITALIC_BYTES,
+                    "Liberation Serif Bold Italic",
+                )),
+            },
+            sans: FaceSet {
+                regular: Face::new(SANS_FONT_BYTES, "Liberation Sans"),
+                bold: Some(Face::new(SANS_BOLD_BYTES, "Liberation Sans Bold")),
+                italic: Some(Face::new(SANS_ITALIC_BYTES, "Liberation Sans Italic")),
+                bold_italic: Some(Face::new(
+                    SANS_BOLD_ITALIC_BYTES,
+                    "Liberation Sans Bold Italic",
+                )),
+            },
+            mono: FaceSet {
+                regular: Face::new(MONO_FONT_BYTES, "DejaVu Sans Mono"),
+                bold: Some(Face::new(MONO_BOLD_BYTES, "DejaVu Sans Mono Bold")),
+                italic: Some(Face::new(MONO_ITALIC_BYTES, "DejaVu Sans Mono Oblique")),
+                bold_italic: Some(Face::new(
+                    MONO_BOLD_ITALIC_BYTES,
+                    "DejaVu Sans Mono Bold Oblique",
+                )),
+            },
+            courier: FaceSet {
+                regular: Face::new(COURIER_FONT_BYTES, "Liberation Mono"),
+                bold: Some(Face::new(COURIER_BOLD_BYTES, "Liberation Mono Bold")),
+                italic: Some(Face::new(COURIER_ITALIC_BYTES, "Liberation Mono Italic")),
+                bold_italic: Some(Face::new(
+                    COURIER_BOLD_ITALIC_BYTES,
+                    "Liberation Mono Bold Italic",
+                )),
+            },
+            system_sans: FaceSet {
+                regular: Face::new(SYSTEM_SANS_FONT_BYTES, "DejaVu Sans"),
+                bold: Some(Face::new(SYSTEM_SANS_BOLD_BYTES, "DejaVu Sans Bold")),
+                // No italic in the upstream set — residual (synthetic shear),
+                // matching the reference Chrome's synthesized oblique.
+                italic: None,
+                bold_italic: None,
+            },
+            icon: Face::new(ICON_FONT_BYTES, "icon font"),
+            fallback: Face::new(FALLBACK_FONT_BYTES, "IPAGothic fallback"),
         }
+    }
+
+    /// The best bundled face for `slot` styled `style`, plus the residual style
+    /// bits no bundled variant covers (which the rasterizer synthesizes). This
+    /// is THE (slot, style) → face function: shaping derives glyph ids and
+    /// advances through it and the rasterizer derives outlines through it, so
+    /// the ids painted are always ids of the face that shaped them. Icon and
+    /// CJK-fallback slots bundle a single face — any styling stays residual —
+    /// and fallback runs keep their face regardless of the requested family.
+    fn styled_face(&self, slot: FontSlot, style: FontStyle) -> (&Face, FontStyle) {
+        let set = match slot {
+            FontSlot::Text => &self.text,
+            FontSlot::Serif => &self.serif,
+            FontSlot::Monospace => &self.mono,
+            FontSlot::Sans => &self.sans,
+            FontSlot::CourierMono => &self.courier,
+            FontSlot::SansSystem => &self.system_sans,
+            FontSlot::Icon => return (&self.icon, style),
+            FontSlot::Fallback => return (&self.fallback, style),
+        };
+        set.styled(style)
+    }
+
+    /// The regular (style-less) face of a slot — vertical metrics and the
+    /// untouched single-style call sites read this.
+    fn regular_face(&self, slot: FontSlot) -> &Face {
+        self.styled_face(slot, FontStyle::REGULAR).0
     }
 
     /// The bundled font slot a `GenericFamily` renders in — each mapping
@@ -150,48 +274,38 @@ impl TextEngine {
         }
     }
 
-    /// The rustybuzz face for a slot, plus its units-per-em. Scaling glyph
-    /// advances by `px / upem` is the CSS convention (`font-size` is the em
-    /// size): Chrome/FreeType scale exactly this way. (Scaling by ab_glyph's
-    /// height metric — ascent−descent — rendered every face at `upem/height`
-    /// of its CSS size: ~85% for Roboto, ~89% for the Liberation faces, so all
-    /// content text was uniformly smaller and narrower than the reference and
-    /// every wrap point drifted.)
-    fn shaping_face(&self, slot: FontSlot) -> (&rustybuzz::Face<'static>, f32) {
-        let face = match slot {
-            FontSlot::Fallback => &self.rb_fallback,
-            FontSlot::Serif => &self.rb_serif,
-            FontSlot::Monospace => &self.rb_mono,
-            FontSlot::Sans => &self.rb_sans,
-            FontSlot::CourierMono => &self.rb_courier,
-            FontSlot::SansSystem => &self.rb_system_sans,
-            _ => &self.rb_font,
-        };
-        (face, face.units_per_em() as f32)
-    }
-
-    /// The ab_glyph scale that rasterizes a `px` CSS font size: ab_glyph's
-    /// `PxScale` divides by the face height (ascent−descent), so multiply it
-    /// back out to net the CSS `px / upem` — keeping painted glyphs the same
-    /// size the shaped advances promise.
-    fn px_scale(&self, slot: FontSlot, px: u32) -> PxScale {
-        let f = self.face_for(slot);
-        let h = f.height_unscaled();
-        let upem = f.units_per_em().unwrap_or(h);
+    /// The ab_glyph scale that rasterizes a `px` CSS font size in `face`:
+    /// ab_glyph's `PxScale` divides by the face height (ascent−descent), so
+    /// multiply it back out to net the CSS `px / upem` — keeping painted glyphs
+    /// the same size the shaped advances promise. Takes the face (not a slot):
+    /// bold/italic variants have their own height/upem ratios.
+    fn px_scale_of(face: &Face, px: u32) -> PxScale {
+        let h = face.ab.height_unscaled();
+        let upem = face.ab.units_per_em().unwrap_or(h);
         PxScale::from(px.max(1) as f32 * h / upem.max(1.0))
     }
 
-    /// The space glyph's advance in a slot's face, scaled `px / upem` — shared
-    /// by the family-less UI path (Text/Roboto) and the per-family content path.
-    /// Fractional (Liberation Sans @16px is 4.453px): the inline flow carries
-    /// the sub-pixel remainder across gaps so wrap points match Chrome's.
-    fn space_advance_in_f(&self, px: u32, slot: FontSlot) -> f32 {
-        let (f, upem) = self.shaping_face(slot);
-        let units_to_px = px.max(1) as f32 / upem.max(1.0);
-        f.glyph_index(' ')
-            .and_then(|g| f.glyph_hor_advance(g))
+    /// [`px_scale_of`](Self::px_scale_of) for a slot's regular face.
+    fn px_scale(&self, slot: FontSlot, px: u32) -> PxScale {
+        Self::px_scale_of(self.regular_face(slot), px)
+    }
+
+    /// The space glyph's advance in `face`, scaled `px / upem`. Fractional
+    /// (Liberation Sans @16px is 4.453px): the inline flow carries the
+    /// sub-pixel remainder across gaps so wrap points match Chrome's.
+    fn space_advance_of_f(face: &Face, px: u32) -> f32 {
+        let units_to_px = px.max(1) as f32 / face.upem().max(1.0);
+        face.rb
+            .glyph_index(' ')
+            .and_then(|g| face.rb.glyph_hor_advance(g))
             .map(|a| (a as f32 * units_to_px).max(0.0))
             .unwrap_or_else(|| (px.max(2) / 2) as f32)
+    }
+
+    /// The space advance in a slot's REGULAR face — shared by the family-less
+    /// UI path (Text/Roboto) and the unstyled per-family content path.
+    fn space_advance_in_f(&self, px: u32, slot: FontSlot) -> f32 {
+        Self::space_advance_of_f(self.regular_face(slot), px)
     }
 
     fn space_advance_in(&self, px: u32, slot: FontSlot) -> u32 {
@@ -201,6 +315,21 @@ impl TextEngine {
     /// Shape `text` at `px` with `primary` as the face for text-covered runs
     /// (CJK still itemizes to the fallback face). `shape` is `primary = Text`.
     fn shape_in(&self, text: &str, px: u32, primary: FontSlot) -> Vec<GlyphBox> {
+        self.shape_in_styled(text, px, primary, FontStyle::REGULAR)
+    }
+
+    /// [`shape_in`](Self::shape_in) with a style: the styled face drives BOTH
+    /// advances and glyph ids, through the same `styled_face(slot, style)`
+    /// derivation the rasterizer applies per glyph — so the ids shaped here are
+    /// ids of the exact face that will outline them. Fallback (CJK) runs keep
+    /// the fallback face regardless of family or style.
+    fn shape_in_styled(
+        &self,
+        text: &str,
+        px: u32,
+        primary: FontSlot,
+        style: FontStyle,
+    ) -> Vec<GlyphBox> {
         let mut out = Vec::with_capacity(text.len());
         let pxf = px.max(1) as f32;
         for (slot, run) in self.itemize(text) {
@@ -211,9 +340,9 @@ impl TextEngine {
             } else {
                 slot
             };
-            let (face, upem) = self.shaping_face(eff);
-            let units_to_px = pxf / upem.max(1.0);
-            shape_run_rb(face, run, px, eff, units_to_px, &mut out);
+            let (face, _residual) = self.styled_face(eff, style);
+            let units_to_px = pxf / face.upem().max(1.0);
+            shape_run_rb(&face.rb, run, px, eff, units_to_px, &mut out);
         }
         out
     }
@@ -223,9 +352,9 @@ impl TextEngine {
     /// `.notdef` (real tofu, as a browser with no matching font shows). This is
     /// the font-itemization a browser does before shaping.
     fn slot_for_char(&self, ch: char) -> FontSlot {
-        if ch.is_whitespace() || self.font.glyph_id(ch).0 != 0 {
+        if ch.is_whitespace() || self.text.regular.ab.glyph_id(ch).0 != 0 {
             FontSlot::Text
-        } else if self.fallback_font.glyph_id(ch).0 != 0 {
+        } else if self.fallback.ab.glyph_id(ch).0 != 0 {
             FontSlot::Fallback
         } else {
             FontSlot::Text
@@ -254,18 +383,9 @@ impl TextEngine {
         runs
     }
 
-    /// The face a glyph was shaped from.
+    /// The regular ab_glyph face of a slot (vertical metrics, icon shaping).
     fn face_for(&self, slot: FontSlot) -> &FontRef<'static> {
-        match slot {
-            FontSlot::Text => &self.font,
-            FontSlot::Icon => &self.icon_font,
-            FontSlot::Fallback => &self.fallback_font,
-            FontSlot::Serif => &self.serif_font,
-            FontSlot::Monospace => &self.mono_font,
-            FontSlot::Sans => &self.sans_font,
-            FontSlot::CourierMono => &self.courier_font,
-            FontSlot::SansSystem => &self.system_sans_font,
-        }
+        &self.regular_face(slot).ab
     }
 
     fn draw_run(
@@ -277,21 +397,23 @@ impl TextEngine {
         target: &mut Framebuffer,
     ) {
         let mut pen_x = origin.x as f32;
-        // Synthetic styling — memory-first, no extra font faces (real weight/slant
-        // faces would be a drop-in asset swap behind this path). Faux-bold smears a
-        // second sample 1px right; faux-italic shears each scanline rightward above
-        // the baseline (~12°).
-        let slant = if style.italic { 0.21f32 } else { 0.0 };
         for g in glyphs {
-            // Each glyph names its own face (a run can mix Roboto + CJK fallback);
-            // the baseline uses that face's ascent so mixed scripts share a line.
-            let font = self.face_for(g.font);
-            let scale = self.px_scale(g.font, g.px);
-            let scaled = font.as_scaled(scale);
+            // Each glyph names its own slot (a run can mix the primary face with
+            // the CJK fallback); `styled_face` re-derives the exact face the glyph
+            // was shaped from — same (slot, style) function — so `g.id` indexes
+            // the face we outline. The baseline uses that face's ascent so mixed
+            // scripts share a line. Residual style bits (bold/italic no bundled
+            // variant covers — Roboto, DejaVu Sans italic, icon/fallback) are
+            // synthesized: faux-bold smears a second sample 1px right, faux-italic
+            // shears each scanline rightward above the baseline (~12°).
+            let (face, residual) = self.styled_face(g.font, style);
+            let scale = Self::px_scale_of(face, g.px);
+            let scaled = face.ab.as_scaled(scale);
             let baseline = origin.y as f32 + scaled.ascent();
+            let slant = if residual.italic { 0.21f32 } else { 0.0 };
 
             let glyph = GlyphId(g.id).with_scale_and_position(scale, point(pen_x, baseline));
-            if let Some(outlined) = font.outline_glyph(glyph) {
+            if let Some(outlined) = face.ab.outline_glyph(glyph) {
                 let bounds = outlined.px_bounds();
                 outlined.draw(|gx, gy, coverage| {
                     let y = bounds.min.y as i32 + gy as i32;
@@ -303,7 +425,7 @@ impl TextEngine {
                     let x = bounds.min.x as i32 + gx as i32 + shear;
                     target.blend_pixel(x, y, color, coverage);
                     // Faux-bold: smear one pixel to the right.
-                    if style.bold {
+                    if residual.bold {
                         target.blend_pixel(x + 1, y, color, coverage);
                     }
                 });
@@ -479,10 +601,25 @@ impl TextShaper for TextEngine {
         self.shape_in(text, px, Self::slot_for_family(family))
     }
 
+    /// Styled shaping: advances AND glyph ids come from the real bold/italic
+    /// variant when the slot bundles one (Times bold is genuinely wider — a 10-H
+    /// run at 100px is 777.8px vs the regular 722.2px), so wrap points match the
+    /// reference. Slots without a variant shape from the regular face and the
+    /// rasterizer synthesizes the residual style, as before.
+    fn shape_styled(
+        &self,
+        text: &str,
+        px: u32,
+        family: GenericFamily,
+        style: FontStyle,
+    ) -> Vec<GlyphBox> {
+        self.shape_in_styled(text, px, Self::slot_for_family(family), style)
+    }
+
     fn shape_icon(&self, ch: char, px: u32) -> Vec<GlyphBox> {
         let scale = self.px_scale(FontSlot::Icon, px);
-        let scaled = self.icon_font.as_scaled(scale);
-        let id = self.icon_font.glyph_id(ch);
+        let scaled = self.icon.ab.as_scaled(scale);
+        let id = self.icon.ab.glyph_id(ch);
         let advance = scaled.h_advance(id).round().max(0.0) as u32;
         vec![GlyphBox {
             advance,
@@ -510,6 +647,14 @@ impl TextShaper for TextEngine {
     /// Fractional; the trait's `space_advance_with` default rounds this.
     fn space_advance_with_f(&self, px: u32, family: GenericFamily) -> f32 {
         self.space_advance_in_f(px, Self::slot_for_family(family))
+    }
+
+    /// The space advance in the styled variant of the family's face — a bold
+    /// space can be wider than a regular one (DejaVu Sans bold is), so styled
+    /// runs' word gaps read the same face their glyphs shape from.
+    fn space_advance_styled_f(&self, px: u32, family: GenericFamily, style: FontStyle) -> f32 {
+        let (face, _residual) = self.styled_face(Self::slot_for_family(family), style);
+        Self::space_advance_of_f(face, px)
     }
 
     /// `line-height: normal` exactly as Blink derives it: ascent, descent, and
@@ -1077,6 +1222,163 @@ mod tests {
             assert_eq!(g.len(), 1);
             assert!(g[0].id != 0, "missing icon glyph U+{:04X}", cp as u32);
         }
+    }
+
+    /// Sum of a styled run's advances at `px` (what layout measures).
+    fn styled_width(e: &TextEngine, text: &str, fam: GenericFamily, style: FontStyle) -> f32 {
+        e.shape_styled(text, 100, fam, style)
+            .iter()
+            .map(|g| g.advance)
+            .sum::<u32>() as f32
+    }
+
+    #[test]
+    fn real_bold_faces_match_reference_advances() {
+        // Reference Chromium (chromium-1194, --headless=new), 10×'H' at 100px:
+        // Times New Roman bold 777.84 (regular 722.17) — bold Times is
+        // genuinely WIDER, which no faux-bold smear can reproduce; Arial bold
+        // 722.17 (same as regular); monospace bold 602.06 (fixed pitch).
+        let e = TextEngine::new();
+        let h10 = "HHHHHHHHHH";
+        let serif_reg = styled_width(&e, h10, GenericFamily::Serif, FontStyle::REGULAR);
+        let serif_bold = styled_width(&e, h10, GenericFamily::Serif, FontStyle::bold());
+        assert!(
+            (serif_bold - 777.84).abs() < 1.0,
+            "Times bold 10H = {serif_bold}, Chrome 777.84"
+        );
+        assert!(
+            (serif_reg - 722.17).abs() < 1.0,
+            "Times regular 10H = {serif_reg}, Chrome 722.17"
+        );
+        assert!(
+            serif_bold > serif_reg + 10.0,
+            "bold serif is a real, wider face"
+        );
+        let sans_bold = styled_width(&e, h10, GenericFamily::SansSerif, FontStyle::bold());
+        assert!(
+            (sans_bold - 722.17).abs() < 1.0,
+            "Arial bold 10H = {sans_bold}, Chrome 722.17"
+        );
+        let mono_bold = styled_width(&e, h10, GenericFamily::Monospace, FontStyle::bold());
+        assert!(
+            (mono_bold - 602.06).abs() < 1.0,
+            "monospace bold 10H = {mono_bold}, Chrome 602.06"
+        );
+    }
+
+    #[test]
+    fn styled_lowercase_runs_match_reference() {
+        // Reference Chromium 'Hamburgefonstiv' at 100px (measured on this exact
+        // binary): Arial bold 822.33 vs regular 755.92; Times italic 690.69 and
+        // bold-italic 722.27 (regular 698.05) — real variant faces reshape
+        // lowercase advances, not just stems.
+        let e = TextEngine::new();
+        let t = "Hamburgefonstiv";
+        let italic = FontStyle {
+            bold: false,
+            italic: true,
+            icon: false,
+        };
+        let bold_italic = FontStyle {
+            bold: true,
+            italic: true,
+            icon: false,
+        };
+        let sans_reg = styled_width(&e, t, GenericFamily::SansSerif, FontStyle::REGULAR);
+        let sans_bold = styled_width(&e, t, GenericFamily::SansSerif, FontStyle::bold());
+        assert!(
+            (sans_reg - 755.92).abs() < 1.0,
+            "Arial regular = {sans_reg}, Chrome 755.92"
+        );
+        assert!(
+            (sans_bold - 822.33).abs() < 1.0,
+            "Arial bold = {sans_bold}, Chrome 822.33"
+        );
+        let serif_italic = styled_width(&e, t, GenericFamily::Serif, italic);
+        assert!(
+            (serif_italic - 690.69).abs() < 1.0,
+            "Times italic = {serif_italic}, Chrome 690.69"
+        );
+        let serif_bold_italic = styled_width(&e, t, GenericFamily::Serif, bold_italic);
+        assert!(
+            (serif_bold_italic - 722.27).abs() < 1.0,
+            "Times bold-italic = {serif_bold_italic}, Chrome 722.27"
+        );
+    }
+
+    #[test]
+    fn slots_without_a_variant_report_residual_style() {
+        // SansSystem (DejaVu Sans) bundles a bold but NO italic file — italic
+        // stays residual for the rasterizer to shear, matching the reference
+        // Chrome, which synthesizes the oblique (measured: italic advances
+        // equal regular's). Bold+italic serves from the bold face with italic
+        // residual. Roboto (Text) has no variants at all.
+        let e = TextEngine::new();
+        let italic = FontStyle {
+            bold: false,
+            italic: true,
+            icon: false,
+        };
+        let bold_italic = FontStyle {
+            bold: true,
+            italic: true,
+            icon: false,
+        };
+        let (_, r) = e.styled_face(FontSlot::SansSystem, italic);
+        assert!(r.italic && !r.bold, "SansSystem italic is residual");
+        let (_, r) = e.styled_face(FontSlot::SansSystem, FontStyle::bold());
+        assert!(!r.bold && !r.italic, "SansSystem bold is a real face");
+        let (_, r) = e.styled_face(FontSlot::SansSystem, bold_italic);
+        assert!(
+            !r.bold && r.italic,
+            "SansSystem bold+italic: real bold, residual italic"
+        );
+        let (_, r) = e.styled_face(FontSlot::Text, bold_italic);
+        assert!(
+            r.bold && r.italic,
+            "Roboto has no variants — full residual style"
+        );
+        // A slot with the full set clears every residual bit.
+        let (_, r) = e.styled_face(FontSlot::Serif, bold_italic);
+        assert!(!r.bold && !r.italic, "Serif bold-italic is a real face");
+    }
+
+    #[test]
+    fn styled_shaping_and_rasterization_share_the_face() {
+        // The glyph ids a styled run shapes must index the face the rasterizer
+        // outlines (`styled_face` is the single derivation): bold Liberation
+        // Serif's 'H' is a different glyph id in a different file than the
+        // regular's, and both must outline real ink.
+        let e = TextEngine::new();
+        let style = FontStyle::bold();
+        let glyphs = e.shape_styled("H", 40, GenericFamily::Serif, style);
+        assert_eq!(glyphs.len(), 1);
+        let (face, residual) = e.styled_face(glyphs[0].font, style);
+        assert!(!residual.bold, "serif bold is real, not residual");
+        // The shaped id resolves to an outline in the styled face.
+        let scale = TextEngine::px_scale_of(face, 40);
+        let glyph = GlyphId(glyphs[0].id).with_scale_and_position(scale, point(0.0, 30.0));
+        assert!(
+            face.ab.outline_glyph(glyph).is_some(),
+            "styled id outlines in the styled face"
+        );
+        // And the run rasterizes ink end-to-end.
+        let mut list = DisplayList::new();
+        list.push(DisplayItem::Glyphs {
+            origin: Point::new(2, 2),
+            glyphs,
+            color: Color::BLACK,
+            style,
+        });
+        let mut fb = Framebuffer::new(Size::new(48, 48));
+        fb.clear(Color::WHITE);
+        e.rasterize(&list, &mut fb);
+        let inked = fb
+            .rgba
+            .chunks_exact(4)
+            .filter(|px| px[..3] != [255, 255, 255])
+            .count();
+        assert!(inked > 0, "styled glyph rasterizes real ink");
     }
 
     #[test]
