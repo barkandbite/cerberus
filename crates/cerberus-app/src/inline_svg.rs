@@ -85,11 +85,22 @@ pub(crate) fn replace_inline_svgs(doc: &mut Document, viewport_w: u32) -> Vec<(S
         markup.hash(&mut hasher);
         let key = format!("{INLINE_SVG_PREFIX}{:016x}", hasher.finish());
 
-        let mut attrs = vec![
-            ("src".to_string(), key.clone()),
-            ("width".to_string(), w.to_string()),
-            ("height".to_string(), h.to_string()),
-        ];
+        // Only bake width/height attributes the SOURCE svg actually carried:
+        // a synthesized axis would defeat CSS ratio-derivation. bbc's logo is
+        // viewBox-only with a class rule `height:28px` — Chrome derives width
+        // 98 from the intrinsic 112/32 ratio; a baked stretch width (1200)
+        // would win over that derivation and paint a container-wide bar. An
+        // axis the source specified still lands as an attribute; a fully
+        // unsized svg falls back to the bitmap's intrinsic size (rasterized
+        // at the Chrome-matching box), which layout clamps to the container —
+        // the same stretch Chrome shows.
+        let mut attrs = vec![("src".to_string(), key.clone())];
+        if let Some(v) = node.attr("width").filter(|v| px_len(v).is_some()) {
+            attrs.push(("width".to_string(), px_len(v).unwrap().round().to_string()));
+        }
+        if let Some(v) = node.attr("height").filter(|v| px_len(v).is_some()) {
+            attrs.push(("height".to_string(), px_len(v).unwrap().round().to_string()));
+        }
         // Carry the styling hooks over so author CSS that sizes the svg by
         // class/id (`.icon { width: 24px }`) still overrides the attributes.
         for name in ["class", "id", "style"] {
@@ -441,13 +452,28 @@ mod tests {
         (doc, pairs)
     }
 
-    /// The (width, height) attrs of the first synthetic `<img>`.
-    fn img_attrs(doc: &Document) -> (u32, u32) {
+    /// The width/height attrs of the first rewritten `<svg>` — `None` per axis
+    /// the source svg did not specify (a synthesized axis would defeat CSS
+    /// intrinsic-ratio derivation; the box then comes from the bitmap).
+    fn img_attrs(doc: &Document) -> (Option<u32>, Option<u32>) {
         let img = find(doc.root(), "svg").expect("synthetic replaced svg");
         (
-            img.attr("width").unwrap().parse().unwrap(),
-            img.attr("height").unwrap().parse().unwrap(),
+            img.attr("width").map(|v| v.parse().unwrap()),
+            img.attr("height").map(|v| v.parse().unwrap()),
         )
+    }
+
+    /// The raster canvas the payload declares — the Chrome-matching box
+    /// (capped at 1024/side), which is the bitmap's intrinsic size for the
+    /// axes the element leaves unspecified.
+    fn raster_attrs(pairs: &[(String, Vec<u8>)]) -> (u32, u32) {
+        let markup = std::str::from_utf8(&pairs[0].1).unwrap();
+        let grab = |name: &str| -> u32 {
+            let pat = format!("{name}=\"");
+            let i = markup.find(&pat).unwrap() + pat.len();
+            markup[i..].split('"').next().unwrap().parse().unwrap()
+        };
+        (grab("width"), grab("height"))
     }
 
     #[test]
@@ -463,7 +489,7 @@ mod tests {
         assert_eq!(img.children().count(), 0, "subtree consumed");
         let src = img.attr("src").unwrap();
         assert!(src.starts_with(INLINE_SVG_PREFIX), "synthetic src: {src}");
-        assert_eq!(img_attrs(&doc), (100, 40));
+        assert_eq!(img_attrs(&doc), (Some(100), Some(40)));
         assert_eq!(pairs.len(), 1);
         assert_eq!(pairs[0].0, src, "payload registered under the img's key");
         let markup = std::str::from_utf8(&pairs[0].1).unwrap();
@@ -500,24 +526,49 @@ mod tests {
     #[test]
     fn sizes_match_chrome_measurements() {
         // Each row cites headless Chromium 139 (see module docs; container
-        // 800px). The container-stretch rows use the viewport width here.
+        // 800px). The RASTER canvas carries the Chrome box (it is the
+        // bitmap's intrinsic size); the element only keeps the attrs the
+        // source declared, so CSS single-axis sizing derives the other axis
+        // from the intrinsic ratio exactly as Chrome does (bbc's
+        // `height:28px` viewBox-only logo).
         let cases = [
-            ("<svg width='100' height='40'/>", (100, 40)),
-            ("<svg width='200' viewBox='0 0 100 50'/>", (200, 100)),
-            ("<svg height='100' viewBox='0 0 100 50'/>", (200, 100)),
-            ("<svg width='200'/>", (200, 150)),
-            ("<svg height='80'/>", (300, 80)),
-            ("<svg viewBox='0 0 400 100'/>", (800, 200)),
-            ("<svg viewBox='0 0 100 400'/>", (800, 3200)),
-            ("<svg/>", (300, 150)),
-            ("<svg width='120px' height='60px'/>", (120, 60)),
+            (
+                "<svg width='100' height='40'/>",
+                (100, 40),
+                (Some(100), Some(40)),
+            ),
+            (
+                "<svg width='200' viewBox='0 0 100 50'/>",
+                (200, 100),
+                (Some(200), None),
+            ),
+            (
+                "<svg height='100' viewBox='0 0 100 50'/>",
+                (200, 100),
+                (None, Some(100)),
+            ),
+            ("<svg width='200'/>", (200, 150), (Some(200), None)),
+            ("<svg height='80'/>", (300, 80), (None, Some(80))),
+            ("<svg viewBox='0 0 400 100'/>", (800, 200), (None, None)),
+            ("<svg viewBox='0 0 100 400'/>", (256, 1024), (None, None)),
+            ("<svg/>", (300, 150), (None, None)),
+            (
+                "<svg width='120px' height='60px'/>",
+                (120, 60),
+                (Some(120), Some(60)),
+            ),
             // Percent lengths resolve against a box we don't know pre-style:
             // treated as absent, falling into the stretch row (Chrome: 400×200).
-            ("<svg width='50%' viewBox='0 0 100 50'/>", (800, 400)),
+            (
+                "<svg width='50%' viewBox='0 0 100 50'/>",
+                (800, 400),
+                (None, None),
+            ),
         ];
-        for (html, want) in cases {
-            let (doc, _) = transform(html, 800);
-            assert_eq!(img_attrs(&doc), want, "case {html}");
+        for (html, want_raster, want_attrs) in cases {
+            let (doc, pairs) = transform(html, 800);
+            assert_eq!(raster_attrs(&pairs), want_raster, "raster for {html}");
+            assert_eq!(img_attrs(&doc), want_attrs, "attrs for {html}");
         }
     }
 
@@ -526,7 +577,7 @@ mod tests {
         // viewBox-only 1:4 at a 1280 viewport: box 1280×5120 (Chrome's stretch
         // rule), bitmap capped to 1024 on the longest side, ratio preserved.
         let (doc, pairs) = transform("<svg viewBox='0 0 100 400'/>", 1280);
-        assert_eq!(img_attrs(&doc), (1280, 5120));
+        assert_eq!(img_attrs(&doc), (None, None), "no synthesized attrs");
         let markup = std::str::from_utf8(&pairs[0].1).unwrap();
         assert!(
             markup.contains("width=\"256\"") && markup.contains("height=\"1024\""),
