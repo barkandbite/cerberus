@@ -731,11 +731,15 @@ fn find_ci(haystack: &str, needle: &str) -> Option<usize> {
     })
 }
 
-/// Decode HTML entities, collapse runs of *collapsible* whitespace to single
-/// spaces, and trim. Only ASCII whitespace collapses: `&nbsp;` (U+00A0) is a
+/// Decode HTML entities and collapse runs of *collapsible* whitespace to
+/// single spaces — INCLUDING a leading/trailing run, which collapses to one
+/// space rather than being trimmed. That boundary space is meaningful across
+/// inline elements (`provided by <a>…` keeps its word gap; `<a>RFC 6761</a>,`
+/// has none — issue #137); layout's whitespace processing decides whether it
+/// renders. Only ASCII whitespace collapses: `&nbsp;` (U+00A0) is a
 /// non-breaking space that CSS whitespace processing preserves verbatim, so it
-/// must survive collapsing and trimming — hence `is_ascii_whitespace` rather than
-/// the Unicode `is_whitespace`, which would fold NBSP into a plain breakable space.
+/// must survive collapsing — hence `is_ascii_whitespace` rather than the
+/// Unicode `is_whitespace`, which would fold NBSP into a plain breakable space.
 fn clean_text(raw: &str) -> String {
     let decoded = decode_entities(raw);
     let mut out = String::with_capacity(decoded.len());
@@ -751,8 +755,7 @@ fn clean_text(raw: &str) -> String {
             prev_space = false;
         }
     }
-    out.trim_matches(|c: char| c.is_ascii_whitespace())
-        .to_string()
+    out
 }
 
 fn decode_entities(s: &str) -> String {

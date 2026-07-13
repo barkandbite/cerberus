@@ -519,6 +519,15 @@ struct Ctx<'a> {
     /// wrap point Chrome takes (shifting everything below). Reset at each
     /// line start; glyph runs already carry their own remainder internally.
     x_frac: f32,
+    /// A collapsible space from the SOURCE text is pending before the next
+    /// word/run (issue #137). Whitespace state must cross inline-element
+    /// boundaries: `<a>RFC 6761</a>, a` has NO space before the comma (the
+    /// old x-position heuristic invented one → "6761 , a"), while
+    /// `by <span nowrap>Public…` has a real one that the nowrap fast path
+    /// dropped → "byPublic". Set by `add_text` from each text node's actual
+    /// leading/inter-word/trailing whitespace; consumed by the next
+    /// `add_word`/`add_run` placement.
+    pending_space: bool,
     line: Vec<LinePiece>,
     line_align: TextAlign,
     /// Output-buffer lengths at the start of the current line, so `text-align`
@@ -614,6 +623,7 @@ impl<'a> Ctx<'a> {
             line_hf: 0.0,
             line_frac: 0.0,
             x_frac: 0.0,
+            pending_space: false,
             line: Vec::new(),
             line_align: TextAlign::Left,
             line_disp0: 0,
@@ -682,6 +692,7 @@ impl<'a> Ctx<'a> {
             line_hf: 0.0,
             line_frac: 0.0,
             x_frac: 0.0,
+            pending_space: false,
             line: Vec::new(),
             line_align: TextAlign::Left,
             line_disp0: 0,
@@ -1405,6 +1416,14 @@ impl<'a> Ctx<'a> {
             }
         };
         let ws = style.white_space;
+        // Collapsible whitespace state crosses element boundaries (#137):
+        // leading whitespace arms `pending_space` for the first word, inter-word
+        // whitespace re-arms it between words, and after the node it reflects
+        // the node's TRAILING whitespace — so `provided by <a>…` keeps its real
+        // space and `<a>RFC 6761</a>,` gets none. A whitespace-only node
+        // (`</a> <a>`) arms the flag without placing anything.
+        let starts_ws = text.starts_with(|c: char| c.is_ascii_whitespace());
+        let ends_ws = text.ends_with(|c: char| c.is_ascii_whitespace());
         if ws.preserves_newlines() {
             // `pre`/`pre-wrap`/`pre-line`: an explicit `\n` is a hard break. Each
             // resulting line then either preserves its spaces (and maybe wraps) or
@@ -1432,23 +1451,41 @@ impl<'a> Ctx<'a> {
                     // are preserved and the collapsed words still wrap.
                     for word in line.split_ascii_whitespace() {
                         self.add_word(word, style, href);
+                        self.pending_space = true;
                     }
                 }
             }
+            // Preserved-space content manages its own spacing literally.
+            self.pending_space = false;
         } else if !ws.wraps() {
             // `white-space: nowrap`: collapse runs of whitespace to single spaces
             // like normal text, but place the whole thing as one atomic run so it
             // never wraps (it may overflow the container, per spec).
+            if starts_ws {
+                self.pending_space = true;
+            }
             let collapsed = text.split_ascii_whitespace().collect::<Vec<_>>().join(" ");
             if !collapsed.is_empty() {
                 self.add_run(&collapsed, style, href);
+                self.pending_space = ends_ws;
+            } else if !text.is_empty() {
+                self.pending_space = true;
             }
         } else {
             // Split on ASCII whitespace only, so a non-breaking space (`&nbsp;`,
             // U+00A0) keeps the words it joins on the same line rather than
             // becoming a wrap opportunity.
+            if starts_ws {
+                self.pending_space = true;
+            }
+            let mut placed_any = false;
             for word in text.split_ascii_whitespace() {
                 self.add_word(word, style, href);
+                self.pending_space = true;
+                placed_any = true;
+            }
+            if placed_any {
+                self.pending_space = ends_ws;
             }
         }
     }
@@ -1516,11 +1553,18 @@ impl<'a> Ctx<'a> {
         // The gap is FRACTIONAL (`x_frac` carries the sub-pixel remainder) and
         // the wrap test compares the fractional total, matching how Chrome
         // accumulates advances across the line.
+        // A gap only where the SOURCE text had whitespace (`pending_space`,
+        // #137): `<a>RFC 6761</a>,` has no space before the comma, and the old
+        // x-position heuristic invented one ("6761 , a"), misrendering and
+        // flipping wrap points.
         let gap_f = if at_line_start {
             std::mem::take(&mut self.pending_indent) as f32
-        } else {
+        } else if self.pending_space {
             (space_width_f(self.shaper, px, style.font_family) + style.word_spacing as f32).max(0.0)
+        } else {
+            0.0
         };
+        self.pending_space = false;
         if !at_line_start && self.x as f32 + self.x_frac + gap_f + w as f32 > self.right as f32 {
             self.newline();
         } else {
@@ -1549,7 +1593,15 @@ impl<'a> Ctx<'a> {
         // trick that hides a button's fallback label behind its sprite icon.
         if self.x == self.left {
             self.x += std::mem::take(&mut self.pending_indent);
+        } else if self.pending_space {
+            // A real space precedes this run in the source (`by <span
+            // nowrap>Public…` — the nowrap fast path used to eat it: #137).
+            self.advance_x_f(
+                (space_width_f(self.shaper, px, style.font_family) + style.word_spacing as f32)
+                    .max(0.0),
+            );
         }
+        self.pending_space = false;
         // `text-overflow: ellipsis`: when this clipped, non-wrapping run would
         // overflow the box, drop the tail glyphs and append `…` so the visible
         // text ends within the box.
@@ -2240,11 +2292,28 @@ impl<'a> Ctx<'a> {
                 e.rect = offset_rect(e.rect, offset, 0);
             }
         }
+        // Underline continuity (#137): a multi-word link underlines its
+        // inter-word gaps too — Chrome rules the whole anchor, not word
+        // islands. Extend each underlined piece's rule to the start of the
+        // next piece when it continues the same link on the same baseline.
+        let mut under_w: Vec<u32> = Vec::with_capacity(self.line.len());
+        for i in 0..self.line.len() {
+            let p = &self.line[i];
+            let mut w = p.w;
+            if p.underline && p.href.is_some() {
+                if let Some(n) = self.line.get(i + 1) {
+                    if n.underline && n.y == p.y && n.href == p.href {
+                        w = w.max((n.x - p.x).max(0) as u32);
+                    }
+                }
+            }
+            under_w.push(w);
+        }
         // Drain through a moved-out buffer so the line `Vec`'s capacity is kept
         // for the next line instead of being dropped each commit (`mem::take`
         // would leave a zero-capacity `Vec`).
         let mut line = std::mem::take(&mut self.line);
-        for piece in line.drain(..) {
+        for (i, piece) in line.drain(..).enumerate() {
             let x = piece.x + offset;
             self.display.push(DisplayItem::Glyphs {
                 origin: Point::new(x, piece.y),
@@ -2254,7 +2323,7 @@ impl<'a> Ctx<'a> {
             });
             if piece.underline {
                 self.display.push(DisplayItem::Rect {
-                    rect: Rect::new(x, piece.y + piece.px as i32, piece.w, 1),
+                    rect: Rect::new(x, piece.y + piece.px as i32, under_w[i], 1),
                     color: piece.color,
                 });
             }
@@ -2311,6 +2380,7 @@ impl<'a> Ctx<'a> {
         self.line_hf = 0.0;
         self.line_frac = 0.0;
         self.x_frac = 0.0;
+        self.pending_space = false;
         self.line.clear();
         self.line_align = TextAlign::Left;
         self.cur_link_node = None;
@@ -5899,6 +5969,78 @@ mod tests {
         assert!(
             count_glyph_items(&grid) >= 2,
             "grid: both the bare text and the span render"
+        );
+    }
+
+    #[test]
+    fn whitespace_state_crosses_inline_boundaries() {
+        // #137: spacing must come from the SOURCE text, not the x-position
+        // heuristic. An inline element boundary adds nothing by itself, so
+        // `<a>RFC 6761</a>, a` must render pixel-identically to the plain text
+        // `RFC 6761, a` (no phantom space before the comma), and a real space
+        // before a nowrap span must survive the atomic-run fast path.
+        let glyph_xs = |laid: &LaidOut| {
+            let mut xs: Vec<i32> = laid
+                .display
+                .items
+                .iter()
+                .filter_map(|i| match i {
+                    DisplayItem::Glyphs { origin, .. } => Some(origin.x),
+                    _ => None,
+                })
+                .collect();
+            xs.sort_unstable();
+            xs
+        };
+        let linked = lay("<p style='margin:0'><a href='#x'>RFC 6761</a>, a</p>", 600);
+        let plain = lay("<p style='margin:0'>RFC 6761, a</p>", 600);
+        // The linked version splits into more pieces, but every piece must sit
+        // where the plain text's words sit: the union of x-origins of the
+        // plain render must be a subset of the linked one at identical x.
+        let (lx, px) = (glyph_xs(&linked), glyph_xs(&plain));
+        assert_eq!(
+            lx.first(),
+            px.first(),
+            "first word starts at the same x: {lx:?} vs {px:?}"
+        );
+        assert_eq!(
+            lx.last(),
+            px.last(),
+            "no phantom space shifts the tail: {lx:?} vs {px:?}"
+        );
+
+        let nowrap = lay(
+            "<p style='margin:0'>by <span style='white-space:nowrap'>Public</span></p>",
+            600,
+        );
+        let nowrap_plain = lay("<p style='margin:0'>by Public</p>", 600);
+        assert_eq!(
+            glyph_xs(&nowrap).last(),
+            glyph_xs(&nowrap_plain).last(),
+            "the space before a nowrap span is kept (was eaten: 'byPublic')"
+        );
+    }
+
+    #[test]
+    fn multi_word_link_underline_is_continuous() {
+        // #137 facet: Chrome underlines the whole anchor including inter-word
+        // gaps; per-word rules left gaps ('RFC 2606' underlined only '2606').
+        let laid = lay("<p style='margin:0'><a href='#x'>two words</a></p>", 600);
+        let mut rules: Vec<Rect> = laid
+            .display
+            .items
+            .iter()
+            .filter_map(|i| match i {
+                DisplayItem::Rect { rect, .. } if rect.h == 1 => Some(*rect),
+                _ => None,
+            })
+            .collect();
+        rules.sort_by_key(|r| r.x);
+        assert_eq!(rules.len(), 2, "one rule per piece: {rules:?}");
+        assert_eq!(
+            rules[0].x + rules[0].w as i32,
+            rules[1].x,
+            "first word's rule extends across the gap to the second: {rules:?}"
         );
     }
 
