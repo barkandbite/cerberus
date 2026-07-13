@@ -438,14 +438,14 @@ Ranked movers (impact × breadth ÷ effort). Status updates in-place as fixes la
 | 7 | Grid explicit line placement (`grid-column: 2/9`, `1/-1`) ignored | HIGH | mozilla hero | **DONE** |
 | 8 | `<center>`/-webkit-center leaks across table-cell boundary | HIGH | hn (~187px shift) | **DONE** |
 | 9 | Table row-height trio: cell-less `<tr height>`, line floor on table font, lost trailing cell margin | HIGH | hn, wikipedia, iana | **DONE** |
-| 10 | Glyph AA raster differs from FreeType | HIGH-floor | all | **2/3 FIXED** (integer baseline + sub-pixel pen: 71→35% of ink >32 off; residual is FreeType light-hinting's vertical grid-fit, unreachable without a hinter — fitted tone LUTs measure as no-ops, fractional word-origin carry measured WORSE and was reverted) |
+| 10 | Glyph AA raster differs from FreeType | HIGH-floor | all | **DONE** (skrifa auto-hinter light — Chrome's mode, measured: cores 34.9→20.1% >32-off; residual is stem-phase AA + integer word origins) (integer baseline + sub-pixel pen: 71→35% of ink >32 off; residual is FreeType light-hinting's vertical grid-fit, unreachable without a hinter — fitted tone LUTs measure as no-ops, fractional word-origin carry measured WORSE and was reverted) |
 | 11 | Inline-image strut descent missing from line box | MED | iana, bbc, apple | **DONE** |
 | 12 | Whitespace at inline boundaries (#137): phantom space before punctuation, eaten space before nowrap, per-word underline | MED | every prose page | **DONE** (+float-band guard) |
 | 13 | calc() resolves % against font-size (wrong, often negative) | MED | iana, apple, mozilla, bbc | **DONE** |
 | 14 | clip:rect/clip-path sr-only pattern → stray visible text | MED | bbc, mozilla, iana, apple | **DONE** |
 | 15 | :has() (and :is/:where) drop whole rules | MED | apple, mozilla, iana | **DONE** (child subset) |
 | 16 | transform:translate static subset (centering, offscreen parking) | MED | apple, bbc, mozilla | backlog |
-| 17 | inline-flex/inline-grid break the inline context; CSS tables flattened | MED | iana, bbc, apple | backlog |
+| 17 | inline-flex/inline-grid break the inline context; CSS tables flattened | MED | iana, bbc, apple | **DONE** (atomic inline + table-cell rows) |
 | 18 | List markers placed inside (Chrome: outside) | MED | all list pages | **DONE** |
 | 19 | min()/max()/clamp() unparsed | LOW | apple, bbc, mozilla | **DONE** |
 | 20 | letter/word-spacing quantized to i32 px | LOW | apple, bbc | backlog |
@@ -487,3 +487,8 @@ data-animation-running set by JS); the static fallback is display:none unless
 .no-js. Rendering it faithfully needs the animation state machine, not more
 CSS - parked below the fold of this rubric. The computed-fill injection that
 investigation produced is landed and benefits every CSS-painted inline svg.
+
+Scoreboard 2026-07-13 (hinted raster + inline-flex round): example 1.84,
+iana 10.94, mfws 12.57, rfc1 4.90, wikipedia 10.18, hn 14.14, mozilla 14.74,
+apple 12.27, bbc 15.06. Every text page improved with hinting; the first
+sub-5% brand-corpus page (rfc1 4.90) landed this round.
