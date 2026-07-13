@@ -185,6 +185,7 @@ impl CssEngine {
             // applied last, tops author `!important`). The UA sheet declares no
             // `!important`, so UA-important is not separately elevated.
             let viewport = (self.media.width as f32, self.media.height as f32);
+            let mut pending = PendingHidden::default();
             for (_, _, _, decls) in &matched {
                 apply_declarations(
                     &mut style,
@@ -194,6 +195,7 @@ impl CssEngine {
                     &vars,
                     false,
                     viewport,
+                    &mut pending,
                 );
             }
             if let Some(decls) = &inline {
@@ -205,6 +207,7 @@ impl CssEngine {
                     &vars,
                     false,
                     viewport,
+                    &mut pending,
                 );
             }
             for (_, _, _, decls) in &matched {
@@ -216,6 +219,7 @@ impl CssEngine {
                     &vars,
                     true,
                     viewport,
+                    &mut pending,
                 );
             }
             if let Some(decls) = &inline {
@@ -227,8 +231,13 @@ impl CssEngine {
                     &vars,
                     true,
                     viewport,
+                    &mut pending,
                 );
             }
+            // An all-hiding `clip`/`clip-path` (sr-only patterns) folds into
+            // `visibility: hidden` once every pass has run — `clip` needs the
+            // final `position`, which any of the passes may have set.
+            pending.finalize(&mut style);
         }
 
         let child_root_font_size = if node.tag() == "html" {
@@ -870,6 +879,33 @@ impl CalcParser<'_> {
 /// Initial root font-size in px (the base for `rem` before any `html {font-size}`).
 const INITIAL_ROOT_FONT_PX: u32 = 16;
 
+/// Cross-declaration state accumulated over one element's cascade passes and
+/// finalized in `build` after all of them: whether the last `clip` /
+/// `clip-path` declaration collapses the element to nothing (the `sr-only`
+/// accessibility-hiding patterns). Deferred because `clip` only applies to
+/// absolutely positioned boxes and `position` may be declared in any rule /
+/// order relative to the `clip` (alphabetized blocks put `clip` first).
+#[derive(Default)]
+struct PendingHidden {
+    /// `clip: rect(...)` left an empty visible region.
+    clip: bool,
+    /// `clip-path: inset(...)` insets away the whole box.
+    clip_path: bool,
+}
+
+impl PendingHidden {
+    /// Fold into the computed style: an all-hiding clip behaves like
+    /// `visibility: hidden` (laid out, not painted, inherited by children) —
+    /// reusing that mechanism means layout/paint need no changes. Real
+    /// (partial) clipping is not modeled; only the invisible case applies.
+    fn finalize(&self, style: &mut ComputedStyle) {
+        let clip_applies = matches!(style.position, Position::Absolute | Position::Fixed);
+        if self.clip_path || (self.clip && clip_applies) {
+            style.visibility = Visibility::Hidden;
+        }
+    }
+}
+
 // The cascade threads per-element bases (parent/root font size, viewport) that
 // vary per call; bundling them would not aid readability (same as `build`).
 #[allow(clippy::too_many_arguments)]
@@ -881,6 +917,7 @@ fn apply_declarations(
     vars: &Vars,
     important: bool,
     viewport: (f32, f32),
+    pending: &mut PendingHidden,
 ) {
     for (prop, value, is_important) in decls {
         // This pass only applies declarations of the matching importance, so the
@@ -1210,6 +1247,13 @@ fn apply_declarations(
                     _ => style.visibility,
                 }
             }
+            // Accessibility hiding: only the *all-hiding* clip forms are
+            // modeled (finalized via `PendingHidden` after the cascade); a
+            // partially-clipping value is treated as visible — we never
+            // attempt real clipping. The last declaration wins, so a visible
+            // `auto`/`none`/partial value overrides an earlier hiding one.
+            "clip" => pending.clip = clip_rect_hides(v, style.font_size as f32),
+            "clip-path" => pending.clip_path = clip_path_inset_hides(v),
             "opacity" => {
                 if let Some(o) = parse_opacity(v) {
                     style.opacity = o;
@@ -1347,6 +1391,59 @@ fn apply_declarations(
             _ => {}
         }
     }
+}
+
+/// Whether a `clip` value is a `rect(...)` that leaves (essentially) nothing
+/// visible: all four edges parse as lengths ≤ 1px — the screen-reader-only
+/// patterns `rect(0, 0, 0, 0)` and `rect(1px, 1px, 1px, 1px)` (the visible
+/// region is `left..right × top..bottom`, so those are empty). `auto` edges or
+/// larger rects leave content visible and return false.
+fn clip_rect_hides(v: &str, em: f32) -> bool {
+    let t = v.trim().to_ascii_lowercase();
+    let Some(inner) = t.strip_prefix("rect(").and_then(|s| s.strip_suffix(')')) else {
+        return false;
+    };
+    // Both the comma and the legacy space-separated forms are valid.
+    let edges: Vec<&str> = inner
+        .split(|c: char| c == ',' || c.is_whitespace())
+        .filter(|s| !s.is_empty())
+        .collect();
+    edges.len() == 4
+        && edges
+            .iter()
+            .all(|e| parse_css_px(e, em).is_some_and(|px| px <= 1.0))
+}
+
+/// Whether a `clip-path` value is an `inset(...)` that insets away the whole
+/// box: opposite percentage insets summing to ≥ 100% on either axis (e.g. the
+/// sr-only `inset(50%)`, or `inset(100%)`). Pixel insets can't be judged
+/// without the box size and count as 0 (conservative: never hide unless the
+/// percentages alone guarantee it) — Chrome shows `inset(0 0 50% 0)` half-
+/// visible, and so do we (visible).
+fn clip_path_inset_hides(v: &str) -> bool {
+    let t = v.trim().to_ascii_lowercase();
+    let Some(inner) = t.strip_prefix("inset(").and_then(|s| s.strip_suffix(')')) else {
+        return false;
+    };
+    // 1–4 values (top/right/bottom/left, CSS order), before any `round` radius.
+    let vals: Vec<&str> = inner
+        .split_whitespace()
+        .take_while(|tok| *tok != "round")
+        .collect();
+    let pct = |i: usize| -> f32 {
+        vals.get(i)
+            .and_then(|tok| tok.strip_suffix('%'))
+            .and_then(|n| n.trim().parse::<f32>().ok())
+            .unwrap_or(0.0)
+    };
+    let (top, right, bottom, left) = match vals.len() {
+        1 => (pct(0), pct(0), pct(0), pct(0)),
+        2 => (pct(0), pct(1), pct(0), pct(1)),
+        3 => (pct(0), pct(1), pct(2), pct(1)),
+        4 => (pct(0), pct(1), pct(2), pct(3)),
+        _ => return false,
+    };
+    top + bottom >= 100.0 || left + right >= 100.0
 }
 
 fn parse_bg_color(v: &str) -> Option<Color> {
@@ -2587,6 +2684,106 @@ mod tests {
         assert_eq!(
             first(&dom.root, "p").unwrap().style.visibility,
             Visibility::Hidden
+        );
+    }
+
+    // ---- sr-only hiding via clip / clip-path (FIX 3) ----
+
+    #[test]
+    fn sr_only_clip_rect_hides_positioned_element() {
+        // The Bootstrap `.visually-hidden` / classic sr-only pattern: the
+        // "Skip to content" link must not paint (bbc/mozilla/iana/apple).
+        let html = "<style>.sr{position:absolute;width:1px;height:1px;clip:rect(0,0,0,0)}\
+                    </style><a class='sr' href='#main'>Skip to content</a><p>body</p>";
+        let dom = CssEngine::new().style(&parse_html(html));
+        assert_eq!(
+            first(&dom.root, "a").unwrap().style.visibility,
+            Visibility::Hidden
+        );
+        assert_eq!(
+            first(&dom.root, "p").unwrap().style.visibility,
+            Visibility::Visible
+        );
+        // The legacy space-separated 1px rect hides too (right − left = 0),
+        // and the hidden visibility reaches children by inheritance.
+        let dom2 = CssEngine::new().style(&parse_html(
+            "<div style='position:absolute;clip:rect(1px 1px 1px 1px)'><span>x</span></div>",
+        ));
+        assert_eq!(
+            first(&dom2.root, "span").unwrap().style.visibility,
+            Visibility::Hidden
+        );
+    }
+
+    #[test]
+    fn clip_requires_absolute_positioning_but_not_declaration_order() {
+        // Per CSS (Chrome-verified), `clip` applies only to absolutely
+        // positioned boxes: a static element keeps painting.
+        let stat = CssEngine::new().style(&parse_html("<div style='clip:rect(0,0,0,0)'>x</div>"));
+        assert_eq!(
+            first(&stat.root, "div").unwrap().style.visibility,
+            Visibility::Visible
+        );
+        // Alphabetized blocks declare `clip` before `position`, and `position`
+        // may come from a different rule entirely; the check runs after the
+        // whole cascade, so both still hide.
+        let html = "<style>.a{clip:rect(0,0,0,0)} .b{position:absolute}</style>\
+                    <i class='a b'>x</i>";
+        let dom = CssEngine::new().style(&parse_html(html));
+        assert_eq!(
+            first(&dom.root, "i").unwrap().style.visibility,
+            Visibility::Hidden
+        );
+        let fixed = CssEngine::new().style(&parse_html(
+            "<div style='clip:rect(0,0,0,0);position:fixed'>x</div>",
+        ));
+        assert_eq!(
+            first(&fixed.root, "div").unwrap().style.visibility,
+            Visibility::Hidden
+        );
+    }
+
+    #[test]
+    fn visible_clip_values_do_not_hide_and_can_override() {
+        // The last declaration wins: `auto` restores a previously-hidden clip.
+        let auto = CssEngine::new().style(&parse_html(
+            "<div style='position:absolute;clip:rect(0,0,0,0);clip:auto'>x</div>",
+        ));
+        assert_eq!(
+            first(&auto.root, "div").unwrap().style.visibility,
+            Visibility::Visible
+        );
+        // A rect that leaves a visible region is ignored (no real clipping).
+        let partial = CssEngine::new().style(&parse_html(
+            "<div style='position:absolute;clip:rect(0, 100px, 100px, 0)'>x</div>",
+        ));
+        assert_eq!(
+            first(&partial.root, "div").unwrap().style.visibility,
+            Visibility::Visible
+        );
+    }
+
+    #[test]
+    fn clip_path_inset_hides_only_when_fully_inset() {
+        let vis = |css: &str| {
+            let dom = CssEngine::new().style(&parse_html(&format!("<div style='{css}'>x</div>")));
+            first(&dom.root, "div").unwrap().style.visibility
+        };
+        // Fully-insetting values hide — no positioning requirement (unlike clip).
+        assert_eq!(vis("clip-path:inset(50%)"), Visibility::Hidden);
+        assert_eq!(vis("clip-path:inset(100%)"), Visibility::Hidden);
+        assert_eq!(vis("clip-path:inset(50% 50%)"), Visibility::Hidden);
+        // A `round` radius suffix doesn't confuse the parse.
+        assert_eq!(vis("clip-path:inset(50% round 8px)"), Visibility::Hidden);
+        // Chrome shows half the box for a one-sided 50% inset — stay visible.
+        assert_eq!(vis("clip-path:inset(0 0 50% 0)"), Visibility::Visible);
+        // px insets can't be judged without the box; other shapes are ignored.
+        assert_eq!(vis("clip-path:inset(10px)"), Visibility::Visible);
+        assert_eq!(vis("clip-path:circle(40%)"), Visibility::Visible);
+        // Last declaration wins: `none` restores.
+        assert_eq!(
+            vis("clip-path:inset(50%);clip-path:none"),
+            Visibility::Visible
         );
     }
 
