@@ -82,3 +82,28 @@ behind the same `ImageDecoder`, sniffed in `ImageCodec::decode` and rasterized
 under the same 1600px cap. Real-site decode jumped (rust-lang 0/9 → 9/9,
 Wikipedia 6/12 → 9/12). Details and the anti-fingerprinting rationale for
 disabling SVG text are in ADR-0009.
+
+## Update — 2026-07-13: hinted glyph rasterization via skrifa
+
+New dependency: **`skrifa` 0.44.0** (MIT OR Apache-2.0; Google Fonts'
+pure-Rust font scaler — the FreeType replacement inside Chrome's own font
+stack roadmap), plus a direct dep on `ab_glyph_rasterizer` (Apache-2.0,
+already in-tree transitively). Transitive additions: `read-fonts`,
+`font-types` (both MIT OR Apache-2.0), `bytemuck`, `once_cell`. Pure Rust
+throughout — no C bindings, consistent with this ADR's CVE-containment
+stance. FreeType C bindings were rejected outright.
+
+Why: the reference Chrome rasterizes through FreeType light hinting, which
+grid-fits stem edges vertically. Our unhinted `ab_glyph` outlines spread that
+coverage, measured as ~35% of ink pixels >32 gray levels off Chrome on a
+pixel-aligned calibration page even with Blink-exact layout. `cerberus-text`
+now draws glyph outlines through skrifa's **auto-hinter in light mode**
+(measured best: 34.9% → 20.1% |Δ|>32, mean |Δ| 36.3 → 24.8; the TrueType
+bytecode interpreter in light mode measured 26.5%), filled by
+`ab_glyph_rasterizer`. Shaping (rustybuzz ids + fractional advances), the
+integer baseline, and layout metrics are unchanged; `ab_glyph` remains for
+vertical metrics and as the per-glyph fallback fill if hinting fails.
+
+Anti-fingerprinting is unaffected: hinting reads only the bundled font bytes
+through a deterministic interpreter — no system fonts, no system FreeType, no
+per-host state. See `crates/cerberus-text/src/hinted.rs`.
