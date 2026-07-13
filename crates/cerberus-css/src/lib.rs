@@ -184,6 +184,7 @@ impl CssEngine {
             // higher origin/specificity/order still wins (inline `!important`,
             // applied last, tops author `!important`). The UA sheet declares no
             // `!important`, so UA-important is not separately elevated.
+            let viewport = (self.media.width as f32, self.media.height as f32);
             for (_, _, _, decls) in &matched {
                 apply_declarations(
                     &mut style,
@@ -192,6 +193,7 @@ impl CssEngine {
                     root_font_size,
                     &vars,
                     false,
+                    viewport,
                 );
             }
             if let Some(decls) = &inline {
@@ -202,6 +204,7 @@ impl CssEngine {
                     root_font_size,
                     &vars,
                     false,
+                    viewport,
                 );
             }
             for (_, _, _, decls) in &matched {
@@ -212,6 +215,7 @@ impl CssEngine {
                     root_font_size,
                     &vars,
                     true,
+                    viewport,
                 );
             }
             if let Some(decls) = &inline {
@@ -222,6 +226,7 @@ impl CssEngine {
                     root_font_size,
                     &vars,
                     true,
+                    viewport,
                 );
             }
         }
@@ -388,10 +393,10 @@ fn collect_vars(
 /// Resolve `var()` substitutions and `calc()` math in a raw declaration value,
 /// yielding a plain CSS value the existing property parsers can consume. Most
 /// values contain neither, so the fast path returns them untouched.
-fn resolve_value(value: &str, vars: &Vars, em: f32) -> String {
+fn resolve_value(value: &str, vars: &Vars, ctx: CalcCtx) -> String {
     let has_var = value.contains("var(");
-    let has_calc = value.contains("calc(");
-    if !has_var && !has_calc {
+    let has_math = find_math_fn(value).is_some();
+    if !has_var && !has_math {
         return value.to_string();
     }
     let substituted = if has_var {
@@ -399,8 +404,8 @@ fn resolve_value(value: &str, vars: &Vars, em: f32) -> String {
     } else {
         value.to_string()
     };
-    if substituted.contains("calc(") {
-        eval_calcs(&substituted, em)
+    if find_math_fn(&substituted).is_some() {
+        eval_calcs(&substituted, ctx)
     } else {
         substituted
     }
@@ -511,31 +516,148 @@ fn split_top_comma(s: &str) -> (&str, Option<&str>) {
     (s, None)
 }
 
-/// Replace every `calc(...)` in `input` with its evaluated length/number (in px
-/// where a unit is involved); leave a `calc()` we cannot evaluate untouched.
-fn eval_calcs(input: &str, em: f32) -> String {
+/// The math functions the value resolver evaluates.
+const MATH_FNS: [&str; 1] = ["calc("];
+
+/// Find the earliest math-function call in `s`, at a word boundary so a
+/// substring like the `max(` inside `minmax(...)` is never mistaken for one.
+/// Returns `(byte offset, matched name incl. '(')`.
+fn find_math_fn(s: &str) -> Option<(usize, &'static str)> {
+    let mut best: Option<(usize, &'static str)> = None;
+    for name in MATH_FNS {
+        let mut from = 0;
+        while let Some(rel) = s[from..].find(name) {
+            let pos = from + rel;
+            let bounded = pos == 0 || {
+                let prev = s.as_bytes()[pos - 1];
+                !(prev.is_ascii_alphanumeric() || prev == b'-' || prev == b'_')
+            };
+            if bounded {
+                if best.is_none_or(|(b, _)| pos < b) {
+                    best = Some((pos, name));
+                }
+                break;
+            }
+            from = pos + 1;
+        }
+    }
+    best
+}
+
+/// The bases a `calc()`/`min()`/`max()`/`clamp()` expression resolves its
+/// relative units against.
+#[derive(Clone, Copy)]
+struct CalcCtx {
+    /// The element's font size in px (the `em` base).
+    em: f32,
+    /// Viewport width/height in px (the `vw`/`vh`/`vmin`/`vmax` bases).
+    vw: f32,
+    vh: f32,
+    /// How `%` resolves for the property being parsed. `Some(base)` folds it to
+    /// px against `base` — correct only for the font-relative properties
+    /// (`font-size`/`line-height`/`vertical-align`). `None` keeps `%` symbolic:
+    /// the expression reduces to the canonical `a% + b·px`, and only a pure
+    /// form (`a == 0` or `b == 0`) resolves. A mixed result (e.g.
+    /// `calc(100% - 32px)` for a width) is left unresolved so the declaration
+    /// falls back to the prior/initial value instead of mis-resolving `%`
+    /// against the font size — Chrome resolves such `%` against the containing
+    /// block, which isn't known until layout, and `Len` has no combined
+    /// `%+px` variant (layout/taffy match on `Len` exhaustively, and
+    /// cerberus-layout must not be edited here).
+    pct_base: Option<f32>,
+}
+
+/// A partially-evaluated calc value in the canonical linear form `px + pct%`
+/// (`%` can't be folded into px without the containing block).
+#[derive(Clone, Copy, PartialEq, Debug)]
+struct CalcVal {
+    px: f32,
+    pct: f32,
+}
+
+impl CalcVal {
+    fn add(self, o: Self) -> Self {
+        CalcVal {
+            px: self.px + o.px,
+            pct: self.pct + o.pct,
+        }
+    }
+
+    fn sub(self, o: Self) -> Self {
+        CalcVal {
+            px: self.px - o.px,
+            pct: self.pct - o.pct,
+        }
+    }
+
+    /// Multiply; one side must be a plain number (no `%` component — unitless
+    /// numbers tokenize with their value in `px`, matching the old behavior).
+    fn mul(self, o: Self) -> Option<Self> {
+        if o.pct == 0.0 {
+            Some(CalcVal {
+                px: self.px * o.px,
+                pct: self.pct * o.px,
+            })
+        } else if self.pct == 0.0 {
+            Some(CalcVal {
+                px: o.px * self.px,
+                pct: o.pct * self.px,
+            })
+        } else {
+            None
+        }
+    }
+
+    /// Divide by a plain non-zero number.
+    fn div(self, o: Self) -> Option<Self> {
+        (o.pct == 0.0 && o.px != 0.0).then(|| CalcVal {
+            px: self.px / o.px,
+            pct: self.pct / o.px,
+        })
+    }
+}
+
+/// Print a resolved calc result as a plain CSS value: `px` when there is no
+/// `%` component, `N%` when it is purely a percentage (the property parsers
+/// then treat it exactly like a literal percentage), `None` when mixed.
+fn format_calc_val(v: CalcVal) -> Option<String> {
+    // Integer-ish results print without a trailing `.0`.
+    let fmt = |n: f32, unit: &str| {
+        if (n.round() - n).abs() < 1e-4 {
+            format!("{}{unit}", n.round() as i64)
+        } else {
+            format!("{n}{unit}")
+        }
+    };
+    if v.pct == 0.0 {
+        Some(fmt(v.px, "px"))
+    } else if v.px == 0.0 {
+        Some(fmt(v.pct, "%"))
+    } else {
+        None
+    }
+}
+
+/// Replace every math function ([`MATH_FNS`]) in `input` with its evaluated
+/// length/percentage; leave one we cannot evaluate untouched so the
+/// declaration fails to parse and falls back.
+fn eval_calcs(input: &str, ctx: CalcCtx) -> String {
     let mut out = String::new();
     let mut rest = input;
-    while let Some(pos) = rest.find("calc(") {
+    while let Some((pos, name)) = find_math_fn(rest) {
         out.push_str(&rest[..pos]);
-        let after = &rest[pos + 5..];
+        let after = &rest[pos + name.len()..];
         let Some((inner, tail)) = take_group(after) else {
             out.push_str(&rest[pos..]);
             return out;
         };
-        // Nested calc() inside this group resolves first.
-        let inner = eval_calcs(inner, em);
-        match eval_calc_expr(&inner, em) {
-            Some(px) => {
-                // Integer-ish results print without a trailing `.0`.
-                if (px.round() - px).abs() < 1e-4 {
-                    out.push_str(&format!("{}px", px.round() as i64));
-                } else {
-                    out.push_str(&format!("{px}px"));
-                }
-            }
+        // Nested math inside this group resolves first.
+        let inner = eval_calcs(inner, ctx);
+        let val = eval_calc_expr(&inner, ctx);
+        match val.and_then(format_calc_val) {
+            Some(s) => out.push_str(&s),
             None => {
-                out.push_str("calc(");
+                out.push_str(name);
                 out.push_str(&inner);
                 out.push(')');
             }
@@ -546,11 +668,11 @@ fn eval_calcs(input: &str, em: f32) -> String {
     out
 }
 
-/// Evaluate a `calc()` expression body to a px value, supporting `+ - * /`,
-/// parentheses, and px/em/rem/pt/% units (others convert via the same rules the
-/// length parser uses). Returns `None` if it cannot be reduced to a number.
-fn eval_calc_expr(expr: &str, em: f32) -> Option<f32> {
-    let tokens = tokenize_calc(expr, em)?;
+/// Evaluate a `calc()` expression body to the canonical `px + %` form,
+/// supporting `+ - * /`, parentheses, and px/em/rem/pt/vw/vh/vmin/vmax/%
+/// units. Returns `None` if it cannot be reduced.
+fn eval_calc_expr(expr: &str, ctx: CalcCtx) -> Option<CalcVal> {
+    let tokens = tokenize_calc(expr, ctx)?;
     let mut p = CalcParser {
         tokens: &tokens,
         i: 0,
@@ -563,10 +685,10 @@ fn eval_calc_expr(expr: &str, em: f32) -> Option<f32> {
     }
 }
 
-/// A `calc()` token: a resolved px/number value or an operator/paren.
+/// A `calc()` token: a resolved value or an operator/paren.
 #[derive(Clone, Copy, PartialEq)]
 enum CalcTok {
-    Num(f32),
+    Num(CalcVal),
     Plus,
     Minus,
     Mul,
@@ -575,7 +697,7 @@ enum CalcTok {
     Close,
 }
 
-fn tokenize_calc(expr: &str, em: f32) -> Option<Vec<CalcTok>> {
+fn tokenize_calc(expr: &str, ctx: CalcCtx) -> Option<Vec<CalcTok>> {
     let mut toks = Vec::new();
     let bytes = expr.as_bytes();
     let mut i = 0;
@@ -625,15 +747,25 @@ fn tokenize_calc(expr: &str, em: f32) -> Option<Vec<CalcTok>> {
                     i += 1;
                 }
                 let unit = &expr[unit_start..i];
-                let px = match unit.to_ascii_lowercase().as_str() {
-                    "" | "px" => num,
-                    "em" => num * em,
-                    "rem" => num * 16.0,
-                    "pt" => num * 96.0 / 72.0,
-                    "%" => num / 100.0 * em,
+                let px = |px: f32| CalcVal { px, pct: 0.0 };
+                let val = match unit.to_ascii_lowercase().as_str() {
+                    "" | "px" => px(num),
+                    "em" => px(num * ctx.em),
+                    "rem" => px(num * 16.0),
+                    "pt" => px(num * 96.0 / 72.0),
+                    "vw" => px(num / 100.0 * ctx.vw),
+                    "vh" => px(num / 100.0 * ctx.vh),
+                    "vmin" => px(num / 100.0 * ctx.vw.min(ctx.vh)),
+                    "vmax" => px(num / 100.0 * ctx.vw.max(ctx.vh)),
+                    // See `CalcCtx::pct_base`: fold against the font-relative
+                    // base, or keep the `%` symbolic for later reduction.
+                    "%" => match ctx.pct_base {
+                        Some(base) => px(num / 100.0 * base),
+                        None => CalcVal { px: 0.0, pct: num },
+                    },
                     _ => return None,
                 };
-                toks.push(CalcTok::Num(px));
+                toks.push(CalcTok::Num(val));
             }
         }
     }
@@ -655,38 +787,35 @@ impl CalcParser<'_> {
         self.tokens.get(self.i).copied()
     }
 
-    fn expr(&mut self) -> Option<f32> {
+    fn expr(&mut self) -> Option<CalcVal> {
         let mut v = self.term()?;
         while let Some(op @ (CalcTok::Plus | CalcTok::Minus)) = self.peek() {
             self.i += 1;
             let rhs = self.term()?;
             v = if op == CalcTok::Plus {
-                v + rhs
+                v.add(rhs)
             } else {
-                v - rhs
+                v.sub(rhs)
             };
         }
         Some(v)
     }
 
-    fn term(&mut self) -> Option<f32> {
+    fn term(&mut self) -> Option<CalcVal> {
         let mut v = self.factor()?;
         while let Some(op @ (CalcTok::Mul | CalcTok::Div)) = self.peek() {
             self.i += 1;
             let rhs = self.factor()?;
-            if op == CalcTok::Mul {
-                v *= rhs;
+            v = if op == CalcTok::Mul {
+                v.mul(rhs)?
             } else {
-                if rhs == 0.0 {
-                    return None;
-                }
-                v /= rhs;
-            }
+                v.div(rhs)?
+            };
         }
         Some(v)
     }
 
-    fn factor(&mut self) -> Option<f32> {
+    fn factor(&mut self) -> Option<CalcVal> {
         match self.peek()? {
             CalcTok::Num(n) => {
                 self.i += 1;
@@ -706,6 +835,9 @@ impl CalcParser<'_> {
 /// Initial root font-size in px (the base for `rem` before any `html {font-size}`).
 const INITIAL_ROOT_FONT_PX: u32 = 16;
 
+// The cascade threads per-element bases (parent/root font size, viewport) that
+// vary per call; bundling them would not aid readability (same as `build`).
+#[allow(clippy::too_many_arguments)]
 fn apply_declarations(
     style: &mut ComputedStyle,
     decls: &[(String, String, bool)],
@@ -713,6 +845,7 @@ fn apply_declarations(
     root_font_size: u32,
     vars: &Vars,
     important: bool,
+    viewport: (f32, f32),
 ) {
     for (prop, value, is_important) in decls {
         // This pass only applies declarations of the matching importance, so the
@@ -728,9 +861,20 @@ fn apply_declarations(
         // Fold `rem` to px against the root font-size up front (`em` stays for
         // per-element resolution), so downstream length parsers see px.
         let value = &substitute_rem(value, root_font_size as f32);
-        // Resolve `var()` references and `calc()` math before parsing the value.
-        // `em` for `calc()` uses the element's current font size.
-        let resolved = resolve_value(value, vars, style.font_size as f32);
+        // Resolve `var()` references and calc()/min()/max()/clamp() math before
+        // parsing the value. `em` uses the element's current font size; `%` only
+        // folds to px for the font-relative properties (see `CalcCtx`).
+        let ctx = CalcCtx {
+            em: style.font_size as f32,
+            vw: viewport.0,
+            vh: viewport.1,
+            pct_base: matches!(
+                prop.as_str(),
+                "font-size" | "line-height" | "vertical-align"
+            )
+            .then_some(style.font_size as f32),
+        };
+        let resolved = resolve_value(value, vars, ctx);
         // Then resolve the `currentColor` keyword against the color cascaded so
         // far, so it works anywhere a color appears (borders, backgrounds,
         // shadows, gradients) — not just as an unresolved literal.
@@ -2628,6 +2772,64 @@ mod tests {
         let p = first(&dom.root, "p").unwrap();
         assert_eq!(p.style.margin_top, Len::Px(24), "2*4 + 16(rem) = 24");
         assert_eq!(p.style.margin_left, Len::Px(24), "8 * 3 = 24");
+    }
+
+    // ---- calc() percentage base (FIX 1) ----
+
+    #[test]
+    fn calc_mixed_pct_px_fails_instead_of_resolving_against_font_size() {
+        // `width: calc(100% - 32px)` must not resolve `%` against the font size
+        // (that gave 16 - 32 = a negative width). The containing block isn't
+        // known at style time, so the declaration is dropped and the width
+        // falls back (auto) — Chrome on an 800px block computes 768px.
+        let dom =
+            CssEngine::new().style(&parse_html("<div style='width:calc(100% - 32px)'>x</div>"));
+        assert_eq!(first(&dom.root, "div").unwrap().style.width, Len::Auto);
+        // A longhand that only sets on parse success keeps its prior value.
+        let dom2 = CssEngine::new().style(&parse_html(
+            "<div style='margin-left:8px;margin-left:calc(100% - 32px)'>x</div>",
+        ));
+        assert_eq!(
+            first(&dom2.root, "div").unwrap().style.margin_left,
+            Len::Px(8)
+        );
+    }
+
+    #[test]
+    fn calc_pure_pct_reduces_to_a_percentage() {
+        // A %-only calc reduces to a plain percentage, which resolves against
+        // the containing block at layout — exactly like a literal `50%`.
+        let dom = CssEngine::new().style(&parse_html(
+            "<div style='width:calc(100%);margin-left:calc(25% + 25%)'>x</div>",
+        ));
+        let d = first(&dom.root, "div").unwrap();
+        assert_eq!(d.style.width, Len::Pct(100.0));
+        assert_eq!(d.style.margin_left, Len::Pct(50.0));
+        // % terms that cancel leave a plain px value.
+        let dom2 = CssEngine::new().style(&parse_html(
+            "<div style='width:calc(50% - 50% + 24px)'>x</div>",
+        ));
+        assert_eq!(first(&dom2.root, "div").unwrap().style.width, Len::Px(24));
+    }
+
+    #[test]
+    fn calc_pct_still_folds_for_font_relative_properties() {
+        // For font-size, `%` IS font-relative (of the inherited size), so a
+        // mixed calc still resolves: 100% of 16px + 2px = 18px (Chrome agrees).
+        let dom =
+            CssEngine::new().style(&parse_html("<p style='font-size:calc(100% + 2px)'>x</p>"));
+        assert_eq!(first(&dom.root, "p").unwrap().style.font_size, 18);
+    }
+
+    #[test]
+    fn calc_viewport_units_resolve_against_the_engine_viewport() {
+        // The default engine viewport is 1280×800.
+        let dom = CssEngine::new().style(&parse_html(
+            "<div style='width:calc(50vw - 40px);height:calc(25vh)'>x</div>",
+        ));
+        let d = first(&dom.root, "div").unwrap();
+        assert_eq!(d.style.width, Len::Px(600), "50vw - 40px = 600px");
+        assert_eq!(d.style.height, Len::Px(200), "25vh = 200px");
     }
 
     #[test]
