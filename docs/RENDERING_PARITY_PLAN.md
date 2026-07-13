@@ -465,6 +465,18 @@ Execution: items 5/6/13/14/15/19 delegated to parallel worktree subagents
 branch (all in cerberus-layout, avoiding merge conflicts). Re-run
 `scripts/parity.sh` after each merge; the table's Status column is the ledger.
 
-Scoreboard 2026-07-13 (after items 1-4,6-9,11-15,19): example 1.82, iana 11.08,
+Superseded scoreboard (mid-round): example 1.82, iana 11.08,
 mfws 14.18, rfc1 5.20, wikipedia 10.37, hn 14.48, mozilla 14.58 (rmse 0.304),
 apple 12.27, bbc 14.80. (Live mirrors re-fetch per run; ±1pt run noise.)
+
+Scoreboard 2026-07-13 final (adds real bold/italic faces, outside list
+markers, computed-fill injection for inline svg): example 1.85, iana 11.05,
+mfws 13.23 (rmse 0.155), rfc1 5.20, wikipedia 10.34, hn 14.59 (rmse 0.125),
+mozilla 14.79 (rmse 0.302), apple 12.32, bbc 14.98 (rmse 0.157).
+
+Note on mozilla's hero flag: the visible green flag in Chrome is the
+ANIMATION variant (11 stacked opacity-animated svg frames gated on
+data-animation-running set by JS); the static fallback is display:none unless
+.no-js. Rendering it faithfully needs the animation state machine, not more
+CSS - parked below the fold of this rubric. The computed-fill injection that
+investigation produced is landed and benefits every CSS-painted inline svg.
