@@ -1092,9 +1092,25 @@ impl<'a> Ctx<'a> {
             self.mark_line_start();
             if visible && style.display == Display::ListItem {
                 if let Some(m) = list_marker(style.list_style_type, self.list_ordinal) {
-                    self.add_run(&m, style, None);
-                    self.x +=
-                        space_width(self.shaper, style.font_size.max(1), style.font_family) as i32;
+                    // `list-style-position: outside` (the CSS default): the
+                    // marker hangs in the list's padding with its right edge a
+                    // gap before the content edge, and the first line starts
+                    // AT the content edge — flowing it inline instead shifted
+                    // every list line right by marker+space (~14px) and let a
+                    // block-level first child push the marker onto its own
+                    // line. Drawn directly (not via the line buffer), so it
+                    // never participates in wrapping or text-align.
+                    self.flush_vmargin();
+                    let px = style.font_size.max(1);
+                    let (glyphs, w) = self.shape_run(&m, px, style);
+                    let gap = space_width(self.shaper, px, style.font_family) as i32;
+                    let x = (self.left - w as i32 - gap).max(0);
+                    self.display.push(DisplayItem::Glyphs {
+                        origin: Point::new(x, self.y),
+                        glyphs,
+                        color: style.color,
+                        style: style.font,
+                    });
                 }
             }
             // Arm `text-indent` for this block's first line: it is consumed as the
@@ -6297,6 +6313,50 @@ mod tests {
             (ys(&plain)[1] - ys(&plain)[0]) + 6,
             "trailing cell margin contained (adds 6px to the row)"
         );
+    }
+
+    #[test]
+    fn list_markers_hang_outside_the_content_edge() {
+        // `list-style-position: outside` (default): the li's text starts at
+        // the SAME x as a plain block at the list's content edge — the marker
+        // hangs in the ul's 40px padding and never displaces the text (inline
+        // flow used to shift every list line right by marker+space), nor does
+        // a block-level first child push the marker onto its own line.
+        let listed = lay(
+            "<ul style='margin:0;padding-left:40px'><li><div>item</div></li></ul>",
+            400,
+        );
+        let plain = lay(
+            "<div style='margin:0;padding-left:40px'><div>item</div></div>",
+            400,
+        );
+        let text_xs = |laid: &LaidOut| {
+            laid.display
+                .items
+                .iter()
+                .filter_map(|i| match i {
+                    DisplayItem::Glyphs { origin, glyphs, .. } if glyphs.len() > 1 => {
+                        Some((origin.x, origin.y))
+                    }
+                    _ => None,
+                })
+                .collect::<Vec<_>>()
+        };
+        let (lx, px) = (text_xs(&listed), text_xs(&plain));
+        assert_eq!(lx.len(), 1);
+        assert_eq!(lx[0].0, px[0].0, "text starts at the content edge");
+        // The marker (single glyph) sits left of the text, on the same line.
+        let marker = listed
+            .display
+            .items
+            .iter()
+            .find_map(|i| match i {
+                DisplayItem::Glyphs { origin, glyphs, .. } if glyphs.len() == 1 => Some(*origin),
+                _ => None,
+            })
+            .expect("marker drawn");
+        assert!(marker.x < lx[0].0, "marker left of text: {marker:?}");
+        assert_eq!(marker.y, lx[0].1, "marker on the first line, not its own");
     }
 
     #[test]
