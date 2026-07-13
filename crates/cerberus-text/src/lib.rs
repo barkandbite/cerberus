@@ -7,16 +7,22 @@
 //! reproducible and an anti-fingerprinting choice (see ADR-0005).
 //!
 //! Glyph **advances** come from `rustybuzz` (a pure-Rust HarfBuzz port) — real
-//! shaping with kerning/ligatures/GPOS/GSUB, the foundation for complex scripts —
-//! while `ab_glyph` remains the outline **rasterizer** (glyph ids are shared font
-//! indices). Both read the same bundled bytes, so text metrics stay reproducible
-//! (ADR-0005). See `RENDERING_ARCHITECTURE_PLAN.md`.
+//! shaping with kerning/ligatures/GPOS/GSUB, the foundation for complex scripts.
+//! Glyph **outlines** come from `skrifa` with FreeType-style light hinting
+//! (vertical grid-fitting, matching the reference Chrome — see `hinted.rs`),
+//! filled by `ab_glyph_rasterizer`; `ab_glyph` remains for vertical metrics and
+//! as the unhinted fallback fill (glyph ids are shared font indices). All read
+//! the same bundled bytes, so text metrics stay reproducible (ADR-0005). See
+//! `RENDERING_ARCHITECTURE_PLAN.md`.
 
 use ab_glyph::{point, Font, FontRef, GlyphId, PxScale, ScaleFont};
 use cerberus_paint::{
     DecodedImage, DisplayItem, DisplayList, FontSlot, Framebuffer, GlyphBox, Rasterizer, TextShaper,
 };
 use cerberus_types::{Color, FontStyle, GenericFamily, ImageFit, ImagePos, Point, Rect};
+use skrifa::MetadataProvider;
+
+mod hinted;
 
 /// The bundled font (Roboto Regular, Apache-2.0). See `assets/Roboto-LICENSE.txt`.
 const FONT_BYTES: &[u8] = include_bytes!("../assets/Roboto-Regular.ttf");
@@ -78,6 +84,13 @@ const SYSTEM_SANS_BOLD_BYTES: &[u8] = include_bytes!("../assets/DejaVuSans-Bold.
 struct Face {
     ab: FontRef<'static>,
     rb: rustybuzz::Face<'static>,
+    /// skrifa outline collection over the same bytes — the hinted rasterizer
+    /// (FreeType-style light grid-fitting; see `hinted.rs`). Glyph ids are
+    /// font indices shared by all three views.
+    sk: skrifa::outline::OutlineGlyphCollection<'static>,
+    /// The bundled bytes themselves — their address keys the per-(face, px)
+    /// hinting-instance cache.
+    bytes: &'static [u8],
 }
 
 impl Face {
@@ -86,7 +99,10 @@ impl Face {
             FontRef::try_from_slice(bytes).unwrap_or_else(|_| panic!("bundled {what} is valid"));
         let rb = rustybuzz::Face::from_slice(bytes, 0)
             .unwrap_or_else(|| panic!("bundled {what} shapes"));
-        Self { ab, rb }
+        let sk = skrifa::FontRef::new(bytes)
+            .unwrap_or_else(|_| panic!("bundled {what} parses in skrifa"))
+            .outline_glyphs();
+        Self { ab, rb, sk, bytes }
     }
 
     /// Units-per-em. Scaling glyph advances by `px / upem` is the CSS
@@ -172,6 +188,8 @@ pub struct TextEngine {
     /// Single style-less faces: private-use icon glyphs and the CJK fallback.
     icon: Face,
     fallback: Face,
+    /// Per-(face, px) skrifa hinting instances for the hinted raster path.
+    hinter: hinted::HintCache,
 }
 
 impl TextEngine {
@@ -225,6 +243,7 @@ impl TextEngine {
             },
             icon: Face::new(ICON_FONT_BYTES, "icon font"),
             fallback: Face::new(FALLBACK_FONT_BYTES, "IPAGothic fallback"),
+            hinter: hinted::HintCache::new(),
         }
     }
 
@@ -417,6 +436,27 @@ impl TextEngine {
             // lines.
             let baseline = origin.y as f32 + scaled.ascent().round();
             let slant = if residual.italic { 0.21f32 } else { 0.0 };
+
+            // Hinted path (skrifa, FreeType-style light grid-fitting — see
+            // `hinted.rs`, measured: 34.9% → 20.1% of ink pixels >32 gray
+            // levels off Chrome): outline+fill only; ids, advances, and the
+            // integer baseline are exactly the ab_glyph path's. Falls through
+            // to the unhinted ab_glyph fill only if hinting fails for this
+            // face/glyph.
+            if self.hinter.draw_glyph(
+                &face.sk,
+                face.bytes.as_ptr() as usize,
+                g.id,
+                g.px,
+                pen_x,
+                baseline,
+                color,
+                residual,
+                target,
+            ) {
+                pen_x += g.advance_f;
+                continue;
+            }
 
             let glyph = GlyphId(g.id).with_scale_and_position(scale, point(pen_x, baseline));
             if let Some(outlined) = face.ab.outline_glyph(glyph) {
@@ -1391,6 +1431,142 @@ mod tests {
             .filter(|px| px[..3] != [255, 255, 255])
             .count();
         assert!(inked > 0, "styled glyph rasterizes real ink");
+    }
+
+    #[test]
+    fn skrifa_and_rustybuzz_agree_on_glyph_ids() {
+        // The hinted rasterizer outlines glyphs by the ids rustybuzz shaped.
+        // Both read the same bundled bytes, so a codepoint's glyph index must
+        // be identical through skrifa's cmap — for every content face.
+        let e = TextEngine::new();
+        let faces: [(&Face, &str); 4] = [
+            (&e.sans.regular, "sans"),
+            (&e.serif.regular, "serif"),
+            (&e.mono.regular, "mono"),
+            (&e.text.regular, "roboto"),
+        ];
+        for (face, name) in faces {
+            let sk = skrifa::FontRef::new(face.bytes).unwrap();
+            let cmap = sk.charmap();
+            for ch in "Hamburgefonstiv 0123456789".chars() {
+                let rb = face.rb.glyph_index(ch).map(|g| g.0 as u32);
+                let sk_id = cmap.map(ch).map(|g| g.to_u32());
+                assert_eq!(rb, sk_id, "{name}: glyph id for {ch:?} diverges");
+            }
+        }
+    }
+
+    #[test]
+    fn hinted_advances_stay_within_half_a_pixel_of_rustybuzz() {
+        // Light hinting grid-fits outlines vertically but must not disturb
+        // horizontal metrics. skrifa (like FreeType) reports the hinted
+        // advance ROUNDED to an integer, so exact parity with rustybuzz's
+        // fractional advance is `round(advance_f)` — a delta of at most 0.5px.
+        // Layout keeps rustybuzz's unrounded advances (as Blink keeps
+        // HarfBuzz's, with subpixel positioning); this asserts the two views
+        // describe the same metric, i.e. hinting moved nothing horizontally.
+        use skrifa::{
+            instance::{LocationRef, Size},
+            outline::{DrawSettings, HintingInstance, HintingOptions, OutlinePen, SmoothMode},
+            MetadataProvider,
+        };
+        struct NullPen;
+        impl OutlinePen for NullPen {
+            fn move_to(&mut self, _: f32, _: f32) {}
+            fn line_to(&mut self, _: f32, _: f32) {}
+            fn quad_to(&mut self, _: f32, _: f32, _: f32, _: f32) {}
+            fn curve_to(&mut self, _: f32, _: f32, _: f32, _: f32, _: f32, _: f32) {}
+            fn close(&mut self) {}
+        }
+        let e = TextEngine::new();
+        for px in [13u32, 16, 24] {
+            for (face, fam) in [
+                (&e.sans.regular, GenericFamily::SansSerif),
+                (&e.serif.regular, GenericFamily::Serif),
+            ] {
+                let sk = skrifa::FontRef::new(face.bytes).unwrap();
+                let outlines = sk.outline_glyphs();
+                let hinter = HintingInstance::new(
+                    &outlines,
+                    Size::new(px as f32),
+                    LocationRef::default(),
+                    HintingOptions {
+                        // Same configuration as the production path in
+                        // `hinted.rs`: auto-hinter, light target.
+                        engine: skrifa::outline::Engine::Auto(None),
+                        target: skrifa::outline::Target::Smooth {
+                            mode: SmoothMode::Light,
+                            symmetric_rendering: true,
+                            preserve_linear_metrics: false,
+                        },
+                    },
+                )
+                .unwrap();
+                for g in e.shape_with("Hamburgefonstiv", px, fam) {
+                    let glyph = outlines
+                        .get(skrifa::GlyphId::new(g.id as u32))
+                        .expect("glyph outlines");
+                    let m = glyph
+                        .draw(DrawSettings::hinted(&hinter, false), &mut NullPen)
+                        .unwrap();
+                    if let Some(adv) = m.advance_width {
+                        assert!(
+                            (adv - g.advance_f).abs() <= 0.5 + 1e-3,
+                            "{fam:?}@{px}px glyph {}: hinted advance {adv} vs rustybuzz {}",
+                            g.id,
+                            g.advance_f
+                        );
+                        assert!(
+                            (adv - g.advance_f.round()).abs() < 1e-3,
+                            "{fam:?}@{px}px glyph {}: hinted advance {adv} is not \
+                             round({}) — hinting moved horizontal metrics",
+                            g.id,
+                            g.advance_f
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn hinted_path_rasterizes_ink_for_every_content_face() {
+        // The skrifa hinted path must draw real ink (not fall back silently)
+        // for every bundled face and calibration size — and be deterministic
+        // (same bytes, same interpreter → same pixels; the farbling stance
+        // never feeds system state into the raster).
+        let e = TextEngine::new();
+        let draw = |fam: GenericFamily, px: u32| {
+            let mut list = DisplayList::new();
+            list.push(DisplayItem::Glyphs {
+                origin: Point::new(2, 2),
+                glyphs: e.shape_with("Hg", px, fam),
+                color: Color::BLACK,
+                style: FontStyle::REGULAR,
+            });
+            let mut fb = Framebuffer::new(Size::new(64, 48));
+            fb.clear(Color::WHITE);
+            e.rasterize(&list, &mut fb);
+            fb.rgba
+        };
+        for fam in [
+            GenericFamily::SansSerif,
+            GenericFamily::Serif,
+            GenericFamily::Monospace,
+            GenericFamily::MonoCourier,
+            GenericFamily::SansSystem,
+        ] {
+            for px in [13u32, 16, 24] {
+                let a = draw(fam, px);
+                let inked = a
+                    .chunks_exact(4)
+                    .filter(|p| p[..3] != [255, 255, 255])
+                    .count();
+                assert!(inked > 0, "{fam:?}@{px}px inked no pixels");
+                let b = draw(fam, px);
+                assert_eq!(a, b, "{fam:?}@{px}px raster is not deterministic");
+            }
+        }
     }
 
     #[test]

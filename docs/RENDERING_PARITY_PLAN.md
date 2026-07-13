@@ -474,6 +474,13 @@ markers, computed-fill injection for inline svg): example 1.85, iana 11.05,
 mfws 13.23 (rmse 0.155), rfc1 5.20, wikipedia 10.34, hn 14.59 (rmse 0.125),
 mozilla 14.79 (rmse 0.302), apple 12.32, bbc 14.98 (rmse 0.157).
 
+Scoreboard 2026-07-13 +hinted glyphs (skrifa auto-hinter light — ADR-0005
+update; calibration-page ink pixels >32 gray levels off Chrome fell
+34.9% → 20.1%): example 1.84, iana 10.94, mfws 12.57 (rmse 0.159),
+rfc1 4.90, wikipedia 10.18, hn 14.14 (rmse 0.126), mozilla 14.68
+(rmse 0.302), apple 12.27, bbc 14.54 (rmse 0.161) — every page's
+mismatch_pct improved.
+
 Note on mozilla's hero flag: the visible green flag in Chrome is the
 ANIMATION variant (11 stacked opacity-animated svg frames gated on
 data-animation-running set by JS); the static fallback is display:none unless
