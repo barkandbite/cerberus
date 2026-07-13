@@ -3143,8 +3143,40 @@ impl<'a> Ctx<'a> {
             .map(|(i, _)| i)
             .unwrap_or(0);
         for it in &items {
-            let rs = (it.style.grid_row_span as usize).max(1);
-            let (r0, c0, cs) = if it.style.grid_named_place {
+            let rs = match (it.style.grid_row_start, it.style.grid_row_end) {
+                // Explicit numeric row lines fix the span too (`grid-row: 1/3`).
+                (Some(a), Some(b)) => {
+                    let a = resolve_grid_line(a, usize::MAX / 2);
+                    let b = resolve_grid_line(b, usize::MAX / 2);
+                    b.saturating_sub(a).max(1)
+                }
+                _ => (it.style.grid_row_span as usize).max(1),
+            };
+            let (r0, c0, cs) = if let Some(start) = it.style.grid_column_start {
+                // Explicit numeric line placement (`grid-column: 2/9`, `1/-1`):
+                // anchor the column to the resolved line — mozilla's hero
+                // anchors its flag text at line 2 of a 12-track grid, a whole
+                // track off under auto-placement. The row takes its own
+                // explicit line when given, else the first row where the
+                // column block is free.
+                let c0 = resolve_grid_line(start, ncols).min(ncols - 1);
+                let cs = match it.style.grid_column_end {
+                    Some(end) => resolve_grid_line(end, ncols).saturating_sub(c0),
+                    None => it.style.grid_column_span as usize,
+                }
+                .clamp(1, ncols - c0);
+                let r0 = match it.style.grid_row_start {
+                    Some(rn) => {
+                        let r0 = resolve_grid_line(rn, usize::MAX / 2);
+                        while occ.len() < r0 + rs {
+                            occ.push(vec![false; ncols]);
+                        }
+                        r0
+                    }
+                    None => find_free_at(&mut occ, ncols, c0, cs, rs),
+                };
+                (r0, c0, cs)
+            } else if it.style.grid_named_place {
                 let c0 = content_col;
                 (find_free_in_col(&mut occ, ncols, c0, rs), c0, 1)
             } else {
@@ -3925,6 +3957,35 @@ fn find_free_cell(
             c = 0;
             r += 1;
         }
+    }
+}
+
+/// Resolve a CSS grid line number against the track count: line `n > 0` is
+/// track index `n − 1`; a negative line counts from the END of the explicit
+/// grid (`-1` is the line after the last track, so `1 / -1` spans all tracks).
+fn resolve_grid_line(n: i32, ncols: usize) -> usize {
+    if n > 0 {
+        (n as usize).saturating_sub(1).min(ncols)
+    } else {
+        (ncols as i64 + 1 + n as i64).max(0) as usize
+    }
+}
+
+/// The first row where columns `[c0, c0+cs)` are free for `rs` rows (row
+/// auto-placement of an explicitly column-anchored item), growing the
+/// occupancy grid as needed.
+fn find_free_at(occ: &mut Vec<Vec<bool>>, ncols: usize, c0: usize, cs: usize, rs: usize) -> usize {
+    let c0 = c0.min(ncols.saturating_sub(1));
+    let end = (c0 + cs).min(ncols);
+    let mut r = 0;
+    loop {
+        while occ.len() < r + rs {
+            occ.push(vec![false; ncols]);
+        }
+        if (r..r + rs).all(|rr| (c0..end).all(|cc| !occ[rr][cc])) {
+            return r;
+        }
+        r += 1;
     }
 }
 
@@ -6115,6 +6176,31 @@ mod tests {
             min_glyph_x < 120,
             "inner table stays at the cell's left edge, got x={min_glyph_x}"
         );
+    }
+
+    #[test]
+    fn grid_explicit_line_placement_anchors_columns() {
+        // `grid-column: 3 / 5` anchors at track 3 (index 2) spanning 2 tracks;
+        // `1 / -1` spans the whole explicit grid. Auto-placement put both in
+        // the first free cell — mozilla's hero text (grid-column: 2/9 of 12)
+        // sat a full track off.
+        let laid = lay(
+            "<div style='display:grid;grid-template-columns:100px 100px 100px 100px'>\
+             <div style='grid-column:3/5;background:#ff0000'>a</div>\
+             <div style='grid-column:1/-1;background:#00ff00'>b</div>\
+             </div>",
+            420,
+        );
+        let rects = fill_rects(&laid);
+        let red = rects.iter().find(|r| r.w > 150 && r.w < 260).copied();
+        let green = rects.iter().find(|r| r.w > 350).copied();
+        let red = red.expect("3/5 spans two 100px tracks");
+        assert!(
+            red.x >= 200,
+            "anchored at line 3 (x≥200 with two tracks before it): {red:?}"
+        );
+        let green = green.expect("1/-1 spans all four tracks");
+        assert!(green.x <= 8, "full-bleed row starts at the left: {green:?}");
     }
 
     #[test]

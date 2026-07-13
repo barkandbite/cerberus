@@ -507,6 +507,14 @@ pub struct ComputedStyle {
     /// 1 unless the item spans multiple tracks. Reset per element (ADR-0038).
     pub grid_column_span: u32,
     pub grid_row_span: u32,
+    /// Explicit numeric grid-line placement (`grid-column: 2 / 9`, `1 / -1`):
+    /// CSS line numbers, 1-based, negative counting from the end (`-1` is the
+    /// line after the last track), resolved against the real track count at
+    /// layout. `None` = auto-placed.
+    pub grid_column_start: Option<i32>,
+    pub grid_column_end: Option<i32>,
+    pub grid_row_start: Option<i32>,
+    pub grid_row_end: Option<i32>,
     /// The item used named-line/area placement we don't resolve (e.g.
     /// `grid-column: content`); layout places it in the container's widest
     /// (content) track rather than dumping it into a leading gutter (ADR-0038).
@@ -601,6 +609,10 @@ impl ComputedStyle {
             grid_cols_named: false,
             grid_column_span: 1,
             grid_row_span: 1,
+            grid_column_start: None,
+            grid_column_end: None,
+            grid_row_start: None,
+            grid_row_end: None,
             grid_named_place: false,
             position: Position::Static,
             inset_top: Len::Auto,
@@ -691,6 +703,10 @@ impl ComputedStyle {
             grid_cols_named: false,
             grid_column_span: 1,
             grid_row_span: 1,
+            grid_column_start: None,
+            grid_column_end: None,
+            grid_row_start: None,
+            grid_row_end: None,
             grid_named_place: false,
             // Positioning is not inherited; every element starts in normal flow.
             position: Position::Static,

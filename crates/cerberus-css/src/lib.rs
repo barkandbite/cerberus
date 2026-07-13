@@ -1637,12 +1637,20 @@ fn apply_declarations(
                     .map(|t| parse_one_track(t, style.font_size as f32));
             }
             "grid-column" => {
-                style.grid_column_span = parse_grid_span(v);
+                let (start, end, span) = parse_grid_placement(v);
+                style.grid_column_start = start;
+                style.grid_column_end = end;
+                style.grid_column_span = span;
                 if grid_line_is_named(v) {
                     style.grid_named_place = true;
                 }
             }
-            "grid-row" => style.grid_row_span = parse_grid_span(v),
+            "grid-row" => {
+                let (start, end, span) = parse_grid_placement(v);
+                style.grid_row_start = start;
+                style.grid_row_end = end;
+                style.grid_row_span = span;
+            }
             "grid-area" => {
                 // `grid-area: name` (a named area/line) — we don't resolve areas,
                 // so flag it for content-track placement (ADR-0038).
@@ -2266,23 +2274,31 @@ fn grid_line_is_named(v: &str) -> bool {
         })
 }
 
-/// Parse a `grid-column`/`grid-row` placement into a track *span* count:
-/// `span N`, `a / b` (→ b−a), `a / span N`, else 1 (ADR-0038).
-fn parse_grid_span(v: &str) -> u32 {
+/// Parse a `grid-column`/`grid-row` placement into `(start line, end line,
+/// span)`. Numeric lines are kept as CSS line numbers (1-based, negative from
+/// the end — `1 / -1` means full width) and resolved against the REAL track
+/// count at layout; the span is a fallback for the forms that imply one
+/// (`span N`, `a / span N`, positive `a / b`). Named lines/areas yield no
+/// numeric placement (the `grid_named_place` content-track path handles them).
+fn parse_grid_placement(v: &str) -> (Option<i32>, Option<i32>, u32) {
     let v = v.trim().to_ascii_lowercase();
     if let Some(rest) = v.strip_prefix("span") {
-        return rest.trim().parse::<u32>().unwrap_or(1).max(1);
+        return (None, None, rest.trim().parse::<u32>().unwrap_or(1).max(1));
     }
     if let Some((a, b)) = v.split_once('/') {
-        let b = b.trim();
+        let (a, b) = (a.trim(), b.trim());
+        let start = a.parse::<i32>().ok().filter(|n| *n != 0);
         if let Some(n) = b.strip_prefix("span") {
-            return n.trim().parse::<u32>().unwrap_or(1).max(1);
+            return (start, None, n.trim().parse::<u32>().unwrap_or(1).max(1));
         }
-        if let (Ok(ai), Ok(bi)) = (a.trim().parse::<i32>(), b.parse::<i32>()) {
-            return (bi - ai).unsigned_abs().max(1);
-        }
+        let end = b.parse::<i32>().ok().filter(|n| *n != 0);
+        let span = match (start, end) {
+            (Some(ai), Some(bi)) if ai > 0 && bi > 0 => (bi - ai).unsigned_abs().max(1),
+            _ => 1,
+        };
+        return (start, end, span);
     }
-    1
+    (v.parse::<i32>().ok().filter(|n| *n != 0), None, 1)
 }
 
 fn apply_font_shorthand(style: &mut ComputedStyle, v: &str, parent_font_size: u32) {
