@@ -438,7 +438,7 @@ Ranked movers (impact × breadth ÷ effort). Status updates in-place as fixes la
 | 7 | Grid explicit line placement (`grid-column: 2/9`, `1/-1`) ignored | HIGH | mozilla hero | **DONE** |
 | 8 | `<center>`/-webkit-center leaks across table-cell boundary | HIGH | hn (~187px shift) | **DONE** |
 | 9 | Table row-height trio: cell-less `<tr height>`, line floor on table font, lost trailing cell margin | HIGH | hn, wikipedia, iana | **DONE** |
-| 10 | Glyph AA raster differs from FreeType (parity FLOOR ~80% of ink on aligned lines) | HIGH-floor | all | measure-only for now |
+| 10 | Glyph AA raster differs from FreeType | HIGH-floor | all | **2/3 FIXED** (integer baseline + sub-pixel pen: 71→35% of ink >32 off; residual is FreeType light-hinting's vertical grid-fit, unreachable without a hinter — fitted tone LUTs measure as no-ops, fractional word-origin carry measured WORSE and was reverted) |
 | 11 | Inline-image strut descent missing from line box | MED | iana, bbc, apple | **DONE** |
 | 12 | Whitespace at inline boundaries (#137): phantom space before punctuation, eaten space before nowrap, per-word underline | MED | every prose page | **DONE** (+float-band guard) |
 | 13 | calc() resolves % against font-size (wrong, often negative) | MED | iana, apple, mozilla, bbc | **DONE** |
