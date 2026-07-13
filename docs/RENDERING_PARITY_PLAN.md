@@ -492,3 +492,15 @@ Scoreboard 2026-07-13 (hinted raster + inline-flex round): example 1.84,
 iana 10.94, mfws 12.57, rfc1 4.90, wikipedia 10.18, hn 14.14, mozilla 14.74,
 apple 12.27, bbc 15.06. Every text page improved with hinting; the first
 sub-5% brand-corpus page (rfc1 4.90) landed this round.
+
+Scoreboard 2026-07-13 (sub-pixel word origins — the planned focused round):
+example 1.84, iana 9.47 (RMSE 0.084->0.065), mfws 12.07 (0.159->0.136),
+rfc1 4.91, wikipedia 10.05, hn 14.63, mozilla 14.67, apple 12.27, bbc 15.56.
+Calibration: sentence-page ink |d|>32 vs Chrome 51% -> 19.3% (the aligned-line
+floor). Text runs now carry their true fractional origin end-to-end; measure
+scratches keep integer widths (table/flex sizing stability — a frozen-mirror
+A/B caught and fixed a 5px HN column shift before it shipped). The glyph
+placement chain is now Blink-exact: integer baseline, sub-pixel pen, sub-pixel
+run origin, skrifa auto-hinter. Remaining text residual is stem-phase AA
+distribution (needs Skia's exact coverage kernel — diminishing returns).
+Next levers: transform:translate static subset; the wikipedia dive.
