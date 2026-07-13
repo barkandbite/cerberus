@@ -202,6 +202,7 @@ impl DisplayList {
                         .iter()
                         .map(|g| GlyphBox {
                             advance: su(g.advance),
+                            advance_f: g.advance_f * scale,
                             w: su(g.w),
                             h: su(g.h),
                             id: g.id,
@@ -253,8 +254,14 @@ pub enum FontSlot {
 /// glyph's font). `id` is `0` for the placeholder shaper.
 #[derive(Clone, Copy, Debug)]
 pub struct GlyphBox {
-    /// Horizontal advance after this glyph.
+    /// Horizontal advance after this glyph, rounded to whole px (layout's
+    /// integer box math; runs error-diffuse so widths stay exact).
     pub advance: u32,
+    /// The TRUE fractional advance. The rasterizer accumulates THIS for pen
+    /// positions and draws each glyph at its fractional x, as Chrome does —
+    /// integer pen quantization put every stem up to half a pixel off the
+    /// reference, which alone mismatched ~38% of ink pixels on aligned lines.
+    pub advance_f: f32,
     /// Inked width (placeholder rasterizer).
     pub w: u32,
     /// Inked height (placeholder rasterizer).
@@ -557,6 +564,7 @@ impl TextShaper for MonoShaper {
                 if ch.is_whitespace() {
                     GlyphBox {
                         advance: cell / 2,
+                        advance_f: (cell / 2) as f32,
                         w: 0,
                         h: 0,
                         id: 0,
@@ -566,6 +574,7 @@ impl TextShaper for MonoShaper {
                 } else {
                     GlyphBox {
                         advance: cell / 2,
+                        advance_f: (cell / 2) as f32,
                         w: cell / 2 - 1,
                         h: cell,
                         id: 0,
@@ -666,6 +675,7 @@ mod tests {
             origin: Point::new(5, 6),
             glyphs: vec![GlyphBox {
                 advance: 8,
+                advance_f: 8.0,
                 w: 0,
                 h: 0,
                 id: 42,

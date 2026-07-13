@@ -409,7 +409,13 @@ impl TextEngine {
             let (face, residual) = self.styled_face(g.font, style);
             let scale = Self::px_scale_of(face, g.px);
             let scaled = face.ab.as_scaled(scale);
-            let baseline = origin.y as f32 + scaled.ascent();
+            // Integer baseline, exactly as Blink rounds font metrics before
+            // rasterizing (lround(ascent) — 14 for 16px Arial-metric, not
+            // 14.48): a fractional baseline drew every glyph ~half a pixel low
+            // AND vertically smeared across an extra row, which alone
+            // mismatched most ink pixels against Chrome on perfectly laid-out
+            // lines.
+            let baseline = origin.y as f32 + scaled.ascent().round();
             let slant = if residual.italic { 0.21f32 } else { 0.0 };
 
             let glyph = GlyphId(g.id).with_scale_and_position(scale, point(pen_x, baseline));
@@ -430,7 +436,9 @@ impl TextEngine {
                     }
                 });
             }
-            pen_x += g.advance as f32;
+            // TRUE fractional pen advance: each glyph rasterizes at its
+            // sub-pixel x, matching Chrome's subpixel text positioning.
+            pen_x += g.advance_f;
         }
     }
 
@@ -577,12 +585,14 @@ fn shape_run_rb(
     let mut acc = 0.0f32;
     let mut prev = 0i32;
     for (info, pos) in infos.iter().zip(positions) {
-        acc += pos.x_advance as f32 * units_to_px;
+        let advance_f = pos.x_advance as f32 * units_to_px;
+        acc += advance_f;
         let rounded = acc.round() as i32;
         let advance = (rounded - prev).max(0) as u32;
         prev = rounded;
         out.push(GlyphBox {
             advance,
+            advance_f,
             w: 0,
             h: 0,
             id: info.glyph_id as u16,
@@ -620,9 +630,11 @@ impl TextShaper for TextEngine {
         let scale = self.px_scale(FontSlot::Icon, px);
         let scaled = self.icon.ab.as_scaled(scale);
         let id = self.icon.ab.glyph_id(ch);
-        let advance = scaled.h_advance(id).round().max(0.0) as u32;
+        let advance_f = scaled.h_advance(id).max(0.0);
+        let advance = advance_f.round() as u32;
         vec![GlyphBox {
             advance,
+            advance_f,
             w: 0,
             h: 0,
             id: id.0,

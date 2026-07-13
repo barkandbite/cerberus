@@ -1447,6 +1447,7 @@ impl<'a> Ctx<'a> {
         if style.letter_spacing != 0 {
             for g in &mut glyphs {
                 g.advance = (g.advance as i32 + style.letter_spacing).max(0) as u32;
+                g.advance_f = (g.advance_f + style.letter_spacing as f32).max(0.0);
             }
         }
         let w = glyphs.iter().map(|g| g.advance).sum();
