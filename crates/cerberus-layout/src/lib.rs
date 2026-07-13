@@ -1118,9 +1118,21 @@ impl<'a> Ctx<'a> {
         for child in &node.children {
             match child {
                 StyledChild::Text(t) => {
-                    self.flush_floats(&mut fb);
-                    if visible {
-                        self.add_text(t, style, href);
+                    // A whitespace-only node (source indentation between
+                    // elements) is not content: it only arms the
+                    // inter-element space (#137). It must NOT close the float
+                    // band — the newline between a float-left logo and a
+                    // float-right nav would otherwise push the nav below the
+                    // logo (iana's header/footer stacked exactly that way).
+                    if t.trim().is_empty() {
+                        if visible && !t.is_empty() {
+                            self.pending_space = true;
+                        }
+                    } else {
+                        self.flush_floats(&mut fb);
+                        if visible {
+                            self.add_text(t, style, href);
+                        }
                     }
                 }
                 StyledChild::Element(e)
