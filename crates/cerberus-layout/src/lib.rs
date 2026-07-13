@@ -946,6 +946,16 @@ impl<'a> Ctx<'a> {
             None
         };
 
+        // `display: inline-flex`/`inline-grid`: an ATOMIC INLINE box (flows on
+        // the current line like an inline-block) whose inside is the flex/grid
+        // context — block-level promotion broke the surrounding line, putting
+        // each such box on its own row. The atom's own sub-layout re-enters
+        // with `as_block_once` set and falls through to the container match.
+        if style.display_inline_level && !self.as_block_once {
+            self.add_inline_block(node, href);
+            self.cur_link_node = saved_link_node;
+            return;
+        }
         // Flex/grid containers lay their items out and return; everything else
         // falls through to block/inline flow.
         match style.display {
@@ -6368,6 +6378,33 @@ mod tests {
             .expect("marker drawn");
         assert!(marker.x < lx[0].0, "marker left of text: {marker:?}");
         assert_eq!(marker.y, lx[0].1, "marker on the first line, not its own");
+    }
+
+    #[test]
+    fn inline_flex_flows_on_the_line_and_table_cells_sit_side_by_side() {
+        // `display: inline-flex` is an atomic inline box — the text before and
+        // after it shares its line (block-level promotion put the container on
+        // its own row). CSS `display: table-cell` siblings sit beside each
+        // other on one row, not stacked.
+        let flexline = lay(
+            "<p style='margin:0'>a <span style='display:inline-flex'>\
+             <span>x</span></span> b</p>",
+            600,
+        );
+        let mut ys = glyph_ys(&flexline);
+        ys.sort_unstable();
+        ys.dedup();
+        assert_eq!(ys.len(), 1, "one shared line: {ys:?}");
+
+        let cells = lay(
+            "<div><div style='display:table-cell'>left</div>\
+             <div style='display:table-cell'>right</div></div>",
+            600,
+        );
+        let mut cys = glyph_ys(&cells);
+        cys.sort_unstable();
+        cys.dedup();
+        assert_eq!(cys.len(), 1, "cells share a row: {cys:?}");
     }
 
     #[test]

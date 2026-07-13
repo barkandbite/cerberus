@@ -470,6 +470,12 @@ pub struct ComputedStyle {
     /// `white-space`: whitespace collapsing, newline preservation, and wrapping.
     /// Inherited.
     pub white_space: WhiteSpace,
+    /// `display: inline-flex` / `inline-grid`: the container is an ATOMIC
+    /// INLINE box (flows on the current line, like an inline-block) whose
+    /// inside establishes the flex/grid formatting context. `display` keeps
+    /// the Flex/Grid variant for the inner context; this flag carries the
+    /// outer inline level. Not inherited.
+    pub display_inline_level: bool,
     /// `visibility: hidden` — laid out but not painted. Inherited.
     pub visibility: Visibility,
     /// SVG `fill` from the CSS cascade (inherited, as in SVG): the computed
@@ -596,6 +602,7 @@ impl ComputedStyle {
             background_position: ImagePos::TOP_LEFT,
             background_position_px: Point::ZERO,
             white_space: WhiteSpace::Normal,
+            display_inline_level: false,
             visibility: Visibility::Visible,
             fill: None,
             opacity: 1.0,
@@ -651,6 +658,7 @@ impl ComputedStyle {
             vertical_align: VerticalAlign::Baseline,
             text_indent: self.text_indent,
             white_space: self.white_space,
+            display_inline_level: false,
             visibility: self.visibility,
             fill: self.fill,
             // Reset per element:

@@ -1383,6 +1383,13 @@ fn apply_declarations(
             "display" => {
                 if let Some(d) = parse_display(v) {
                     style.display = d;
+                    // inline-flex / inline-grid: Flex/Grid INSIDE, atomic
+                    // inline OUTSIDE (block-level promotion broke the
+                    // surrounding line, putting each such box on its own row).
+                    style.display_inline_level = matches!(
+                        v.trim().to_ascii_lowercase().as_str(),
+                        "inline-flex" | "inline-grid"
+                    );
                 }
             }
             "margin" => apply_margin_shorthand(style, v, style.font_size as f32),
@@ -1822,7 +1829,11 @@ fn parse_display(v: &str) -> Option<Display> {
         "inline-block" => Display::InlineBlock,
         "flex" | "inline-flex" => Display::Flex,
         "grid" | "inline-grid" => Display::Grid,
-        "block" | "table" | "table-row" | "table-cell" | "flow-root" => Display::Block,
+        "block" | "table" | "table-row" | "flow-root" => Display::Block,
+        // A CSS table cell sits on a row beside its siblings; the shrink-to-fit
+        // atomic inline-block is the closest box we model (stacking them as
+        // full-width blocks put every "cell" on its own line).
+        "table-cell" => Display::InlineBlock,
         _ => return None,
     })
 }
