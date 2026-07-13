@@ -433,7 +433,7 @@ Ranked movers (impact × breadth ÷ effort). Status updates in-place as fixes la
 | 2 | Integer space advances flip wrap points (4 vs 4.453px) | HIGH | every text page | **DONE** |
 | 3 | line-height:normal must be Blink's per-component-rounded INTEGER (14+3+1=18@16px); explicit fractional lh accumulates | HIGH | every text page | **DONE** |
 | 4 | Flex/grid drop bare text children (anonymous items) | HIGH | mozilla nav, apple, bbc | **DONE** |
-| 5 | Only Regular faces bundled; faux bold/italic mis-measure every bold run | HIGH | all 9 pages | agent v2 running |
+| 5 | Only Regular faces bundled; faux bold/italic mis-measure every bold run | HIGH | all 9 pages | **DONE** (13 real faces; 60/60 cases <0.5px of Chrome) |
 | 6 | Inline `<svg>` display:none'd (resvg already rasterizes for `<img>`) | HIGH | bbc(99), apple(64), mozilla, wikipedia | **DONE** (svg keeps tag; source-only attrs) |
 | 7 | Grid explicit line placement (`grid-column: 2/9`, `1/-1`) ignored | HIGH | mozilla hero | **DONE** |
 | 8 | `<center>`/-webkit-center leaks across table-cell boundary | HIGH | hn (~187px shift) | **DONE** |
@@ -446,7 +446,7 @@ Ranked movers (impact × breadth ÷ effort). Status updates in-place as fixes la
 | 15 | :has() (and :is/:where) drop whole rules | MED | apple, mozilla, iana | **DONE** (child subset) |
 | 16 | transform:translate static subset (centering, offscreen parking) | MED | apple, bbc, mozilla | backlog |
 | 17 | inline-flex/inline-grid break the inline context; CSS tables flattened | MED | iana, bbc, apple | backlog |
-| 18 | List markers placed inside (Chrome: outside) | MED | all list pages | me |
+| 18 | List markers placed inside (Chrome: outside) | MED | all list pages | **DONE** |
 | 19 | min()/max()/clamp() unparsed | LOW | apple, bbc, mozilla | **DONE** |
 | 20 | letter/word-spacing quantized to i32 px | LOW | apple, bbc | backlog |
 | 21 | vertical-align top/middle/bottom positioning (suppression done) | LOW | iana, apple | partial |
