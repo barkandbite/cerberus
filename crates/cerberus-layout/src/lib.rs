@@ -3459,12 +3459,27 @@ impl<'a> Ctx<'a> {
                 col += span;
             }
             if placed.is_empty() {
+                // A cell-less spacer row (`<tr style="height:5px">` — HN
+                // separates stories with these) still contributes its declared
+                // height; it used to contribute nothing, compressing the list
+                // by ~5px per item.
+                let h = row
+                    .style
+                    .height
+                    .resolve_vp(0, self.vw, self.vh)
+                    .or_else(|| row.attr("height").and_then(parse_dim).map(|v| v as i32))
+                    .unwrap_or(0);
+                row_y += h.max(0);
                 continue;
             }
 
             // Sub-lay every cell, capturing its items/links/fields and height.
+            // The row is as tall as its tallest CELL (plus padding) — flooring
+            // at the TABLE font's line height inflated small-print rows (HN's
+            // 7pt subtext measures 10px in Chrome, not the table's 15px line).
+            // An explicit `<tr height>` still sets a minimum.
             let mut laid: Vec<CellLayout> = Vec::with_capacity(placed.len());
-            let mut row_h = line_height(node.style.font_size.max(1));
+            let mut row_h = 0;
             for &(cell, col, span) in &placed {
                 let cell_x = col_x[col];
                 let cell_w = (col_x[(col + span).min(num_cols)] - cell_x).max(1);
@@ -3473,7 +3488,13 @@ impl<'a> Ctx<'a> {
                 row_h = row_h.max(h);
                 laid.push((items, links, fields, h));
             }
-            row_h = (row_h + 2 * pad).max(1);
+            let tr_min = row
+                .style
+                .height
+                .resolve_vp(0, self.vw, self.vh)
+                .or_else(|| row.attr("height").and_then(parse_dim).map(|v| v as i32))
+                .unwrap_or(0);
+            row_h = (row_h + 2 * pad).max(tr_min).max(1);
 
             // Emit each cell's box (fill + border) under its content.
             for &(cell, col, span) in &placed {
@@ -3575,11 +3596,22 @@ impl<'a> Ctx<'a> {
             }
         }
         sub.flush_line();
+        // A last child's deferred bottom margin is contained by the cell (a
+        // table cell establishes its own formatting context; margins never
+        // escape it) — HN's votearrow div (`margin: 3px 2px 6px`) lost its
+        // bottom 6px here, shorting every item row.
+        sub.flush_vmargin();
 
         // Carry the advanced control counter back to the parent.
         self.field_id = sub.field_id;
-        // After flush, `sub.y` already includes the last line; floor at one line.
-        let height = (sub.y - content_top).max(line_height(cell.style.font_size.max(1)));
+        // After flush, `sub.y` already includes the last line; a cell WITH
+        // content is floored at one line of its own font, an empty cell
+        // contributes nothing (Chrome: an empty row is padding-tall).
+        let height = if sub.y > content_top || !sub.display.items.is_empty() {
+            (sub.y - content_top).max(line_height(cell.style.font_size.max(1)))
+        } else {
+            0
+        };
         (sub.display.items, sub.links, sub.fields, height)
     }
 
@@ -6201,6 +6233,70 @@ mod tests {
         );
         let green = green.expect("1/-1 spans all four tracks");
         assert!(green.x <= 8, "full-bleed row starts at the left: {green:?}");
+    }
+
+    #[test]
+    fn table_row_heights_follow_cells_spacers_and_margins() {
+        // Three HN-measured behaviors in one table: (1) a cell-less spacer row
+        // contributes its declared height; (2) a small-font row is its own
+        // content height, not the table font's line; (3) a last child's
+        // bottom margin is contained by its cell.
+        let spaced = lay(
+            "<table><tr><td>a</td></tr>\
+             <tr style='height:20px'></tr>\
+             <tr><td>b</td></tr></table>",
+            400,
+        );
+        let flat = lay(
+            "<table><tr><td>a</td></tr>\
+             <tr><td>b</td></tr></table>",
+            400,
+        );
+        let ys = |laid: &LaidOut| {
+            let mut v = glyph_ys(laid);
+            v.sort_unstable();
+            v
+        };
+        let (sy, fy) = (ys(&spaced), ys(&flat));
+        assert_eq!(
+            sy[1] - sy[0],
+            (fy[1] - fy[0]) + 20,
+            "spacer row adds exactly its 20px: {sy:?} vs {fy:?}"
+        );
+
+        // Small-font row: the gap between two 10px-font rows is smaller than
+        // between two default(16px)-font rows in the same table.
+        let small = lay(
+            "<table style='font-size:16px'>\
+             <tr><td style='font-size:10px'>a</td></tr>\
+             <tr><td style='font-size:10px'>b</td></tr></table>",
+            400,
+        );
+        let big = lay(
+            "<table style='font-size:16px'><tr><td>a</td></tr><tr><td>b</td></tr></table>",
+            400,
+        );
+        assert!(
+            ys(&small)[1] - ys(&small)[0] < ys(&big)[1] - ys(&big)[0],
+            "a small-print row is shorter than the table font's line"
+        );
+
+        // Bottom margin of a cell's last block child extends the row.
+        let margined = lay(
+            "<table><tr><td><div style='margin:0 0 6px 0'>a</div></td></tr>\
+             <tr><td>b</td></tr></table>",
+            400,
+        );
+        let plain = lay(
+            "<table><tr><td><div style='margin:0'>a</div></td></tr>\
+             <tr><td>b</td></tr></table>",
+            400,
+        );
+        assert_eq!(
+            ys(&margined)[1] - ys(&margined)[0],
+            (ys(&plain)[1] - ys(&plain)[0]) + 6,
+            "trailing cell margin contained (adds 6px to the row)"
+        );
     }
 
     #[test]
