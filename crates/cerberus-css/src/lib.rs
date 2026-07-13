@@ -1204,6 +1204,18 @@ fn apply_declarations(
                     style.color = c;
                 }
             }
+            // SVG paint: computed here so the app can inject it into the
+            // pre-rasterized inline-svg payload (resvg never sees author CSS).
+            "fill" => {
+                let lv = v.to_ascii_lowercase();
+                if lv == "currentcolor" {
+                    style.fill = Some(style.color);
+                } else if lv == "none" {
+                    style.fill = None;
+                } else if let Some(c) = parse_color(v) {
+                    style.fill = Some(c);
+                }
+            }
             "background" | "background-color" => {
                 if prop == "background" {
                     // The shorthand resets *every* longhand it can set to its

@@ -1256,7 +1256,19 @@ pub fn render(config: &RenderConfig) -> Result<RenderOutcome, AppError> {
     // Chrome would reserve without painting a placeholder.
     if !inline_svgs.is_empty() {
         let codec = ImageCodec::new();
+        // The cascade's computed `fill` per key (mozilla's flag is
+        // `fill: var(--m24-green)` on a root with `fill="none"` — resvg only
+        // sees the payload, so the computed paint is injected into its root).
+        let fills = inline_svg::styled_fills(&styled.root);
         for (key, bytes) in &inline_svgs {
+            let painted;
+            let bytes: &[u8] = match fills.get(key.as_str()) {
+                Some(c) => {
+                    painted = inline_svg::inject_root_fill(bytes, *c);
+                    &painted
+                }
+                None => bytes,
+            };
             let state = match codec.decode(bytes) {
                 Ok(img) => ImageState::Ready(Arc::new(img)),
                 Err(_) => ImageState::Ready(Arc::new(transparent_stand_in())),
@@ -2483,6 +2495,11 @@ pub struct BrowserApp {
     style_engine: CssEngine,
     image_codec: ImageCodec,
     images: HashMap<String, ImageState>,
+    /// Serialized inline-svg payloads by synthetic key, kept so a restyle can
+    /// re-decode with an updated computed `fill` (see `refresh_svg_fills`).
+    svg_payloads: HashMap<String, Vec<u8>>,
+    /// The fill each payload was last decoded with (change detector).
+    svg_applied_fill: HashMap<String, Option<cerberus_types::Color>>,
     /// The text-only image policy (global default + per-image overrides), used
     /// both to skip fetching text-only images and to render them as text.
     image_policy: ImagePolicy,
@@ -2712,6 +2729,8 @@ impl BrowserApp {
             text: TextEngine::new(),
             style_engine,
             image_codec: ImageCodec::new(),
+            svg_payloads: HashMap::new(),
+            svg_applied_fill: HashMap::new(),
             images: HashMap::new(),
             image_policy: ImagePolicy {
                 default: ImageDisplayMode::from_env(),
@@ -2945,7 +2964,7 @@ impl BrowserApp {
         // decode them into the image store — after scripts (so script-built
         // SVG participates), before styling (so layout sees `<img>`).
         let viewport_w = self.toolbar.content_size(self.last_size).w;
-        self.register_inline_svgs(replace_inline_svgs(&mut doc, viewport_w));
+        let inline_svgs = replace_inline_svgs(&mut doc, viewport_w);
         self.page_title = doc.title();
         // New page: drop the previous page's external stylesheets. The first
         // cascade uses inline CSS only; external `<link>` sheets fetch on the
@@ -2957,6 +2976,10 @@ impl BrowserApp {
         let t = Instant::now();
         self.styled = self.style_engine.style(&doc);
         self.timings.record("style", t.elapsed());
+        // Registered AFTER styling so the cascade's computed `fill` can be
+        // injected into each payload; kept for re-injection when external
+        // sheets restyle (the fill rule often lives in one).
+        self.register_inline_svgs(inline_svgs);
         self.document = doc;
         // Dispatch any fetches the page scheduled at load to the worker (async).
         self.pump_fetches();
@@ -2972,6 +2995,9 @@ impl BrowserApp {
             .style_engine
             .style_with_sheets(&self.document, &self.sheets);
         self.timings.record("style", t.elapsed());
+        // External sheets often carry the svg `fill` rules; re-inject any
+        // whose computed fill the new cascade changed.
+        self.refresh_svg_fills();
     }
 
     /// Run the document's inline scripts against the active head's engine and
@@ -4047,28 +4073,55 @@ impl BrowserApp {
         // styling. Content-hash keys make this idempotent — an icon already in
         // the store is neither re-serialized into a new key nor re-decoded.
         let viewport_w = self.toolbar.content_size(self.last_size).w;
-        self.register_inline_svgs(replace_inline_svgs(&mut document, viewport_w));
+        let inline_svgs = replace_inline_svgs(&mut document, viewport_w);
         self.page_title = document.title();
         let t = Instant::now();
         self.styled = self.style_engine.style(&document);
         self.timings.record("style", t.elapsed());
+        self.register_inline_svgs(inline_svgs);
         self.document = document;
     }
 
     /// Decode serialized inline-SVG payloads (from [`replace_inline_svgs`])
-    /// into the per-page image store under their synthetic keys. Already-
-    /// registered keys are skipped (reconciles re-run the rewrite). A declined
-    /// payload registers a transparent stand-in so the box is still reserved.
+    /// into the per-page image store under their synthetic keys, injecting the
+    /// cascade's computed `fill` (call AFTER styling). Payloads are retained so
+    /// a later restyle — external sheets often carry the fill rule — can
+    /// re-decode any whose computed fill changed. A declined payload registers
+    /// a transparent stand-in so the box is still reserved.
     fn register_inline_svgs(&mut self, svgs: Vec<(String, Vec<u8>)>) {
         for (key, bytes) in svgs {
-            if self.images.contains_key(&key) {
+            self.svg_payloads.entry(key).or_insert(bytes);
+        }
+        self.refresh_svg_fills();
+    }
+
+    /// (Re-)decode inline-svg payloads whose computed `fill` changed since the
+    /// last decode (or that were never decoded).
+    fn refresh_svg_fills(&mut self) {
+        if self.svg_payloads.is_empty() {
+            return;
+        }
+        let fills = inline_svg::styled_fills(&self.styled.root);
+        for (key, bytes) in &self.svg_payloads {
+            let fill = fills.get(key.as_str()).copied();
+            let stale = self.svg_applied_fill.get(key) != Some(&fill);
+            if !stale && self.images.contains_key(key) {
                 continue;
             }
-            let state = match self.image_codec.decode(&bytes) {
+            let painted;
+            let bytes: &[u8] = match fill {
+                Some(c) => {
+                    painted = inline_svg::inject_root_fill(bytes, c);
+                    &painted
+                }
+                None => bytes,
+            };
+            let state = match self.image_codec.decode(bytes) {
                 Ok(img) => ImageState::Ready(Arc::new(img)),
                 Err(_) => ImageState::Ready(Arc::new(transparent_stand_in())),
             };
-            self.images.insert(key, state);
+            self.images.insert(key.clone(), state);
+            self.svg_applied_fill.insert(key.clone(), fill);
         }
     }
 

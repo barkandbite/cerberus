@@ -42,7 +42,10 @@
 //! in the module contract rather than plumbed from computed style.
 
 use cerberus_dom::{Document, NodeId, NodeRef};
+use cerberus_style::{StyledChild, StyledNode};
+use cerberus_types::Color;
 use std::collections::hash_map::DefaultHasher;
+use std::collections::HashMap;
 use std::hash::{Hash, Hasher};
 
 /// Scheme prefix of the synthetic `src` a rewritten inline `<svg>` carries.
@@ -675,5 +678,120 @@ mod tests {
         }
         imgs(doc.root(), &mut count);
         assert_eq!(count, 1, "one replaced element");
+    }
+}
+
+/// The computed CSS `fill` per rewritten inline-svg key: real sites paint
+/// icon/logo internals from the cascade (`.m24-c-flag-media svg
+/// {fill:var(--m24-green)}`, `.csOpzq{fill:currentcolor}`), which resvg never
+/// sees — the app injects the computed color into the payload root before
+/// decoding. First styled occurrence wins per key (identical markup styled
+/// two different colors on one page would need per-instance keys; not seen in
+/// the corpus).
+pub(crate) fn styled_fills(root: &StyledNode) -> HashMap<String, Color> {
+    let mut out = HashMap::new();
+    fn walk(n: &StyledNode, out: &mut HashMap<String, Color>) {
+        if n.tag == "svg" {
+            if let (Some(src), Some(fill)) = (n.attr("src"), n.style.fill) {
+                out.entry(src.to_string()).or_insert(fill);
+            }
+        }
+        for c in &n.children {
+            if let StyledChild::Element(e) = c {
+                walk(e, out);
+            }
+        }
+    }
+    walk(root, &mut out);
+    out
+}
+
+/// Rewrite the payload's ROOT `<svg …>` tag to carry `fill` (replacing an
+/// existing root fill attribute — a root `fill="none"` with CSS fill green
+/// paints green in Chrome: specified style beats the presentation attribute).
+pub(crate) fn inject_root_fill(bytes: &[u8], fill: Color) -> Vec<u8> {
+    let Ok(text) = std::str::from_utf8(bytes) else {
+        return bytes.to_vec();
+    };
+    let Some(open) = text.find("<svg") else {
+        return bytes.to_vec();
+    };
+    let Some(end_rel) = text[open..].find('>') else {
+        return bytes.to_vec();
+    };
+    let end = open + end_rel;
+    let mut tag = text[open..end].to_string();
+    // Drop an existing fill="…" from the root tag only.
+    if let Some(f) = tag.find(" fill=\"") {
+        let vstart = f + " fill=\"".len();
+        if let Some(vlen) = tag[vstart..].find('"') {
+            tag.replace_range(f..vstart + vlen + 1, "");
+        }
+    }
+    let css = if fill.a == 255 {
+        format!(" fill=\"#{:02x}{:02x}{:02x}\"", fill.r, fill.g, fill.b)
+    } else {
+        format!(
+            " fill=\"rgba({},{},{},{})\"",
+            fill.r,
+            fill.g,
+            fill.b,
+            fill.a as f32 / 255.0
+        )
+    };
+    tag.push_str(&css);
+    let mut out = String::with_capacity(text.len() + 24);
+    out.push_str(&text[..open]);
+    out.push_str(&tag);
+    out.push_str(&text[end..]);
+    out.into_bytes()
+}
+
+#[cfg(test)]
+mod fill_tests {
+    use super::*;
+    use cerberus_paint::ImageDecoder;
+
+    #[test]
+    fn inject_root_fill_replaces_the_root_attribute_only() {
+        // mozilla's flag: root fill="none", CSS fill green — specified style
+        // beats the presentation attribute, so injection must REPLACE it. A
+        // child's own fill attribute stays untouched.
+        let svg = br#"<svg fill="none" viewBox="0 0 4 4"><path fill="red" d="M0 0h4v4z"/></svg>"#;
+        let out = inject_root_fill(svg, Color::rgb(0, 0xd2, 0x30));
+        let text = std::str::from_utf8(&out).unwrap();
+        let root_end = text.find('>').unwrap();
+        assert!(
+            text[..root_end].contains("fill=\"#00d230\""),
+            "root carries the computed fill: {text}"
+        );
+        assert!(
+            !text[..root_end].contains("none"),
+            "root fill=none dropped: {text}"
+        );
+        assert!(
+            text[root_end..].contains("fill=\"red\""),
+            "child fill untouched: {text}"
+        );
+    }
+
+    #[test]
+    fn styled_fill_rasterizes_through_the_codec() {
+        // End-to-end: a payload whose paths have NO usable fill (root
+        // fill=none) rasterizes fully transparent; with an injected green it
+        // paints green — proving the cascade's paint reaches resvg.
+        let svg = br#"<svg width="8" height="8" viewBox="0 0 8 8" fill="none"><path d="M0 0h8v8H0z"/></svg>"#;
+        let codec = cerberus_image::ImageCodec::new();
+        let plain = codec.decode(svg).expect("decodes");
+        let center = ((4 * plain.size.w + 4) * 4) as usize;
+        assert_eq!(plain.rgba[center + 3], 0, "fill=none paints nothing");
+        let green = codec
+            .decode(&inject_root_fill(svg, Color::rgb(0, 0xd2, 0x30)))
+            .expect("decodes");
+        assert_eq!(
+            &green.rgba[center..center + 4],
+            &[0, 0xd2, 0x30, 255],
+            "computed fill paints"
+        );
     }
 }

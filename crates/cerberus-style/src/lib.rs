@@ -472,6 +472,13 @@ pub struct ComputedStyle {
     pub white_space: WhiteSpace,
     /// `visibility: hidden` — laid out but not painted. Inherited.
     pub visibility: Visibility,
+    /// SVG `fill` from the CSS cascade (inherited, as in SVG): the computed
+    /// paint an inline `<svg>`'s content inherits — `currentColor` resolves to
+    /// the element's `color` at cascade time. The app injects this into the
+    /// pre-rasterized payload's root, since resvg never sees author CSS
+    /// (mozilla's flag is `fill: var(--m24-green)` on a root with
+    /// `fill="none"`). `None` = no CSS fill; the markup's own attrs apply.
+    pub fill: Option<Color>,
     /// `opacity` in `[0.0, 1.0]`, composited in paint. Not inherited.
     pub opacity: f32,
     /// Flex/grid container properties (meaningful only when `display` is
@@ -590,6 +597,7 @@ impl ComputedStyle {
             background_position_px: Point::ZERO,
             white_space: WhiteSpace::Normal,
             visibility: Visibility::Visible,
+            fill: None,
             opacity: 1.0,
             flex_direction: FlexDirection::Row,
             flex_reverse: false,
@@ -644,6 +652,7 @@ impl ComputedStyle {
             text_indent: self.text_indent,
             white_space: self.white_space,
             visibility: self.visibility,
+            fill: self.fill,
             // Reset per element:
             display: Display::Inline,
             background: None,
