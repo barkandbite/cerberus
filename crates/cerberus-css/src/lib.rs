@@ -196,6 +196,8 @@ impl CssEngine {
             // higher origin/specificity/order still wins (inline `!important`,
             // applied last, tops author `!important`). The UA sheet declares no
             // `!important`, so UA-important is not separately elevated.
+            let viewport = (self.media.width as f32, self.media.height as f32);
+            let mut pending = PendingHidden::default();
             for (_, _, _, decls) in &matched {
                 apply_declarations(
                     &mut style,
@@ -204,6 +206,8 @@ impl CssEngine {
                     root_font_size,
                     &vars,
                     false,
+                    viewport,
+                    &mut pending,
                 );
             }
             if let Some(decls) = &inline {
@@ -214,6 +218,8 @@ impl CssEngine {
                     root_font_size,
                     &vars,
                     false,
+                    viewport,
+                    &mut pending,
                 );
             }
             for (_, _, _, decls) in &matched {
@@ -224,6 +230,8 @@ impl CssEngine {
                     root_font_size,
                     &vars,
                     true,
+                    viewport,
+                    &mut pending,
                 );
             }
             if let Some(decls) = &inline {
@@ -234,8 +242,14 @@ impl CssEngine {
                     root_font_size,
                     &vars,
                     true,
+                    viewport,
+                    &mut pending,
                 );
             }
+            // An all-hiding `clip`/`clip-path` (sr-only patterns) folds into
+            // `visibility: hidden` once every pass has run — `clip` needs the
+            // final `position`, which any of the passes may have set.
+            pending.finalize(&mut style);
         }
 
         // The monospace-size quirk: an unspecified (`medium`) font-size resolves
@@ -372,10 +386,22 @@ impl CssEngine {
                 }
             }
         }
-        let resolved = resolve_value(&content_raw?, vars, elem_style.font_size as f32);
+        let em = elem_style.font_size as f32;
+        let viewport = (self.media.width as f32, self.media.height as f32);
+        let resolved = resolve_value(
+            &content_raw?,
+            vars,
+            CalcCtx {
+                em,
+                vw: viewport.0,
+                vh: viewport.1,
+                pct_base: Some(em),
+            },
+        );
         let text = parse_content_value(&resolved, node)?;
 
         let mut style = elem_style.inherit();
+        let mut pending = PendingHidden::default();
         for (_, _, _, decls) in &matched {
             apply_declarations(
                 &mut style,
@@ -384,6 +410,8 @@ impl CssEngine {
                 root_font_size,
                 vars,
                 false,
+                viewport,
+                &mut pending,
             );
         }
         for (_, _, _, decls) in &matched {
@@ -394,8 +422,11 @@ impl CssEngine {
                 root_font_size,
                 vars,
                 true,
+                viewport,
+                &mut pending,
             );
         }
+        pending.finalize(&mut style);
         if style.display == Display::None {
             return None;
         }
@@ -453,6 +484,21 @@ impl StyleEngine for CssEngine {
 }
 
 fn sibling_ref(node: NodeRef<'_>) -> SiblingRef {
+    let mut r = shallow_sibling_ref(node);
+    // One level of element children so `:has(...)` can check direct children
+    // during the cascade. The children's own lists stay empty — `:has` is a
+    // documented direct-child subset, so nothing looks deeper.
+    r.children = node
+        .children()
+        .filter(|c| c.is_element())
+        .map(shallow_sibling_ref)
+        .collect::<Vec<_>>()
+        .into();
+    r
+}
+
+/// A [`SiblingRef`] without children (the leaf form; `sibling_ref` fills them).
+fn shallow_sibling_ref(node: NodeRef<'_>) -> SiblingRef {
     SiblingRef {
         tag: node.tag().to_string(),
         id: node.attr("id").map(str::to_string),
@@ -461,6 +507,7 @@ fn sibling_ref(node: NodeRef<'_>) -> SiblingRef {
             .map(|c| c.split_whitespace().map(str::to_string).collect())
             .unwrap_or_default(),
         attrs: node.attrs().to_vec(),
+        children: Rc::from([]),
     }
 }
 
@@ -534,10 +581,10 @@ fn collect_vars(
 /// Resolve `var()` substitutions and `calc()` math in a raw declaration value,
 /// yielding a plain CSS value the existing property parsers can consume. Most
 /// values contain neither, so the fast path returns them untouched.
-fn resolve_value(value: &str, vars: &Vars, em: f32) -> String {
+fn resolve_value(value: &str, vars: &Vars, ctx: CalcCtx) -> String {
     let has_var = value.contains("var(");
-    let has_calc = value.contains("calc(");
-    if !has_var && !has_calc {
+    let has_math = find_math_fn(value).is_some();
+    if !has_var && !has_math {
         return value.to_string();
     }
     let substituted = if has_var {
@@ -545,8 +592,8 @@ fn resolve_value(value: &str, vars: &Vars, em: f32) -> String {
     } else {
         value.to_string()
     };
-    if substituted.contains("calc(") {
-        eval_calcs(&substituted, em)
+    if find_math_fn(&substituted).is_some() {
+        eval_calcs(&substituted, ctx)
     } else {
         substituted
     }
@@ -657,31 +704,152 @@ fn split_top_comma(s: &str) -> (&str, Option<&str>) {
     (s, None)
 }
 
-/// Replace every `calc(...)` in `input` with its evaluated length/number (in px
-/// where a unit is involved); leave a `calc()` we cannot evaluate untouched.
-fn eval_calcs(input: &str, em: f32) -> String {
+/// The math functions the value resolver evaluates.
+const MATH_FNS: [&str; 4] = ["calc(", "min(", "max(", "clamp("];
+
+/// Find the earliest math-function call in `s`, at a word boundary so a
+/// substring like the `max(` inside `minmax(...)` is never mistaken for one.
+/// Returns `(byte offset, matched name incl. '(')`.
+fn find_math_fn(s: &str) -> Option<(usize, &'static str)> {
+    let mut best: Option<(usize, &'static str)> = None;
+    for name in MATH_FNS {
+        let mut from = 0;
+        while let Some(rel) = s[from..].find(name) {
+            let pos = from + rel;
+            let bounded = pos == 0 || {
+                let prev = s.as_bytes()[pos - 1];
+                !(prev.is_ascii_alphanumeric() || prev == b'-' || prev == b'_')
+            };
+            if bounded {
+                if best.is_none_or(|(b, _)| pos < b) {
+                    best = Some((pos, name));
+                }
+                break;
+            }
+            from = pos + 1;
+        }
+    }
+    best
+}
+
+/// The bases a `calc()`/`min()`/`max()`/`clamp()` expression resolves its
+/// relative units against.
+#[derive(Clone, Copy)]
+struct CalcCtx {
+    /// The element's font size in px (the `em` base).
+    em: f32,
+    /// Viewport width/height in px (the `vw`/`vh`/`vmin`/`vmax` bases).
+    vw: f32,
+    vh: f32,
+    /// How `%` resolves for the property being parsed. `Some(base)` folds it to
+    /// px against `base` — correct only for the font-relative properties
+    /// (`font-size`/`line-height`/`vertical-align`). `None` keeps `%` symbolic:
+    /// the expression reduces to the canonical `a% + b·px`, and only a pure
+    /// form (`a == 0` or `b == 0`) resolves. A mixed result (e.g.
+    /// `calc(100% - 32px)` for a width) is left unresolved so the declaration
+    /// falls back to the prior/initial value instead of mis-resolving `%`
+    /// against the font size — Chrome resolves such `%` against the containing
+    /// block, which isn't known until layout, and `Len` has no combined
+    /// `%+px` variant (layout/taffy match on `Len` exhaustively, and
+    /// cerberus-layout must not be edited here).
+    pct_base: Option<f32>,
+}
+
+/// A partially-evaluated calc value in the canonical linear form `px + pct%`
+/// (`%` can't be folded into px without the containing block).
+#[derive(Clone, Copy, PartialEq, Debug)]
+struct CalcVal {
+    px: f32,
+    pct: f32,
+}
+
+impl CalcVal {
+    fn add(self, o: Self) -> Self {
+        CalcVal {
+            px: self.px + o.px,
+            pct: self.pct + o.pct,
+        }
+    }
+
+    fn sub(self, o: Self) -> Self {
+        CalcVal {
+            px: self.px - o.px,
+            pct: self.pct - o.pct,
+        }
+    }
+
+    /// Multiply; one side must be a plain number (no `%` component — unitless
+    /// numbers tokenize with their value in `px`, matching the old behavior).
+    fn mul(self, o: Self) -> Option<Self> {
+        if o.pct == 0.0 {
+            Some(CalcVal {
+                px: self.px * o.px,
+                pct: self.pct * o.px,
+            })
+        } else if self.pct == 0.0 {
+            Some(CalcVal {
+                px: o.px * self.px,
+                pct: o.pct * self.px,
+            })
+        } else {
+            None
+        }
+    }
+
+    /// Divide by a plain non-zero number.
+    fn div(self, o: Self) -> Option<Self> {
+        (o.pct == 0.0 && o.px != 0.0).then(|| CalcVal {
+            px: self.px / o.px,
+            pct: self.pct / o.px,
+        })
+    }
+}
+
+/// Print a resolved calc result as a plain CSS value: `px` when there is no
+/// `%` component, `N%` when it is purely a percentage (the property parsers
+/// then treat it exactly like a literal percentage), `None` when mixed.
+fn format_calc_val(v: CalcVal) -> Option<String> {
+    // Integer-ish results print without a trailing `.0`.
+    let fmt = |n: f32, unit: &str| {
+        if (n.round() - n).abs() < 1e-4 {
+            format!("{}{unit}", n.round() as i64)
+        } else {
+            format!("{n}{unit}")
+        }
+    };
+    if v.pct == 0.0 {
+        Some(fmt(v.px, "px"))
+    } else if v.px == 0.0 {
+        Some(fmt(v.pct, "%"))
+    } else {
+        None
+    }
+}
+
+/// Replace every math function ([`MATH_FNS`]) in `input` with its evaluated
+/// length/percentage; leave one we cannot evaluate untouched so the
+/// declaration fails to parse and falls back.
+fn eval_calcs(input: &str, ctx: CalcCtx) -> String {
     let mut out = String::new();
     let mut rest = input;
-    while let Some(pos) = rest.find("calc(") {
+    while let Some((pos, name)) = find_math_fn(rest) {
         out.push_str(&rest[..pos]);
-        let after = &rest[pos + 5..];
+        let after = &rest[pos + name.len()..];
         let Some((inner, tail)) = take_group(after) else {
             out.push_str(&rest[pos..]);
             return out;
         };
-        // Nested calc() inside this group resolves first.
-        let inner = eval_calcs(inner, em);
-        match eval_calc_expr(&inner, em) {
-            Some(px) => {
-                // Integer-ish results print without a trailing `.0`.
-                if (px.round() - px).abs() < 1e-4 {
-                    out.push_str(&format!("{}px", px.round() as i64));
-                } else {
-                    out.push_str(&format!("{px}px"));
-                }
-            }
+        // Nested math inside this group resolves first.
+        let inner = eval_calcs(inner, ctx);
+        let val = if name == "calc(" {
+            eval_calc_expr(&inner, ctx)
+        } else {
+            eval_min_max_clamp(name, &inner, ctx)
+        };
+        match val.and_then(format_calc_val) {
+            Some(s) => out.push_str(&s),
             None => {
-                out.push_str("calc(");
+                out.push_str(name);
                 out.push_str(&inner);
                 out.push(')');
             }
@@ -692,11 +860,42 @@ fn eval_calcs(input: &str, em: f32) -> String {
     out
 }
 
-/// Evaluate a `calc()` expression body to a px value, supporting `+ - * /`,
-/// parentheses, and px/em/rem/pt/% units (others convert via the same rules the
-/// length parser uses). Returns `None` if it cannot be reduced to a number.
-fn eval_calc_expr(expr: &str, em: f32) -> Option<f32> {
-    let tokens = tokenize_calc(expr, em)?;
+/// Evaluate `min(...)`/`max(...)`/`clamp(lo, mid, hi)` over comma-separated
+/// calc expressions. The arguments are only mutually comparable without a
+/// containing block when they are all pure px or all pure `%`; anything mixed
+/// (`min(100%, 500px)`) is left unresolved — the same safety rule as `calc()`
+/// itself (FIX 1), so `%` is never compared against a font-size-derived px.
+fn eval_min_max_clamp(name: &str, inner: &str, ctx: CalcCtx) -> Option<CalcVal> {
+    let args: Vec<CalcVal> = split_top_commas(inner)
+        .iter()
+        .map(|a| eval_calc_expr(a, ctx))
+        .collect::<Option<_>>()?;
+    let all_px = args.iter().all(|a| a.pct == 0.0);
+    let all_pct = args.iter().all(|a| a.px == 0.0);
+    if args.is_empty() || !(all_px || all_pct) {
+        return None;
+    }
+    // `%` compares monotonically because its (containing-block) base is ≥ 0.
+    let key = |a: &CalcVal| if all_px { a.px } else { a.pct };
+    let n = match name {
+        "min(" => args.iter().map(key).fold(f32::INFINITY, f32::min),
+        "max(" => args.iter().map(key).fold(f32::NEG_INFINITY, f32::max),
+        // clamp(lo, mid, hi) = max(lo, min(mid, hi)); exactly three arguments.
+        "clamp(" if args.len() == 3 => key(&args[0]).max(key(&args[1]).min(key(&args[2]))),
+        _ => return None,
+    };
+    Some(if all_px {
+        CalcVal { px: n, pct: 0.0 }
+    } else {
+        CalcVal { px: 0.0, pct: n }
+    })
+}
+
+/// Evaluate a `calc()` expression body to the canonical `px + %` form,
+/// supporting `+ - * /`, parentheses, and px/em/rem/pt/vw/vh/vmin/vmax/%
+/// units. Returns `None` if it cannot be reduced.
+fn eval_calc_expr(expr: &str, ctx: CalcCtx) -> Option<CalcVal> {
+    let tokens = tokenize_calc(expr, ctx)?;
     let mut p = CalcParser {
         tokens: &tokens,
         i: 0,
@@ -709,10 +908,10 @@ fn eval_calc_expr(expr: &str, em: f32) -> Option<f32> {
     }
 }
 
-/// A `calc()` token: a resolved px/number value or an operator/paren.
+/// A `calc()` token: a resolved value or an operator/paren.
 #[derive(Clone, Copy, PartialEq)]
 enum CalcTok {
-    Num(f32),
+    Num(CalcVal),
     Plus,
     Minus,
     Mul,
@@ -721,7 +920,7 @@ enum CalcTok {
     Close,
 }
 
-fn tokenize_calc(expr: &str, em: f32) -> Option<Vec<CalcTok>> {
+fn tokenize_calc(expr: &str, ctx: CalcCtx) -> Option<Vec<CalcTok>> {
     let mut toks = Vec::new();
     let bytes = expr.as_bytes();
     let mut i = 0;
@@ -771,15 +970,25 @@ fn tokenize_calc(expr: &str, em: f32) -> Option<Vec<CalcTok>> {
                     i += 1;
                 }
                 let unit = &expr[unit_start..i];
-                let px = match unit.to_ascii_lowercase().as_str() {
-                    "" | "px" => num,
-                    "em" => num * em,
-                    "rem" => num * 16.0,
-                    "pt" => num * 96.0 / 72.0,
-                    "%" => num / 100.0 * em,
+                let px = |px: f32| CalcVal { px, pct: 0.0 };
+                let val = match unit.to_ascii_lowercase().as_str() {
+                    "" | "px" => px(num),
+                    "em" => px(num * ctx.em),
+                    "rem" => px(num * 16.0),
+                    "pt" => px(num * 96.0 / 72.0),
+                    "vw" => px(num / 100.0 * ctx.vw),
+                    "vh" => px(num / 100.0 * ctx.vh),
+                    "vmin" => px(num / 100.0 * ctx.vw.min(ctx.vh)),
+                    "vmax" => px(num / 100.0 * ctx.vw.max(ctx.vh)),
+                    // See `CalcCtx::pct_base`: fold against the font-relative
+                    // base, or keep the `%` symbolic for later reduction.
+                    "%" => match ctx.pct_base {
+                        Some(base) => px(num / 100.0 * base),
+                        None => CalcVal { px: 0.0, pct: num },
+                    },
                     _ => return None,
                 };
-                toks.push(CalcTok::Num(px));
+                toks.push(CalcTok::Num(val));
             }
         }
     }
@@ -801,38 +1010,35 @@ impl CalcParser<'_> {
         self.tokens.get(self.i).copied()
     }
 
-    fn expr(&mut self) -> Option<f32> {
+    fn expr(&mut self) -> Option<CalcVal> {
         let mut v = self.term()?;
         while let Some(op @ (CalcTok::Plus | CalcTok::Minus)) = self.peek() {
             self.i += 1;
             let rhs = self.term()?;
             v = if op == CalcTok::Plus {
-                v + rhs
+                v.add(rhs)
             } else {
-                v - rhs
+                v.sub(rhs)
             };
         }
         Some(v)
     }
 
-    fn term(&mut self) -> Option<f32> {
+    fn term(&mut self) -> Option<CalcVal> {
         let mut v = self.factor()?;
         while let Some(op @ (CalcTok::Mul | CalcTok::Div)) = self.peek() {
             self.i += 1;
             let rhs = self.factor()?;
-            if op == CalcTok::Mul {
-                v *= rhs;
+            v = if op == CalcTok::Mul {
+                v.mul(rhs)?
             } else {
-                if rhs == 0.0 {
-                    return None;
-                }
-                v /= rhs;
-            }
+                v.div(rhs)?
+            };
         }
         Some(v)
     }
 
-    fn factor(&mut self) -> Option<f32> {
+    fn factor(&mut self) -> Option<CalcVal> {
         match self.peek()? {
             CalcTok::Num(n) => {
                 self.i += 1;
@@ -908,6 +1114,36 @@ fn parse_content_value(v: &str, node: NodeRef<'_>) -> Option<String> {
     Some(out)
 }
 
+/// Cross-declaration state accumulated over one element's cascade passes and
+/// finalized in `build` after all of them: whether the last `clip` /
+/// `clip-path` declaration collapses the element to nothing (the `sr-only`
+/// accessibility-hiding patterns). Deferred because `clip` only applies to
+/// absolutely positioned boxes and `position` may be declared in any rule /
+/// order relative to the `clip` (alphabetized blocks put `clip` first).
+#[derive(Default)]
+struct PendingHidden {
+    /// `clip: rect(...)` left an empty visible region.
+    clip: bool,
+    /// `clip-path: inset(...)` insets away the whole box.
+    clip_path: bool,
+}
+
+impl PendingHidden {
+    /// Fold into the computed style: an all-hiding clip behaves like
+    /// `visibility: hidden` (laid out, not painted, inherited by children) —
+    /// reusing that mechanism means layout/paint need no changes. Real
+    /// (partial) clipping is not modeled; only the invisible case applies.
+    fn finalize(&self, style: &mut ComputedStyle) {
+        let clip_applies = matches!(style.position, Position::Absolute | Position::Fixed);
+        if self.clip_path || (self.clip && clip_applies) {
+            style.visibility = Visibility::Hidden;
+        }
+    }
+}
+
+// The cascade threads per-element bases (parent/root font size, viewport) that
+// vary per call; bundling them would not aid readability (same as `build`).
+#[allow(clippy::too_many_arguments)]
 fn apply_declarations(
     style: &mut ComputedStyle,
     decls: &[(String, String, bool)],
@@ -915,6 +1151,8 @@ fn apply_declarations(
     root_font_size: u32,
     vars: &Vars,
     important: bool,
+    viewport: (f32, f32),
+    pending: &mut PendingHidden,
 ) {
     for (prop, value, is_important) in decls {
         // This pass only applies declarations of the matching importance, so the
@@ -930,9 +1168,20 @@ fn apply_declarations(
         // Fold `rem` to px against the root font-size up front (`em` stays for
         // per-element resolution), so downstream length parsers see px.
         let value = &substitute_rem(value, root_font_size as f32);
-        // Resolve `var()` references and `calc()` math before parsing the value.
-        // `em` for `calc()` uses the element's current font size.
-        let resolved = resolve_value(value, vars, style.font_size as f32);
+        // Resolve `var()` references and calc()/min()/max()/clamp() math before
+        // parsing the value. `em` uses the element's current font size; `%` only
+        // folds to px for the font-relative properties (see `CalcCtx`).
+        let ctx = CalcCtx {
+            em: style.font_size as f32,
+            vw: viewport.0,
+            vh: viewport.1,
+            pct_base: matches!(
+                prop.as_str(),
+                "font-size" | "line-height" | "vertical-align"
+            )
+            .then_some(style.font_size as f32),
+        };
+        let resolved = resolve_value(value, vars, ctx);
         // Then resolve the `currentColor` keyword against the color cascaded so
         // far, so it works anywhere a color appears (borders, backgrounds,
         // shadows, gradients) — not just as an unresolved literal.
@@ -1251,6 +1500,13 @@ fn apply_declarations(
                     _ => style.visibility,
                 }
             }
+            // Accessibility hiding: only the *all-hiding* clip forms are
+            // modeled (finalized via `PendingHidden` after the cascade); a
+            // partially-clipping value is treated as visible — we never
+            // attempt real clipping. The last declaration wins, so a visible
+            // `auto`/`none`/partial value overrides an earlier hiding one.
+            "clip" => pending.clip = clip_rect_hides(v, style.font_size as f32),
+            "clip-path" => pending.clip_path = clip_path_inset_hides(v),
             "opacity" => {
                 if let Some(o) = parse_opacity(v) {
                     style.opacity = o;
@@ -1388,6 +1644,59 @@ fn apply_declarations(
             _ => {}
         }
     }
+}
+
+/// Whether a `clip` value is a `rect(...)` that leaves (essentially) nothing
+/// visible: all four edges parse as lengths ≤ 1px — the screen-reader-only
+/// patterns `rect(0, 0, 0, 0)` and `rect(1px, 1px, 1px, 1px)` (the visible
+/// region is `left..right × top..bottom`, so those are empty). `auto` edges or
+/// larger rects leave content visible and return false.
+fn clip_rect_hides(v: &str, em: f32) -> bool {
+    let t = v.trim().to_ascii_lowercase();
+    let Some(inner) = t.strip_prefix("rect(").and_then(|s| s.strip_suffix(')')) else {
+        return false;
+    };
+    // Both the comma and the legacy space-separated forms are valid.
+    let edges: Vec<&str> = inner
+        .split(|c: char| c == ',' || c.is_whitespace())
+        .filter(|s| !s.is_empty())
+        .collect();
+    edges.len() == 4
+        && edges
+            .iter()
+            .all(|e| parse_css_px(e, em).is_some_and(|px| px <= 1.0))
+}
+
+/// Whether a `clip-path` value is an `inset(...)` that insets away the whole
+/// box: opposite percentage insets summing to ≥ 100% on either axis (e.g. the
+/// sr-only `inset(50%)`, or `inset(100%)`). Pixel insets can't be judged
+/// without the box size and count as 0 (conservative: never hide unless the
+/// percentages alone guarantee it) — Chrome shows `inset(0 0 50% 0)` half-
+/// visible, and so do we (visible).
+fn clip_path_inset_hides(v: &str) -> bool {
+    let t = v.trim().to_ascii_lowercase();
+    let Some(inner) = t.strip_prefix("inset(").and_then(|s| s.strip_suffix(')')) else {
+        return false;
+    };
+    // 1–4 values (top/right/bottom/left, CSS order), before any `round` radius.
+    let vals: Vec<&str> = inner
+        .split_whitespace()
+        .take_while(|tok| *tok != "round")
+        .collect();
+    let pct = |i: usize| -> f32 {
+        vals.get(i)
+            .and_then(|tok| tok.strip_suffix('%'))
+            .and_then(|n| n.trim().parse::<f32>().ok())
+            .unwrap_or(0.0)
+    };
+    let (top, right, bottom, left) = match vals.len() {
+        1 => (pct(0), pct(0), pct(0), pct(0)),
+        2 => (pct(0), pct(1), pct(0), pct(1)),
+        3 => (pct(0), pct(1), pct(2), pct(1)),
+        4 => (pct(0), pct(1), pct(2), pct(3)),
+        _ => return false,
+    };
+    top + bottom >= 100.0 || left + right >= 100.0
 }
 
 fn parse_bg_color(v: &str) -> Option<Color> {
@@ -2759,6 +3068,106 @@ mod tests {
         );
     }
 
+    // ---- sr-only hiding via clip / clip-path (FIX 3) ----
+
+    #[test]
+    fn sr_only_clip_rect_hides_positioned_element() {
+        // The Bootstrap `.visually-hidden` / classic sr-only pattern: the
+        // "Skip to content" link must not paint (bbc/mozilla/iana/apple).
+        let html = "<style>.sr{position:absolute;width:1px;height:1px;clip:rect(0,0,0,0)}\
+                    </style><a class='sr' href='#main'>Skip to content</a><p>body</p>";
+        let dom = CssEngine::new().style(&parse_html(html));
+        assert_eq!(
+            first(&dom.root, "a").unwrap().style.visibility,
+            Visibility::Hidden
+        );
+        assert_eq!(
+            first(&dom.root, "p").unwrap().style.visibility,
+            Visibility::Visible
+        );
+        // The legacy space-separated 1px rect hides too (right − left = 0),
+        // and the hidden visibility reaches children by inheritance.
+        let dom2 = CssEngine::new().style(&parse_html(
+            "<div style='position:absolute;clip:rect(1px 1px 1px 1px)'><span>x</span></div>",
+        ));
+        assert_eq!(
+            first(&dom2.root, "span").unwrap().style.visibility,
+            Visibility::Hidden
+        );
+    }
+
+    #[test]
+    fn clip_requires_absolute_positioning_but_not_declaration_order() {
+        // Per CSS (Chrome-verified), `clip` applies only to absolutely
+        // positioned boxes: a static element keeps painting.
+        let stat = CssEngine::new().style(&parse_html("<div style='clip:rect(0,0,0,0)'>x</div>"));
+        assert_eq!(
+            first(&stat.root, "div").unwrap().style.visibility,
+            Visibility::Visible
+        );
+        // Alphabetized blocks declare `clip` before `position`, and `position`
+        // may come from a different rule entirely; the check runs after the
+        // whole cascade, so both still hide.
+        let html = "<style>.a{clip:rect(0,0,0,0)} .b{position:absolute}</style>\
+                    <i class='a b'>x</i>";
+        let dom = CssEngine::new().style(&parse_html(html));
+        assert_eq!(
+            first(&dom.root, "i").unwrap().style.visibility,
+            Visibility::Hidden
+        );
+        let fixed = CssEngine::new().style(&parse_html(
+            "<div style='clip:rect(0,0,0,0);position:fixed'>x</div>",
+        ));
+        assert_eq!(
+            first(&fixed.root, "div").unwrap().style.visibility,
+            Visibility::Hidden
+        );
+    }
+
+    #[test]
+    fn visible_clip_values_do_not_hide_and_can_override() {
+        // The last declaration wins: `auto` restores a previously-hidden clip.
+        let auto = CssEngine::new().style(&parse_html(
+            "<div style='position:absolute;clip:rect(0,0,0,0);clip:auto'>x</div>",
+        ));
+        assert_eq!(
+            first(&auto.root, "div").unwrap().style.visibility,
+            Visibility::Visible
+        );
+        // A rect that leaves a visible region is ignored (no real clipping).
+        let partial = CssEngine::new().style(&parse_html(
+            "<div style='position:absolute;clip:rect(0, 100px, 100px, 0)'>x</div>",
+        ));
+        assert_eq!(
+            first(&partial.root, "div").unwrap().style.visibility,
+            Visibility::Visible
+        );
+    }
+
+    #[test]
+    fn clip_path_inset_hides_only_when_fully_inset() {
+        let vis = |css: &str| {
+            let dom = CssEngine::new().style(&parse_html(&format!("<div style='{css}'>x</div>")));
+            first(&dom.root, "div").unwrap().style.visibility
+        };
+        // Fully-insetting values hide — no positioning requirement (unlike clip).
+        assert_eq!(vis("clip-path:inset(50%)"), Visibility::Hidden);
+        assert_eq!(vis("clip-path:inset(100%)"), Visibility::Hidden);
+        assert_eq!(vis("clip-path:inset(50% 50%)"), Visibility::Hidden);
+        // A `round` radius suffix doesn't confuse the parse.
+        assert_eq!(vis("clip-path:inset(50% round 8px)"), Visibility::Hidden);
+        // Chrome shows half the box for a one-sided 50% inset — stay visible.
+        assert_eq!(vis("clip-path:inset(0 0 50% 0)"), Visibility::Visible);
+        // px insets can't be judged without the box; other shapes are ignored.
+        assert_eq!(vis("clip-path:inset(10px)"), Visibility::Visible);
+        assert_eq!(vis("clip-path:circle(40%)"), Visibility::Visible);
+        // Last declaration wins: `none` restores.
+        assert_eq!(
+            vis("clip-path:inset(50%);clip-path:none"),
+            Visibility::Visible
+        );
+    }
+
     #[test]
     fn flex_and_grid_parse() {
         let html = "<div style='display:flex; flex-direction:column; \
@@ -2811,6 +3220,40 @@ mod tests {
         assert_eq!(
             first(&dom.root, "input").unwrap().style.color,
             Color::rgb(0, 0xff, 0)
+        );
+    }
+
+    #[test]
+    fn has_is_where_cascade_end_to_end() {
+        // (FIX 4) `:has(> a)` through the real cascade: only the div with a
+        // direct <a> child turns red; `:is`/`:where` match the element itself.
+        let html = "<style>\
+            div:has(> a) { color: #ff0000 }\
+            section:has(> a) { color: #0000ff }\
+            p:is(.hero, .lead) { color: #00ff00 }\
+            span:where([data-x]) { color: #00ffff }\
+            </style>\
+            <div><a href='/x'>l</a></div>\
+            <section><b><a href='/y'>m</a></b></section>\
+            <p class='lead'>t</p><span data-x='1'>s</span>";
+        let dom = CssEngine::new().style(&parse_html(html));
+        assert_eq!(
+            first(&dom.root, "div").unwrap().style.color,
+            Color::rgb(0xff, 0, 0),
+            "div has a direct <a> child"
+        );
+        assert_eq!(
+            first(&dom.root, "section").unwrap().style.color,
+            Color::BLACK,
+            "the section's <a> is nested, not a direct child"
+        );
+        assert_eq!(
+            first(&dom.root, "p").unwrap().style.color,
+            Color::rgb(0, 0xff, 0)
+        );
+        assert_eq!(
+            first(&dom.root, "span").unwrap().style.color,
+            Color::rgb(0, 0xff, 0xff)
         );
     }
 
@@ -3041,6 +3484,128 @@ mod tests {
         let p = first(&dom.root, "p").unwrap();
         assert_eq!(p.style.margin_top, Len::Px(24), "2*4 + 16(rem) = 24");
         assert_eq!(p.style.margin_left, Len::Px(24), "8 * 3 = 24");
+    }
+
+    // ---- calc() percentage base (FIX 1) ----
+
+    #[test]
+    fn calc_mixed_pct_px_fails_instead_of_resolving_against_font_size() {
+        // `width: calc(100% - 32px)` must not resolve `%` against the font size
+        // (that gave 16 - 32 = a negative width). The containing block isn't
+        // known at style time, so the declaration is dropped and the width
+        // falls back (auto) — Chrome on an 800px block computes 768px.
+        let dom =
+            CssEngine::new().style(&parse_html("<div style='width:calc(100% - 32px)'>x</div>"));
+        assert_eq!(first(&dom.root, "div").unwrap().style.width, Len::Auto);
+        // A longhand that only sets on parse success keeps its prior value.
+        let dom2 = CssEngine::new().style(&parse_html(
+            "<div style='margin-left:8px;margin-left:calc(100% - 32px)'>x</div>",
+        ));
+        assert_eq!(
+            first(&dom2.root, "div").unwrap().style.margin_left,
+            Len::Px(8)
+        );
+    }
+
+    #[test]
+    fn calc_pure_pct_reduces_to_a_percentage() {
+        // A %-only calc reduces to a plain percentage, which resolves against
+        // the containing block at layout — exactly like a literal `50%`.
+        let dom = CssEngine::new().style(&parse_html(
+            "<div style='width:calc(100%);margin-left:calc(25% + 25%)'>x</div>",
+        ));
+        let d = first(&dom.root, "div").unwrap();
+        assert_eq!(d.style.width, Len::Pct(100.0));
+        assert_eq!(d.style.margin_left, Len::Pct(50.0));
+        // % terms that cancel leave a plain px value.
+        let dom2 = CssEngine::new().style(&parse_html(
+            "<div style='width:calc(50% - 50% + 24px)'>x</div>",
+        ));
+        assert_eq!(first(&dom2.root, "div").unwrap().style.width, Len::Px(24));
+    }
+
+    #[test]
+    fn calc_pct_still_folds_for_font_relative_properties() {
+        // For font-size, `%` IS font-relative (of the inherited size), so a
+        // mixed calc still resolves: 100% of 16px + 2px = 18px (Chrome agrees).
+        let dom =
+            CssEngine::new().style(&parse_html("<p style='font-size:calc(100% + 2px)'>x</p>"));
+        assert_eq!(first(&dom.root, "p").unwrap().style.font_size, 18);
+    }
+
+    #[test]
+    fn calc_viewport_units_resolve_against_the_engine_viewport() {
+        // The default engine viewport is 1280×800.
+        let dom = CssEngine::new().style(&parse_html(
+            "<div style='width:calc(50vw - 40px);height:calc(25vh)'>x</div>",
+        ));
+        let d = first(&dom.root, "div").unwrap();
+        assert_eq!(d.style.width, Len::Px(600), "50vw - 40px = 600px");
+        assert_eq!(d.style.height, Len::Px(200), "25vh = 200px");
+    }
+
+    // ---- min()/max()/clamp() (FIX 2) ----
+
+    #[test]
+    fn min_max_evaluate_over_calc_units() {
+        // min/max over px-reducible units (em here: 30em = 480px < 500px).
+        let dom = CssEngine::new().style(&parse_html(
+            "<div style='width:min(500px, 30em);height:max(100px, 10em)'>x</div>",
+        ));
+        let d = first(&dom.root, "div").unwrap();
+        assert_eq!(d.style.width, Len::Px(480));
+        assert_eq!(d.style.height, Len::Px(160));
+        // Pure percentages compare symbolically and stay a percentage.
+        let dom2 = CssEngine::new().style(&parse_html(
+            "<div style='width:min(50%, 80%);height:200px;max-height:max(25%, 10%)'>x</div>",
+        ));
+        let d2 = first(&dom2.root, "div").unwrap();
+        assert_eq!(d2.style.width, Len::Pct(50.0));
+        assert_eq!(d2.style.max_height, Len::Pct(25.0));
+    }
+
+    #[test]
+    fn clamp_picks_lo_mid_hi() {
+        let clamp = |css: &str| {
+            let dom = CssEngine::new().style(&parse_html(&format!("<div style='{css}'>x</div>")));
+            first(&dom.root, "div").unwrap().style.width
+        };
+        assert_eq!(clamp("width:clamp(10px, 5px, 20px)"), Len::Px(10), "lo");
+        assert_eq!(clamp("width:clamp(10px, 15px, 20px)"), Len::Px(15), "mid");
+        assert_eq!(clamp("width:clamp(10px, 25px, 20px)"), Len::Px(20), "hi");
+        // Wrong arity is invalid and falls back.
+        assert_eq!(clamp("width:clamp(10px, 20px)"), Len::Auto);
+    }
+
+    #[test]
+    fn min_max_mixed_pct_px_falls_back_like_calc() {
+        // `%` and px can't be compared without the containing block; the
+        // declaration is dropped rather than mis-resolved (FIX 1 safety rule).
+        let dom =
+            CssEngine::new().style(&parse_html("<div style='width:min(100%, 500px)'>x</div>"));
+        assert_eq!(first(&dom.root, "div").unwrap().style.width, Len::Auto);
+    }
+
+    #[test]
+    fn math_functions_nest_and_leave_minmax_alone() {
+        // min() inside calc() (and vice versa) resolve innermost-first.
+        let dom = CssEngine::new().style(&parse_html(
+            "<div style='width:calc(min(10px, 20px) * 2);height:min(calc(3px * 4), 50px)'>x</div>",
+        ));
+        let d = first(&dom.root, "div").unwrap();
+        assert_eq!(d.style.width, Len::Px(20));
+        assert_eq!(d.style.height, Len::Px(12));
+        // The `max(` substring inside grid `minmax(` is not a math function.
+        let grid = CssEngine::new().style(&parse_html(
+            "<div style='display:grid;grid-template-columns:minmax(100px, 1fr) 2fr'>x</div>",
+        ));
+        assert_eq!(
+            first(&grid.root, "div")
+                .unwrap()
+                .style
+                .grid_template_columns,
+            vec![Track::MinMax(100, TrackMax::Fr(1.0)), Track::Fr(2.0)]
+        );
     }
 
     #[test]

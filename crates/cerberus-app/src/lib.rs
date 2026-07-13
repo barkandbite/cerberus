@@ -7759,7 +7759,12 @@ mod tests {
 
     /// The `Image` display-item rects a layout of `styled` emits at 800×600.
     fn image_rects(styled: &StyledDom, images: &HashMap<String, ImageState>) -> Vec<Rect> {
-        let provider = StoreImages { base: None, images };
+        let policy = ImagePolicy::default();
+        let provider = StoreImages {
+            base: None,
+            images,
+            policy: &policy,
+        };
         let text = TextEngine::new();
         let mut layout = BlockLayout::default();
         let laid = layout.layout(styled, Size::new(800, 600), &text, &provider, &NoForms);
@@ -7806,9 +7811,12 @@ mod tests {
         // pipeline synthesizes the stretch as viewport-width attributes and
         // layout re-clamps to the actual containing block, landing on the
         // same 784×196.
+        // The <body> matters: the UA sheet's `body{margin:8px}` supplies the
+        // 8px inset Chrome shows (the engine no longer has a built-in page
+        // margin), so the stretch clamps to 784 wide.
         let mut doc = parse_html(
-            "<svg viewBox='0 0 400 100'>\
-             <rect width='400' height='100' fill='#00ff00'/></svg>",
+            "<body><svg viewBox='0 0 400 100'>\
+             <rect width='400' height='100' fill='#00ff00'/></svg></body>",
         );
         let pairs = replace_inline_svgs(&mut doc, 800);
         let codec = ImageCodec::new();
@@ -7849,9 +7857,11 @@ mod tests {
         assert!(matches!(state, ImageState::Ready(_)), "decoded eagerly");
         // The provider resolves the synthetic src verbatim (opaque scheme
         // round-trip), so layout finds the bitmap; a frame renders fine.
+        let policy = ImagePolicy::default();
         let provider = StoreImages {
             base: b.current_url.as_ref(),
             images: &b.images,
+            policy: &policy,
         };
         assert!(provider.get(key).is_some(), "provider serves the bitmap");
         b.render_frame(Size::new(800, 600));
