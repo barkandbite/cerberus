@@ -136,12 +136,14 @@ fn faux_page(text: &TextEngine, logical: Size, site: &str) -> DisplayList {
     let top = cerberus_ui::TOOLBAR_HEIGHT as i32 + 24;
     list.push(DisplayItem::Glyphs {
         origin: Point::new(40, top),
+        frac_x: 0.0,
         glyphs: text.shape("Travel Claims — Processing Queue", 24),
         color: Color::rgb(0x22, 0x22, 0x22),
         style: FontStyle::REGULAR,
     });
     list.push(DisplayItem::Glyphs {
         origin: Point::new(40, top + 30),
+        frac_x: 0.0,
         glyphs: text.shape(&format!("{site}  ·  18,412 claims pending"), 14),
         color: Color::rgb(0x70, 0x70, 0x70),
         style: FontStyle::REGULAR,
@@ -156,6 +158,7 @@ fn faux_page(text: &TextEngine, logical: Size, site: &str) -> DisplayList {
         }
         list.push(DisplayItem::Glyphs {
             origin: Point::new(48, y),
+            frac_x: 0.0,
             glyphs: text.shape(
                 &format!(
                     "CLM-2026-{:05}    bump-through    pending review",

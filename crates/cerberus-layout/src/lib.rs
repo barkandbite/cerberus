@@ -438,6 +438,11 @@ type CellLayout = (Vec<DisplayItem>, Vec<LinkBox>, Vec<FormFieldBox>, i32);
 /// One placed run of text on the current (not-yet-aligned) line.
 struct LinePiece {
     x: i32,
+    /// Sub-pixel remainder of the piece's TRUE x origin (`x + frac_x` is the
+    /// exact fractional position captured from the inline cursor). Emitted
+    /// into `DisplayItem::Glyphs::frac_x` so the rasterizer starts the pen at
+    /// Chrome's fractional run position.
+    frac_x: f32,
     y: i32,
     w: u32,
     px: u32,
@@ -1117,6 +1122,7 @@ impl<'a> Ctx<'a> {
                     let x = (self.left - w as i32 - gap).max(0);
                     self.display.push(DisplayItem::Glyphs {
                         origin: Point::new(x, self.y),
+                        frac_x: 0.0,
                         glyphs,
                         color: style.color,
                         style: style.font,
@@ -1798,8 +1804,15 @@ impl<'a> Ctx<'a> {
             VerticalAlign::Sub => px as i32 / 3,
             VerticalAlign::Baseline | VerticalAlign::OffBaseline => 0,
         };
+        // The TRUE fractional width of the run (the integer `w` is its
+        // error-diffused rounding, kept for link/underline/wrap box math).
+        let w_f: f32 = glyphs.iter().map(|g| g.advance_f).sum();
         self.line.push(LinePiece {
             x: self.x,
+            // The exact fractional origin: the cursor's sub-pixel debt at this
+            // moment. `x + frac_x` equals the exact f32 advance accumulation
+            // since line start, which is where Chrome places this run.
+            frac_x: self.x_frac,
             y: self.y + voffset,
             w,
             px,
@@ -1811,7 +1824,23 @@ impl<'a> Ctx<'a> {
             href: href.map(str::to_string),
             link_node: self.cur_link_node,
         });
-        self.x += w as i32;
+        // Advance the cursor. In the PAINT flow, advance by the TRUE width so
+        // `x + x_frac` tracks Chrome's exact fractional origins (the plain
+        // `+= w` discarded each word's fractional width, phase-shifting every
+        // later run — the root cause behind the reverted spacer attempt).
+        //
+        // In a MEASURE scratch (intrinsic/min-content width for table columns,
+        // flex/grid items), advance by the INTEGER width instead: `max_x` sizes
+        // those boxes, and `round(Σ w_f)` differs from the historical
+        // `Σ round(w)` by up to a couple px over a long run — enough to resize
+        // a table column and shift the whole layout (measured: HN's item list
+        // jumped 5px). The scratch's `frac_x`/display output is discarded, so
+        // only `max_x` matters there, and it must stay integer-stable.
+        if self.measuring {
+            self.x += w as i32;
+        } else {
+            self.advance_x_f(w_f);
+        }
         self.max_x = self.max_x.max(self.x);
         // Resolve `line-height` against this piece's own font size, so a unitless
         // factor inherited from an ancestor scales to this element (not the
@@ -2248,6 +2277,7 @@ impl<'a> Ctx<'a> {
         let glyphs = self.shaper.shape(text, px);
         self.display.push(DisplayItem::Glyphs {
             origin: Point::new(self.x + pad_x, self.y + pad_y),
+            frac_x: 0.0,
             glyphs,
             color,
             style: FontStyle::REGULAR,
@@ -2393,6 +2423,9 @@ impl<'a> Ctx<'a> {
             let x = piece.x + offset;
             self.display.push(DisplayItem::Glyphs {
                 origin: Point::new(x, piece.y),
+                // The run's true sub-pixel origin survives the (integer)
+                // text-align shift untouched.
+                frac_x: piece.frac_x,
                 glyphs: piece.glyphs,
                 color: piece.color,
                 style: piece.font,
@@ -2492,8 +2525,12 @@ impl<'a> Ctx<'a> {
         // `add_inline_block`, which would recurse here) — ADR-0042. An
         // element-children `<button>` takes the same block path, else the walk
         // re-dispatches to `form_button` and recurses back into measurement.
-        scratch.as_block_once =
-            matches!(node.style.display, Display::InlineBlock) || button_wants_block(node);
+        scratch.as_block_once = matches!(node.style.display, Display::InlineBlock)
+            // Inline-level flex/grid measures as its block content too — the
+            // scratch walk would otherwise re-route into add_inline_block,
+            // which re-enters measurement and recurses unboundedly.
+            || node.style.display_inline_level
+            || button_wants_block(node);
         scratch.walk(node, None);
         scratch.flush_line();
         let width = scratch.max_x.max(1);
@@ -2522,8 +2559,12 @@ impl<'a> Ctx<'a> {
         });
         scratch.reset_for_measure(field_id);
         scratch.right = 1; // force a wrap at every opportunity
-        scratch.as_block_once =
-            matches!(node.style.display, Display::InlineBlock) || button_wants_block(node);
+        scratch.as_block_once = matches!(node.style.display, Display::InlineBlock)
+            // Inline-level flex/grid measures as its block content too — the
+            // scratch walk would otherwise re-route into add_inline_block,
+            // which re-enters measurement and recurses unboundedly.
+            || node.style.display_inline_level
+            || button_wants_block(node);
         scratch.walk(node, None);
         scratch.flush_line();
         let width = scratch.max_x.max(1);
@@ -6405,6 +6446,66 @@ mod tests {
         cys.sort_unstable();
         cys.dedup();
         assert_eq!(cys.len(), 1, "cells share a row: {cys:?}");
+    }
+
+    #[test]
+    fn word_origins_carry_exact_fractional_positions() {
+        // The plan's worked arithmetic: gaps 4.453px, fractional glyph
+        // advances. Each emitted run's `origin.x + frac_x` must equal the
+        // exact f32 accumulation since line start (Chrome's fractional word
+        // origins), and |frac| stays ≤ 0.5. The old `x += w` (integer) lost
+        // each word's fractional width and phase-shifted every later run.
+        struct FracShaper;
+        impl TextShaper for FracShaper {
+            fn shape(&self, text: &str, px: u32) -> Vec<GlyphBox> {
+                let mut v = MonoShaper.shape(text, px);
+                for g in &mut v {
+                    g.advance_f = 5.13; // fractional per-glyph advance
+                    g.advance = 5;
+                }
+                v
+            }
+            fn space_advance_with_f(&self, _px: u32, _family: GenericFamily) -> f32 {
+                4.453
+            }
+        }
+        let styled = CssEngine::new().style(&parse_html(
+            "<body style='margin:0'><p style='margin:0;font-size:10px'>aaaaa bbbbb ccccc</p></body>",
+        ));
+        let laid = BlockLayout::default().layout(
+            &styled,
+            Size::new(400, 200),
+            &FracShaper,
+            &NoImages,
+            &NoForms,
+        );
+        let runs: Vec<(i32, f32)> = laid
+            .display
+            .items
+            .iter()
+            .filter_map(|i| match i {
+                DisplayItem::Glyphs {
+                    origin,
+                    frac_x,
+                    glyphs,
+                    ..
+                } if glyphs.len() > 1 => Some((origin.x, *frac_x)),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(runs.len(), 3, "three words: {runs:?}");
+        // Exact accumulation: word width 5×5.13 = 25.65, gap 4.453.
+        let w = 25.65f32;
+        let g = 4.453f32;
+        let want = [0.0, w + g, 2.0 * (w + g)];
+        for ((x, f), want) in runs.iter().zip(want) {
+            let true_x = *x as f32 + f;
+            assert!(
+                (true_x - want).abs() < 1e-3,
+                "run at {x}+{f} = {true_x}, want {want}"
+            );
+            assert!(f.abs() <= 0.5, "|frac| bounded: {f}");
+        }
     }
 
     #[test]

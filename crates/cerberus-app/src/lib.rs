@@ -4910,6 +4910,7 @@ impl FrameApp for BrowserApp {
                 let mut list = DisplayList::new();
                 list.push(DisplayItem::Glyphs {
                     origin: Point::new(p.x + 12, p.y + p.h as i32 - 14),
+                    frac_x: 0.0,
                     glyphs: self
                         .text
                         .shape(&format!("Timed seconds: {buf}_  (Enter)"), 13),
@@ -4940,6 +4941,7 @@ impl FrameApp for BrowserApp {
                 let mut list = DisplayList::new();
                 list.push(DisplayItem::Glyphs {
                     origin: Point::new(p.x + 16, p.y + 122),
+                    frac_x: 0.0,
                     glyphs: self.text.shape(msg, 12),
                     color: Color::rgb(0x20, 0x40, 0x70),
                     style: FontStyle::REGULAR,
@@ -5785,6 +5787,7 @@ fn paint_insecure_button(fb: &mut Framebuffer, text: &TextEngine, scale: f32) ->
     });
     list.push(DisplayItem::Glyphs {
         origin: Point::new(rect.x + 8, rect.y + 8),
+        frac_x: 0.0,
         glyphs: text.shape("Load anyway (insecure)", 16),
         color: Color::WHITE,
         style: FontStyle::REGULAR,
@@ -5841,12 +5844,14 @@ fn paint_settings_overlay(
     });
     list.push(DisplayItem::Glyphs {
         origin: Point::new(px + 12, py + 20),
+        frac_x: 0.0,
         glyphs: shaper.shape("Settings", 22),
         color: Color::BLACK,
         style: FontStyle::REGULAR,
     });
     list.push(DisplayItem::Glyphs {
         origin: Point::new(px + 12, py + 52),
+        frac_x: 0.0,
         glyphs: shaper.shape("identities | vault | consent | farbling (coming soon)", 14),
         color: Color::rgb(0x50, 0x50, 0x50),
         style: FontStyle::REGULAR,
@@ -5858,6 +5863,7 @@ fn paint_settings_overlay(
     };
     list.push(DisplayItem::Glyphs {
         origin: Point::new(px + 12, py + 78),
+        frac_x: 0.0,
         glyphs: shaper.shape(vault_line, 14),
         color: Color::rgb(0x50, 0x50, 0x50),
         style: FontStyle::REGULAR,
@@ -5867,12 +5873,14 @@ fn paint_settings_overlay(
         let mask = "\u{2022}".repeat(input_chars);
         list.push(DisplayItem::Glyphs {
             origin: Point::new(px + 12, py + 104),
+            frac_x: 0.0,
             glyphs: shaper.shape(&format!("passphrase: {mask}_"), 14),
             color: Color::BLACK,
             style: FontStyle::REGULAR,
         });
         list.push(DisplayItem::Glyphs {
             origin: Point::new(px + 12, py + 126),
+            frac_x: 0.0,
             glyphs: shaper.shape("(type, then Enter to unlock)", 12),
             color: Color::rgb(0x80, 0x80, 0x80),
             style: FontStyle::REGULAR,
@@ -5881,6 +5889,7 @@ fn paint_settings_overlay(
     if let Some(msg) = vault_msg {
         list.push(DisplayItem::Glyphs {
             origin: Point::new(px + 12, py + 150),
+            frac_x: 0.0,
             glyphs: shaper.shape(msg, 14),
             color: Color::rgb(0x90, 0x30, 0x30),
             style: FontStyle::REGULAR,
@@ -5899,6 +5908,7 @@ fn paint_settings_overlay(
     });
     list.push(DisplayItem::Glyphs {
         origin: Point::new(cr.x + 8, cr.y + row_label_dy),
+        frac_x: 0.0,
         glyphs: shaper.shape("manage cookies  >", 14),
         color: Color::rgb(0x20, 0x40, 0x70),
         style: FontStyle::REGULAR,
@@ -5911,6 +5921,7 @@ fn paint_settings_overlay(
     });
     list.push(DisplayItem::Glyphs {
         origin: Point::new(tr.x + 8, tr.y + row_label_dy),
+        frac_x: 0.0,
         glyphs: shaper.shape(
             if hud_on {
                 "performance HUD: on"

@@ -410,12 +410,16 @@ impl TextEngine {
     fn draw_run(
         &self,
         origin: Point,
+        frac_x: f32,
         glyphs: &[GlyphBox],
         color: Color,
         style: FontStyle,
         target: &mut Framebuffer,
     ) {
-        let mut pen_x = origin.x as f32;
+        // The run's TRUE fractional origin: Chrome positions text runs at
+        // fractional x; the pen starts there and every glyph rasterizes at
+        // its exact sub-pixel position.
+        let mut pen_x = origin.x as f32 + frac_x;
         for g in glyphs {
             // Each glyph names its own slot (a run can mix the primary face with
             // the CJK fallback); `styled_face` re-derives the exact face the glyph
@@ -938,10 +942,11 @@ impl Rasterizer for TextEngine {
                 } => self.draw_image(*rect, image, *fit, *pos, *pos_px, target),
                 DisplayItem::Glyphs {
                     origin,
+                    frac_x,
                     glyphs,
                     color,
                     style,
-                } => self.draw_run(*origin, glyphs, *color, *style, target),
+                } => self.draw_run(*origin, *frac_x, glyphs, *color, *style, target),
                 DisplayItem::Line { a, b, width, color } => {
                     self.draw_line(*a, *b, *width, *color, target)
                 }
@@ -1244,6 +1249,7 @@ mod tests {
         let mut list = DisplayList::new();
         list.push(DisplayItem::Glyphs {
             origin: Point::new(2, 2),
+            frac_x: 0.0,
             glyphs: engine.shape("A", 40),
             color: Color::BLACK,
             style: FontStyle::REGULAR,
@@ -1418,6 +1424,7 @@ mod tests {
         let mut list = DisplayList::new();
         list.push(DisplayItem::Glyphs {
             origin: Point::new(2, 2),
+            frac_x: 0.0,
             glyphs,
             color: Color::BLACK,
             style,
@@ -1540,6 +1547,7 @@ mod tests {
             let mut list = DisplayList::new();
             list.push(DisplayItem::Glyphs {
                 origin: Point::new(2, 2),
+                frac_x: 0.0,
                 glyphs: e.shape_with("Hg", px, fam),
                 color: Color::BLACK,
                 style: FontStyle::REGULAR,

@@ -41,6 +41,13 @@ pub enum DisplayItem {
     /// A run of shaped glyphs anchored at `origin` (top-left of the first box).
     Glyphs {
         origin: Point,
+        /// Sub-pixel remainder of the run's TRUE x origin (`origin.x + frac_x`
+        /// is the exact fractional position, |frac| ≤ 0.5). Chrome positions
+        /// every text run fractionally; integer-only origins put each run up
+        /// to half a pixel out of phase with the reference raster. Rect math,
+        /// sorting, and translation stay integer — only the rasterizer's pen
+        /// start consumes this.
+        frac_x: f32,
         glyphs: Vec<GlyphBox>,
         color: Color,
         style: FontStyle,
@@ -193,26 +200,35 @@ impl DisplayList {
                 },
                 DisplayItem::Glyphs {
                     origin,
+                    frac_x,
                     glyphs,
                     color,
                     style,
-                } => DisplayItem::Glyphs {
-                    origin: Point::new(si(origin.x), si(origin.y)),
-                    glyphs: glyphs
-                        .iter()
-                        .map(|g| GlyphBox {
-                            advance: su(g.advance),
-                            advance_f: g.advance_f * scale,
-                            w: su(g.w),
-                            h: su(g.h),
-                            id: g.id,
-                            px: su(g.px).max(1),
-                            font: g.font,
-                        })
-                        .collect(),
-                    color: *color,
-                    style: *style,
-                },
+                } => {
+                    // Rescale the TRUE fractional x and re-decompose, keeping
+                    // |frac| ≤ 0.5 (scaling the parts separately would let the
+                    // fraction grow past a pixel).
+                    let t = (origin.x as f32 + frac_x) * scale;
+                    let x = t.round();
+                    DisplayItem::Glyphs {
+                        origin: Point::new(x as i32, si(origin.y)),
+                        frac_x: t - x,
+                        glyphs: glyphs
+                            .iter()
+                            .map(|g| GlyphBox {
+                                advance: su(g.advance),
+                                advance_f: g.advance_f * scale,
+                                w: su(g.w),
+                                h: su(g.h),
+                                id: g.id,
+                                px: su(g.px).max(1),
+                                font: g.font,
+                            })
+                            .collect(),
+                        color: *color,
+                        style: *style,
+                    }
+                }
             })
             .collect();
         DisplayList { items }
@@ -665,6 +681,37 @@ mod tests {
     }
 
     #[test]
+    fn scaled_preserves_fractional_run_origins() {
+        // HiDPI scaling must scale the TRUE fractional x and re-decompose:
+        // (origin.x + frac) × scale == origin'.x + frac', with |frac'| ≤ 0.5.
+        let mut list = DisplayList::new();
+        list.push(DisplayItem::Glyphs {
+            origin: Point::new(10, 6),
+            frac_x: 0.4,
+            glyphs: vec![GlyphBox {
+                advance: 8,
+                advance_f: 8.0,
+                w: 0,
+                h: 0,
+                id: 42,
+                px: 16,
+                font: FontSlot::Text,
+            }],
+            color: Color::BLACK,
+            style: FontStyle::REGULAR,
+        });
+        let scaled = list.scaled(1.5);
+        match &scaled.items[0] {
+            DisplayItem::Glyphs { origin, frac_x, .. } => {
+                let true_x = origin.x as f32 + frac_x;
+                assert!((true_x - 10.4 * 1.5).abs() < 1e-4, "exact: {true_x}");
+                assert!(frac_x.abs() <= 0.5, "re-decomposed: {frac_x}");
+            }
+            other => panic!("expected Glyphs, got {other:?}"),
+        }
+    }
+
+    #[test]
     fn scaled_multiplies_geometry_and_glyph_pixels() {
         let mut list = DisplayList::new();
         list.push(DisplayItem::Rect {
@@ -673,6 +720,7 @@ mod tests {
         });
         list.push(DisplayItem::Glyphs {
             origin: Point::new(5, 6),
+            frac_x: 0.0,
             glyphs: vec![GlyphBox {
                 advance: 8,
                 advance_f: 8.0,
@@ -711,6 +759,7 @@ mod tests {
         let mut list = DisplayList::new();
         list.push(DisplayItem::Glyphs {
             origin: Point::new(0, 0),
+            frac_x: 0.0,
             glyphs,
             color: Color::BLACK,
             style: FontStyle::REGULAR,
