@@ -45,13 +45,13 @@ details, summary { display: block; }
 center { text-align: -webkit-center; }
 nobr { white-space: nowrap; }
 head, title, meta, link, style, script, base, template { display: none; }
-/* Straggler guard. Inline SVG *does* render: the app rewrites every <svg>
-   subtree into a synthetic replaced element (cerberus-app::inline_svg, via the
-   resvg raster path) before the cascade ever runs, so no <svg> normally
-   reaches this rule. One that slips through unconverted (a path that styles a
-   raw document, e.g. the mirror driver) must not flow its <text>/<title>/
-   markup as stray page text or boxes — hide the subtree instead. */
-svg { display: none; }
+/* Inline SVG renders: the app pre-rasterizes every <svg> subtree
+   (cerberus-app::inline_svg, resvg) and the element KEEPS its tag with a
+   synthetic `src`, so author tag selectors (`.logo svg{width:84px}`,
+   media-query variant hiding) size and toggle it exactly as in Chrome. No
+   display:none guard here — layout renders a src-carrying <svg> as a
+   replaced image and skips a raw (unconverted) <svg> subtree entirely, so
+   its <text>/<title> can never leak as page text. */
 li { display: list-item; }
 ol { list-style-type: decimal; }
 /* The `type` attribute selects the ordered-list marker (HTML UA stylesheet). */
@@ -282,8 +282,19 @@ impl CssEngine {
         let mut elem_index = 0usize;
         let mut children: Vec<StyledChild> = node
             .children()
-            .map(|child| match child.text() {
-                Some(t) => StyledChild::Text(t.to_string()),
+            .filter_map(|child| match child.text() {
+                Some(t) => Some(StyledChild::Text(t.to_string())),
+                // A RAW inline `<svg>` subtree (no synthetic `src` — a path
+                // that skipped the app's pre-raster rewrite, e.g. styling a
+                // bare document) is pruned here: styling its (often huge)
+                // subtree would only leak `<text>`/`<title>` as page content
+                // and burn memory. A REWRITTEN svg is childless and carries
+                // `src`, so it styles normally and author `svg{…}` tag
+                // selectors keep matching it.
+                None if child.tag() == "svg" && child.attr("src").is_none() => {
+                    elem_index += 1;
+                    None
+                }
                 None => {
                     let styled = self.build(
                         child,
@@ -296,7 +307,7 @@ impl CssEngine {
                         child_root_font_size,
                     );
                     elem_index += 1;
-                    StyledChild::Element(Box::new(styled))
+                    Some(StyledChild::Element(Box::new(styled)))
                 }
             })
             .collect();

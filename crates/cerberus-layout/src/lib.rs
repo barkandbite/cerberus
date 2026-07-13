@@ -764,6 +764,21 @@ impl<'a> Ctx<'a> {
                 }
                 return;
             }
+            // An inline `<svg>` the app pre-rasterized keeps its tag (so author
+            // `svg{…}` tag selectors size/hide it) and carries a synthetic
+            // `src` — treat it as the replaced image it now is. A RAW svg
+            // subtree (no `src`; a path that skipped the rewrite) renders
+            // nothing: its `<text>`/`<title>` must not leak as page text.
+            "svg" => {
+                if visible && node.attr("src").is_some() {
+                    let base = self.positioned_base(style);
+                    self.image(node, in_link);
+                    if let Some(base) = base {
+                        self.apply_positioning(style, base);
+                    }
+                }
+                return;
+            }
             "picture" => {
                 // A <picture> with a direct <img> selects one URL from its
                 // <source> children (by `type`/`media`) and renders that <img>

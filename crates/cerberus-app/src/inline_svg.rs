@@ -91,9 +91,7 @@ pub(crate) fn replace_inline_svgs(doc: &mut Document, viewport_w: u32) -> Vec<(S
             ("height".to_string(), h.to_string()),
         ];
         // Carry the styling hooks over so author CSS that sizes the svg by
-        // class/id (`.icon { width: 24px }` — the common real-world pattern)
-        // still overrides the attributes on the replaced element. Tag-selector
-        // rules (`svg { … }`) no longer match — a knowing limitation.
+        // class/id (`.icon { width: 24px }`) still overrides the attributes.
         for name in ["class", "id", "style"] {
             if let Some(v) = node.attr(name) {
                 attrs.push((name.to_string(), v.to_string()));
@@ -102,7 +100,14 @@ pub(crate) fn replace_inline_svgs(doc: &mut Document, viewport_w: u32) -> Vec<(S
         if !out.iter().any(|(k, _)| *k == key) {
             out.push((key, markup.into_bytes()));
         }
-        doc.replace_element(id, "img", attrs);
+        // The element KEEPS its `svg` tag (now childless, with a synthetic
+        // `src`): tag-selector rules (`svg{…}`, `.logo svg{width:84px}`,
+        // media-query variant hiding) are how real sites size and toggle
+        // inline icons — renaming to `img` broke all of them (bbc's header
+        // logo stretched to the container and both responsive variants
+        // painted). Layout routes a src-carrying `svg` through the replaced
+        // `<img>` path and skips raw `<svg>` subtrees entirely.
+        doc.replace_element(id, "svg", attrs);
     }
     out
 }
@@ -438,7 +443,7 @@ mod tests {
 
     /// The (width, height) attrs of the first synthetic `<img>`.
     fn img_attrs(doc: &Document) -> (u32, u32) {
-        let img = find(doc.root(), "img").expect("synthetic img");
+        let img = find(doc.root(), "svg").expect("synthetic replaced svg");
         (
             img.attr("width").unwrap().parse().unwrap(),
             img.attr("height").unwrap().parse().unwrap(),
@@ -452,8 +457,10 @@ mod tests {
              fill='#ff0000'/></svg><p>after</p>",
             800,
         );
-        assert!(find(doc.root(), "svg").is_none(), "svg rewritten");
-        let img = find(doc.root(), "img").expect("img");
+        // The tag stays `svg` (so author tag selectors keep matching) but the
+        // subtree is gone, replaced by a childless src-carrying element.
+        let img = find(doc.root(), "svg").expect("replaced svg");
+        assert_eq!(img.children().count(), 0, "subtree consumed");
         let src = img.attr("src").unwrap();
         assert!(src.starts_with(INLINE_SVG_PREFIX), "synthetic src: {src}");
         assert_eq!(img_attrs(&doc), (100, 40));
@@ -534,7 +541,7 @@ mod tests {
         assert_eq!(pairs.len(), 1, "one payload for two identical icons");
         let mut srcs = Vec::new();
         fn imgs<'a>(n: NodeRef<'a>, out: &mut Vec<&'a str>) {
-            if n.tag() == "img" {
+            if n.tag() == "svg" {
                 out.push(n.attr("src").unwrap());
             }
             n.children()
@@ -588,7 +595,7 @@ mod tests {
             "<svg class='icon big' id='logo' style='margin:2px' viewBox='0 0 24 24'/>",
             800,
         );
-        let img = find(doc.root(), "img").expect("img");
+        let img = find(doc.root(), "svg").expect("replaced svg");
         assert_eq!(img.attr("class"), Some("icon big"));
         assert_eq!(img.attr("id"), Some("logo"));
         assert_eq!(img.attr("style"), Some("margin:2px"));
@@ -608,7 +615,7 @@ mod tests {
         );
         let mut count = 0;
         fn imgs(n: NodeRef<'_>, count: &mut u32) {
-            if n.tag() == "img" {
+            if n.tag() == "svg" {
                 *count += 1;
             }
             n.children()

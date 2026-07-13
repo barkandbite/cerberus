@@ -112,11 +112,16 @@ PYSTRIP
       curl -fsSL -A "Mozilla/5.0" "$origin/$p" -o "$mir/$p" 2>/dev/null || true
     done
 
-  # 8300-9799: stays clear of Chrome's unsafe-port list (10080 = ERR_UNSAFE_PORT).
-  local port; port=$(( (RANDOM % 1500) + 8300 ))
+  # Sequential ports from 8300 (clear of Chrome's unsafe-port list; 10080 =
+  # ERR_UNSAFE_PORT). Random ports collided across pages when a previous
+  # page's server lingered — the next page then screenshotted the OLD mirror
+  # (wikipedia scored against a served HN), so each page gets a unique port
+  # and the server is awaited dead before returning.
+  PORT_SEQ=$(( ${PORT_SEQ:-8299} + 1 ))
+  local port=$PORT_SEQ
   ( cd "$mir" && python3 -m http.server "$port" --bind 127.0.0.1 >/dev/null 2>&1 ) &
   local srv=$!
-  trap 'kill "$srv" 2>/dev/null || true' RETURN
+  trap 'kill "$srv" 2>/dev/null || true; wait "$srv" 2>/dev/null || true' RETURN
   # Wait for the server to accept connections.
   local local_url="http://127.0.0.1:$port/index.html" i
   for i in 1 2 3 4 5 6 7 8 9 10; do
