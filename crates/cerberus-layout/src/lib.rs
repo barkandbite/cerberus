@@ -519,6 +519,13 @@ struct Ctx<'a> {
     /// wrap point Chrome takes (shifting everything below). Reset at each
     /// line start; glyph runs already carry their own remainder internally.
     x_frac: f32,
+    /// Flowing inside a table cell. Legacy `<center>` (`-webkit-center`)
+    /// centering does NOT propagate across a cell boundary (measured on the
+    /// reference: HN's `<center><table>…<td><table>` leaves the inner
+    /// item-list table at the cell's LEFT edge, ~187px left of where
+    /// re-centering would put it) — `table()` only honors an inherited
+    /// WebkitCenter when this is false.
+    in_cell: bool,
     /// A collapsible space from the SOURCE text is pending before the next
     /// word/run (issue #137). Whitespace state must cross inline-element
     /// boundaries: `<a>RFC 6761</a>, a` has NO space before the comma (the
@@ -623,6 +630,7 @@ impl<'a> Ctx<'a> {
             line_hf: 0.0,
             line_frac: 0.0,
             x_frac: 0.0,
+            in_cell: false,
             pending_space: false,
             line: Vec::new(),
             line_align: TextAlign::Left,
@@ -692,6 +700,7 @@ impl<'a> Ctx<'a> {
             line_hf: 0.0,
             line_frac: 0.0,
             x_frac: 0.0,
+            in_cell: false,
             pending_space: false,
             line: Vec::new(),
             line_align: TextAlign::Left,
@@ -3344,7 +3353,10 @@ impl<'a> Ctx<'a> {
         // margins — the HN shell pattern (`<center><table width=85%>`): the
         // BOX centers while cell text stays left (see flow_cell).
         let table_w: i32 = col_widths.iter().sum();
-        let centered = matches!(node.style.text_align, TextAlign::WebkitCenter)
+        // Inherited `<center>` stops at a cell boundary (`in_cell`): the inner
+        // table sits at the cell's left edge in the reference, even though the
+        // outer table centered. `align=center`/auto margins still center.
+        let centered = (matches!(node.style.text_align, TextAlign::WebkitCenter) && !self.in_cell)
             || (node.style.margin_left_auto && node.style.margin_right_auto);
         let x0 = if centered {
             left + ((avail - table_w) / 2).max(0)
@@ -3473,6 +3485,8 @@ impl<'a> Ctx<'a> {
             self.vw,
             self.vh,
         );
+        // Legacy `<center>` block-centering stops here (see `in_cell`).
+        sub.in_cell = true;
 
         let is_header = cell.tag == "th";
         // Headers centre their text; cells take their own alignment — except
@@ -6041,6 +6055,38 @@ mod tests {
             rules[0].x + rules[0].w as i32,
             rules[1].x,
             "first word's rule extends across the gap to the second: {rules:?}"
+        );
+    }
+
+    #[test]
+    fn center_does_not_recenter_tables_inside_cells() {
+        // The HN shell: `<center><table width=85%>` centers the OUTER table
+        // box, but an auto-width table nested inside one of its cells stays at
+        // the cell's LEFT edge in the reference — inherited -webkit-center
+        // must not cross the cell boundary (it displaced HN's item list
+        // ~187px right).
+        let laid = lay(
+            "<center><table width='500'><tr><td>\
+             <table><tr><td>inner</td></tr></table>\
+             </td></tr></table></center>",
+            600,
+        );
+        let min_glyph_x = laid
+            .display
+            .items
+            .iter()
+            .filter_map(|i| match i {
+                DisplayItem::Glyphs { origin, .. } => Some(origin.x),
+                _ => None,
+            })
+            .min()
+            .expect("inner text renders");
+        // Outer table: centered 500px box in 600px → starts ~x=50; the inner
+        // table must hug the cell's left padding (well under the ~300px a
+        // re-centering would produce).
+        assert!(
+            min_glyph_x < 120,
+            "inner table stays at the cell's left edge, got x={min_glyph_x}"
         );
     }
 
