@@ -446,6 +446,23 @@ pub trait TextShaper: Send + Sync {
         self.shape(text, px)
     }
 
+    /// Shape `text` at `px` in `family` with the run's bold/italic style: a
+    /// shaper bundling real weight/slant variants picks the styled face — whose
+    /// advances AND glyph ids differ from the regular's (Times bold is wider) —
+    /// so styled runs measure (and wrap) as the reference browser does. The
+    /// default ignores the style and shapes the regular face, which stays
+    /// correct for shapers whose styling is synthesized at raster time (the
+    /// smear/shear preserves advances).
+    fn shape_styled(
+        &self,
+        text: &str,
+        px: u32,
+        family: GenericFamily,
+        _style: FontStyle,
+    ) -> Vec<GlyphBox> {
+        self.shape_with(text, px, family)
+    }
+
     /// Shape a single icon glyph (a codepoint in the bundled icon font), to be
     /// painted in a run styled [`FontStyle::ICON`]. Default: no glyph (a shaper
     /// without an icon font draws nothing).
@@ -477,6 +494,14 @@ pub trait TextShaper: Send + Sync {
     /// carries the sub-pixel remainder across gaps and rounds per placement.
     fn space_advance_with_f(&self, px: u32, _family: GenericFamily) -> f32 {
         self.space_advance(px) as f32
+    }
+
+    /// [`space_advance_with_f`](Self::space_advance_with_f) with the run's
+    /// bold/italic style — a bold face's space can be wider than the regular's,
+    /// so styled runs' word gaps read the same face their glyphs shape from.
+    /// Default: ignore the style (single-style shapers).
+    fn space_advance_styled_f(&self, px: u32, family: GenericFamily, _style: FontStyle) -> f32 {
+        self.space_advance_with_f(px, family)
     }
 
     /// The `line-height: normal` pitch for `px`-sized text in `family`. Browsers

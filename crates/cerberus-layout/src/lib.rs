@@ -1437,9 +1437,13 @@ impl<'a> Ctx<'a> {
     }
 
     /// Shape a run and apply `letter-spacing` (px, may be negative) to advances,
-    /// returning the glyphs and their total width (ADR-0041).
+    /// returning the glyphs and their total width (ADR-0041). Shaping is styled:
+    /// a bold/italic run measures with the real variant face when the shaper
+    /// bundles one (Times bold is wider than regular), so wrap points match.
     fn shape_run(&self, text: &str, px: u32, style: &ComputedStyle) -> (Vec<GlyphBox>, u32) {
-        let mut glyphs = self.shaper.shape_with(text, px, style.font_family);
+        let mut glyphs = self
+            .shaper
+            .shape_styled(text, px, style.font_family, style.font);
         if style.letter_spacing != 0 {
             for g in &mut glyphs {
                 g.advance = (g.advance as i32 + style.letter_spacing).max(0) as u32;
@@ -1550,7 +1554,9 @@ impl<'a> Ctx<'a> {
     /// counted as one space each — a small simplification, noted here.
     fn add_pre_wrap_line(&mut self, line: &str, style: &ComputedStyle, href: Option<&str>) {
         let px = style.font_size.max(1);
-        let sw = space_width_f(self.shaper, px, style.font_family);
+        let sw = self
+            .shaper
+            .space_advance_styled_f(px, style.font_family, style.font);
         // Accumulated leading-whitespace width for the next word (fractional —
         // a preserved space run's width is `count × exact advance`; see
         // `x_frac`).
@@ -1612,7 +1618,11 @@ impl<'a> Ctx<'a> {
         let gap_f = if at_line_start {
             std::mem::take(&mut self.pending_indent) as f32
         } else if self.pending_space {
-            (space_width_f(self.shaper, px, style.font_family) + style.word_spacing as f32).max(0.0)
+            (self
+                .shaper
+                .space_advance_styled_f(px, style.font_family, style.font)
+                + style.word_spacing as f32)
+                .max(0.0)
         } else {
             0.0
         };
@@ -1649,7 +1659,10 @@ impl<'a> Ctx<'a> {
             // A real space precedes this run in the source (`by <span
             // nowrap>Public…` — the nowrap fast path used to eat it: #137).
             self.advance_x_f(
-                (space_width_f(self.shaper, px, style.font_family) + style.word_spacing as f32)
+                (self
+                    .shaper
+                    .space_advance_styled_f(px, style.font_family, style.font)
+                    + style.word_spacing as f32)
                     .max(0.0),
             );
         }
@@ -4315,14 +4328,11 @@ fn space_width(shaper: &dyn TextShaper, px: u32, family: GenericFamily) -> u32 {
     // Delegates to the shaper's `space_advance_with`, which real shapers implement
     // without the per-call `Vec` allocation `shape(" ", …)` would incur — this
     // runs once per word in the inline loop. The family matters for `<pre>`/
-    // `<code>`: a monospace space is wider than a proportional one.
+    // `<code>`: a monospace space is wider than a proportional one. Inter-word
+    // gaps on the inline path use `space_advance_styled_f` directly (fractional,
+    // and styled — a bold face's space can differ); this rounded helper serves
+    // the list-marker gap, where no run style applies.
     shaper.space_advance_with(px, family)
-}
-
-/// [`space_width`] without the rounding — inter-word gaps accumulate
-/// fractionally along a line (see `Ctx::x_frac`).
-fn space_width_f(shaper: &dyn TextShaper, px: u32, family: GenericFamily) -> f32 {
-    shaper.space_advance_with_f(px, family)
 }
 
 /// Parse an `<img width/height>` attribute (a bare number or `Npx`).
