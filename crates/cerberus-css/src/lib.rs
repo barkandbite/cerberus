@@ -517,7 +517,7 @@ fn split_top_comma(s: &str) -> (&str, Option<&str>) {
 }
 
 /// The math functions the value resolver evaluates.
-const MATH_FNS: [&str; 1] = ["calc("];
+const MATH_FNS: [&str; 4] = ["calc(", "min(", "max(", "clamp("];
 
 /// Find the earliest math-function call in `s`, at a word boundary so a
 /// substring like the `max(` inside `minmax(...)` is never mistaken for one.
@@ -653,7 +653,11 @@ fn eval_calcs(input: &str, ctx: CalcCtx) -> String {
         };
         // Nested math inside this group resolves first.
         let inner = eval_calcs(inner, ctx);
-        let val = eval_calc_expr(&inner, ctx);
+        let val = if name == "calc(" {
+            eval_calc_expr(&inner, ctx)
+        } else {
+            eval_min_max_clamp(name, &inner, ctx)
+        };
         match val.and_then(format_calc_val) {
             Some(s) => out.push_str(&s),
             None => {
@@ -666,6 +670,37 @@ fn eval_calcs(input: &str, ctx: CalcCtx) -> String {
     }
     out.push_str(rest);
     out
+}
+
+/// Evaluate `min(...)`/`max(...)`/`clamp(lo, mid, hi)` over comma-separated
+/// calc expressions. The arguments are only mutually comparable without a
+/// containing block when they are all pure px or all pure `%`; anything mixed
+/// (`min(100%, 500px)`) is left unresolved — the same safety rule as `calc()`
+/// itself (FIX 1), so `%` is never compared against a font-size-derived px.
+fn eval_min_max_clamp(name: &str, inner: &str, ctx: CalcCtx) -> Option<CalcVal> {
+    let args: Vec<CalcVal> = split_top_commas(inner)
+        .iter()
+        .map(|a| eval_calc_expr(a, ctx))
+        .collect::<Option<_>>()?;
+    let all_px = args.iter().all(|a| a.pct == 0.0);
+    let all_pct = args.iter().all(|a| a.px == 0.0);
+    if args.is_empty() || !(all_px || all_pct) {
+        return None;
+    }
+    // `%` compares monotonically because its (containing-block) base is ≥ 0.
+    let key = |a: &CalcVal| if all_px { a.px } else { a.pct };
+    let n = match name {
+        "min(" => args.iter().map(key).fold(f32::INFINITY, f32::min),
+        "max(" => args.iter().map(key).fold(f32::NEG_INFINITY, f32::max),
+        // clamp(lo, mid, hi) = max(lo, min(mid, hi)); exactly three arguments.
+        "clamp(" if args.len() == 3 => key(&args[0]).max(key(&args[1]).min(key(&args[2]))),
+        _ => return None,
+    };
+    Some(if all_px {
+        CalcVal { px: n, pct: 0.0 }
+    } else {
+        CalcVal { px: 0.0, pct: n }
+    })
 }
 
 /// Evaluate a `calc()` expression body to the canonical `px + %` form,
@@ -2830,6 +2865,70 @@ mod tests {
         let d = first(&dom.root, "div").unwrap();
         assert_eq!(d.style.width, Len::Px(600), "50vw - 40px = 600px");
         assert_eq!(d.style.height, Len::Px(200), "25vh = 200px");
+    }
+
+    // ---- min()/max()/clamp() (FIX 2) ----
+
+    #[test]
+    fn min_max_evaluate_over_calc_units() {
+        // min/max over px-reducible units (em here: 30em = 480px < 500px).
+        let dom = CssEngine::new().style(&parse_html(
+            "<div style='width:min(500px, 30em);height:max(100px, 10em)'>x</div>",
+        ));
+        let d = first(&dom.root, "div").unwrap();
+        assert_eq!(d.style.width, Len::Px(480));
+        assert_eq!(d.style.height, Len::Px(160));
+        // Pure percentages compare symbolically and stay a percentage.
+        let dom2 = CssEngine::new().style(&parse_html(
+            "<div style='width:min(50%, 80%);height:200px;max-height:max(25%, 10%)'>x</div>",
+        ));
+        let d2 = first(&dom2.root, "div").unwrap();
+        assert_eq!(d2.style.width, Len::Pct(50.0));
+        assert_eq!(d2.style.max_height, Len::Pct(25.0));
+    }
+
+    #[test]
+    fn clamp_picks_lo_mid_hi() {
+        let clamp = |css: &str| {
+            let dom = CssEngine::new().style(&parse_html(&format!("<div style='{css}'>x</div>")));
+            first(&dom.root, "div").unwrap().style.width
+        };
+        assert_eq!(clamp("width:clamp(10px, 5px, 20px)"), Len::Px(10), "lo");
+        assert_eq!(clamp("width:clamp(10px, 15px, 20px)"), Len::Px(15), "mid");
+        assert_eq!(clamp("width:clamp(10px, 25px, 20px)"), Len::Px(20), "hi");
+        // Wrong arity is invalid and falls back.
+        assert_eq!(clamp("width:clamp(10px, 20px)"), Len::Auto);
+    }
+
+    #[test]
+    fn min_max_mixed_pct_px_falls_back_like_calc() {
+        // `%` and px can't be compared without the containing block; the
+        // declaration is dropped rather than mis-resolved (FIX 1 safety rule).
+        let dom =
+            CssEngine::new().style(&parse_html("<div style='width:min(100%, 500px)'>x</div>"));
+        assert_eq!(first(&dom.root, "div").unwrap().style.width, Len::Auto);
+    }
+
+    #[test]
+    fn math_functions_nest_and_leave_minmax_alone() {
+        // min() inside calc() (and vice versa) resolve innermost-first.
+        let dom = CssEngine::new().style(&parse_html(
+            "<div style='width:calc(min(10px, 20px) * 2);height:min(calc(3px * 4), 50px)'>x</div>",
+        ));
+        let d = first(&dom.root, "div").unwrap();
+        assert_eq!(d.style.width, Len::Px(20));
+        assert_eq!(d.style.height, Len::Px(12));
+        // The `max(` substring inside grid `minmax(` is not a math function.
+        let grid = CssEngine::new().style(&parse_html(
+            "<div style='display:grid;grid-template-columns:minmax(100px, 1fr) 2fr'>x</div>",
+        ));
+        assert_eq!(
+            first(&grid.root, "div")
+                .unwrap()
+                .style
+                .grid_template_columns,
+            vec![Track::MinMax(100, TrackMax::Fr(1.0)), Track::Fr(2.0)]
+        );
     }
 
     #[test]
