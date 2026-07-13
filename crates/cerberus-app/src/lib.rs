@@ -8,8 +8,11 @@
 //! identities → sealed storage → (built-in) fetch → parse → layout → paint →
 //! present, with the consent and farbling seams exercised along the way.
 
+mod inline_svg;
 pub mod mirror;
 pub mod parity;
+
+use inline_svg::replace_inline_svgs;
 
 /// Lock a `Mutex`, recovering the guard if a previous holder panicked and
 /// poisoned it instead of propagating the panic — one poisoned critical
@@ -1183,6 +1186,13 @@ pub fn render(config: &RenderConfig) -> Result<RenderOutcome, AppError> {
     let engines_live = heads.engines_live();
     timings.record("scripts", scripts_t.elapsed());
 
+    // Inline `<svg>` subtrees become synthetic replaced elements backed by the
+    // existing SVG raster path (ADR-0009): serialized, content-hash keyed, and
+    // rewritten to `<img src="cerb-inline-svg:…">` *before* styling, so
+    // layout's replaced-element sizing (and CSS overrides) applies. The
+    // payloads decode into the image store below.
+    let inline_svgs = replace_inline_svgs(&mut document, config.viewport.w);
+
     // Subresource context (sealed jar + consent) shared by this page's external
     // CSS and images, so both carry/capture cookies under the same first party.
     let sub_ctx = FetchContext {
@@ -1224,7 +1234,7 @@ pub fn render(config: &RenderConfig) -> Result<RenderOutcome, AppError> {
         default: config.image_mode,
         overrides: config.text_only_images.clone(),
     };
-    let images = match &client {
+    let mut images = match &client {
         Some(client) => fetch_images_sync(
             &document,
             &styled,
@@ -1239,6 +1249,21 @@ pub fn render(config: &RenderConfig) -> Result<RenderOutcome, AppError> {
         ),
         None => HashMap::new(),
     };
+    // Register the page's inline SVGs (first-party document content — no fetch,
+    // no consent gate) under their synthetic keys, decoded through the same
+    // codec (and byte/size ceilings) as an SVG file. A payload the decoder
+    // declines still reserves its box: a transparent stand-in keeps the space
+    // Chrome would reserve without painting a placeholder.
+    if !inline_svgs.is_empty() {
+        let codec = ImageCodec::new();
+        for (key, bytes) in &inline_svgs {
+            let state = match codec.decode(bytes) {
+                Ok(img) => ImageState::Ready(Arc::new(img)),
+                Err(_) => ImageState::Ready(Arc::new(transparent_stand_in())),
+            };
+            images.insert(key.clone(), state);
+        }
+    }
     let subresources_blocked = images
         .values()
         .filter(|s| matches!(s, ImageState::Blocked))
@@ -1900,6 +1925,19 @@ fn normalize_url(input: &str) -> String {
         t.to_string()
     } else {
         format!("https://{t}")
+    }
+}
+
+/// A 1×1 fully transparent bitmap: the stand-in for an inline SVG the decoder
+/// declined (byte-ceiling bomb, malformed markup). The synthetic `<img>`
+/// carries both width/height attributes, so layout stretches this invisible
+/// pixel over the exact box Chrome would reserve — space preserved, nothing
+/// painted (a grey placeholder for a broken decorative icon would be noisier
+/// than the blank Chrome shows).
+fn transparent_stand_in() -> DecodedImage {
+    DecodedImage {
+        size: Size::new(1, 1),
+        rgba: vec![0, 0, 0, 0],
     }
 }
 
@@ -2901,8 +2939,13 @@ impl BrowserApp {
         // Time scripts and style separately (M11); `Instant` directly because
         // both calls borrow `self`.
         let t = Instant::now();
-        let doc = self.run_scripts(doc);
+        let mut doc = self.run_scripts(doc);
         self.timings.record("scripts", t.elapsed());
+        // Rewrite inline `<svg>` subtrees into synthetic replaced elements and
+        // decode them into the image store — after scripts (so script-built
+        // SVG participates), before styling (so layout sees `<img>`).
+        let viewport_w = self.toolbar.content_size(self.last_size).w;
+        self.register_inline_svgs(replace_inline_svgs(&mut doc, viewport_w));
         self.page_title = doc.title();
         // New page: drop the previous page's external stylesheets. The first
         // cascade uses inline CSS only; external `<link>` sheets fetch on the
@@ -3995,13 +4038,38 @@ impl BrowserApp {
     /// restyle, and swap in the new document (the next frame relays out and
     /// repaints). Mirrors the styling half of [`BrowserApp::set_document`].
     fn reconcile_dispatched(&mut self, dom: RebuiltDom) {
-        let RebuiltDom { document, id_map } = dom;
+        let RebuiltDom {
+            mut document,
+            id_map,
+        } = dom;
         self.node_to_js = invert_id_map(&id_map);
+        // The realm serializes `<svg>` elements back; re-rewrite them before
+        // styling. Content-hash keys make this idempotent — an icon already in
+        // the store is neither re-serialized into a new key nor re-decoded.
+        let viewport_w = self.toolbar.content_size(self.last_size).w;
+        self.register_inline_svgs(replace_inline_svgs(&mut document, viewport_w));
         self.page_title = document.title();
         let t = Instant::now();
         self.styled = self.style_engine.style(&document);
         self.timings.record("style", t.elapsed());
         self.document = document;
+    }
+
+    /// Decode serialized inline-SVG payloads (from [`replace_inline_svgs`])
+    /// into the per-page image store under their synthetic keys. Already-
+    /// registered keys are skipped (reconciles re-run the rewrite). A declined
+    /// payload registers a transparent stand-in so the box is still reserved.
+    fn register_inline_svgs(&mut self, svgs: Vec<(String, Vec<u8>)>) {
+        for (key, bytes) in svgs {
+            if self.images.contains_key(&key) {
+                continue;
+            }
+            let state = match self.image_codec.decode(&bytes) {
+                Ok(img) => ImageState::Ready(Arc::new(img)),
+                Err(_) => ImageState::Ready(Arc::new(transparent_stand_in())),
+            };
+            self.images.insert(key, state);
+        }
     }
 
     /// Fire a DOM `input` event at the focused control after a keystroke: push
@@ -7686,6 +7754,106 @@ mod tests {
             "provider supplies the decoded image to layout"
         );
         // A frame renders without panicking now that an Image item is present.
+        b.render_frame(Size::new(800, 600));
+    }
+
+    /// The `Image` display-item rects a layout of `styled` emits at 800×600.
+    fn image_rects(styled: &StyledDom, images: &HashMap<String, ImageState>) -> Vec<Rect> {
+        let provider = StoreImages { base: None, images };
+        let text = TextEngine::new();
+        let mut layout = BlockLayout::default();
+        let laid = layout.layout(styled, Size::new(800, 600), &text, &provider, &NoForms);
+        laid.display
+            .items
+            .iter()
+            .filter_map(|i| match i {
+                DisplayItem::Image { rect, .. } => Some(*rect),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn inline_svg_renders_as_an_image_item_with_its_declared_box() {
+        // End-to-end through the document-preparation seam: an inline <svg>
+        // becomes a synthetic <img>, its bytes rasterize through the resvg
+        // path, and layout emits an Image item at the svg's 100×40 box —
+        // instead of the old `svg{display:none}` collapse.
+        let mut doc = parse_html(
+            "<p>hi</p><svg width='100' height='40'>\
+             <rect width='100' height='40' fill='#ff0000'/></svg>",
+        );
+        let pairs = replace_inline_svgs(&mut doc, 800);
+        let codec = ImageCodec::new();
+        let mut images = HashMap::new();
+        for (k, b) in &pairs {
+            let img = codec.decode(b).expect("inline svg rasterizes");
+            images.insert(k.clone(), ImageState::Ready(Arc::new(img)));
+        }
+        let styled = CssEngine::new().style(&doc);
+        let rects = image_rects(&styled, &images);
+        assert_eq!(rects.len(), 1, "one Image item for the inline svg");
+        assert_eq!((rects[0].w, rects[0].h), (100, 40), "attr-sized box");
+    }
+
+    #[test]
+    fn viewbox_only_inline_svg_sizes_like_chrome() {
+        // Headless Chromium 139 measurements (2026-07-13, --headless=new
+        // --dump-dom over getBoundingClientRect): <svg viewBox="0 0 400 100">
+        // with no width/height stretches to its container, height from the
+        // viewBox ratio — 800×200 in an explicit 800px div; **784×196** at
+        // body level in an 800px window (8px body margin each side). Our
+        // pipeline synthesizes the stretch as viewport-width attributes and
+        // layout re-clamps to the actual containing block, landing on the
+        // same 784×196.
+        let mut doc = parse_html(
+            "<svg viewBox='0 0 400 100'>\
+             <rect width='400' height='100' fill='#00ff00'/></svg>",
+        );
+        let pairs = replace_inline_svgs(&mut doc, 800);
+        let codec = ImageCodec::new();
+        let mut images = HashMap::new();
+        for (k, b) in &pairs {
+            let img = codec.decode(b).expect("inline svg rasterizes");
+            images.insert(k.clone(), ImageState::Ready(Arc::new(img)));
+        }
+        let styled = CssEngine::new().style(&doc);
+        let rects = image_rects(&styled, &images);
+        assert_eq!(rects.len(), 1);
+        assert_eq!((rects[0].w, rects[0].h), (784, 196), "Chrome's stretch box");
+    }
+
+    #[test]
+    fn browser_registers_inline_svg_without_a_network_fetch() {
+        // The interactive path: commit → set_document rewrites the svg and
+        // decodes it straight into the image store under its synthetic key —
+        // the loader is never asked for it (nothing to consent-gate either).
+        let mut b = fake_app(vec![(
+            "https://svg.test/",
+            Ok(page(
+                "https://svg.test/",
+                200,
+                None,
+                "<p>hi</p><svg width='24' height='24'>\
+                 <rect width='24' height='24' fill='#0000ff'/></svg>",
+            )),
+        )]);
+        b.navigate("https://svg.test/");
+        assert!(b.poll());
+        assert_eq!(b.images.len(), 1, "one store entry for the inline svg");
+        let (key, state) = b.images.iter().next().unwrap();
+        assert!(
+            key.starts_with(inline_svg::INLINE_SVG_PREFIX),
+            "synthetic key, not a URL: {key}"
+        );
+        assert!(matches!(state, ImageState::Ready(_)), "decoded eagerly");
+        // The provider resolves the synthetic src verbatim (opaque scheme
+        // round-trip), so layout finds the bitmap; a frame renders fine.
+        let provider = StoreImages {
+            base: b.current_url.as_ref(),
+            images: &b.images,
+        };
+        assert!(provider.get(key).is_some(), "provider serves the bitmap");
         b.render_frame(Size::new(800, 600));
     }
 

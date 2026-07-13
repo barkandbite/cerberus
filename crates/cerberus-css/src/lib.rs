@@ -45,9 +45,12 @@ details, summary { display: block; }
 center { text-align: -webkit-center; }
 nobr { white-space: nowrap; }
 head, title, meta, link, style, script, base, template { display: none; }
-/* We don't paint SVG graphics; hiding it avoids flowing its <text>/markup as
-   stray page text (e.g. decorative symbol grids). Icons render as nothing,
-   which is what unpainted SVG already was. */
+/* Straggler guard. Inline SVG *does* render: the app rewrites every <svg>
+   subtree into a synthetic replaced element (cerberus-app::inline_svg, via the
+   resvg raster path) before the cascade ever runs, so no <svg> normally
+   reaches this rule. One that slips through unconverted (a path that styles a
+   raw document, e.g. the mirror driver) must not flow its <text>/<title>/
+   markup as stray page text or boxes — hide the subtree instead. */
 svg { display: none; }
 li { display: list-item; }
 ol { list-style-type: decimal; }
