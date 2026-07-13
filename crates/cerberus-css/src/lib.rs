@@ -321,6 +321,21 @@ impl StyleEngine for CssEngine {
 }
 
 fn sibling_ref(node: NodeRef<'_>) -> SiblingRef {
+    let mut r = shallow_sibling_ref(node);
+    // One level of element children so `:has(...)` can check direct children
+    // during the cascade. The children's own lists stay empty — `:has` is a
+    // documented direct-child subset, so nothing looks deeper.
+    r.children = node
+        .children()
+        .filter(|c| c.is_element())
+        .map(shallow_sibling_ref)
+        .collect::<Vec<_>>()
+        .into();
+    r
+}
+
+/// A [`SiblingRef`] without children (the leaf form; `sibling_ref` fills them).
+fn shallow_sibling_ref(node: NodeRef<'_>) -> SiblingRef {
     SiblingRef {
         tag: node.tag().to_string(),
         id: node.attr("id").map(str::to_string),
@@ -329,6 +344,7 @@ fn sibling_ref(node: NodeRef<'_>) -> SiblingRef {
             .map(|c| c.split_whitespace().map(str::to_string).collect())
             .unwrap_or_default(),
         attrs: node.attrs().to_vec(),
+        children: Rc::from([]),
     }
 }
 
@@ -2839,6 +2855,40 @@ mod tests {
         assert_eq!(
             first(&dom.root, "input").unwrap().style.color,
             Color::rgb(0, 0xff, 0)
+        );
+    }
+
+    #[test]
+    fn has_is_where_cascade_end_to_end() {
+        // (FIX 4) `:has(> a)` through the real cascade: only the div with a
+        // direct <a> child turns red; `:is`/`:where` match the element itself.
+        let html = "<style>\
+            div:has(> a) { color: #ff0000 }\
+            section:has(> a) { color: #0000ff }\
+            p:is(.hero, .lead) { color: #00ff00 }\
+            span:where([data-x]) { color: #00ffff }\
+            </style>\
+            <div><a href='/x'>l</a></div>\
+            <section><b><a href='/y'>m</a></b></section>\
+            <p class='lead'>t</p><span data-x='1'>s</span>";
+        let dom = CssEngine::new().style(&parse_html(html));
+        assert_eq!(
+            first(&dom.root, "div").unwrap().style.color,
+            Color::rgb(0xff, 0, 0),
+            "div has a direct <a> child"
+        );
+        assert_eq!(
+            first(&dom.root, "section").unwrap().style.color,
+            Color::BLACK,
+            "the section's <a> is nested, not a direct child"
+        );
+        assert_eq!(
+            first(&dom.root, "p").unwrap().style.color,
+            Color::rgb(0, 0xff, 0)
+        );
+        assert_eq!(
+            first(&dom.root, "span").unwrap().style.color,
+            Color::rgb(0, 0xff, 0xff)
         );
     }
 

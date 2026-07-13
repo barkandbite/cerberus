@@ -6,9 +6,12 @@
 //! `:nth-last-child(an+b)`, the `*-of-type` family (`:first-of-type`,
 //! `:last-of-type`, `:only-of-type`, `:nth-of-type(an+b)`,
 //! `:nth-last-of-type(an+b)`), `:not(…)`,
+//! `:is(…)`/`:where(…)` over simple-compound argument lists, `:has(…)` as a
+//! direct-child subset,
 //! `:root`), grouping `,`, and the descendant / child (`>`) / adjacent-sibling
 //! (`+`) / general-sibling (`~`) combinators. State pseudo-classes (`:hover`,
-//! `:focus`, `:active`, `:visited`, `:link`) parse but never match in the static
+//! `:focus`, `:active`, `:visited`, `:link`) and any unknown/unsupported
+//! pseudo parse but never match in the static
 //! cascade. `@media` blocks are parsed and gated on the viewport plus the fixed
 //! desktop persona (`prefers-color-scheme: light`, no reduced-motion/contrast,
 //! `hover`/`pointer: fine`, no forced colors) — matching what JS `matchMedia`
@@ -34,6 +37,9 @@ pub struct SiblingRef {
     pub id: Option<String>,
     pub classes: Vec<String>,
     pub attrs: Vec<(String, String)>,
+    /// The element's direct element children, one level deep (the children's
+    /// own lists are empty), so `:has(...)` can check them during the cascade.
+    pub children: Rc<[SiblingRef]>,
 }
 
 /// An element on the match path: its parent's element children (shared via `Rc`
@@ -88,7 +94,18 @@ enum Pseudo {
     NthOfType(i32, i32),
     NthLastOfType(i32, i32), // an+b among same-tag siblings, counting from the end
     Root,
-    Never, // :hover/:focus/:active/:visited/:link — no static match
+    /// `:is(...)`/`:where(...)`: matches when ANY argument compound matches
+    /// the element itself. They differ only in specificity — `:where` adds
+    /// nothing, `:is` its most specific argument (CSS Selectors 4).
+    Is(Vec<Compound>),
+    Where(Vec<Compound>),
+    /// `:has(...)` restricted to DIRECT children: matches when any element
+    /// child matches any argument compound. Both `:has(> x)` and `:has(x)`
+    /// check children only — `SiblingRef` carries one level of children, so
+    /// deeper descent isn't reachable from the match path. This under-matches
+    /// Chrome for descendant arguments but never over-matches.
+    HasChild(Vec<Compound>),
+    Never, // :hover/:focus/unknown/unsupported — no static match
 }
 
 #[derive(Clone, Debug, Default)]
@@ -105,14 +122,32 @@ struct Compound {
 
 impl Compound {
     fn specificity(&self) -> Specificity {
+        fn add(s: &mut Specificity, o: Specificity) {
+            s.0 += o.0;
+            s.1 += o.1;
+            s.2 += o.2;
+        }
         let mut s = (
             u32::from(self.id.is_some()),
-            self.classes.len() as u32 + self.attrs.len() as u32 + self.pseudos.len() as u32,
+            self.classes.len() as u32 + self.attrs.len() as u32,
             u32::from(self.tag.is_some()),
         );
+        for p in &self.pseudos {
+            match p {
+                // `:is()`/`:has()` contribute their most specific argument;
+                // `:where()` contributes zero (CSS Selectors 4).
+                Pseudo::Is(args) | Pseudo::HasChild(args) => {
+                    if let Some(m) = args.iter().map(Compound::specificity).max() {
+                        add(&mut s, m);
+                    }
+                }
+                Pseudo::Where(_) => {}
+                // Every other pseudo-class counts at class level.
+                _ => s.1 += 1,
+            }
+        }
         for n in &self.not {
-            let inner = n.specificity();
-            s = (s.0 + inner.0, s.1 + inner.1, s.2 + inner.2);
+            add(&mut s, n.specificity());
         }
         s
     }
@@ -205,6 +240,13 @@ fn pseudo_matches(
         Pseudo::NthOfType(a, b) => nth_matches(*a, *b, type_pos()),
         Pseudo::NthLastOfType(a, b) => nth_matches(*a, *b, type_total() as i32 - type_pos() + 1),
         Pseudo::Root => el.tag == "html",
+        Pseudo::Is(args) | Pseudo::Where(args) => {
+            args.iter().any(|a| a.matches(el, index, total, siblings))
+        }
+        Pseudo::HasChild(args) => el.children.iter().enumerate().any(|(i, child)| {
+            args.iter()
+                .any(|a| a.matches(child, i, el.children.len(), &el.children))
+        }),
         Pseudo::Never => false,
     }
 }
@@ -582,7 +624,10 @@ fn parse_media_feature(text: &str) -> Option<MediaFeature> {
 }
 
 fn parse_selectors(text: &str) -> Vec<Selector> {
-    text.split(',')
+    // Split at top-level commas only, so the comma inside a functional
+    // pseudo-class argument (`:is(a, b)`) doesn't split the selector itself.
+    crate::split_top_commas(text)
+        .iter()
         .filter_map(|s| {
             let sel = parse_selector(s.trim());
             (!sel.compounds.is_empty()).then_some(sel)
@@ -593,13 +638,15 @@ fn parse_selectors(text: &str) -> Vec<Selector> {
 fn parse_selector(text: &str) -> Selector {
     let mut compounds = Vec::new();
     let mut pending = Combinator::Descendant;
-    for token in text.split_whitespace() {
-        match token {
+    // Top-level whitespace split: spaces inside a functional pseudo argument
+    // (`:has(> a)`, `:nth-child(2n + 1)`) don't break the compound apart.
+    for token in crate::split_top(text) {
+        match token.as_str() {
             ">" => pending = Combinator::Child,
             "+" => pending = Combinator::Adjacent,
             "~" => pending = Combinator::General,
             _ => {
-                if let Some(mut c) = parse_compound(token) {
+                if let Some(mut c) = parse_compound(&token) {
                     // The first compound's combinator is unused; the rest carry
                     // their relation to the compound on their left.
                     c.combinator = if compounds.is_empty() {
@@ -739,12 +786,88 @@ fn apply_pseudo(c: &mut Compound, name: &str, arg: &str) {
                 c.not.push(inner);
             }
         }
+        // `:is(...)`/`:where(...)` over a selector list of simple compounds.
+        // The list is forgiving (CSS Selectors 4): arguments we can't parse or
+        // evaluate (combinators) are dropped; an empty result matches nothing.
+        "is" | "where" => {
+            let args = parse_compound_list(arg);
+            c.pseudos.push(match (args.is_empty(), name == "is") {
+                (true, _) => Pseudo::Never,
+                (false, true) => Pseudo::Is(args),
+                (false, false) => Pseudo::Where(args),
+            });
+        }
+        // `:has(...)` with single-compound arguments and an optional leading
+        // `>`; both forms check direct children (see `Pseudo::HasChild`).
+        "has" => {
+            let args = parse_has_args(arg);
+            c.pseudos.push(if args.is_empty() {
+                Pseudo::Never
+            } else {
+                Pseudo::HasChild(args)
+            });
+        }
         // State pseudo-classes have no static answer; force a non-match so we
         // never wrongly apply (e.g.) :hover styles at rest.
         "hover" | "focus" | "active" | "visited" | "link" | "focus-within" | "focus-visible"
         | "checked" | "disabled" | "enabled" => c.pseudos.push(Pseudo::Never),
-        _ => {} // unknown pseudo — ignore (matches nothing extra)
+        // Unknown/unsupported pseudo-classes and pseudo-elements likewise
+        // force a non-match, so a rule guarded by something we can't evaluate
+        // is never wrongly applied to the element itself (Chrome drops such
+        // rules). Previously they were silently ignored, which over-matched —
+        // e.g. `p::first-line` styled the whole `<p>`.
+        _ => c.pseudos.push(Pseudo::Never),
     }
+}
+
+/// Parse a `:is()`/`:where()` argument list: top-level-comma-separated simple
+/// compounds. An argument with top-level combinators/whitespace (not
+/// evaluable against a single element) or that fails to parse is dropped.
+fn parse_compound_list(arg: &str) -> Vec<Compound> {
+    crate::split_top_commas(arg)
+        .iter()
+        .filter_map(|part| {
+            let part = part.trim();
+            (!has_top_level_structure(part))
+                .then(|| parse_compound(part))
+                .flatten()
+        })
+        .collect()
+}
+
+/// Parse `:has()` arguments: each a single compound with an optional leading
+/// `>` combinator. Descendant/sibling arguments are dropped (under-match).
+fn parse_has_args(arg: &str) -> Vec<Compound> {
+    crate::split_top_commas(arg)
+        .iter()
+        .filter_map(|part| {
+            let part = part.trim();
+            let rest = match part.strip_prefix('>') {
+                Some(r) => r.trim_start(),
+                None => part,
+            };
+            (!has_top_level_structure(rest))
+                .then(|| parse_compound(rest))
+                .flatten()
+        })
+        .collect()
+}
+
+/// Whether `s` has top-level (outside parentheses) whitespace or a combinator —
+/// i.e. it is more than one simple compound.
+fn has_top_level_structure(s: &str) -> bool {
+    let mut depth = 0i32;
+    for ch in s.chars() {
+        match ch {
+            '(' => depth += 1,
+            ')' => depth = (depth - 1).max(0),
+            c if depth == 0 && (c.is_whitespace() || matches!(c, '>' | '+' | '~')) => {
+                return true;
+            }
+            _ => {}
+        }
+    }
+    false
 }
 
 /// Parse the `An+B` microsyntax: `odd`, `even`, `3`, `2n`, `2n+1`, `-n+3`, `n`.
@@ -873,7 +996,13 @@ mod tests {
                 .iter()
                 .map(|(k, v)| (k.to_string(), v.to_string()))
                 .collect(),
+            children: Rc::from([]),
         }
+    }
+
+    fn with_children(mut r: SiblingRef, kids: Vec<SiblingRef>) -> SiblingRef {
+        r.children = kids.into();
+        r
     }
 
     /// Build a path where each level is a single only-child (no siblings).
@@ -1015,6 +1144,110 @@ mod tests {
     fn state_pseudos_never_match_statically() {
         let path = chain(vec![sref("a", None, &[], &[])]);
         assert!(!matches("a:hover { a: b }", &path));
+    }
+
+    #[test]
+    fn unknown_pseudos_never_match() {
+        // A rule guarded by a pseudo we can't evaluate must not apply to the
+        // element itself (Chrome drops such rules entirely).
+        let path = chain(vec![sref("p", None, &[], &[])]);
+        assert!(!matches("p:target { a: b }", &path));
+        assert!(!matches("p::first-line { a: b }", &path));
+        // ...while `:not(<never-matching>)` stays vacuously true.
+        assert!(matches("p:not(:target) { a: b }", &path));
+    }
+
+    #[test]
+    fn is_and_where_match_any_argument_compound() {
+        let at = |classes: &[&str]| chain(vec![sref("p", None, classes, &[])]);
+        assert!(matches("p:is(.a, .b) { x: y }", &at(&["b"])));
+        assert!(!matches("p:is(.a, .b) { x: y }", &at(&["c"])));
+        assert!(matches(":where(.a, p) { x: y }", &at(&[])));
+        // The list is forgiving: an argument we can't evaluate (combinators)
+        // is dropped while the rest still match…
+        assert!(matches("p:is(div span, .b) { x: y }", &at(&["b"])));
+        // …and with no usable argument the pseudo never matches.
+        assert!(!matches("p:is(div span) { x: y }", &at(&["b"])));
+        // A top-level comma inside :is() must not split the selector list.
+        let sheet = parse_stylesheet("p:is(.a, .b), h1 { x: y }");
+        assert_eq!(sheet.rules[0].selectors.len(), 2);
+        assert!(sheet.rules[0]
+            .matches(&chain(vec![sref("h1", None, &[], &[])]))
+            .is_some());
+    }
+
+    #[test]
+    fn is_takes_max_argument_specificity_where_takes_none() {
+        let spec = |css: &str| parse_stylesheet(css).rules[0].selectors[0].specificity();
+        assert_eq!(
+            spec("p:is(#a, .b) { x: y }"),
+            (1, 0, 1),
+            ":is contributes its most specific argument"
+        );
+        assert_eq!(
+            spec("p:where(#a, .b) { x: y }"),
+            (0, 0, 1),
+            ":where contributes zero"
+        );
+        assert_eq!(
+            spec("div:has(.b) { x: y }"),
+            (0, 1, 1),
+            ":has contributes its most specific argument"
+        );
+    }
+
+    #[test]
+    fn has_matches_direct_children_only() {
+        let a = sref("a", None, &[], &[("href", "#")]);
+        let div_direct = with_children(sref("div", None, &[], &[]), vec![a.clone()]);
+        let span_with_a = with_children(sref("span", None, &[], &[]), vec![a.clone()]);
+        let div_nested = with_children(sref("div", None, &[], &[]), vec![span_with_a]);
+        assert!(matches(
+            "div:has(> a) { x: y }",
+            &chain(vec![div_direct.clone()])
+        ));
+        assert!(matches(
+            "div:has(a[href]) { x: y }",
+            &chain(vec![div_direct.clone()])
+        ));
+        assert!(!matches(
+            "div:has(> a) { x: y }",
+            &chain(vec![div_nested.clone()])
+        ));
+        // Documented subset: Chrome's `:has(a)` also matches via a grandchild;
+        // `SiblingRef` carries one level of children, so we under-match here
+        // (never over-match).
+        assert!(!matches("div:has(a) { x: y }", &chain(vec![div_nested])));
+        // No matching child, no match; a descendant argument is unsupported
+        // and never matches.
+        assert!(!matches(
+            "div:has(> p) { x: y }",
+            &chain(vec![div_direct.clone()])
+        ));
+        assert!(!matches(
+            "div:has(span a) { x: y }",
+            &chain(vec![div_direct])
+        ));
+    }
+
+    #[test]
+    fn has_evaluates_structural_pseudos_of_children() {
+        let li = |cls: &[&str]| sref("li", None, cls, &[]);
+        let ul = with_children(sref("ul", None, &[], &[]), vec![li(&[]), li(&["x"])]);
+        // The second child is :nth-child(2) — and `2n + 1` style spaces inside
+        // the argument survive the (now paren-aware) selector tokenizer.
+        assert!(matches(
+            "ul:has(> li:nth-child(2).x) { a: b }",
+            &chain(vec![ul.clone()])
+        ));
+        assert!(matches(
+            "ul:has(> li:nth-child(2n + 1)) { a: b }",
+            &chain(vec![ul.clone()])
+        ));
+        assert!(!matches(
+            "ul:has(> li:nth-child(3)) { a: b }",
+            &chain(vec![ul])
+        ));
     }
 
     #[test]
