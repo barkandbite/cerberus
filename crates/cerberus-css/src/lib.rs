@@ -595,7 +595,8 @@ fn collect_vars(
 fn resolve_value(value: &str, vars: &Vars, ctx: CalcCtx) -> String {
     let has_var = value.contains("var(");
     let has_math = find_math_fn(value).is_some();
-    if !has_var && !has_math {
+    let has_ld = value.contains("light-dark(");
+    if !has_var && !has_math && !has_ld {
         return value.to_string();
     }
     let substituted = if has_var {
@@ -603,11 +604,83 @@ fn resolve_value(value: &str, vars: &Vars, ctx: CalcCtx) -> String {
     } else {
         value.to_string()
     };
+    // `light-dark(a, b)` picks by the used color-scheme. The head is a fixed
+    // light persona (see the `@media prefers-color-scheme` handling), so it
+    // always resolves to the first argument — exactly what Chrome computes here
+    // for a light user. Modern design systems (MDN, and any site built with
+    // `@csstools/postcss-light-dark-function`) drive their whole theme through
+    // this; without it the function was an unknown value, so the declaration
+    // was dropped and the theme fell back to its dark branch (measured: MDN's
+    // header painted `--color-gray-10` instead of `--color-gray-90`).
+    let substituted = if substituted.contains("light-dark(") {
+        resolve_light_dark(&substituted, 0)
+    } else {
+        substituted
+    };
     if find_math_fn(&substituted).is_some() {
         eval_calcs(&substituted, ctx)
     } else {
         substituted
     }
+}
+
+/// Replace every `light-dark(light, dark)` with its `light` argument (the head's
+/// fixed light persona). Paren/quote-aware so the two arguments split at the
+/// top-level comma only (an argument may itself be `rgb(…)`, `var(…)` fallback,
+/// or a nested `light-dark(…)`, which the chosen argument resolves in turn).
+fn resolve_light_dark(input: &str, depth: usize) -> String {
+    if depth > 16 {
+        return input.to_string();
+    }
+    let Some(start) = input.find("light-dark(") else {
+        return input.to_string();
+    };
+    let open = start + "light-dark(".len() - 1; // index of '('
+    let Some(close) = matching_paren(input, open) else {
+        return input.to_string();
+    };
+    let inner = &input[open + 1..close];
+    // First top-level argument (before the first top-level comma).
+    let light_arg = split_top_commas(inner)
+        .into_iter()
+        .next()
+        .unwrap_or_default();
+    let light_arg = resolve_light_dark(light_arg.trim(), depth + 1);
+    let mut out = String::with_capacity(input.len());
+    out.push_str(&input[..start]);
+    out.push_str(&light_arg);
+    out.push_str(&input[close + 1..]);
+    // Resolve any further `light-dark(...)` that followed this one.
+    resolve_light_dark(&out, depth + 1)
+}
+
+/// Index of the `)` matching the `(` at `open`, honoring nested parens and
+/// skipping over quoted strings.
+fn matching_paren(s: &str, open: usize) -> Option<usize> {
+    let bytes = s.as_bytes();
+    let mut depth = 0i32;
+    let mut quote: Option<u8> = None;
+    for (i, &b) in bytes.iter().enumerate().skip(open) {
+        match quote {
+            Some(q) => {
+                if b == q {
+                    quote = None;
+                }
+            }
+            None => match b {
+                b'"' | b'\'' => quote = Some(b),
+                b'(' => depth += 1,
+                b')' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        return Some(i);
+                    }
+                }
+                _ => {}
+            },
+        }
+    }
+    None
 }
 
 /// Replace the `currentColor` keyword (case-insensitive) with `color` rendered
@@ -646,10 +719,30 @@ fn substitute_current_color(value: &str, color: cerberus_types::Color) -> String
     out
 }
 
+/// The CSS **guaranteed-invalid value** (CSS Variables §3), as a sentinel token
+/// that can't occur in real CSS. A `var()` that references an undefined custom
+/// property (or one explicitly set to `initial`) with no fallback resolves to
+/// this; any value that ends up containing it is *invalid at computed-value
+/// time* and is dropped, so a wrapping `var(--x, fallback)` takes its fallback
+/// and a real declaration is ignored (keeping the prior cascade value). Treating
+/// the case as empty string instead silently kept the wrong branch of the
+/// custom-property "light-dark toggle" every modern design system compiles to
+/// (measured: MDN's header inverted to its dark palette on a light persona).
+const IACVT: &str = "\u{1}iacvt\u{1}";
+
+/// Whether a custom-property value is the guaranteed-invalid value — either the
+/// sentinel already, or the literal `initial` (which resets a custom property
+/// TO the guaranteed-invalid value, unlike its meaning on normal properties).
+fn is_iacvt(v: &str) -> bool {
+    let t = v.trim();
+    t.contains(IACVT) || t.eq_ignore_ascii_case("initial")
+}
+
 /// Replace every `var(--name[, fallback])` in `input` with the custom property's
 /// value (resolved recursively, since a custom property may itself reference
-/// others), falling back to the comma fallback or empty. Guarded against cycles
-/// and runaway depth.
+/// others). An undefined/`initial` property with no fallback yields the
+/// guaranteed-invalid value ([`IACVT`]); a resolved value that turns out invalid
+/// makes the reference take its fallback. Guarded against cycles and depth.
 fn substitute_vars(input: &str, vars: &Vars, depth: usize) -> String {
     if depth > 32 {
         return String::new();
@@ -666,11 +759,34 @@ fn substitute_vars(input: &str, vars: &Vars, depth: usize) -> String {
         };
         let (name, fallback) = split_top_comma(inner);
         let key = name.trim().to_ascii_lowercase();
-        let replacement = match vars.get(&key) {
-            Some(v) => substitute_vars(v, vars, depth + 1),
+        // A property's substituted value, or `None` when it resolves to the
+        // guaranteed-invalid value (undefined / `initial` / resolves-to-IACVT).
+        let resolved: Option<String> = match vars.get(&key) {
+            Some(v) if is_iacvt(v) => None,
+            Some(v) => {
+                let r = substitute_vars(v, vars, depth + 1);
+                if r.contains(IACVT) {
+                    None
+                } else {
+                    Some(r)
+                }
+            }
+            None => None,
+        };
+        let replacement = match resolved {
+            Some(r) => r,
+            // Invalid reference: take the fallback (itself possibly invalid), or
+            // propagate the guaranteed-invalid value up.
             None => match fallback {
-                Some(fb) => substitute_vars(fb.trim(), vars, depth + 1),
-                None => String::new(),
+                Some(fb) => {
+                    let r = substitute_vars(fb.trim(), vars, depth + 1);
+                    if r.contains(IACVT) {
+                        IACVT.to_string()
+                    } else {
+                        r
+                    }
+                }
+                None => IACVT.to_string(),
             },
         };
         out.push_str(replacement.trim());
@@ -1193,6 +1309,13 @@ fn apply_declarations(
             .then_some(style.font_size as f32),
         };
         let resolved = resolve_value(value, vars, ctx);
+        // A value that resolved to the guaranteed-invalid value (an undefined /
+        // `initial` custom property reached through `var()` with no usable
+        // fallback) is invalid at computed-value time — drop the declaration so
+        // the property keeps its prior cascade value, exactly as a browser does.
+        if resolved.contains(IACVT) {
+            continue;
+        }
         // Then resolve the `currentColor` keyword against the color cascaded so
         // far, so it works anywhere a color appears (borders, backgrounds,
         // shadows, gradients) — not just as an unresolved literal.
@@ -4333,6 +4456,55 @@ mod tests {
                 .as_deref()
                 .unwrap()
                 .vertical
+        );
+    }
+
+    #[test]
+    fn light_dark_picks_the_light_argument() {
+        // `light-dark(a, b)` → a on the fixed light persona, matching Chrome for
+        // a light user. Args may be nested vars/functions.
+        let dom = CssEngine::new().style(&parse_html(
+            "<div style='background-color: light-dark(#f7f7f8, #212426)'>x</div>",
+        ));
+        assert_eq!(
+            first(&dom.root, "div").unwrap().style.background,
+            Some(Color::rgb(0xf7, 0xf7, 0xf8)),
+            "light-dark takes the light (first) argument"
+        );
+    }
+
+    #[test]
+    fn guaranteed_invalid_var_takes_the_outer_fallback() {
+        // The custom-property "light-dark toggle" every modern design system
+        // compiles to: an `initial` custom property reached through a var()
+        // with no fallback is the GUARANTEED-INVALID value, so the wrapping
+        // `var(--toggle, LIGHT)` must take its LIGHT fallback — not resolve the
+        // inner to empty and keep the dark branch (the MDN regression).
+        let css = "<style>div{\
+            --cs-light:initial;\
+            --toggle:var(--cs-light) #212426;\
+            --bg:var(--toggle,#f7f7f8);\
+            background-color:var(--bg);}\
+            </style><div>x</div>";
+        let dom = CssEngine::new().style(&parse_html(css));
+        assert_eq!(
+            first(&dom.root, "div").unwrap().style.background,
+            Some(Color::rgb(0xf7, 0xf7, 0xf8)),
+            "invalid toggle falls back to the light value"
+        );
+    }
+
+    #[test]
+    fn undefined_var_without_fallback_drops_the_declaration() {
+        // `color: var(--nope)` with no fallback is invalid at computed-value
+        // time → the declaration is dropped and the inherited color kept, not
+        // reset to a default.
+        let css = "<style>p{color:#112233;color:var(--nope)}</style><p>x</p>";
+        let dom = CssEngine::new().style(&parse_html(css));
+        assert_eq!(
+            first(&dom.root, "p").unwrap().style.color,
+            Color::rgb(0x11, 0x22, 0x33),
+            "invalid var() declaration dropped, prior value kept"
         );
     }
 
