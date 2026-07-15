@@ -504,3 +504,31 @@ placement chain is now Blink-exact: integer baseline, sub-pixel pen, sub-pixel
 run origin, skrifa auto-hinter. Remaining text residual is stem-phase AA
 distribution (needs Skia's exact coverage kernel — diminishing returns).
 Next levers: transform:translate static subset; the wikipedia dive.
+
+---
+
+## 15. Mirroring pitfall — valid Chrome references require FULL mirrors (2026-07-13)
+
+**Problem found in real-site testing:** headless Chrome in the dev environment
+**cannot reach the network** (the agent proxy resets its connections —
+`ERR_CONNECTION_RESET`), so every reference is rendered from a local mirror.
+The original `parity.sh` mirror **stripped cross-origin CSS/JS**. Modern sites
+serve their stylesheets from CDNs (cross-origin), so the stripped mirror had no
+CSS → *both* Chrome and Cerberus rendered an unstyled DOM, and the "Chrome
+reference" was a degraded page, not what a real browser shows. This silently
+invalidated comparisons for any CDN-CSS site (Stripe, Django, ESPN, …); only
+same-origin-CSS sites (Wikipedia, HN, MDN, NYT) were valid.
+
+**Fix:** `scripts/full-mirror.py` downloads the HTML **plus all stylesheets
+(same- and cross-origin), their `@import`s, `url()` fonts/images, and `<img>`
+sources** via `curl` (which *can* reach the network through the proxy),
+rewriting every reference to a local file. Only `<script>` is dropped (we can't
+run page JS; both engines compare on the same static DOM). Chrome then renders
+the REAL styled page.
+
+**Confirmed with full mirrors:** the flex/grid **width-distribution** bug is
+real (usa.gov's two-column banner collapses to min-content ribbons on a *valid*
+reference; Django's sidebar column is too narrow), as is inline-SVG logo sizing
+(Django's wordmark renders as a bare circle). Use `full-mirror.py` for any
+real-site comparison; reserve the in-repo `parity.sh` self-mirror for the fixed
+same-origin corpus only.
