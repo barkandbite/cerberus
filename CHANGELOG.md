@@ -3,6 +3,59 @@
 All notable changes to Cerberus are recorded here. Versions are small while the
 browser is pre-1.0; this is the first tagged preview.
 
+## [0.0.11] — 2026-07-13
+
+Rendering-parity release: the glyph pipeline is now Blink-exact end to end, real
+bold/italic and inline SVG render, and a batch of CSS/layout gaps that broke
+real brand pages are closed. Every change is measured against headless Chrome
+(pixel-diff corpus + per-cause calibration pages).
+
+### Added
+- **Real bold/italic font faces.** Bundled the Liberation (Arial/Times/Courier
+  metric) and DejaVu bold/italic/bold-italic companions; runs now select the real
+  face by weight/style instead of the faux 1px smear / shear. Measured advances
+  land within 0.5px of Chrome across 60 face × style × text cases; the synthetic
+  path survives only where no real face exists (icon/CJK).
+- **Inline `<svg>` rendering.** Inline SVG subtrees are serialized and rasterized
+  through the existing resvg path (content-hash keyed, decoded once), keeping the
+  `svg` tag so author CSS still sizes/toggles them. The cascade's computed `fill`
+  (including `currentColor` and `light-dark()`-driven values) is injected into the
+  payload, so CSS-painted logos and icons render in the right color.
+- **Modern CSS values.** `light-dark()` (resolves to the light argument on the
+  fixed light persona); the CSS **guaranteed-invalid value** for `var()` (an
+  undefined / `initial` custom property with no fallback correctly invalidates,
+  so a wrapping `var(--x, fallback)` takes its fallback); `min()`/`max()`/
+  `clamp()`; Media Queries 4 range syntax (`(width <= 1000px)`); `calc()`
+  percentages resolved against the right base; `:is()`/`:where()`/`:has()`
+  (direct-child subset); sr-only `clip`/`clip-path` hiding.
+- **Layout coverage.** Anonymous flex/grid items for bare text children; explicit
+  numeric grid line placement (`grid-column: 2 / 9`, `1 / -1`); `inline-flex`/
+  `inline-grid` as atomic inline boxes; `display: table-cell` rows.
+
+### Fixed
+- **Blink-exact glyph placement.** Integer baseline (rounded ascent), sub-pixel
+  pen advances within a run, **sub-pixel word-run origins** across the line, and
+  **skrifa auto-hinted** outlines (light mode — the mode Chrome-on-Linux actually
+  uses). Ink-pixel mismatch on aligned text fell from ~71% to ~20% (the remaining
+  residual is anti-aliasing coverage). Measure scratches keep integer widths so
+  table/flex sizing stays stable.
+- **Dark-theme inversion.** Sites built with `light-dark()` / the standard PostCSS
+  color-scheme polyfill (e.g. MDN) rendered entirely in their dark palette on a
+  light persona; the header now matches Chrome. Fixed by the `light-dark()` and
+  guaranteed-invalid-value work above.
+- **Text metrics.** `line-height: normal` is Blink's per-component-rounded integer;
+  explicit fractional line-heights accumulate with per-line rounding; inter-word
+  gaps are fractional (wrap points now flip where Chrome's flip); baseline-aligned
+  inline images reserve the strut descent.
+- **Inline whitespace (#137).** Whitespace fidelity across inline element
+  boundaries — no phantom space before punctuation, the space before a `nowrap`
+  span is kept, multi-word links underline continuously, and whitespace-only nodes
+  no longer break float bands.
+- **Legacy/table layout.** `<center>` block-centering stops at table-cell
+  boundaries; table row heights follow their cells (cell-less spacer rows count,
+  no table-font floor, trailing cell margins contained); list markers hang outside
+  the content edge.
+
 ## [0.0.10] — 2026-07-04
 
 Coherent per-window fingerprint personas: each identity now presents one
