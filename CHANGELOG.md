@@ -3,6 +3,24 @@
 All notable changes to Cerberus are recorded here. Versions are small while the
 browser is pre-1.0; this is the first tagged preview.
 
+## [0.0.12] — 2026-07-13
+
+Tooling release: trustworthy parity references. No engine behavior changes.
+
+### Added
+- **Full-fidelity mirror (`scripts/full-mirror.py`).** Headless Chrome cannot
+  reach the network in the dev environment (the agent proxy resets its
+  connections), so parity references are rendered from a local mirror. The
+  previous mirror stripped cross-origin CSS/JS — but modern sites serve their
+  stylesheets from CDNs, so Chrome was rendering a degraded, unstyled page and
+  the "Chrome reference" was wrong for any CDN-CSS site. The new tool downloads
+  the HTML plus **all** stylesheets (same- and cross-origin), their `@import`s,
+  `url()` fonts/images, and `<img>` sources via `curl` (which does reach the
+  network through the proxy), rewriting each reference to a local file; only
+  `<script>` is dropped. Chrome then renders the real styled page, turning
+  degraded-both comparisons into valid ones. Documented in
+  `docs/RENDERING_PARITY_PLAN.md` §15.
+
 ## [0.0.11] — 2026-07-13
 
 Rendering-parity release: the glyph pipeline is now Blink-exact end to end, real
