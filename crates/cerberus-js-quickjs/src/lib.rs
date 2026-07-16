@@ -209,11 +209,18 @@ const SPEED_FIRST_PRELUDE: &str = r#"
 /// [`JsError::Eval`] instead of a process OOM kill.
 const MAX_JS_HEAP_BYTES: usize = 192 * 1024 * 1024;
 
-/// Max QuickJS interpreter stack size. This matches rquickjs's own built-in
-/// default (see `Runtime::set_max_stack_size` doc comment); we set it
-/// explicitly rather than relying on the implicit default so the cap is
-/// visible and auditable here rather than only inside the vendored crate.
-const MAX_JS_STACK_BYTES: usize = 256 * 1024;
+/// Max QuickJS interpreter stack size — the ceiling QuickJS enforces on its own
+/// C-stack usage before raising a catchable stack-overflow, independent of (and
+/// far below) the OS thread stack (~8 MiB). rquickjs's built-in default is
+/// 256 KiB, but that is too tight for legitimate recursion on targets with
+/// heavier native frames: on a Windows debug build even `sum(100)` overflows
+/// 256 KiB, while the same code fits easily on Linux. 1 MiB accommodates the
+/// modest recursion real pages use across all targets while remaining a small
+/// fraction of the thread stack, so a runaway script still trips this guard (a
+/// prompt, catchable `JsError::Eval`) long before it can overflow the real
+/// stack and crash the process. Set explicitly so the cap is auditable here
+/// rather than only inside the vendored crate.
+const MAX_JS_STACK_BYTES: usize = 1024 * 1024;
 
 /// Default wall-clock budget for a single top-level [`QuickJsEngine::eval`]
 /// call (issue #68): stops a page-controlled `while (true) {}` from hanging
