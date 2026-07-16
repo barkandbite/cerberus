@@ -3,6 +3,18 @@
 All notable changes to Cerberus are recorded here. Versions are small while the
 browser is pre-1.0; this is the first tagged preview.
 
+## [Unreleased]
+
+### Added
+- **Page scrolling.** The main content area now scrolls: mouse wheel and
+  trackpad, `↑`/`↓` (48 px), `Page Up`/`Page Down` (90% of the viewport), and
+  `Home`/`End` (jump to top/bottom). The offset is clamped to the document
+  height (computed from the display list via `cerberus_paint::content_height`)
+  and reset to the top on every navigation. Link, form-control, and element hit
+  boxes — and scripted-page `getBoundingClientRect` — follow the scroll offset,
+  so clicks land on what's visible. Previously the viewport was fixed to the top
+  of the page with no way to reach content below the fold.
+
 ## [0.0.12] — 2026-07-13
 
 Tooling release: trustworthy parity references. No engine behavior changes.

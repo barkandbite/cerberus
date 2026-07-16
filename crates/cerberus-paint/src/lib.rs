@@ -114,6 +114,30 @@ pub fn translate_items(items: &mut [DisplayItem], dx: i32, dy: i32) {
     }
 }
 
+/// The lowest painted pixel across `items` (0 if empty) — the full document
+/// height used to bound vertical scrolling. Glyph runs count their box height
+/// below the top-left anchor so a run flush against the bottom isn't clipped;
+/// `ClipPop` has no geometry.
+pub fn content_height(items: &[DisplayItem]) -> i32 {
+    items
+        .iter()
+        .map(|it| match it {
+            DisplayItem::Rect { rect, .. }
+            | DisplayItem::RoundRect { rect, .. }
+            | DisplayItem::Gradient { rect, .. }
+            | DisplayItem::Shadow { rect, .. }
+            | DisplayItem::Image { rect, .. }
+            | DisplayItem::ClipPush { rect } => rect.y + rect.h as i32,
+            DisplayItem::Glyphs { origin, glyphs, .. } => {
+                origin.y + glyphs.iter().map(|g| g.h as i32).max().unwrap_or(0)
+            }
+            DisplayItem::Line { a, b, .. } => a.y.max(b.y),
+            DisplayItem::ClipPop => 0,
+        })
+        .max()
+        .unwrap_or(0)
+}
+
 /// A flat, ordered list of paint primitives produced by layout.
 #[derive(Clone, Debug, Default)]
 pub struct DisplayList {
@@ -646,6 +670,46 @@ impl Rasterizer for BoxRasterizer {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn content_height_is_the_lowest_painted_pixel() {
+        let items = vec![
+            DisplayItem::Rect {
+                rect: Rect::new(0, 0, 100, 40),
+                color: Color::BLACK,
+            },
+            // A rect further down sets the document bottom to y + h = 220.
+            DisplayItem::Rect {
+                rect: Rect::new(0, 180, 100, 40),
+                color: Color::BLACK,
+            },
+            DisplayItem::ClipPop,
+        ];
+        assert_eq!(content_height(&items), 220);
+        assert_eq!(content_height(&[]), 0);
+    }
+
+    #[test]
+    fn content_height_counts_glyph_box_below_the_anchor() {
+        // A glyph run anchored at y=300 with 16px-tall boxes extends to 316,
+        // so a run flush against the bottom isn't reported as clipped.
+        let items = vec![DisplayItem::Glyphs {
+            origin: Point::new(0, 300),
+            frac_x: 0.0,
+            glyphs: vec![GlyphBox {
+                advance: 8,
+                advance_f: 8.0,
+                w: 8,
+                h: 16,
+                id: 0,
+                px: 16,
+                font: FontSlot::Text,
+            }],
+            color: Color::BLACK,
+            style: FontStyle::REGULAR,
+        }];
+        assert_eq!(content_height(&items), 316);
+    }
 
     #[test]
     fn fill_rect_is_clipped_and_readable() {

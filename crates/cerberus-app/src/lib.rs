@@ -2557,6 +2557,13 @@ pub struct BrowserApp {
     settings_open: bool,
     background: Color,
     last_size: Size,
+    /// Vertical scroll offset of the main page content, in logical pixels
+    /// (0 = top). Clamped to `[0, max_scroll]` at paint; navigation resets it.
+    scroll_y: i32,
+    /// Largest valid `scroll_y` for the last painted page (content height minus
+    /// viewport height, floored at 0). Lets wheel/key handlers clamp without
+    /// re-running layout.
+    max_scroll: i32,
     /// HiDPI scale factor (physical ÷ logical px). 1.0 unless the shell sets it.
     scale: f32,
     /// Consent policy shared with the worker-side cookie jar.
@@ -2761,6 +2768,8 @@ impl BrowserApp {
             settings_open: false,
             background: Color::WHITE,
             last_size: Size::new(800, 600),
+            scroll_y: 0,
+            max_scroll: 0,
             scale: 1.0,
             consent: Arc::new(Mutex::new(DefaultDenyPolicy::new(true))),
             cookie_policy: Arc::new(Mutex::new(CookiePolicy::new())),
@@ -2883,6 +2892,9 @@ impl BrowserApp {
         self.forms.clear();
         self.focused_field = None;
         self.form_fields.clear();
+        // A new document starts scrolled to the top.
+        self.scroll_y = 0;
+        self.max_scroll = 0;
 
         if url.starts_with("cerberus:") {
             self.load_builtin(url); // built-in pages are GET-only; ignore any body
@@ -4282,6 +4294,17 @@ impl BrowserApp {
     /// line of that, which is exact for the single-line editing we support today
     /// (newlines can't be typed — Enter submits). The caret is always clamped
     /// inside the box.
+    /// Height of the page content viewport in logical pixels — the toolbar
+    /// content area minus any consent banner. Used to size a Page Up/Down step.
+    fn page_viewport_h(&self) -> i32 {
+        let banner_h = if self.consent_prompts.is_empty() {
+            0
+        } else {
+            BANNER_HEIGHT
+        };
+        (self.toolbar.content_size(self.last_size).h as i32 - banner_h as i32).max(1)
+    }
+
     fn paint_caret(&self, page: &mut Framebuffer, origin: Point, scale: f32) {
         let Some(id) = self.focused_field else {
             return;
@@ -4793,18 +4816,29 @@ impl FrameApp for BrowserApp {
         // Time layout+paint (M11). The image provider's borrow of `self` is
         // scoped to this block so the timing record (a `&mut self` op) is free.
         let t = Instant::now();
-        let (laid, mut page) = {
+        let (laid, mut page, scroll_y) = {
             let provider = StoreImages {
                 base: self.current_url.as_ref(),
                 images: &self.images,
                 policy: &self.image_policy,
             };
             let mut layout = BlockLayout::default();
-            let laid = layout.layout(&self.styled, content, &self.text, &provider, &self.forms);
+            let mut laid = layout.layout(&self.styled, content, &self.text, &provider, &self.forms);
+
+            // Clamp the requested scroll to the document height, then shift the
+            // page content up by that offset so the viewport shows a lower slice.
+            // Hit boxes below are placed with the same offset (window coords).
+            let doc_h = cerberus_paint::content_height(&laid.display.items);
+            let max_scroll = (doc_h - content.h as i32).max(0);
+            let scroll_y = self.scroll_y.clamp(0, max_scroll);
+            self.max_scroll = max_scroll;
+            self.scroll_y = scroll_y;
+            cerberus_paint::translate_items(&mut laid.display.items, 0, -scroll_y);
+
             let mut page = Framebuffer::new(Size::new(su(content.w), su(content.h)));
             page.clear(canvas_bg);
             self.text.rasterize(&laid.display.scaled(scale), &mut page);
-            (laid, page)
+            (laid, page, scroll_y)
         };
         self.timings.record("layout+paint", t.elapsed());
 
@@ -4817,16 +4851,23 @@ impl FrameApp for BrowserApp {
             laid.elements
                 .iter()
                 .filter_map(|e| self.node_to_js.get(&e.node).map(|&js| (js, e.rect)))
+                .map(|(js, mut rect)| {
+                    // getBoundingClientRect is viewport-relative, so it follows
+                    // the scroll offset (top goes negative once scrolled past).
+                    rect.y -= scroll_y;
+                    (js, rect)
+                })
                 .collect()
         };
 
-        // Record link hit-boxes in window coordinates for click handling.
+        // Record link hit-boxes in window coordinates for click handling. The
+        // scroll offset moves them with the painted content so clicks land.
         self.links = laid
             .links
             .into_iter()
             .map(|mut l| {
                 l.rect.x += origin.x;
-                l.rect.y += origin.y;
+                l.rect.y += origin.y - scroll_y;
                 l
             })
             .collect();
@@ -4837,7 +4878,7 @@ impl FrameApp for BrowserApp {
             .into_iter()
             .map(|mut f| {
                 f.rect.x += origin.x;
-                f.rect.y += origin.y;
+                f.rect.y += origin.y - scroll_y;
                 f
             })
             .collect();
@@ -4848,7 +4889,7 @@ impl FrameApp for BrowserApp {
             .into_iter()
             .map(|mut e| {
                 e.rect.x += origin.x;
-                e.rect.y += origin.y;
+                e.rect.y += origin.y - scroll_y;
                 e
             })
             .collect();
@@ -5168,6 +5209,40 @@ impl FrameApp for BrowserApp {
             return true;
         }
         false
+    }
+
+    fn scroll_by(&mut self, dy: i32) -> bool {
+        // Overlays own the wheel while open (they scroll their own lists via
+        // clicks); don't move the page underneath them.
+        if self.mirc_open || self.cookie_manager_open || self.settings_open {
+            return false;
+        }
+        let new = (self.scroll_y + dy).clamp(0, self.max_scroll);
+        if new != self.scroll_y {
+            self.scroll_y = new;
+            true
+        } else {
+            false
+        }
+    }
+
+    fn scroll_page(&mut self, down: bool) -> bool {
+        // A page step leaves a sliver of overlap (Chrome keeps ~10%).
+        let step = (self.page_viewport_h() * 9 / 10).max(1);
+        self.scroll_by(if down { step } else { -step })
+    }
+
+    fn scroll_to_end(&mut self, end: bool) -> bool {
+        if self.mirc_open || self.cookie_manager_open || self.settings_open {
+            return false;
+        }
+        let target = if end { self.max_scroll } else { 0 };
+        if target != self.scroll_y {
+            self.scroll_y = target;
+            true
+        } else {
+            false
+        }
     }
 }
 
@@ -8083,6 +8158,79 @@ mod tests {
         b.navigate(url);
         assert!(b.poll(), "page load + fetch cascade drained");
         b
+    }
+
+    #[test]
+    fn wheel_and_keys_scroll_the_page_and_clamp_to_content() {
+        // A page far taller than the viewport becomes scrollable; the offset
+        // clamps to the document bottom and to the top, and a fresh navigation
+        // resets it. Drives the FrameApp scroll seam the winit shell calls.
+        let tall: String = (0..200).map(|i| format!("<p>line {i}</p>")).collect();
+        let mut b = loaded(
+            vec![(
+                "https://site.test/",
+                Ok(page("https://site.test/", 200, None, &tall)),
+            )],
+            "https://site.test/",
+        );
+        // Render at a short viewport so the content overflows it.
+        let _ = b.render_frame(Size::new(400, 300));
+        assert!(b.max_scroll > 0, "tall page overflows the viewport");
+        assert_eq!(b.scroll_y, 0, "starts at the top");
+
+        // Wheel/arrow scroll moves the offset down.
+        assert!(b.scroll_by(48), "scrolling down changes the offset");
+        assert_eq!(b.scroll_y, 48);
+
+        // Can't scroll above the top; a no-op scroll reports no redraw.
+        assert!(b.scroll_by(-1000));
+        assert_eq!(b.scroll_y, 0);
+        assert!(!b.scroll_by(-1000), "already at the top: no redraw");
+
+        // End jumps to the bottom; further downward scroll is clamped there.
+        assert!(b.scroll_to_end(true));
+        assert_eq!(b.scroll_y, b.max_scroll);
+        assert!(!b.scroll_by(1000), "already at the bottom: no redraw");
+
+        // A new navigation resets scroll to the top.
+        b.navigate("https://site.test/");
+        assert!(b.poll(), "reload drained");
+        assert_eq!(b.scroll_y, 0, "navigation resets scroll");
+    }
+
+    #[test]
+    fn scrolled_link_hit_boxes_follow_the_content() {
+        // A link below the fold is clickable after scrolling it into view: its
+        // recorded hit box moves up with the painted content by the scroll offset.
+        let mut body = String::from("<div style='height:1000px'>tall</div>");
+        body.push_str("<a href='https://site.test/target'>go</a>");
+        let mut b = loaded(
+            vec![
+                (
+                    "https://site.test/",
+                    Ok(page("https://site.test/", 200, None, &body)),
+                ),
+                (
+                    "https://site.test/target",
+                    Ok(page("https://site.test/target", 200, None, "arrived")),
+                ),
+            ],
+            "https://site.test/",
+        );
+        let _ = b.render_frame(Size::new(400, 300));
+        let before: Vec<i32> = b.links.iter().map(|l| l.rect.y).collect();
+        assert!(!before.is_empty(), "the page has a link");
+
+        // Scroll down and re-render: the link's window-space y drops by 200.
+        assert!(b.scroll_by(200));
+        let _ = b.render_frame(Size::new(400, 300));
+        let after: Vec<i32> = b.links.iter().map(|l| l.rect.y).collect();
+        assert_eq!(after.len(), before.len());
+        assert_eq!(
+            after[0],
+            before[0] - 200,
+            "hit box tracks the scroll offset"
+        );
     }
 
     #[test]
