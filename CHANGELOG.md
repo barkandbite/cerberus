@@ -6,6 +6,11 @@ browser is pre-1.0; this is the first tagged preview.
 ## [Unreleased]
 
 ### Added
+- **Settings: working "images" toggle.** The settings panel now has a real
+  images control (graphical ↔ text-only) alongside the existing cookie-manager
+  and performance-HUD rows, replacing greyed-out placeholder text with a live
+  button. Text-only skips image fetches entirely (privacy + speed); toggling
+  reloads the current page so the new policy takes full effect.
 - **Page scrolling.** The main content area now scrolls: mouse wheel and
   trackpad, `↑`/`↓` (48 px), `Page Up`/`Page Down` (90% of the viewport), and
   `Home`/`End` (jump to top/bottom). The offset is clamped to the document

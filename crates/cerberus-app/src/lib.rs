@@ -4935,6 +4935,7 @@ impl FrameApp for BrowserApp {
                 self.vault_input.chars().count(),
                 self.vault_msg.as_deref(),
                 self.hud_on,
+                self.image_policy.default == ImageDisplayMode::TextOnly,
                 scale,
             );
         }
@@ -5052,6 +5053,19 @@ impl FrameApp for BrowserApp {
             // Toggle the performance HUD.
             if point_in_rect(settings_timers_rect(self.last_size), x, y) {
                 self.hud_on = !self.hud_on;
+                return true;
+            }
+            // Toggle image loading (graphical <-> text-only) and reload the
+            // current page so the new policy takes full effect — text-only skips
+            // the fetch entirely, graphical needs the bytes it may have skipped.
+            if point_in_rect(settings_images_rect(self.last_size), x, y) {
+                self.image_policy.default = match self.image_policy.default {
+                    ImageDisplayMode::Graphical => ImageDisplayMode::TextOnly,
+                    ImageDisplayMode::TextOnly => ImageDisplayMode::Graphical,
+                };
+                if let Some(url) = self.current_url.clone() {
+                    self.begin_load(&url.to_string(), None, true);
+                }
                 return true;
             }
             // Clicks inside the panel stay in the panel (passphrase entry);
@@ -5892,6 +5906,12 @@ fn settings_timers_rect(size: Size) -> Rect {
     Rect::new(p.x + 12, p.y + 204, 220, 22)
 }
 
+/// The clickable "images" toggle row inside the settings overlay.
+fn settings_images_rect(size: Size) -> Rect {
+    let p = settings_panel_rect(size);
+    Rect::new(p.x + 12, p.y + 232, 220, 22)
+}
+
 /// Paint the centered settings panel: vault state + passphrase entry.
 #[allow(clippy::too_many_arguments)]
 fn paint_settings_overlay(
@@ -5903,6 +5923,7 @@ fn paint_settings_overlay(
     input_chars: usize,
     vault_msg: Option<&str>,
     hud_on: bool,
+    images_text_only: bool,
     scale: f32,
 ) {
     let panel = settings_panel_rect(size);
@@ -6002,6 +6023,26 @@ fn paint_settings_overlay(
                 "performance HUD: on"
             } else {
                 "performance HUD: off"
+            },
+            14,
+        ),
+        color: Color::rgb(0x20, 0x40, 0x70),
+        style: FontStyle::REGULAR,
+    });
+    // Images: graphical vs text-only (privacy + speed — skips image fetches).
+    let ir = settings_images_rect(size);
+    list.push(DisplayItem::Rect {
+        rect: ir,
+        color: Color::rgb(0xE6, 0xEE, 0xF6),
+    });
+    list.push(DisplayItem::Glyphs {
+        origin: Point::new(ir.x + 8, ir.y + row_label_dy),
+        frac_x: 0.0,
+        glyphs: shaper.shape(
+            if images_text_only {
+                "images: text-only"
+            } else {
+                "images: on"
             },
             14,
         ),
@@ -6456,8 +6497,14 @@ mod tests {
         let mut fb = Framebuffer::new(size);
         fb.clear(Color::WHITE);
         let text = TextEngine::new();
-        paint_settings_overlay(&mut fb, size, &text, &text, true, 3, None, false, 1.0);
-        for row in [settings_cookies_rect(size), settings_timers_rect(size)] {
+        paint_settings_overlay(
+            &mut fb, size, &text, &text, true, 3, None, false, false, 1.0,
+        );
+        for row in [
+            settings_cookies_rect(size),
+            settings_timers_rect(size),
+            settings_images_rect(size),
+        ] {
             let below = (row.y + row.h as i32) as u32;
             for y in below..below + 5 {
                 for x in (row.x as u32)..(row.x as u32 + row.w) {
@@ -6473,6 +6520,39 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn settings_images_row_toggles_the_policy() {
+        // Clicking the settings "images" row flips the global image policy
+        // between graphical and text-only (and reloads); a real control, not a
+        // greyed-out label.
+        let mut b = loaded(
+            vec![(
+                "https://site.test/",
+                Ok(page("https://site.test/", 200, None, "<p>hi</p>")),
+            )],
+            "https://site.test/",
+        );
+        let _ = b.render_frame(Size::new(800, 650)); // sets last_size
+        assert_eq!(b.image_policy.default, ImageDisplayMode::Graphical);
+
+        b.settings_open = true;
+        let r = settings_images_rect(b.last_size);
+        let (cx, cy) = (r.x + r.w as i32 / 2, r.y + r.h as i32 / 2);
+        assert!(b.pointer_down(cx, cy), "clicking the images row is handled");
+        assert_eq!(
+            b.image_policy.default,
+            ImageDisplayMode::TextOnly,
+            "first click switches to text-only"
+        );
+
+        assert!(b.pointer_down(cx, cy), "row stays live after the toggle");
+        assert_eq!(
+            b.image_policy.default,
+            ImageDisplayMode::Graphical,
+            "second click switches back to graphical"
+        );
     }
 
     #[test]
