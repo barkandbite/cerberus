@@ -5,14 +5,6 @@ browser is pre-1.0; this is the first tagged preview.
 
 ## [Unreleased]
 
-### Fixed
-- **Deeper JavaScript recursion on all platforms.** The QuickJS interpreter
-  stack cap was 256 KiB, which is too tight on targets with heavier native call
-  frames — a Windows build overflowed on recursion as shallow as depth 100.
-  Raised to 1 MiB: enough for the recursion real pages use, still a small
-  fraction of the OS thread stack, so a runaway script still surfaces as a
-  catchable error instead of crashing the process.
-
 ### Added
 - **Page scrolling.** The main content area now scrolls: mouse wheel and
   trackpad, `↑`/`↓` (48 px), `Page Up`/`Page Down` (90% of the viewport), and
