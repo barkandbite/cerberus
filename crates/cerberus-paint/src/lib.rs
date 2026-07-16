@@ -6,7 +6,7 @@
 //! approved crates land at M2; this crate ships only the traits plus deliberately
 //! trivial built-in stubs so the M0 render path is end-to-end.
 
-use cerberus_types::{Color, FontStyle, ImageFit, ImagePos, Point, Rect, Size};
+use cerberus_types::{Color, FontStyle, GenericFamily, ImageFit, ImagePos, Point, Rect, Size};
 use std::sync::Arc;
 
 /// One drawing primitive in a resolution-independent display list.
@@ -41,6 +41,13 @@ pub enum DisplayItem {
     /// A run of shaped glyphs anchored at `origin` (top-left of the first box).
     Glyphs {
         origin: Point,
+        /// Sub-pixel remainder of the run's TRUE x origin (`origin.x + frac_x`
+        /// is the exact fractional position, |frac| ≤ 0.5). Chrome positions
+        /// every text run fractionally; integer-only origins put each run up
+        /// to half a pixel out of phase with the reference raster. Rect math,
+        /// sorting, and translation stay integer — only the rasterizer's pen
+        /// start consumes this.
+        frac_x: f32,
         glyphs: Vec<GlyphBox>,
         color: Color,
         style: FontStyle,
@@ -193,25 +200,35 @@ impl DisplayList {
                 },
                 DisplayItem::Glyphs {
                     origin,
+                    frac_x,
                     glyphs,
                     color,
                     style,
-                } => DisplayItem::Glyphs {
-                    origin: Point::new(si(origin.x), si(origin.y)),
-                    glyphs: glyphs
-                        .iter()
-                        .map(|g| GlyphBox {
-                            advance: su(g.advance),
-                            w: su(g.w),
-                            h: su(g.h),
-                            id: g.id,
-                            px: su(g.px).max(1),
-                            font: g.font,
-                        })
-                        .collect(),
-                    color: *color,
-                    style: *style,
-                },
+                } => {
+                    // Rescale the TRUE fractional x and re-decompose, keeping
+                    // |frac| ≤ 0.5 (scaling the parts separately would let the
+                    // fraction grow past a pixel).
+                    let t = (origin.x as f32 + frac_x) * scale;
+                    let x = t.round();
+                    DisplayItem::Glyphs {
+                        origin: Point::new(x as i32, si(origin.y)),
+                        frac_x: t - x,
+                        glyphs: glyphs
+                            .iter()
+                            .map(|g| GlyphBox {
+                                advance: su(g.advance),
+                                advance_f: g.advance_f * scale,
+                                w: su(g.w),
+                                h: su(g.h),
+                                id: g.id,
+                                px: su(g.px).max(1),
+                                font: g.font,
+                            })
+                            .collect(),
+                        color: *color,
+                        style: *style,
+                    }
+                }
             })
             .collect();
         DisplayList { items }
@@ -223,7 +240,8 @@ impl DisplayList {
 /// fallback), so the face is tracked per glyph rather than per run.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
 pub enum FontSlot {
-    /// The primary text font (Roboto).
+    /// The primary text font (Roboto) — the browser's own UI/chrome face, and the
+    /// page face when a page names Roboto specifically.
     #[default]
     Text,
     /// The bundled icon font (private-use icon glyphs).
@@ -231,6 +249,20 @@ pub enum FontSlot {
     /// The bundled fallback face for characters the text font can't render
     /// (CJK, etc.).
     Fallback,
+    /// The bundled serif face (Liberation Serif ≈ Times — what the reference
+    /// Chrome's generic `serif` resolves to via fontconfig).
+    Serif,
+    /// The bundled generic-monospace face (DejaVu Sans Mono — the reference's
+    /// measured `monospace` resolution).
+    Monospace,
+    /// The bundled Arial-metric sans face (Liberation Sans ≈ Arial) — the
+    /// reference's generic `sans-serif` AND its named-Arial substitution.
+    Sans,
+    /// The bundled Courier-metric mono face (Liberation Mono) — a page naming
+    /// Courier New specifically (fontconfig metric alias).
+    CourierMono,
+    /// The bundled system-UI sans (DejaVu Sans) — the `system-ui` resolution.
+    SansSystem,
 }
 
 /// A shaped glyph: enough for both the placeholder box rasterizer (uses `w`/`h`)
@@ -238,8 +270,14 @@ pub enum FontSlot {
 /// glyph's font). `id` is `0` for the placeholder shaper.
 #[derive(Clone, Copy, Debug)]
 pub struct GlyphBox {
-    /// Horizontal advance after this glyph.
+    /// Horizontal advance after this glyph, rounded to whole px (layout's
+    /// integer box math; runs error-diffuse so widths stay exact).
     pub advance: u32,
+    /// The TRUE fractional advance. The rasterizer accumulates THIS for pen
+    /// positions and draws each glyph at its fractional x, as Chrome does —
+    /// integer pen quantization put every stem up to half a pixel off the
+    /// reference, which alone mismatched ~38% of ink pixels on aligned lines.
+    pub advance_f: f32,
     /// Inked width (placeholder rasterizer).
     pub w: u32,
     /// Inked height (placeholder rasterizer).
@@ -422,6 +460,32 @@ pub trait TextShaper: Send + Sync {
     /// Shape `text` at the given pixel size into glyph boxes.
     fn shape(&self, text: &str, px: u32) -> Vec<GlyphBox>;
 
+    /// Shape `text` at `px` in the given generic family (serif/monospace/…). The
+    /// default ignores the family and shapes in the primary face, so shapers that
+    /// bundle only one face stay correct; a multi-face shaper overrides this to
+    /// pick the matching bundled face. Content layout calls this; UI/chrome text
+    /// uses the family-less [`shape`](Self::shape).
+    fn shape_with(&self, text: &str, px: u32, _family: GenericFamily) -> Vec<GlyphBox> {
+        self.shape(text, px)
+    }
+
+    /// Shape `text` at `px` in `family` with the run's bold/italic style: a
+    /// shaper bundling real weight/slant variants picks the styled face — whose
+    /// advances AND glyph ids differ from the regular's (Times bold is wider) —
+    /// so styled runs measure (and wrap) as the reference browser does. The
+    /// default ignores the style and shapes the regular face, which stays
+    /// correct for shapers whose styling is synthesized at raster time (the
+    /// smear/shear preserves advances).
+    fn shape_styled(
+        &self,
+        text: &str,
+        px: u32,
+        family: GenericFamily,
+        _style: FontStyle,
+    ) -> Vec<GlyphBox> {
+        self.shape_with(text, px, family)
+    }
+
     /// Shape a single icon glyph (a codepoint in the bundled icon font), to be
     /// painted in a run styled [`FontStyle::ICON`]. Default: no glyph (a shaper
     /// without an icon font draws nothing).
@@ -436,6 +500,63 @@ pub trait TextShaper: Send + Sync {
     /// Default: shape a single space and sum, so any shaper stays correct.
     fn space_advance(&self, px: u32) -> u32 {
         self.shape(" ", px).iter().map(|g| g.advance).sum()
+    }
+
+    /// The space advance in the given generic family — a monospace space is wider
+    /// than a proportional one, so word gaps in `<pre>`/`<code>` need the right
+    /// face. Default: ignore the family (single-face shapers).
+    fn space_advance_with(&self, px: u32, family: GenericFamily) -> u32 {
+        self.space_advance_with_f(px, family).round().max(0.0) as u32
+    }
+
+    /// [`space_advance_with`](Self::space_advance_with) without the rounding.
+    /// Chrome accumulates fractional advances across a line: a Liberation Sans
+    /// space at 16px is 4.453px, and rounding it to 4 starves a 20-space line
+    /// of ~9px — enough to fit one more word and flip the wrap point, which
+    /// cascades into a vertical shift of everything below. The inline flow
+    /// carries the sub-pixel remainder across gaps and rounds per placement.
+    fn space_advance_with_f(&self, px: u32, _family: GenericFamily) -> f32 {
+        self.space_advance(px) as f32
+    }
+
+    /// [`space_advance_with_f`](Self::space_advance_with_f) with the run's
+    /// bold/italic style — a bold face's space can be wider than the regular's,
+    /// so styled runs' word gaps read the same face their glyphs shape from.
+    /// Default: ignore the style (single-style shapers).
+    fn space_advance_styled_f(&self, px: u32, family: GenericFamily, _style: FontStyle) -> f32 {
+        self.space_advance_with_f(px, family)
+    }
+
+    /// The `line-height: normal` pitch for `px`-sized text in `family`. Browsers
+    /// derive this from the face's own vertical metrics (ascent + descent +
+    /// line gap): ~1.15× for the Times/Arial-metric faces, ~1.17× for Roboto —
+    /// a flat 1.2 drifts one pixel every couple of lines and accumulates into
+    /// visible below-the-fold misalignment on text-heavy pages. Default keeps
+    /// the 1.2 approximation for shapers without real metrics.
+    fn natural_leading(&self, px: u32, family: GenericFamily) -> i32 {
+        self.natural_leading_f(px, family).round() as i32
+    }
+
+    /// The face's ascent and descent at `px`, each rounded to whole px exactly
+    /// as Blink rounds font metrics (individually, before any use). Layout
+    /// needs them to size the line box under a baseline-aligned inline image:
+    /// the image's bottom sits ON the baseline, so the box extends
+    /// `descent + half-leading` below it. Default approximates the common
+    /// ~80/20 ascent/descent split for shapers without real metrics.
+    fn ascent_descent(&self, px: u32, _family: GenericFamily) -> (i32, i32) {
+        let p = px.max(1) as f32;
+        ((p * 0.8).round() as i32, (p * 0.2).round() as i32)
+    }
+
+    /// [`natural_leading`](Self::natural_leading) as the f32 the inline flow
+    /// accumulates. For `normal`, Blink's value is a whole number of px (it
+    /// rounds ascent/descent/gap individually, then sums — see the TextEngine
+    /// impl), so real shapers return an integer-valued f32 here; only explicit
+    /// fractional `line-height`s (e.g. `1.15`) produce sub-pixel pitch, which
+    /// layout accumulates and rounds per line so line N sits at
+    /// `round(N × pitch)` exactly as Chrome places it.
+    fn natural_leading_f(&self, px: u32, _family: GenericFamily) -> f32 {
+        px.max(1) as f32 * 1.2
     }
 }
 
@@ -459,6 +580,7 @@ impl TextShaper for MonoShaper {
                 if ch.is_whitespace() {
                     GlyphBox {
                         advance: cell / 2,
+                        advance_f: (cell / 2) as f32,
                         w: 0,
                         h: 0,
                         id: 0,
@@ -468,6 +590,7 @@ impl TextShaper for MonoShaper {
                 } else {
                     GlyphBox {
                         advance: cell / 2,
+                        advance_f: (cell / 2) as f32,
                         w: cell / 2 - 1,
                         h: cell,
                         id: 0,
@@ -558,6 +681,37 @@ mod tests {
     }
 
     #[test]
+    fn scaled_preserves_fractional_run_origins() {
+        // HiDPI scaling must scale the TRUE fractional x and re-decompose:
+        // (origin.x + frac) × scale == origin'.x + frac', with |frac'| ≤ 0.5.
+        let mut list = DisplayList::new();
+        list.push(DisplayItem::Glyphs {
+            origin: Point::new(10, 6),
+            frac_x: 0.4,
+            glyphs: vec![GlyphBox {
+                advance: 8,
+                advance_f: 8.0,
+                w: 0,
+                h: 0,
+                id: 42,
+                px: 16,
+                font: FontSlot::Text,
+            }],
+            color: Color::BLACK,
+            style: FontStyle::REGULAR,
+        });
+        let scaled = list.scaled(1.5);
+        match &scaled.items[0] {
+            DisplayItem::Glyphs { origin, frac_x, .. } => {
+                let true_x = origin.x as f32 + frac_x;
+                assert!((true_x - 10.4 * 1.5).abs() < 1e-4, "exact: {true_x}");
+                assert!(frac_x.abs() <= 0.5, "re-decomposed: {frac_x}");
+            }
+            other => panic!("expected Glyphs, got {other:?}"),
+        }
+    }
+
+    #[test]
     fn scaled_multiplies_geometry_and_glyph_pixels() {
         let mut list = DisplayList::new();
         list.push(DisplayItem::Rect {
@@ -566,8 +720,10 @@ mod tests {
         });
         list.push(DisplayItem::Glyphs {
             origin: Point::new(5, 6),
+            frac_x: 0.0,
             glyphs: vec![GlyphBox {
                 advance: 8,
+                advance_f: 8.0,
                 w: 0,
                 h: 0,
                 id: 42,
@@ -603,6 +759,7 @@ mod tests {
         let mut list = DisplayList::new();
         list.push(DisplayItem::Glyphs {
             origin: Point::new(0, 0),
+            frac_x: 0.0,
             glyphs,
             color: Color::BLACK,
             style: FontStyle::REGULAR,

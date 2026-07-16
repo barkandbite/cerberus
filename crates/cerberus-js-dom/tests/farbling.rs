@@ -187,16 +187,50 @@ fn measure_text_jitter_is_bounded() {
     let wa = eval_num(a.as_mut(), ra, probe);
     let wb = eval_num(b.as_mut(), rb, probe);
 
-    // Base width for 'Hello world' at 16px: 10 glyphs * 0.6 + 1 space * 0.33.
+    // Base advance for 'Hello world' at 16px: 10 glyphs * 0.6 + 1 space * 0.33.
+    // An installed family (here the generic `sans-serif`) gets a stable per-head
+    // advance factor in ~[0.90, 1.12] of that base.
     let base = (10.0 * 0.6 + 0.33) * 16.0;
     for w in [wa, wb] {
-        assert!(w >= base, "width below base: {w} < {base}");
-        assert!(w <= base * 1.02, "jitter exceeds 2%: {w} vs {base}");
+        assert!(
+            w >= base * 0.90 && w <= base * 1.12,
+            "width {w} outside [.90,1.12]*{base}"
+        );
     }
-    // Per-head divergence (it is a farbled surface).
+    // Per-head divergence (a farbled surface) and within-head determinism.
     assert_ne!(wa, wb);
-    // Determinism within a head.
     assert_eq!(wa, eval_num(a.as_mut(), ra, probe));
+}
+
+#[test]
+fn measure_text_enumeration_defense() {
+    // The width-comparison enumeration trick must fail: a font this head does NOT
+    // present measures identically to the generic fallback (reads as absent),
+    // while a font it DOES present measures differently (reads as installed) —
+    // and both are consistent with document.fonts.check.
+    let (mut e, r) = engine_for_seed(0xF0F0);
+    // Inject a minimal persona font list, as the profile prologue would.
+    e.eval(
+        r,
+        "globalThis.__CERBERUS_PROFILE__ = { fonts: ['Verdana'] };",
+    )
+    .expect("set profile");
+    let w = |eng: &mut dyn JsEngine, css: &str| -> f64 {
+        eval_num(
+            eng,
+            r,
+            &format!("__cerberusFarble.measureText('mmmmmmmmmm', '16px {css}').width"),
+        )
+    };
+    let fallback = w(e.as_mut(), "sans-serif");
+    let absent = w(e.as_mut(), "\\\"No Such Font 9000\\\"");
+    let present = w(e.as_mut(), "\\\"Verdana\\\"");
+
+    // A non-installed family collapses to the generic fallback advance.
+    assert_eq!(absent, fallback, "absent font must measure as the fallback");
+    // An installed family measures differently, so it is detectable as present
+    // (as a real installed font would be) — but only because it is in the list.
+    assert_ne!(present, fallback, "installed font measures distinctly");
 }
 
 #[test]

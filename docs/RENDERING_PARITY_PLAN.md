@@ -71,13 +71,33 @@ PNGs, crops Cerberus's 36px toolbar (`--crop-top 36`), compares over the overlap
 and prints an **RMSE** (`0.0` = identical) plus a mismatch fraction; `--fail-over
 <rmse>` makes it a regression gate. `docs/parity-corpus.txt` holds the corpus and
 `scripts/parity.sh` runs the whole loop (mirror → Chrome + Cerberus render →
-diff) emitting a `parity.csv`. **Current baselines** (toolbar cropped, tolerance 8): `example` RMSE **0.068**
-(1.6% — was 0.095 / 89% before the canvas-background fix below), `iana` RMSE
-**0.131** (16.3% — was 22.6%; inline spacing + line-height + table columns fixed,
-remainder is font-face/wrap-point drift), `wikipedia` RMSE **0.143** (9.05% — was
-9.19%; search field now fills its container and its language dropdown is pinned
-out of flow, remainder is the JS-built footer + font drift). Drive these down; a
-rise is a regression.
+diff) emitting a `parity.csv`. **Current baselines** (toolbar cropped, tolerance 8, block engine —
+2026-07-11, after the Chrome-exact font-metric + UA-margin + table-model
+batch): `example` **0.075**/1.8%, `iana` **0.149**/25.2% (the page was
+REDESIGNED upstream — modern oklch palette + `a:link` styling, both now
+supported; not comparable to the old 0.131), `mfws` **0.207**/15.4% (best
+recorded; was stuck at 0.240 before the metric work), `rfc1` **0.134**/5.1%,
+`wikipedia` **0.154**/11.1%, `hn` **0.171**/19.3% (was 77.8%% mismatched
+before the `<center>`-table/bgcolor/cellpadding fixes). Font metrics are
+now measured pixel-identical to the reference on a 100px calibration page
+(see `docs/FONTS.md`); `colspan` landed (hn 19.3%% mismatched).
+**Major-brand pages** (self-contained mirrors; same-origin absolute asset
+URLs are rewritten relative so the STYLED page is compared): `mozilla`
+**0.320**/15.8% fully styled (was 0.415/35.0%: the unknown-pseudo
+selector fix removed phantom top bands + the right-rail squeeze, and
+`::before`/`::after` generated content now paints its staircase
+transitions; remaining: nav menu row, hero x-inset, SVG flag), `apple`
+**0.137**/12.2%, `bbc` **0.160**/15.0% (its CSS is cross-origin, so the
+comparison is partially styled). The pseudo work also moved `wikipedia`
+0.154→**0.136**/10.3% and `hn`→**0.157**/17.8%. **Clickability**
+(`scripts/clickcheck.sh`: every visible navigable href must have a
+non-degenerate hit box): 100% on example/iana/mfws/rfc1/wikipedia/hn/
+mozilla, 95% apple, 82% bbc (residue: its JS-hydrated nav drawer).
+Known next levers: fractional line pitch (Chrome advances lines at e.g.
+18.4px, we round to 18 — ~0.4px/line cumulative), a wikipedia-specific
+dive, inline whitespace at element boundaries (#137: `byPublic`,
+`6761 , a`), and table `rowspan`. Drive these down; a rise is a
+regression.
 
 **Search-widget layout** (W-C): two general inline-block fixes closed most of it.
 (1) An inline-block's percentage `width` was resolved twice — once to size its
@@ -395,3 +415,120 @@ track).
   extend these.
 - Keep the fingerprint-persona work (`cerberus-profile`, farbling, reese84) as a
   separate track from rendering; don't entangle them.
+
+---
+
+## 14. Parity gap rubric (2026-07-12 enumeration — 5-agent diagnostic sweep)
+
+Scoreboard before this round (styled brand mirrors, RMSE / % pixels off):
+example 0.075/1.8, iana 0.149/25.2, mfws 0.207/15.4, rfc1 0.134/5.1,
+wikipedia 0.136/10.3, hn 0.157/17.8, mozilla 0.320/15.8, apple 0.137/12.2,
+bbc 0.160/15.0.
+
+Ranked movers (impact × breadth ÷ effort). Status updates in-place as fixes land.
+
+| # | Gap | Impact | Pages | Status |
+|---|-----|--------|-------|--------|
+| 1 | MQ4 range syntax `(width <= N)` → AlwaysFalse | HIGH | iana (−11pts alone), any modern site | **DONE** |
+| 2 | Integer space advances flip wrap points (4 vs 4.453px) | HIGH | every text page | **DONE** |
+| 3 | line-height:normal must be Blink's per-component-rounded INTEGER (14+3+1=18@16px); explicit fractional lh accumulates | HIGH | every text page | **DONE** |
+| 4 | Flex/grid drop bare text children (anonymous items) | HIGH | mozilla nav, apple, bbc | **DONE** |
+| 5 | Only Regular faces bundled; faux bold/italic mis-measure every bold run | HIGH | all 9 pages | **DONE** (13 real faces; 60/60 cases <0.5px of Chrome) |
+| 6 | Inline `<svg>` display:none'd (resvg already rasterizes for `<img>`) | HIGH | bbc(99), apple(64), mozilla, wikipedia | **DONE** (svg keeps tag; source-only attrs) |
+| 7 | Grid explicit line placement (`grid-column: 2/9`, `1/-1`) ignored | HIGH | mozilla hero | **DONE** |
+| 8 | `<center>`/-webkit-center leaks across table-cell boundary | HIGH | hn (~187px shift) | **DONE** |
+| 9 | Table row-height trio: cell-less `<tr height>`, line floor on table font, lost trailing cell margin | HIGH | hn, wikipedia, iana | **DONE** |
+| 10 | Glyph AA raster differs from FreeType | HIGH-floor | all | **DONE** (skrifa auto-hinter light — Chrome's mode, measured: cores 34.9→20.1% >32-off; residual is stem-phase AA + integer word origins) (integer baseline + sub-pixel pen: 71→35% of ink >32 off; residual is FreeType light-hinting's vertical grid-fit, unreachable without a hinter — fitted tone LUTs measure as no-ops, fractional word-origin carry measured WORSE and was reverted) |
+| 11 | Inline-image strut descent missing from line box | MED | iana, bbc, apple | **DONE** |
+| 12 | Whitespace at inline boundaries (#137): phantom space before punctuation, eaten space before nowrap, per-word underline | MED | every prose page | **DONE** (+float-band guard) |
+| 13 | calc() resolves % against font-size (wrong, often negative) | MED | iana, apple, mozilla, bbc | **DONE** |
+| 14 | clip:rect/clip-path sr-only pattern → stray visible text | MED | bbc, mozilla, iana, apple | **DONE** |
+| 15 | :has() (and :is/:where) drop whole rules | MED | apple, mozilla, iana | **DONE** (child subset) |
+| 16 | transform:translate static subset (centering, offscreen parking) | MED | apple, bbc, mozilla | backlog |
+| 17 | inline-flex/inline-grid break the inline context; CSS tables flattened | MED | iana, bbc, apple | **DONE** (atomic inline + table-cell rows) |
+| 18 | List markers placed inside (Chrome: outside) | MED | all list pages | **DONE** |
+| 19 | min()/max()/clamp() unparsed | LOW | apple, bbc, mozilla | **DONE** |
+| 20 | letter/word-spacing quantized to i32 px | LOW | apple, bbc | backlog |
+| 21 | vertical-align top/middle/bottom positioning (suppression done) | LOW | iana, apple | partial |
+| 22 | box-shadow inset/multi/spread | LOW | wikipedia, mozilla | backlog |
+| 23 | aspect-ratio | LOW | bbc | backlog |
+| 24 | filter/backdrop-filter | LOW | apple, wikipedia | backlog |
+| 25 | em-margin/geometry i32 truncation drift | LOW | long pages | backlog |
+
+Verified NON-issues (measured, do not chase): @font-face (mirrors ship no
+reachable webfonts — Chrome falls back to the same fontconfig faces);
+Verdana→DejaVu metric alias (measured 722.2px = Arial-metric in the reference,
+the existing fall-through is correct).
+
+Execution: items 5/6/13/14/15/19 delegated to parallel worktree subagents
+(fonts / inline-svg / css-values); items 7/8/9/12/18 handled inline on the main
+branch (all in cerberus-layout, avoiding merge conflicts). Re-run
+`scripts/parity.sh` after each merge; the table's Status column is the ledger.
+
+Superseded scoreboard (mid-round): example 1.82, iana 11.08,
+mfws 14.18, rfc1 5.20, wikipedia 10.37, hn 14.48, mozilla 14.58 (rmse 0.304),
+apple 12.27, bbc 14.80. (Live mirrors re-fetch per run; ±1pt run noise.)
+
+Scoreboard 2026-07-13 final (adds real bold/italic faces, outside list
+markers, computed-fill injection for inline svg): example 1.85, iana 11.05,
+mfws 13.23 (rmse 0.155), rfc1 5.20, wikipedia 10.34, hn 14.59 (rmse 0.125),
+mozilla 14.79 (rmse 0.302), apple 12.32, bbc 14.98 (rmse 0.157).
+
+Scoreboard 2026-07-13 +hinted glyphs (skrifa auto-hinter light — ADR-0005
+update; calibration-page ink pixels >32 gray levels off Chrome fell
+34.9% → 20.1%): example 1.84, iana 10.94, mfws 12.57 (rmse 0.159),
+rfc1 4.90, wikipedia 10.18, hn 14.14 (rmse 0.126), mozilla 14.68
+(rmse 0.302), apple 12.27, bbc 14.54 (rmse 0.161) — every page's
+mismatch_pct improved.
+
+Note on mozilla's hero flag: the visible green flag in Chrome is the
+ANIMATION variant (11 stacked opacity-animated svg frames gated on
+data-animation-running set by JS); the static fallback is display:none unless
+.no-js. Rendering it faithfully needs the animation state machine, not more
+CSS - parked below the fold of this rubric. The computed-fill injection that
+investigation produced is landed and benefits every CSS-painted inline svg.
+
+Scoreboard 2026-07-13 (hinted raster + inline-flex round): example 1.84,
+iana 10.94, mfws 12.57, rfc1 4.90, wikipedia 10.18, hn 14.14, mozilla 14.74,
+apple 12.27, bbc 15.06. Every text page improved with hinting; the first
+sub-5% brand-corpus page (rfc1 4.90) landed this round.
+
+Scoreboard 2026-07-13 (sub-pixel word origins — the planned focused round):
+example 1.84, iana 9.47 (RMSE 0.084->0.065), mfws 12.07 (0.159->0.136),
+rfc1 4.91, wikipedia 10.05, hn 14.63, mozilla 14.67, apple 12.27, bbc 15.56.
+Calibration: sentence-page ink |d|>32 vs Chrome 51% -> 19.3% (the aligned-line
+floor). Text runs now carry their true fractional origin end-to-end; measure
+scratches keep integer widths (table/flex sizing stability — a frozen-mirror
+A/B caught and fixed a 5px HN column shift before it shipped). The glyph
+placement chain is now Blink-exact: integer baseline, sub-pixel pen, sub-pixel
+run origin, skrifa auto-hinter. Remaining text residual is stem-phase AA
+distribution (needs Skia's exact coverage kernel — diminishing returns).
+Next levers: transform:translate static subset; the wikipedia dive.
+
+---
+
+## 15. Mirroring pitfall — valid Chrome references require FULL mirrors (2026-07-13)
+
+**Problem found in real-site testing:** headless Chrome in the dev environment
+**cannot reach the network** (the agent proxy resets its connections —
+`ERR_CONNECTION_RESET`), so every reference is rendered from a local mirror.
+The original `parity.sh` mirror **stripped cross-origin CSS/JS**. Modern sites
+serve their stylesheets from CDNs (cross-origin), so the stripped mirror had no
+CSS → *both* Chrome and Cerberus rendered an unstyled DOM, and the "Chrome
+reference" was a degraded page, not what a real browser shows. This silently
+invalidated comparisons for any CDN-CSS site (Stripe, Django, ESPN, …); only
+same-origin-CSS sites (Wikipedia, HN, MDN, NYT) were valid.
+
+**Fix:** `scripts/full-mirror.py` downloads the HTML **plus all stylesheets
+(same- and cross-origin), their `@import`s, `url()` fonts/images, and `<img>`
+sources** via `curl` (which *can* reach the network through the proxy),
+rewriting every reference to a local file. Only `<script>` is dropped (we can't
+run page JS; both engines compare on the same static DOM). Chrome then renders
+the REAL styled page.
+
+**Confirmed with full mirrors:** the flex/grid **width-distribution** bug is
+real (usa.gov's two-column banner collapses to min-content ribbons on a *valid*
+reference; Django's sidebar column is too narrow), as is inline-SVG logo sizing
+(Django's wordmark renders as a bare circle). Use `full-mirror.py` for any
+real-site comparison; reserve the in-repo `parity.sh` self-mirror for the fixed
+same-origin corpus only.

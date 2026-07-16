@@ -18,10 +18,10 @@ use cerberus_style::{
     Position, StyleEngine, StyledChild, StyledDom, StyledNode, TextAlign, TextTransform, Track,
     TrackMax, VerticalAlign, Visibility, WhiteSpace,
 };
-use cerberus_types::{Color, ImageFit, ImagePos, Point};
+use cerberus_types::{Color, GenericFamily, ImageFit, ImagePos, Point};
 use parser::{
-    parse_declaration_block, parse_stylesheet, ElemRef, MediaContext, SiblingRef, Specificity,
-    Stylesheet,
+    parse_declaration_block, parse_stylesheet, ElemRef, MediaContext, PseudoElement, SiblingRef,
+    Specificity, Stylesheet,
 };
 use std::collections::HashMap;
 use std::rc::Rc;
@@ -42,13 +42,16 @@ header, footer, nav, main, aside, blockquote, pre, figure, figcaption, form,
 table, tr, hr, dl, dt, dd, fieldset, address, center,
 details, summary { display: block; }
 /* Legacy presentational elements still seen on older pages. */
-center { text-align: center; }
+center { text-align: -webkit-center; }
 nobr { white-space: nowrap; }
 head, title, meta, link, style, script, base, template { display: none; }
-/* We don't paint SVG graphics; hiding it avoids flowing its <text>/markup as
-   stray page text (e.g. decorative symbol grids). Icons render as nothing,
-   which is what unpainted SVG already was. */
-svg { display: none; }
+/* Inline SVG renders: the app pre-rasterizes every <svg> subtree
+   (cerberus-app::inline_svg, resvg) and the element KEEPS its tag with a
+   synthetic `src`, so author tag selectors (`.logo svg{width:84px}`,
+   media-query variant hiding) size and toggle it exactly as in Chrome. No
+   display:none guard here — layout renders a src-carrying <svg> as a
+   replaced image and skips a raw (unconverted) <svg> subtree entirely, so
+   its <text>/<title> can never leak as page text. */
 li { display: list-item; }
 ol { list-style-type: decimal; }
 /* The `type` attribute selects the ordered-list marker (HTML UA stylesheet). */
@@ -57,19 +60,28 @@ ol[type="A"] { list-style-type: upper-alpha; }
 ol[type="i"] { list-style-type: lower-roman; }
 ol[type="I"] { list-style-type: upper-roman; }
 ol[type="1"] { list-style-type: decimal; }
-h1 { font-size: 32px; font-weight: bold; margin-top: 16px; margin-bottom: 16px; }
-h2 { font-size: 24px; font-weight: bold; margin-top: 14px; margin-bottom: 14px; }
-h3 { font-size: 20px; font-weight: bold; margin-top: 12px; margin-bottom: 12px; }
-h4 { font-size: 17px; font-weight: bold; margin-top: 10px; margin-bottom: 10px; }
-h5 { font-size: 15px; font-weight: bold; margin-top: 10px; margin-bottom: 10px; }
-h6 { font-size: 13px; font-weight: bold; margin-top: 10px; margin-bottom: 10px; }
-p { margin-top: 8px; margin-bottom: 8px; }
-ul, ol { margin-top: 8px; margin-bottom: 8px; margin-left: 24px; }
-blockquote { margin-left: 24px; margin-top: 8px; margin-bottom: 8px; }
+/* The page inset is the BODY's margin (Chrome UA: body{margin:8px}), not an
+   engine constant — so `body{margin:0}` pages (most modern sites) really start
+   at the edge, and the body margin collapses with its first child's like any
+   other margin. */
+body { margin: 8px; }
+/* Heading sizes and margins mirror Chrome's UA sheet (em values computed
+   against each heading's own size: h1 0.67em of 32px = 21px, h4 1.33em of
+   16px = 21px, …) so unstyled pages keep Chrome's vertical rhythm. */
+h1 { font-size: 32px; font-weight: bold; margin-top: 21px; margin-bottom: 21px; }
+h2 { font-size: 24px; font-weight: bold; margin-top: 20px; margin-bottom: 20px; }
+h3 { font-size: 19px; font-weight: bold; margin-top: 19px; margin-bottom: 19px; }
+h4 { font-size: 16px; font-weight: bold; margin-top: 21px; margin-bottom: 21px; }
+h5 { font-size: 13px; font-weight: bold; margin-top: 22px; margin-bottom: 22px; }
+h6 { font-size: 11px; font-weight: bold; margin-top: 25px; margin-bottom: 25px; }
+p { margin-top: 16px; margin-bottom: 16px; }
+/* Chrome indents lists with 40px of padding (marker outside), not margin. */
+ul, ol { margin-top: 16px; margin-bottom: 16px; padding-left: 40px; }
+blockquote { margin-top: 16px; margin-bottom: 16px; margin-left: 40px; margin-right: 40px; }
 figure { margin-top: 16px; margin-bottom: 16px; margin-left: 40px; margin-right: 40px; }
 dd { margin-left: 40px; }
-pre { white-space: pre; margin-top: 8px; margin-bottom: 8px; }
-code, kbd, samp { white-space: pre; }
+pre { white-space: pre; margin-top: 16px; margin-bottom: 16px; font-family: monospace; }
+code, kbd, samp, tt { white-space: pre; font-family: monospace; }
 /* Only anchors with an href are links (`:any-link`); a bare `<a name=…>`
    placeholder is not styled blue/underlined. */
 a[href] { color: #154fd2; text-decoration: underline; }
@@ -184,6 +196,8 @@ impl CssEngine {
             // higher origin/specificity/order still wins (inline `!important`,
             // applied last, tops author `!important`). The UA sheet declares no
             // `!important`, so UA-important is not separately elevated.
+            let viewport = (self.media.width as f32, self.media.height as f32);
+            let mut pending = PendingHidden::default();
             for (_, _, _, decls) in &matched {
                 apply_declarations(
                     &mut style,
@@ -192,6 +206,8 @@ impl CssEngine {
                     root_font_size,
                     &vars,
                     false,
+                    viewport,
+                    &mut pending,
                 );
             }
             if let Some(decls) = &inline {
@@ -202,6 +218,8 @@ impl CssEngine {
                     root_font_size,
                     &vars,
                     false,
+                    viewport,
+                    &mut pending,
                 );
             }
             for (_, _, _, decls) in &matched {
@@ -212,6 +230,8 @@ impl CssEngine {
                     root_font_size,
                     &vars,
                     true,
+                    viewport,
+                    &mut pending,
                 );
             }
             if let Some(decls) = &inline {
@@ -222,8 +242,27 @@ impl CssEngine {
                     root_font_size,
                     &vars,
                     true,
+                    viewport,
+                    &mut pending,
                 );
             }
+            // An all-hiding `clip`/`clip-path` (sr-only patterns) folds into
+            // `visibility: hidden` once every pass has run — `clip` needs the
+            // final `position`, which any of the passes may have set.
+            pending.finalize(&mut style);
+        }
+
+        // The monospace-size quirk: an unspecified (`medium`) font-size resolves
+        // to 13px for the monospace generic and 16px otherwise, matching Chrome —
+        // so `<pre>`/`<code>` render smaller than surrounding proportional text.
+        // Applied once here, after both font-size and font-family are known, so
+        // children inherit the resolved px.
+        if style.font_size_medium {
+            style.font_size = if style.font_family == GenericFamily::Monospace {
+                13
+            } else {
+                16
+            };
         }
 
         let child_root_font_size = if node.tag() == "html" {
@@ -241,10 +280,21 @@ impl CssEngine {
             .collect::<Vec<_>>()
             .into();
         let mut elem_index = 0usize;
-        let children = node
+        let mut children: Vec<StyledChild> = node
             .children()
-            .map(|child| match child.text() {
-                Some(t) => StyledChild::Text(t.to_string()),
+            .filter_map(|child| match child.text() {
+                Some(t) => Some(StyledChild::Text(t.to_string())),
+                // A RAW inline `<svg>` subtree (no synthetic `src` — a path
+                // that skipped the app's pre-raster rewrite, e.g. styling a
+                // bare document) is pruned here: styling its (often huge)
+                // subtree would only leak `<text>`/`<title>` as page content
+                // and burn memory. A REWRITTEN svg is childless and carries
+                // `src`, so it styles normally and author `svg{…}` tag
+                // selectors keep matching it.
+                None if child.tag() == "svg" && child.attr("src").is_none() => {
+                    elem_index += 1;
+                    None
+                }
                 None => {
                     let styled = self.build(
                         child,
@@ -257,10 +307,39 @@ impl CssEngine {
                         child_root_font_size,
                     );
                     elem_index += 1;
-                    StyledChild::Element(Box::new(styled))
+                    Some(StyledChild::Element(Box::new(styled)))
                 }
             })
             .collect();
+
+        // Generated content (`::before`/`::after`): a matching pseudo rule with
+        // a real `content` value synthesizes a styled child at the front/back —
+        // the box then flows, paints, and inherits exactly like markup. This is
+        // how sites draw icons, decorative bands, and clearfix spacers.
+        if !is_root {
+            if let Some(b) = self.pseudo_child(
+                PseudoElement::Before,
+                path,
+                author,
+                &style,
+                &vars,
+                child_root_font_size,
+                node,
+            ) {
+                children.insert(0, StyledChild::Element(Box::new(b)));
+            }
+            if let Some(a) = self.pseudo_child(
+                PseudoElement::After,
+                path,
+                author,
+                &style,
+                &vars,
+                child_root_font_size,
+                node,
+            ) {
+                children.push(StyledChild::Element(Box::new(a)));
+            }
+        }
 
         path.pop();
         StyledNode {
@@ -270,6 +349,115 @@ impl CssEngine {
             children,
             node_id: node.id(),
         }
+    }
+
+    /// Build the `::before`/`::after` box for the element at `path`, if any
+    /// rule targets it with a renderable `content`. The pseudo inherits from
+    /// its originating element and its declarations cascade in the usual
+    /// (origin, specificity, order) sequence; `content: none|normal` (or no
+    /// content declaration at all) generates nothing.
+    #[allow(clippy::too_many_arguments)]
+    fn pseudo_child(
+        &self,
+        which: PseudoElement,
+        path: &[ElemRef],
+        author: &Stylesheet,
+        elem_style: &ComputedStyle,
+        vars: &Vars,
+        root_font_size: u32,
+        node: NodeRef<'_>,
+    ) -> Option<StyledNode> {
+        let mut matched: Vec<MatchedRule<'_>> = Vec::new();
+        for (order, rule) in self.ua.rules.iter().enumerate() {
+            if rule.applies(self.media) {
+                if let Some(spec) = rule.matches_pseudo(path, which) {
+                    matched.push((0, spec, order, &rule.declarations));
+                }
+            }
+        }
+        for (order, rule) in author.rules.iter().enumerate() {
+            if rule.applies(self.media) {
+                if let Some(spec) = rule.matches_pseudo(path, which) {
+                    matched.push((1, spec, order, &rule.declarations));
+                }
+            }
+        }
+        if matched.is_empty() {
+            return None;
+        }
+        matched.sort_by(|a, b| (a.0, a.1, a.2).cmp(&(b.0, b.1, b.2)));
+
+        // The winning `content` (last in cascade order; important simplified to
+        // last-wins alongside — content is rarely !important-fought).
+        let mut content_raw: Option<String> = None;
+        for (_, _, _, decls) in &matched {
+            for (prop, value, _) in decls.iter() {
+                if prop == "content" {
+                    content_raw = Some(value.clone());
+                }
+            }
+        }
+        let em = elem_style.font_size as f32;
+        let viewport = (self.media.width as f32, self.media.height as f32);
+        let resolved = resolve_value(
+            &content_raw?,
+            vars,
+            CalcCtx {
+                em,
+                vw: viewport.0,
+                vh: viewport.1,
+                pct_base: Some(em),
+            },
+        );
+        let text = parse_content_value(&resolved, node)?;
+
+        let mut style = elem_style.inherit();
+        let mut pending = PendingHidden::default();
+        for (_, _, _, decls) in &matched {
+            apply_declarations(
+                &mut style,
+                decls,
+                elem_style.font_size,
+                root_font_size,
+                vars,
+                false,
+                viewport,
+                &mut pending,
+            );
+        }
+        for (_, _, _, decls) in &matched {
+            apply_declarations(
+                &mut style,
+                decls,
+                elem_style.font_size,
+                root_font_size,
+                vars,
+                true,
+                viewport,
+                &mut pending,
+            );
+        }
+        pending.finalize(&mut style);
+        if style.display == Display::None {
+            return None;
+        }
+        let children = if text.is_empty() {
+            Vec::new()
+        } else {
+            vec![StyledChild::Text(text)]
+        };
+        Some(StyledNode {
+            tag: match which {
+                PseudoElement::Before => "::before".to_string(),
+                PseudoElement::After => "::after".to_string(),
+            },
+            attrs: Vec::new(),
+            style,
+            children,
+            // The generated box belongs to its originating element for
+            // hit-testing/dispatch purposes.
+            node_id: node.id(),
+        })
     }
 }
 
@@ -307,6 +495,21 @@ impl StyleEngine for CssEngine {
 }
 
 fn sibling_ref(node: NodeRef<'_>) -> SiblingRef {
+    let mut r = shallow_sibling_ref(node);
+    // One level of element children so `:has(...)` can check direct children
+    // during the cascade. The children's own lists stay empty — `:has` is a
+    // documented direct-child subset, so nothing looks deeper.
+    r.children = node
+        .children()
+        .filter(|c| c.is_element())
+        .map(shallow_sibling_ref)
+        .collect::<Vec<_>>()
+        .into();
+    r
+}
+
+/// A [`SiblingRef`] without children (the leaf form; `sibling_ref` fills them).
+fn shallow_sibling_ref(node: NodeRef<'_>) -> SiblingRef {
     SiblingRef {
         tag: node.tag().to_string(),
         id: node.attr("id").map(str::to_string),
@@ -315,6 +518,7 @@ fn sibling_ref(node: NodeRef<'_>) -> SiblingRef {
             .map(|c| c.split_whitespace().map(str::to_string).collect())
             .unwrap_or_default(),
         attrs: node.attrs().to_vec(),
+        children: Rc::from([]),
     }
 }
 
@@ -388,10 +592,11 @@ fn collect_vars(
 /// Resolve `var()` substitutions and `calc()` math in a raw declaration value,
 /// yielding a plain CSS value the existing property parsers can consume. Most
 /// values contain neither, so the fast path returns them untouched.
-fn resolve_value(value: &str, vars: &Vars, em: f32) -> String {
+fn resolve_value(value: &str, vars: &Vars, ctx: CalcCtx) -> String {
     let has_var = value.contains("var(");
-    let has_calc = value.contains("calc(");
-    if !has_var && !has_calc {
+    let has_math = find_math_fn(value).is_some();
+    let has_ld = value.contains("light-dark(");
+    if !has_var && !has_math && !has_ld {
         return value.to_string();
     }
     let substituted = if has_var {
@@ -399,11 +604,83 @@ fn resolve_value(value: &str, vars: &Vars, em: f32) -> String {
     } else {
         value.to_string()
     };
-    if substituted.contains("calc(") {
-        eval_calcs(&substituted, em)
+    // `light-dark(a, b)` picks by the used color-scheme. The head is a fixed
+    // light persona (see the `@media prefers-color-scheme` handling), so it
+    // always resolves to the first argument — exactly what Chrome computes here
+    // for a light user. Modern design systems (MDN, and any site built with
+    // `@csstools/postcss-light-dark-function`) drive their whole theme through
+    // this; without it the function was an unknown value, so the declaration
+    // was dropped and the theme fell back to its dark branch (measured: MDN's
+    // header painted `--color-gray-10` instead of `--color-gray-90`).
+    let substituted = if substituted.contains("light-dark(") {
+        resolve_light_dark(&substituted, 0)
+    } else {
+        substituted
+    };
+    if find_math_fn(&substituted).is_some() {
+        eval_calcs(&substituted, ctx)
     } else {
         substituted
     }
+}
+
+/// Replace every `light-dark(light, dark)` with its `light` argument (the head's
+/// fixed light persona). Paren/quote-aware so the two arguments split at the
+/// top-level comma only (an argument may itself be `rgb(…)`, `var(…)` fallback,
+/// or a nested `light-dark(…)`, which the chosen argument resolves in turn).
+fn resolve_light_dark(input: &str, depth: usize) -> String {
+    if depth > 16 {
+        return input.to_string();
+    }
+    let Some(start) = input.find("light-dark(") else {
+        return input.to_string();
+    };
+    let open = start + "light-dark(".len() - 1; // index of '('
+    let Some(close) = matching_paren(input, open) else {
+        return input.to_string();
+    };
+    let inner = &input[open + 1..close];
+    // First top-level argument (before the first top-level comma).
+    let light_arg = split_top_commas(inner)
+        .into_iter()
+        .next()
+        .unwrap_or_default();
+    let light_arg = resolve_light_dark(light_arg.trim(), depth + 1);
+    let mut out = String::with_capacity(input.len());
+    out.push_str(&input[..start]);
+    out.push_str(&light_arg);
+    out.push_str(&input[close + 1..]);
+    // Resolve any further `light-dark(...)` that followed this one.
+    resolve_light_dark(&out, depth + 1)
+}
+
+/// Index of the `)` matching the `(` at `open`, honoring nested parens and
+/// skipping over quoted strings.
+fn matching_paren(s: &str, open: usize) -> Option<usize> {
+    let bytes = s.as_bytes();
+    let mut depth = 0i32;
+    let mut quote: Option<u8> = None;
+    for (i, &b) in bytes.iter().enumerate().skip(open) {
+        match quote {
+            Some(q) => {
+                if b == q {
+                    quote = None;
+                }
+            }
+            None => match b {
+                b'"' | b'\'' => quote = Some(b),
+                b'(' => depth += 1,
+                b')' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        return Some(i);
+                    }
+                }
+                _ => {}
+            },
+        }
+    }
+    None
 }
 
 /// Replace the `currentColor` keyword (case-insensitive) with `color` rendered
@@ -442,10 +719,30 @@ fn substitute_current_color(value: &str, color: cerberus_types::Color) -> String
     out
 }
 
+/// The CSS **guaranteed-invalid value** (CSS Variables §3), as a sentinel token
+/// that can't occur in real CSS. A `var()` that references an undefined custom
+/// property (or one explicitly set to `initial`) with no fallback resolves to
+/// this; any value that ends up containing it is *invalid at computed-value
+/// time* and is dropped, so a wrapping `var(--x, fallback)` takes its fallback
+/// and a real declaration is ignored (keeping the prior cascade value). Treating
+/// the case as empty string instead silently kept the wrong branch of the
+/// custom-property "light-dark toggle" every modern design system compiles to
+/// (measured: MDN's header inverted to its dark palette on a light persona).
+const IACVT: &str = "\u{1}iacvt\u{1}";
+
+/// Whether a custom-property value is the guaranteed-invalid value — either the
+/// sentinel already, or the literal `initial` (which resets a custom property
+/// TO the guaranteed-invalid value, unlike its meaning on normal properties).
+fn is_iacvt(v: &str) -> bool {
+    let t = v.trim();
+    t.contains(IACVT) || t.eq_ignore_ascii_case("initial")
+}
+
 /// Replace every `var(--name[, fallback])` in `input` with the custom property's
 /// value (resolved recursively, since a custom property may itself reference
-/// others), falling back to the comma fallback or empty. Guarded against cycles
-/// and runaway depth.
+/// others). An undefined/`initial` property with no fallback yields the
+/// guaranteed-invalid value ([`IACVT`]); a resolved value that turns out invalid
+/// makes the reference take its fallback. Guarded against cycles and depth.
 fn substitute_vars(input: &str, vars: &Vars, depth: usize) -> String {
     if depth > 32 {
         return String::new();
@@ -462,11 +759,34 @@ fn substitute_vars(input: &str, vars: &Vars, depth: usize) -> String {
         };
         let (name, fallback) = split_top_comma(inner);
         let key = name.trim().to_ascii_lowercase();
-        let replacement = match vars.get(&key) {
-            Some(v) => substitute_vars(v, vars, depth + 1),
+        // A property's substituted value, or `None` when it resolves to the
+        // guaranteed-invalid value (undefined / `initial` / resolves-to-IACVT).
+        let resolved: Option<String> = match vars.get(&key) {
+            Some(v) if is_iacvt(v) => None,
+            Some(v) => {
+                let r = substitute_vars(v, vars, depth + 1);
+                if r.contains(IACVT) {
+                    None
+                } else {
+                    Some(r)
+                }
+            }
+            None => None,
+        };
+        let replacement = match resolved {
+            Some(r) => r,
+            // Invalid reference: take the fallback (itself possibly invalid), or
+            // propagate the guaranteed-invalid value up.
             None => match fallback {
-                Some(fb) => substitute_vars(fb.trim(), vars, depth + 1),
-                None => String::new(),
+                Some(fb) => {
+                    let r = substitute_vars(fb.trim(), vars, depth + 1);
+                    if r.contains(IACVT) {
+                        IACVT.to_string()
+                    } else {
+                        r
+                    }
+                }
+                None => IACVT.to_string(),
             },
         };
         out.push_str(replacement.trim());
@@ -511,31 +831,152 @@ fn split_top_comma(s: &str) -> (&str, Option<&str>) {
     (s, None)
 }
 
-/// Replace every `calc(...)` in `input` with its evaluated length/number (in px
-/// where a unit is involved); leave a `calc()` we cannot evaluate untouched.
-fn eval_calcs(input: &str, em: f32) -> String {
+/// The math functions the value resolver evaluates.
+const MATH_FNS: [&str; 4] = ["calc(", "min(", "max(", "clamp("];
+
+/// Find the earliest math-function call in `s`, at a word boundary so a
+/// substring like the `max(` inside `minmax(...)` is never mistaken for one.
+/// Returns `(byte offset, matched name incl. '(')`.
+fn find_math_fn(s: &str) -> Option<(usize, &'static str)> {
+    let mut best: Option<(usize, &'static str)> = None;
+    for name in MATH_FNS {
+        let mut from = 0;
+        while let Some(rel) = s[from..].find(name) {
+            let pos = from + rel;
+            let bounded = pos == 0 || {
+                let prev = s.as_bytes()[pos - 1];
+                !(prev.is_ascii_alphanumeric() || prev == b'-' || prev == b'_')
+            };
+            if bounded {
+                if best.is_none_or(|(b, _)| pos < b) {
+                    best = Some((pos, name));
+                }
+                break;
+            }
+            from = pos + 1;
+        }
+    }
+    best
+}
+
+/// The bases a `calc()`/`min()`/`max()`/`clamp()` expression resolves its
+/// relative units against.
+#[derive(Clone, Copy)]
+struct CalcCtx {
+    /// The element's font size in px (the `em` base).
+    em: f32,
+    /// Viewport width/height in px (the `vw`/`vh`/`vmin`/`vmax` bases).
+    vw: f32,
+    vh: f32,
+    /// How `%` resolves for the property being parsed. `Some(base)` folds it to
+    /// px against `base` — correct only for the font-relative properties
+    /// (`font-size`/`line-height`/`vertical-align`). `None` keeps `%` symbolic:
+    /// the expression reduces to the canonical `a% + b·px`, and only a pure
+    /// form (`a == 0` or `b == 0`) resolves. A mixed result (e.g.
+    /// `calc(100% - 32px)` for a width) is left unresolved so the declaration
+    /// falls back to the prior/initial value instead of mis-resolving `%`
+    /// against the font size — Chrome resolves such `%` against the containing
+    /// block, which isn't known until layout, and `Len` has no combined
+    /// `%+px` variant (layout/taffy match on `Len` exhaustively, and
+    /// cerberus-layout must not be edited here).
+    pct_base: Option<f32>,
+}
+
+/// A partially-evaluated calc value in the canonical linear form `px + pct%`
+/// (`%` can't be folded into px without the containing block).
+#[derive(Clone, Copy, PartialEq, Debug)]
+struct CalcVal {
+    px: f32,
+    pct: f32,
+}
+
+impl CalcVal {
+    fn add(self, o: Self) -> Self {
+        CalcVal {
+            px: self.px + o.px,
+            pct: self.pct + o.pct,
+        }
+    }
+
+    fn sub(self, o: Self) -> Self {
+        CalcVal {
+            px: self.px - o.px,
+            pct: self.pct - o.pct,
+        }
+    }
+
+    /// Multiply; one side must be a plain number (no `%` component — unitless
+    /// numbers tokenize with their value in `px`, matching the old behavior).
+    fn mul(self, o: Self) -> Option<Self> {
+        if o.pct == 0.0 {
+            Some(CalcVal {
+                px: self.px * o.px,
+                pct: self.pct * o.px,
+            })
+        } else if self.pct == 0.0 {
+            Some(CalcVal {
+                px: o.px * self.px,
+                pct: o.pct * self.px,
+            })
+        } else {
+            None
+        }
+    }
+
+    /// Divide by a plain non-zero number.
+    fn div(self, o: Self) -> Option<Self> {
+        (o.pct == 0.0 && o.px != 0.0).then(|| CalcVal {
+            px: self.px / o.px,
+            pct: self.pct / o.px,
+        })
+    }
+}
+
+/// Print a resolved calc result as a plain CSS value: `px` when there is no
+/// `%` component, `N%` when it is purely a percentage (the property parsers
+/// then treat it exactly like a literal percentage), `None` when mixed.
+fn format_calc_val(v: CalcVal) -> Option<String> {
+    // Integer-ish results print without a trailing `.0`.
+    let fmt = |n: f32, unit: &str| {
+        if (n.round() - n).abs() < 1e-4 {
+            format!("{}{unit}", n.round() as i64)
+        } else {
+            format!("{n}{unit}")
+        }
+    };
+    if v.pct == 0.0 {
+        Some(fmt(v.px, "px"))
+    } else if v.px == 0.0 {
+        Some(fmt(v.pct, "%"))
+    } else {
+        None
+    }
+}
+
+/// Replace every math function ([`MATH_FNS`]) in `input` with its evaluated
+/// length/percentage; leave one we cannot evaluate untouched so the
+/// declaration fails to parse and falls back.
+fn eval_calcs(input: &str, ctx: CalcCtx) -> String {
     let mut out = String::new();
     let mut rest = input;
-    while let Some(pos) = rest.find("calc(") {
+    while let Some((pos, name)) = find_math_fn(rest) {
         out.push_str(&rest[..pos]);
-        let after = &rest[pos + 5..];
+        let after = &rest[pos + name.len()..];
         let Some((inner, tail)) = take_group(after) else {
             out.push_str(&rest[pos..]);
             return out;
         };
-        // Nested calc() inside this group resolves first.
-        let inner = eval_calcs(inner, em);
-        match eval_calc_expr(&inner, em) {
-            Some(px) => {
-                // Integer-ish results print without a trailing `.0`.
-                if (px.round() - px).abs() < 1e-4 {
-                    out.push_str(&format!("{}px", px.round() as i64));
-                } else {
-                    out.push_str(&format!("{px}px"));
-                }
-            }
+        // Nested math inside this group resolves first.
+        let inner = eval_calcs(inner, ctx);
+        let val = if name == "calc(" {
+            eval_calc_expr(&inner, ctx)
+        } else {
+            eval_min_max_clamp(name, &inner, ctx)
+        };
+        match val.and_then(format_calc_val) {
+            Some(s) => out.push_str(&s),
             None => {
-                out.push_str("calc(");
+                out.push_str(name);
                 out.push_str(&inner);
                 out.push(')');
             }
@@ -546,11 +987,42 @@ fn eval_calcs(input: &str, em: f32) -> String {
     out
 }
 
-/// Evaluate a `calc()` expression body to a px value, supporting `+ - * /`,
-/// parentheses, and px/em/rem/pt/% units (others convert via the same rules the
-/// length parser uses). Returns `None` if it cannot be reduced to a number.
-fn eval_calc_expr(expr: &str, em: f32) -> Option<f32> {
-    let tokens = tokenize_calc(expr, em)?;
+/// Evaluate `min(...)`/`max(...)`/`clamp(lo, mid, hi)` over comma-separated
+/// calc expressions. The arguments are only mutually comparable without a
+/// containing block when they are all pure px or all pure `%`; anything mixed
+/// (`min(100%, 500px)`) is left unresolved — the same safety rule as `calc()`
+/// itself (FIX 1), so `%` is never compared against a font-size-derived px.
+fn eval_min_max_clamp(name: &str, inner: &str, ctx: CalcCtx) -> Option<CalcVal> {
+    let args: Vec<CalcVal> = split_top_commas(inner)
+        .iter()
+        .map(|a| eval_calc_expr(a, ctx))
+        .collect::<Option<_>>()?;
+    let all_px = args.iter().all(|a| a.pct == 0.0);
+    let all_pct = args.iter().all(|a| a.px == 0.0);
+    if args.is_empty() || !(all_px || all_pct) {
+        return None;
+    }
+    // `%` compares monotonically because its (containing-block) base is ≥ 0.
+    let key = |a: &CalcVal| if all_px { a.px } else { a.pct };
+    let n = match name {
+        "min(" => args.iter().map(key).fold(f32::INFINITY, f32::min),
+        "max(" => args.iter().map(key).fold(f32::NEG_INFINITY, f32::max),
+        // clamp(lo, mid, hi) = max(lo, min(mid, hi)); exactly three arguments.
+        "clamp(" if args.len() == 3 => key(&args[0]).max(key(&args[1]).min(key(&args[2]))),
+        _ => return None,
+    };
+    Some(if all_px {
+        CalcVal { px: n, pct: 0.0 }
+    } else {
+        CalcVal { px: 0.0, pct: n }
+    })
+}
+
+/// Evaluate a `calc()` expression body to the canonical `px + %` form,
+/// supporting `+ - * /`, parentheses, and px/em/rem/pt/vw/vh/vmin/vmax/%
+/// units. Returns `None` if it cannot be reduced.
+fn eval_calc_expr(expr: &str, ctx: CalcCtx) -> Option<CalcVal> {
+    let tokens = tokenize_calc(expr, ctx)?;
     let mut p = CalcParser {
         tokens: &tokens,
         i: 0,
@@ -563,10 +1035,10 @@ fn eval_calc_expr(expr: &str, em: f32) -> Option<f32> {
     }
 }
 
-/// A `calc()` token: a resolved px/number value or an operator/paren.
+/// A `calc()` token: a resolved value or an operator/paren.
 #[derive(Clone, Copy, PartialEq)]
 enum CalcTok {
-    Num(f32),
+    Num(CalcVal),
     Plus,
     Minus,
     Mul,
@@ -575,7 +1047,7 @@ enum CalcTok {
     Close,
 }
 
-fn tokenize_calc(expr: &str, em: f32) -> Option<Vec<CalcTok>> {
+fn tokenize_calc(expr: &str, ctx: CalcCtx) -> Option<Vec<CalcTok>> {
     let mut toks = Vec::new();
     let bytes = expr.as_bytes();
     let mut i = 0;
@@ -625,15 +1097,25 @@ fn tokenize_calc(expr: &str, em: f32) -> Option<Vec<CalcTok>> {
                     i += 1;
                 }
                 let unit = &expr[unit_start..i];
-                let px = match unit.to_ascii_lowercase().as_str() {
-                    "" | "px" => num,
-                    "em" => num * em,
-                    "rem" => num * 16.0,
-                    "pt" => num * 96.0 / 72.0,
-                    "%" => num / 100.0 * em,
+                let px = |px: f32| CalcVal { px, pct: 0.0 };
+                let val = match unit.to_ascii_lowercase().as_str() {
+                    "" | "px" => px(num),
+                    "em" => px(num * ctx.em),
+                    "rem" => px(num * 16.0),
+                    "pt" => px(num * 96.0 / 72.0),
+                    "vw" => px(num / 100.0 * ctx.vw),
+                    "vh" => px(num / 100.0 * ctx.vh),
+                    "vmin" => px(num / 100.0 * ctx.vw.min(ctx.vh)),
+                    "vmax" => px(num / 100.0 * ctx.vw.max(ctx.vh)),
+                    // See `CalcCtx::pct_base`: fold against the font-relative
+                    // base, or keep the `%` symbolic for later reduction.
+                    "%" => match ctx.pct_base {
+                        Some(base) => px(num / 100.0 * base),
+                        None => CalcVal { px: 0.0, pct: num },
+                    },
                     _ => return None,
                 };
-                toks.push(CalcTok::Num(px));
+                toks.push(CalcTok::Num(val));
             }
         }
     }
@@ -655,38 +1137,35 @@ impl CalcParser<'_> {
         self.tokens.get(self.i).copied()
     }
 
-    fn expr(&mut self) -> Option<f32> {
+    fn expr(&mut self) -> Option<CalcVal> {
         let mut v = self.term()?;
         while let Some(op @ (CalcTok::Plus | CalcTok::Minus)) = self.peek() {
             self.i += 1;
             let rhs = self.term()?;
             v = if op == CalcTok::Plus {
-                v + rhs
+                v.add(rhs)
             } else {
-                v - rhs
+                v.sub(rhs)
             };
         }
         Some(v)
     }
 
-    fn term(&mut self) -> Option<f32> {
+    fn term(&mut self) -> Option<CalcVal> {
         let mut v = self.factor()?;
         while let Some(op @ (CalcTok::Mul | CalcTok::Div)) = self.peek() {
             self.i += 1;
             let rhs = self.factor()?;
-            if op == CalcTok::Mul {
-                v *= rhs;
+            v = if op == CalcTok::Mul {
+                v.mul(rhs)?
             } else {
-                if rhs == 0.0 {
-                    return None;
-                }
-                v /= rhs;
-            }
+                v.div(rhs)?
+            };
         }
         Some(v)
     }
 
-    fn factor(&mut self) -> Option<f32> {
+    fn factor(&mut self) -> Option<CalcVal> {
         match self.peek()? {
             CalcTok::Num(n) => {
                 self.i += 1;
@@ -706,6 +1185,92 @@ impl CalcParser<'_> {
 /// Initial root font-size in px (the base for `rem` before any `html {font-size}`).
 const INITIAL_ROOT_FONT_PX: u32 = 16;
 
+/// Resolve a `content` value to the text the generated box carries:
+/// `none`/`normal` → no box (`None`); quoted strings concatenate; `attr(x)`
+/// reads the originating element; `counter()`/`url()`/unknown functions
+/// contribute nothing but still allow an (empty) box, which is how decorative
+/// bands and clearfix spacers render.
+fn parse_content_value(v: &str, node: NodeRef<'_>) -> Option<String> {
+    let t = v.trim();
+    if t.is_empty() || t.eq_ignore_ascii_case("none") || t.eq_ignore_ascii_case("normal") {
+        return None;
+    }
+    let mut out = String::new();
+    let mut rest = t;
+    while !rest.is_empty() {
+        rest = rest.trim_start();
+        if rest.is_empty() {
+            break;
+        }
+        let c = rest.chars().next().unwrap();
+        if c == '"' || c == '\'' {
+            // A quoted string piece (no escape handling — content strings on
+            // real pages are plain glyph runs).
+            if let Some(end) = rest[1..].find(c) {
+                out.push_str(&rest[1..1 + end]);
+                rest = &rest[end + 2..];
+                continue;
+            }
+            break;
+        }
+        // A function or keyword token up to whitespace (tracking parens so
+        // `attr(data-x)` stays one token).
+        let mut depth = 0i32;
+        let mut split = rest.len();
+        for (i, ch) in rest.char_indices() {
+            match ch {
+                '(' => depth += 1,
+                ')' => depth -= 1,
+                ch if ch.is_whitespace() && depth == 0 => {
+                    split = i;
+                    break;
+                }
+                _ => {}
+            }
+        }
+        let tok = &rest[..split];
+        rest = &rest[split..];
+        let low = tok.to_ascii_lowercase();
+        if let Some(name) = low.strip_prefix("attr(").and_then(|x| x.strip_suffix(')')) {
+            if let Some(val) = node.attr(name.trim()) {
+                out.push_str(val);
+            }
+        }
+        // counter()/url()/open-quote/… contribute nothing (box still forms).
+    }
+    Some(out)
+}
+
+/// Cross-declaration state accumulated over one element's cascade passes and
+/// finalized in `build` after all of them: whether the last `clip` /
+/// `clip-path` declaration collapses the element to nothing (the `sr-only`
+/// accessibility-hiding patterns). Deferred because `clip` only applies to
+/// absolutely positioned boxes and `position` may be declared in any rule /
+/// order relative to the `clip` (alphabetized blocks put `clip` first).
+#[derive(Default)]
+struct PendingHidden {
+    /// `clip: rect(...)` left an empty visible region.
+    clip: bool,
+    /// `clip-path: inset(...)` insets away the whole box.
+    clip_path: bool,
+}
+
+impl PendingHidden {
+    /// Fold into the computed style: an all-hiding clip behaves like
+    /// `visibility: hidden` (laid out, not painted, inherited by children) —
+    /// reusing that mechanism means layout/paint need no changes. Real
+    /// (partial) clipping is not modeled; only the invisible case applies.
+    fn finalize(&self, style: &mut ComputedStyle) {
+        let clip_applies = matches!(style.position, Position::Absolute | Position::Fixed);
+        if self.clip_path || (self.clip && clip_applies) {
+            style.visibility = Visibility::Hidden;
+        }
+    }
+}
+
+// The cascade threads per-element bases (parent/root font size, viewport) that
+// vary per call; bundling them would not aid readability (same as `build`).
+#[allow(clippy::too_many_arguments)]
 fn apply_declarations(
     style: &mut ComputedStyle,
     decls: &[(String, String, bool)],
@@ -713,6 +1278,8 @@ fn apply_declarations(
     root_font_size: u32,
     vars: &Vars,
     important: bool,
+    viewport: (f32, f32),
+    pending: &mut PendingHidden,
 ) {
     for (prop, value, is_important) in decls {
         // This pass only applies declarations of the matching importance, so the
@@ -728,9 +1295,27 @@ fn apply_declarations(
         // Fold `rem` to px against the root font-size up front (`em` stays for
         // per-element resolution), so downstream length parsers see px.
         let value = &substitute_rem(value, root_font_size as f32);
-        // Resolve `var()` references and `calc()` math before parsing the value.
-        // `em` for `calc()` uses the element's current font size.
-        let resolved = resolve_value(value, vars, style.font_size as f32);
+        // Resolve `var()` references and calc()/min()/max()/clamp() math before
+        // parsing the value. `em` uses the element's current font size; `%` only
+        // folds to px for the font-relative properties (see `CalcCtx`).
+        let ctx = CalcCtx {
+            em: style.font_size as f32,
+            vw: viewport.0,
+            vh: viewport.1,
+            pct_base: matches!(
+                prop.as_str(),
+                "font-size" | "line-height" | "vertical-align"
+            )
+            .then_some(style.font_size as f32),
+        };
+        let resolved = resolve_value(value, vars, ctx);
+        // A value that resolved to the guaranteed-invalid value (an undefined /
+        // `initial` custom property reached through `var()` with no usable
+        // fallback) is invalid at computed-value time — drop the declaration so
+        // the property keeps its prior cascade value, exactly as a browser does.
+        if resolved.contains(IACVT) {
+            continue;
+        }
         // Then resolve the `currentColor` keyword against the color cascaded so
         // far, so it works anywhere a color appears (borders, backgrounds,
         // shadows, gradients) — not just as an unresolved literal.
@@ -740,6 +1325,18 @@ fn apply_declarations(
             "color" => {
                 if let Some(c) = parse_color(v) {
                     style.color = c;
+                }
+            }
+            // SVG paint: computed here so the app can inject it into the
+            // pre-rasterized inline-svg payload (resvg never sees author CSS).
+            "fill" => {
+                let lv = v.to_ascii_lowercase();
+                if lv == "currentcolor" {
+                    style.fill = Some(style.color);
+                } else if lv == "none" {
+                    style.fill = None;
+                } else if let Some(c) = parse_color(v) {
+                    style.fill = Some(c);
                 }
             }
             "background" | "background-color" => {
@@ -804,6 +1401,10 @@ fn apply_declarations(
             "font-size" => {
                 if let Some(px) = parse_size(v, parent_font_size) {
                     style.font_size = px;
+                    // Track whether the value is still the initial `medium` keyword
+                    // (vs an explicit length/keyword), for the monospace-size quirk
+                    // resolved post-cascade.
+                    style.font_size_medium = v.trim().eq_ignore_ascii_case("medium");
                 }
             }
             "font-weight" => style.font.bold = is_bold(v),
@@ -812,15 +1413,21 @@ fn apply_declarations(
                 style.font.italic = low == "italic" || low == "oblique";
             }
             "font" => apply_font_shorthand(style, v, parent_font_size),
-            // `font-family` is intentionally not honored: the font set is fixed
-            // to the bundled face (a privacy/anti-fingerprinting property — no
-            // system or downloadable fonts are read), so families and `@font-face`
-            // text render in the bundled font. Consumed here so the decision is
-            // explicit rather than a silent fall-through (ADR-0038).
-            "font-family" => {}
+            // `font-family` resolves to a generic class (serif / sans-serif /
+            // monospace / …), which selects one of the bundled metric-compatible
+            // faces at rasterization. The *named* fonts are never shipped or read
+            // (a privacy/anti-fingerprinting property — no system or downloadable
+            // fonts), so e.g. `Georgia, serif` and `Consolas, monospace` render in
+            // the bundled serif/mono face rather than the literal named font.
+            "font-family" => {
+                if let Some(g) = parse_font_family(v) {
+                    style.font_family = g;
+                }
+            }
             "text-align" => {
                 style.text_align = match v.to_ascii_lowercase().as_str() {
                     "center" => TextAlign::Center,
+                    "-webkit-center" | "-moz-center" => TextAlign::WebkitCenter,
                     "right" | "end" => TextAlign::Right,
                     "left" | "start" => TextAlign::Left,
                     _ => style.text_align,
@@ -858,6 +1465,9 @@ fn apply_declarations(
                 style.vertical_align = match v.trim().to_ascii_lowercase().as_str() {
                     "sub" => VerticalAlign::Sub,
                     "super" => VerticalAlign::Super,
+                    "top" | "middle" | "bottom" | "text-top" | "text-bottom" => {
+                        VerticalAlign::OffBaseline
+                    }
                     _ => VerticalAlign::Baseline,
                 };
             }
@@ -896,6 +1506,13 @@ fn apply_declarations(
             "display" => {
                 if let Some(d) = parse_display(v) {
                     style.display = d;
+                    // inline-flex / inline-grid: Flex/Grid INSIDE, atomic
+                    // inline OUTSIDE (block-level promotion broke the
+                    // surrounding line, putting each such box on its own row).
+                    style.display_inline_level = matches!(
+                        v.trim().to_ascii_lowercase().as_str(),
+                        "inline-flex" | "inline-grid"
+                    );
                 }
             }
             "margin" => apply_margin_shorthand(style, v, style.font_size as f32),
@@ -968,6 +1585,11 @@ fn apply_declarations(
                     style.overflow_clip = false;
                 }
             }
+            "text-overflow" => {
+                // `ellipsis` truncates a clipped non-wrapping line with `…`;
+                // `clip` (the default) hard-cuts.
+                style.text_overflow_ellipsis = v.trim().eq_ignore_ascii_case("ellipsis");
+            }
             "padding" => apply_box_shorthand(
                 v,
                 style.font_size as f32,
@@ -1031,6 +1653,13 @@ fn apply_declarations(
                     _ => style.visibility,
                 }
             }
+            // Accessibility hiding: only the *all-hiding* clip forms are
+            // modeled (finalized via `PendingHidden` after the cascade); a
+            // partially-clipping value is treated as visible — we never
+            // attempt real clipping. The last declaration wins, so a visible
+            // `auto`/`none`/partial value overrides an earlier hiding one.
+            "clip" => pending.clip = clip_rect_hides(v, style.font_size as f32),
+            "clip-path" => pending.clip_path = clip_path_inset_hides(v),
             "opacity" => {
                 if let Some(o) = parse_opacity(v) {
                     style.opacity = o;
@@ -1150,12 +1779,20 @@ fn apply_declarations(
                     .map(|t| parse_one_track(t, style.font_size as f32));
             }
             "grid-column" => {
-                style.grid_column_span = parse_grid_span(v);
+                let (start, end, span) = parse_grid_placement(v);
+                style.grid_column_start = start;
+                style.grid_column_end = end;
+                style.grid_column_span = span;
                 if grid_line_is_named(v) {
                     style.grid_named_place = true;
                 }
             }
-            "grid-row" => style.grid_row_span = parse_grid_span(v),
+            "grid-row" => {
+                let (start, end, span) = parse_grid_placement(v);
+                style.grid_row_start = start;
+                style.grid_row_end = end;
+                style.grid_row_span = span;
+            }
             "grid-area" => {
                 // `grid-area: name` (a named area/line) — we don't resolve areas,
                 // so flag it for content-track placement (ADR-0038).
@@ -1168,6 +1805,59 @@ fn apply_declarations(
             _ => {}
         }
     }
+}
+
+/// Whether a `clip` value is a `rect(...)` that leaves (essentially) nothing
+/// visible: all four edges parse as lengths ≤ 1px — the screen-reader-only
+/// patterns `rect(0, 0, 0, 0)` and `rect(1px, 1px, 1px, 1px)` (the visible
+/// region is `left..right × top..bottom`, so those are empty). `auto` edges or
+/// larger rects leave content visible and return false.
+fn clip_rect_hides(v: &str, em: f32) -> bool {
+    let t = v.trim().to_ascii_lowercase();
+    let Some(inner) = t.strip_prefix("rect(").and_then(|s| s.strip_suffix(')')) else {
+        return false;
+    };
+    // Both the comma and the legacy space-separated forms are valid.
+    let edges: Vec<&str> = inner
+        .split(|c: char| c == ',' || c.is_whitespace())
+        .filter(|s| !s.is_empty())
+        .collect();
+    edges.len() == 4
+        && edges
+            .iter()
+            .all(|e| parse_css_px(e, em).is_some_and(|px| px <= 1.0))
+}
+
+/// Whether a `clip-path` value is an `inset(...)` that insets away the whole
+/// box: opposite percentage insets summing to ≥ 100% on either axis (e.g. the
+/// sr-only `inset(50%)`, or `inset(100%)`). Pixel insets can't be judged
+/// without the box size and count as 0 (conservative: never hide unless the
+/// percentages alone guarantee it) — Chrome shows `inset(0 0 50% 0)` half-
+/// visible, and so do we (visible).
+fn clip_path_inset_hides(v: &str) -> bool {
+    let t = v.trim().to_ascii_lowercase();
+    let Some(inner) = t.strip_prefix("inset(").and_then(|s| s.strip_suffix(')')) else {
+        return false;
+    };
+    // 1–4 values (top/right/bottom/left, CSS order), before any `round` radius.
+    let vals: Vec<&str> = inner
+        .split_whitespace()
+        .take_while(|tok| *tok != "round")
+        .collect();
+    let pct = |i: usize| -> f32 {
+        vals.get(i)
+            .and_then(|tok| tok.strip_suffix('%'))
+            .and_then(|n| n.trim().parse::<f32>().ok())
+            .unwrap_or(0.0)
+    };
+    let (top, right, bottom, left) = match vals.len() {
+        1 => (pct(0), pct(0), pct(0), pct(0)),
+        2 => (pct(0), pct(1), pct(0), pct(1)),
+        3 => (pct(0), pct(1), pct(2), pct(1)),
+        4 => (pct(0), pct(1), pct(2), pct(3)),
+        _ => return false,
+    };
+    top + bottom >= 100.0 || left + right >= 100.0
 }
 
 fn parse_bg_color(v: &str) -> Option<Color> {
@@ -1262,7 +1952,11 @@ fn parse_display(v: &str) -> Option<Display> {
         "inline-block" => Display::InlineBlock,
         "flex" | "inline-flex" => Display::Flex,
         "grid" | "inline-grid" => Display::Grid,
-        "block" | "table" | "table-row" | "table-cell" | "flow-root" => Display::Block,
+        "block" | "table" | "table-row" | "flow-root" => Display::Block,
+        // A CSS table cell sits on a row beside its siblings; the shrink-to-fit
+        // atomic inline-block is the closest box we model (stacking them as
+        // full-width blocks put every "cell" on its own line).
+        "table-cell" => Display::InlineBlock,
         _ => return None,
     })
 }
@@ -1726,23 +2420,31 @@ fn grid_line_is_named(v: &str) -> bool {
         })
 }
 
-/// Parse a `grid-column`/`grid-row` placement into a track *span* count:
-/// `span N`, `a / b` (→ b−a), `a / span N`, else 1 (ADR-0038).
-fn parse_grid_span(v: &str) -> u32 {
+/// Parse a `grid-column`/`grid-row` placement into `(start line, end line,
+/// span)`. Numeric lines are kept as CSS line numbers (1-based, negative from
+/// the end — `1 / -1` means full width) and resolved against the REAL track
+/// count at layout; the span is a fallback for the forms that imply one
+/// (`span N`, `a / span N`, positive `a / b`). Named lines/areas yield no
+/// numeric placement (the `grid_named_place` content-track path handles them).
+fn parse_grid_placement(v: &str) -> (Option<i32>, Option<i32>, u32) {
     let v = v.trim().to_ascii_lowercase();
     if let Some(rest) = v.strip_prefix("span") {
-        return rest.trim().parse::<u32>().unwrap_or(1).max(1);
+        return (None, None, rest.trim().parse::<u32>().unwrap_or(1).max(1));
     }
     if let Some((a, b)) = v.split_once('/') {
-        let b = b.trim();
+        let (a, b) = (a.trim(), b.trim());
+        let start = a.parse::<i32>().ok().filter(|n| *n != 0);
         if let Some(n) = b.strip_prefix("span") {
-            return n.trim().parse::<u32>().unwrap_or(1).max(1);
+            return (start, None, n.trim().parse::<u32>().unwrap_or(1).max(1));
         }
-        if let (Ok(ai), Ok(bi)) = (a.trim().parse::<i32>(), b.parse::<i32>()) {
-            return (bi - ai).unsigned_abs().max(1);
-        }
+        let end = b.parse::<i32>().ok().filter(|n| *n != 0);
+        let span = match (start, end) {
+            (Some(ai), Some(bi)) if ai > 0 && bi > 0 => (bi - ai).unsigned_abs().max(1),
+            _ => 1,
+        };
+        return (start, end, span);
     }
-    1
+    (v.parse::<i32>().ok().filter(|n| *n != 0), None, 1)
 }
 
 fn apply_font_shorthand(style: &mut ComputedStyle, v: &str, parent_font_size: u32) {
@@ -1755,9 +2457,72 @@ fn apply_font_shorthand(style: &mut ComputedStyle, v: &str, parent_font_size: u3
         } else if t.chars().any(|c| c.is_ascii_digit()) {
             if let Some(px) = parse_size(&t, parent_font_size) {
                 style.font_size = px;
+                style.font_size_medium = false; // the shorthand set an explicit size
             }
         }
     }
+    // The trailing family list (best-effort: size/style tokens don't classify).
+    if let Some(g) = parse_font_family(v) {
+        style.font_family = g;
+    }
+}
+
+/// Classify one `font-family` entry into a generic class, or `None` if the name
+/// is unknown (so the caller falls through to the next family in the list). CSS
+/// generic keywords resolve directly; named faces resolve by well-known keywords
+/// in the name (`mono`, `serif`, script/handwriting cues), defaulting a plain
+/// named face to sans-serif only when nothing else matches.
+fn classify_font_family(name: &str) -> Option<GenericFamily> {
+    let n = name
+        .trim()
+        .trim_matches(['"', '\''])
+        .trim()
+        .to_ascii_lowercase();
+    // Generic keywords resolve directly. `cursive`/`fantasy` render the
+    // standard (serif) face: the reference browser's preferences for them are
+    // uninstalled fonts, so it falls back to its standard font (measured).
+    match n.as_str() {
+        "serif" => return Some(GenericFamily::Serif),
+        "sans-serif" => return Some(GenericFamily::SansSerif),
+        "system-ui" | "ui-sans-serif" | "ui-rounded" => return Some(GenericFamily::SansSystem),
+        "monospace" | "ui-monospace" => return Some(GenericFamily::Monospace),
+        "cursive" => return Some(GenericFamily::Cursive),
+        "fantasy" => return Some(GenericFamily::Fantasy),
+        _ => {}
+    }
+    // Named faces resolve ONLY when the reference actually resolves them — the
+    // fontconfig strong (metric) aliases and the faces installed there. Any
+    // other name returns None so the stack falls through to its next entry
+    // (measured: Chrome renders uninstalled names — Verdana, Georgia, Menlo,
+    // Roboto, Segoe UI — as the NEXT resolvable entry, or as the standard
+    // serif when nothing in the stack resolves; fontconfig's weak best-match
+    // is not used).
+    let has = |kw: &str| n.contains(kw);
+    if has("arial") || has("helvetica") || has("liberation sans") || has("arimo") {
+        Some(GenericFamily::SansArial)
+    } else if has("times") || has("tinos") || has("liberation serif") || has("nimbus roman") {
+        Some(GenericFamily::Serif)
+    } else if has("courier") || has("cousine") || has("liberation mono") || has("nimbus mono") {
+        Some(GenericFamily::MonoCourier)
+    } else if n == "dejavu sans mono" {
+        Some(GenericFamily::Monospace)
+    } else if n == "dejavu sans" {
+        Some(GenericFamily::SansSystem)
+    } else if n == "dejavu serif" {
+        Some(GenericFamily::Serif)
+    } else {
+        None
+    }
+}
+
+/// Resolve a `font-family` value (a comma-separated list) to one generic class:
+/// the first entry that resolves on the reference persona wins (real "first
+/// available font" behavior), so `"MyBrand", Georgia, sans-serif` → sans-serif
+/// (neither named face is installed). `None` if nothing in the list resolves
+/// (the caller keeps the inherited family, whose root default is the standard
+/// serif — the reference's unresolvable-stack fallback).
+fn parse_font_family(v: &str) -> Option<GenericFamily> {
+    v.split(',').find_map(classify_font_family)
 }
 
 fn apply_margin_shorthand(style: &mut ComputedStyle, v: &str, em_base: f32) {
@@ -2165,6 +2930,69 @@ mod tests {
     }
 
     #[test]
+    fn font_family_resolves_to_generic() {
+        let dom = CssEngine::new().style(&parse_html(
+            "<p id=a style='font-family:Georgia, serif'>a</p>\
+             <p id=b style='font-family:Arial, sans-serif'>b</p>\
+             <p id=c style='font-family:Consolas, monospace'>c</p>\
+             <p id=d style='font-family:\"Brush Script MT\", cursive'>d</p>\
+             <p id=e style='font-family:\"Segoe UI\", sans-serif'>e</p>",
+        ));
+        let fam = |id: &str| {
+            fn by_id<'a>(n: &'a StyledNode, id: &str) -> Option<&'a StyledNode> {
+                if n.attr("id") == Some(id) {
+                    return Some(n);
+                }
+                n.children.iter().find_map(|c| match c {
+                    StyledChild::Element(e) => by_id(e, id),
+                    StyledChild::Text(_) => None,
+                })
+            }
+            by_id(&dom.root, id).unwrap().style.font_family
+        };
+        assert_eq!(fam("a"), GenericFamily::Serif, "Georgia → serif");
+        assert_eq!(
+            fam("b"),
+            GenericFamily::SansArial,
+            "Arial → Arial-metric sans"
+        );
+        assert_eq!(fam("c"), GenericFamily::Monospace, "Consolas → monospace");
+        assert_eq!(fam("d"), GenericFamily::Cursive, "Brush Script → cursive");
+        // A non-Arial named sans (and the generic) fall to the Roboto default.
+        assert_eq!(
+            fam("e"),
+            GenericFamily::SansSerif,
+            "Segoe UI → default sans"
+        );
+    }
+
+    #[test]
+    fn monospace_uses_chrome_default_13px_size() {
+        // `<pre>`/`<code>` inherit the UA monospace family; with an unspecified
+        // (`medium`) size they resolve to 13px, matching Chrome's smaller default
+        // for the fixed font. Proportional text stays 16px. An explicit size wins.
+        let dom = CssEngine::new().style(&parse_html(
+            "<p>prose</p><pre>code block</pre>\
+             <code style='font-size:20px'>big</code>",
+        ));
+        assert_eq!(
+            first(&dom.root, "p").unwrap().style.font_size,
+            16,
+            "proportional medium → 16"
+        );
+        assert_eq!(
+            first(&dom.root, "pre").unwrap().style.font_size,
+            13,
+            "monospace medium → 13"
+        );
+        assert_eq!(
+            first(&dom.root, "code").unwrap().style.font_size,
+            20,
+            "explicit monospace size is honored"
+        );
+    }
+
+    #[test]
     fn text_decoration_line_through_and_combos() {
         let strike = CssEngine::new().style(&parse_html(
             "<span style='text-decoration:line-through'>x</span>",
@@ -2239,11 +3067,13 @@ mod tests {
 
     #[test]
     fn ua_styles_legacy_center_and_nobr() {
-        // `<center>` is a centered block; `<nobr>` prevents wrapping.
+        // `<center>` is a centered block carrying the legacy `-webkit-center`
+        // value (centers child table boxes, not table-cell text); `<nobr>`
+        // prevents wrapping.
         let dom = CssEngine::new().style(&parse_html("<center>c</center><nobr>n</nobr>"));
         let c = first(&dom.root, "center").unwrap();
         assert_eq!(c.style.display, Display::Block);
-        assert_eq!(c.style.text_align, TextAlign::Center);
+        assert_eq!(c.style.text_align, TextAlign::WebkitCenter);
         assert_eq!(
             first(&dom.root, "nobr").unwrap().style.white_space,
             cerberus_style::WhiteSpace::Nowrap
@@ -2411,6 +3241,106 @@ mod tests {
         );
     }
 
+    // ---- sr-only hiding via clip / clip-path (FIX 3) ----
+
+    #[test]
+    fn sr_only_clip_rect_hides_positioned_element() {
+        // The Bootstrap `.visually-hidden` / classic sr-only pattern: the
+        // "Skip to content" link must not paint (bbc/mozilla/iana/apple).
+        let html = "<style>.sr{position:absolute;width:1px;height:1px;clip:rect(0,0,0,0)}\
+                    </style><a class='sr' href='#main'>Skip to content</a><p>body</p>";
+        let dom = CssEngine::new().style(&parse_html(html));
+        assert_eq!(
+            first(&dom.root, "a").unwrap().style.visibility,
+            Visibility::Hidden
+        );
+        assert_eq!(
+            first(&dom.root, "p").unwrap().style.visibility,
+            Visibility::Visible
+        );
+        // The legacy space-separated 1px rect hides too (right − left = 0),
+        // and the hidden visibility reaches children by inheritance.
+        let dom2 = CssEngine::new().style(&parse_html(
+            "<div style='position:absolute;clip:rect(1px 1px 1px 1px)'><span>x</span></div>",
+        ));
+        assert_eq!(
+            first(&dom2.root, "span").unwrap().style.visibility,
+            Visibility::Hidden
+        );
+    }
+
+    #[test]
+    fn clip_requires_absolute_positioning_but_not_declaration_order() {
+        // Per CSS (Chrome-verified), `clip` applies only to absolutely
+        // positioned boxes: a static element keeps painting.
+        let stat = CssEngine::new().style(&parse_html("<div style='clip:rect(0,0,0,0)'>x</div>"));
+        assert_eq!(
+            first(&stat.root, "div").unwrap().style.visibility,
+            Visibility::Visible
+        );
+        // Alphabetized blocks declare `clip` before `position`, and `position`
+        // may come from a different rule entirely; the check runs after the
+        // whole cascade, so both still hide.
+        let html = "<style>.a{clip:rect(0,0,0,0)} .b{position:absolute}</style>\
+                    <i class='a b'>x</i>";
+        let dom = CssEngine::new().style(&parse_html(html));
+        assert_eq!(
+            first(&dom.root, "i").unwrap().style.visibility,
+            Visibility::Hidden
+        );
+        let fixed = CssEngine::new().style(&parse_html(
+            "<div style='clip:rect(0,0,0,0);position:fixed'>x</div>",
+        ));
+        assert_eq!(
+            first(&fixed.root, "div").unwrap().style.visibility,
+            Visibility::Hidden
+        );
+    }
+
+    #[test]
+    fn visible_clip_values_do_not_hide_and_can_override() {
+        // The last declaration wins: `auto` restores a previously-hidden clip.
+        let auto = CssEngine::new().style(&parse_html(
+            "<div style='position:absolute;clip:rect(0,0,0,0);clip:auto'>x</div>",
+        ));
+        assert_eq!(
+            first(&auto.root, "div").unwrap().style.visibility,
+            Visibility::Visible
+        );
+        // A rect that leaves a visible region is ignored (no real clipping).
+        let partial = CssEngine::new().style(&parse_html(
+            "<div style='position:absolute;clip:rect(0, 100px, 100px, 0)'>x</div>",
+        ));
+        assert_eq!(
+            first(&partial.root, "div").unwrap().style.visibility,
+            Visibility::Visible
+        );
+    }
+
+    #[test]
+    fn clip_path_inset_hides_only_when_fully_inset() {
+        let vis = |css: &str| {
+            let dom = CssEngine::new().style(&parse_html(&format!("<div style='{css}'>x</div>")));
+            first(&dom.root, "div").unwrap().style.visibility
+        };
+        // Fully-insetting values hide — no positioning requirement (unlike clip).
+        assert_eq!(vis("clip-path:inset(50%)"), Visibility::Hidden);
+        assert_eq!(vis("clip-path:inset(100%)"), Visibility::Hidden);
+        assert_eq!(vis("clip-path:inset(50% 50%)"), Visibility::Hidden);
+        // A `round` radius suffix doesn't confuse the parse.
+        assert_eq!(vis("clip-path:inset(50% round 8px)"), Visibility::Hidden);
+        // Chrome shows half the box for a one-sided 50% inset — stay visible.
+        assert_eq!(vis("clip-path:inset(0 0 50% 0)"), Visibility::Visible);
+        // px insets can't be judged without the box; other shapes are ignored.
+        assert_eq!(vis("clip-path:inset(10px)"), Visibility::Visible);
+        assert_eq!(vis("clip-path:circle(40%)"), Visibility::Visible);
+        // Last declaration wins: `none` restores.
+        assert_eq!(
+            vis("clip-path:inset(50%);clip-path:none"),
+            Visibility::Visible
+        );
+    }
+
     #[test]
     fn flex_and_grid_parse() {
         let html = "<div style='display:flex; flex-direction:column; \
@@ -2467,6 +3397,40 @@ mod tests {
     }
 
     #[test]
+    fn has_is_where_cascade_end_to_end() {
+        // (FIX 4) `:has(> a)` through the real cascade: only the div with a
+        // direct <a> child turns red; `:is`/`:where` match the element itself.
+        let html = "<style>\
+            div:has(> a) { color: #ff0000 }\
+            section:has(> a) { color: #0000ff }\
+            p:is(.hero, .lead) { color: #00ff00 }\
+            span:where([data-x]) { color: #00ffff }\
+            </style>\
+            <div><a href='/x'>l</a></div>\
+            <section><b><a href='/y'>m</a></b></section>\
+            <p class='lead'>t</p><span data-x='1'>s</span>";
+        let dom = CssEngine::new().style(&parse_html(html));
+        assert_eq!(
+            first(&dom.root, "div").unwrap().style.color,
+            Color::rgb(0xff, 0, 0),
+            "div has a direct <a> child"
+        );
+        assert_eq!(
+            first(&dom.root, "section").unwrap().style.color,
+            Color::BLACK,
+            "the section's <a> is nested, not a direct child"
+        );
+        assert_eq!(
+            first(&dom.root, "p").unwrap().style.color,
+            Color::rgb(0, 0xff, 0)
+        );
+        assert_eq!(
+            first(&dom.root, "span").unwrap().style.color,
+            Color::rgb(0, 0xff, 0xff)
+        );
+    }
+
+    #[test]
     fn nth_of_type_cascades_over_mixed_siblings() {
         // Among a mix of tags, `p:first-of-type` targets the first <p> even though
         // it isn't the first child, and `:nth-of-type(2)` the second <p>.
@@ -2519,6 +3483,71 @@ mod tests {
         assert_eq!(lis[0].style.color, Color::BLACK, "first li unaffected");
         assert_eq!(lis[1].style.color, Color::rgb(0, 0xff, 0), "2nd-from-last");
         assert_eq!(lis[2].style.color, Color::rgb(0xff, 0, 0), "last");
+    }
+
+    #[test]
+    fn generated_content_builds_before_and_after_boxes() {
+        // ::before prepends, ::after appends; the box inherits from its
+        // originating element and carries the content text; attr() reads the
+        // element; content:none (or no content) generates nothing.
+        let dom = CssEngine::new().style(&parse_html(
+            "<style>               .x::before { content: '-> '; color: #ff0000 }               .x:after { content: attr(data-n) '!'; }               .y::before { content: none; background: #00ff00 }               .z::before { background: #0000ff }             </style>             <p class='x' data-n='42'>mid</p><p class='y'>y</p><p class='z'>z</p>",
+        ));
+        fn by_class<'a>(n: &'a StyledNode, class: &str) -> Option<&'a StyledNode> {
+            if n.attr("class") == Some(class) {
+                return Some(n);
+            }
+            n.children.iter().find_map(|c| match c {
+                StyledChild::Element(e) => by_class(e, class),
+                _ => None,
+            })
+        }
+        let x = by_class(&dom.root, "x").unwrap();
+        let ps = [
+            x,
+            by_class(&dom.root, "y").unwrap(),
+            by_class(&dom.root, "z").unwrap(),
+        ];
+        let first = match &x.children[0] {
+            StyledChild::Element(e) => e,
+            other => panic!("expected ::before element, got {other:?}"),
+        };
+        assert_eq!(first.tag, "::before");
+        assert_eq!(first.text(), "-> ");
+        assert_eq!(first.style.color, Color::rgb(0xff, 0, 0));
+        assert_eq!(first.node_id, x.node_id, "pseudo belongs to its element");
+        let last = match x.children.last().unwrap() {
+            StyledChild::Element(e) => e,
+            other => panic!("expected ::after element, got {other:?}"),
+        };
+        assert_eq!(last.tag, "::after");
+        assert_eq!(last.text(), "42!", "attr() + string concatenation");
+        // content:none and MISSING content both suppress the box.
+        assert!(ps[1]
+            .children
+            .iter()
+            .all(|c| !matches!(c, StyledChild::Element(e) if e.tag.starts_with("::"))));
+        assert!(ps[2]
+            .children
+            .iter()
+            .all(|c| !matches!(c, StyledChild::Element(e) if e.tag.starts_with("::"))));
+    }
+
+    #[test]
+    fn generated_content_empty_string_still_makes_a_box() {
+        // content:"" + a background is the decorative-band/clearfix pattern:
+        // the box exists (and its styles apply) with no text.
+        let dom = CssEngine::new().style(&parse_html(
+            "<style>.band::before { content: ''; background: #112233 }</style>             <div class='band'>t</div>",
+        ));
+        let d = first(&dom.root, "div").unwrap();
+        let b = match &d.children[0] {
+            StyledChild::Element(e) => e,
+            other => panic!("expected ::before, got {other:?}"),
+        };
+        assert_eq!(b.tag, "::before");
+        assert!(b.children.is_empty(), "empty content, no text child");
+        assert_eq!(b.style.background, Some(Color::rgb(0x11, 0x22, 0x33)));
     }
 
     #[test]
@@ -2628,6 +3657,128 @@ mod tests {
         let p = first(&dom.root, "p").unwrap();
         assert_eq!(p.style.margin_top, Len::Px(24), "2*4 + 16(rem) = 24");
         assert_eq!(p.style.margin_left, Len::Px(24), "8 * 3 = 24");
+    }
+
+    // ---- calc() percentage base (FIX 1) ----
+
+    #[test]
+    fn calc_mixed_pct_px_fails_instead_of_resolving_against_font_size() {
+        // `width: calc(100% - 32px)` must not resolve `%` against the font size
+        // (that gave 16 - 32 = a negative width). The containing block isn't
+        // known at style time, so the declaration is dropped and the width
+        // falls back (auto) — Chrome on an 800px block computes 768px.
+        let dom =
+            CssEngine::new().style(&parse_html("<div style='width:calc(100% - 32px)'>x</div>"));
+        assert_eq!(first(&dom.root, "div").unwrap().style.width, Len::Auto);
+        // A longhand that only sets on parse success keeps its prior value.
+        let dom2 = CssEngine::new().style(&parse_html(
+            "<div style='margin-left:8px;margin-left:calc(100% - 32px)'>x</div>",
+        ));
+        assert_eq!(
+            first(&dom2.root, "div").unwrap().style.margin_left,
+            Len::Px(8)
+        );
+    }
+
+    #[test]
+    fn calc_pure_pct_reduces_to_a_percentage() {
+        // A %-only calc reduces to a plain percentage, which resolves against
+        // the containing block at layout — exactly like a literal `50%`.
+        let dom = CssEngine::new().style(&parse_html(
+            "<div style='width:calc(100%);margin-left:calc(25% + 25%)'>x</div>",
+        ));
+        let d = first(&dom.root, "div").unwrap();
+        assert_eq!(d.style.width, Len::Pct(100.0));
+        assert_eq!(d.style.margin_left, Len::Pct(50.0));
+        // % terms that cancel leave a plain px value.
+        let dom2 = CssEngine::new().style(&parse_html(
+            "<div style='width:calc(50% - 50% + 24px)'>x</div>",
+        ));
+        assert_eq!(first(&dom2.root, "div").unwrap().style.width, Len::Px(24));
+    }
+
+    #[test]
+    fn calc_pct_still_folds_for_font_relative_properties() {
+        // For font-size, `%` IS font-relative (of the inherited size), so a
+        // mixed calc still resolves: 100% of 16px + 2px = 18px (Chrome agrees).
+        let dom =
+            CssEngine::new().style(&parse_html("<p style='font-size:calc(100% + 2px)'>x</p>"));
+        assert_eq!(first(&dom.root, "p").unwrap().style.font_size, 18);
+    }
+
+    #[test]
+    fn calc_viewport_units_resolve_against_the_engine_viewport() {
+        // The default engine viewport is 1280×800.
+        let dom = CssEngine::new().style(&parse_html(
+            "<div style='width:calc(50vw - 40px);height:calc(25vh)'>x</div>",
+        ));
+        let d = first(&dom.root, "div").unwrap();
+        assert_eq!(d.style.width, Len::Px(600), "50vw - 40px = 600px");
+        assert_eq!(d.style.height, Len::Px(200), "25vh = 200px");
+    }
+
+    // ---- min()/max()/clamp() (FIX 2) ----
+
+    #[test]
+    fn min_max_evaluate_over_calc_units() {
+        // min/max over px-reducible units (em here: 30em = 480px < 500px).
+        let dom = CssEngine::new().style(&parse_html(
+            "<div style='width:min(500px, 30em);height:max(100px, 10em)'>x</div>",
+        ));
+        let d = first(&dom.root, "div").unwrap();
+        assert_eq!(d.style.width, Len::Px(480));
+        assert_eq!(d.style.height, Len::Px(160));
+        // Pure percentages compare symbolically and stay a percentage.
+        let dom2 = CssEngine::new().style(&parse_html(
+            "<div style='width:min(50%, 80%);height:200px;max-height:max(25%, 10%)'>x</div>",
+        ));
+        let d2 = first(&dom2.root, "div").unwrap();
+        assert_eq!(d2.style.width, Len::Pct(50.0));
+        assert_eq!(d2.style.max_height, Len::Pct(25.0));
+    }
+
+    #[test]
+    fn clamp_picks_lo_mid_hi() {
+        let clamp = |css: &str| {
+            let dom = CssEngine::new().style(&parse_html(&format!("<div style='{css}'>x</div>")));
+            first(&dom.root, "div").unwrap().style.width
+        };
+        assert_eq!(clamp("width:clamp(10px, 5px, 20px)"), Len::Px(10), "lo");
+        assert_eq!(clamp("width:clamp(10px, 15px, 20px)"), Len::Px(15), "mid");
+        assert_eq!(clamp("width:clamp(10px, 25px, 20px)"), Len::Px(20), "hi");
+        // Wrong arity is invalid and falls back.
+        assert_eq!(clamp("width:clamp(10px, 20px)"), Len::Auto);
+    }
+
+    #[test]
+    fn min_max_mixed_pct_px_falls_back_like_calc() {
+        // `%` and px can't be compared without the containing block; the
+        // declaration is dropped rather than mis-resolved (FIX 1 safety rule).
+        let dom =
+            CssEngine::new().style(&parse_html("<div style='width:min(100%, 500px)'>x</div>"));
+        assert_eq!(first(&dom.root, "div").unwrap().style.width, Len::Auto);
+    }
+
+    #[test]
+    fn math_functions_nest_and_leave_minmax_alone() {
+        // min() inside calc() (and vice versa) resolve innermost-first.
+        let dom = CssEngine::new().style(&parse_html(
+            "<div style='width:calc(min(10px, 20px) * 2);height:min(calc(3px * 4), 50px)'>x</div>",
+        ));
+        let d = first(&dom.root, "div").unwrap();
+        assert_eq!(d.style.width, Len::Px(20));
+        assert_eq!(d.style.height, Len::Px(12));
+        // The `max(` substring inside grid `minmax(` is not a math function.
+        let grid = CssEngine::new().style(&parse_html(
+            "<div style='display:grid;grid-template-columns:minmax(100px, 1fr) 2fr'>x</div>",
+        ));
+        assert_eq!(
+            first(&grid.root, "div")
+                .unwrap()
+                .style
+                .grid_template_columns,
+            vec![Track::MinMax(100, TrackMax::Fr(1.0)), Track::Fr(2.0)]
+        );
     }
 
     #[test]
@@ -3305,6 +4456,55 @@ mod tests {
                 .as_deref()
                 .unwrap()
                 .vertical
+        );
+    }
+
+    #[test]
+    fn light_dark_picks_the_light_argument() {
+        // `light-dark(a, b)` → a on the fixed light persona, matching Chrome for
+        // a light user. Args may be nested vars/functions.
+        let dom = CssEngine::new().style(&parse_html(
+            "<div style='background-color: light-dark(#f7f7f8, #212426)'>x</div>",
+        ));
+        assert_eq!(
+            first(&dom.root, "div").unwrap().style.background,
+            Some(Color::rgb(0xf7, 0xf7, 0xf8)),
+            "light-dark takes the light (first) argument"
+        );
+    }
+
+    #[test]
+    fn guaranteed_invalid_var_takes_the_outer_fallback() {
+        // The custom-property "light-dark toggle" every modern design system
+        // compiles to: an `initial` custom property reached through a var()
+        // with no fallback is the GUARANTEED-INVALID value, so the wrapping
+        // `var(--toggle, LIGHT)` must take its LIGHT fallback — not resolve the
+        // inner to empty and keep the dark branch (the MDN regression).
+        let css = "<style>div{\
+            --cs-light:initial;\
+            --toggle:var(--cs-light) #212426;\
+            --bg:var(--toggle,#f7f7f8);\
+            background-color:var(--bg);}\
+            </style><div>x</div>";
+        let dom = CssEngine::new().style(&parse_html(css));
+        assert_eq!(
+            first(&dom.root, "div").unwrap().style.background,
+            Some(Color::rgb(0xf7, 0xf7, 0xf8)),
+            "invalid toggle falls back to the light value"
+        );
+    }
+
+    #[test]
+    fn undefined_var_without_fallback_drops_the_declaration() {
+        // `color: var(--nope)` with no fallback is invalid at computed-value
+        // time → the declaration is dropped and the inherited color kept, not
+        // reset to a default.
+        let css = "<style>p{color:#112233;color:var(--nope)}</style><p>x</p>";
+        let dom = CssEngine::new().style(&parse_html(css));
+        assert_eq!(
+            first(&dom.root, "p").unwrap().style.color,
+            Color::rgb(0x11, 0x22, 0x33),
+            "invalid var() declaration dropped, prior value kept"
         );
     }
 

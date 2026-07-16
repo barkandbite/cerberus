@@ -16,6 +16,13 @@ rfc1       https://www.rfc-editor.org/rfc/rfc1.html   1000 800
 wikipedia  https://www.wikipedia.org          1200 1000
 hn         https://news.ycombinator.com       1200 1000
 
+# Major-brand pages (goal: brand pages render properly vs Chrome). These are
+# JS-heavy; the mirror captures HTML + same-origin assets, so the comparison is
+# the static render both browsers make of the same bytes.
+mozilla    https://www.mozilla.org/en-US/     1200 1000
+apple      https://www.apple.com/             1200 1000
+bbc        https://www.bbc.com/               1200 1000
+
 # Add as fidelity improves (see plan §11 sequencing):
 # mdn      https://developer.mozilla.org/en-US/docs/Web/CSS  1200 1000
 # news     <a stable news front page>          1200 1000

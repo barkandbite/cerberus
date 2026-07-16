@@ -80,6 +80,28 @@ html = html.replace("</head>", css + "</head>", 1)
 open(path, "w", encoding="utf-8").write(html)
 PYHIDE
   fi
+  # Self-contain the mirror: drop cross-origin scripts/styles/frames (the
+  # sandbox can't reach them — Chrome otherwise stalls on their loads until the
+  # kill timeout). Both browsers then render the SAME self-contained bytes,
+  # which is the yardstick's contract.
+  python3 - "$mir/index.html" "$origin" <<'PYSTRIP'
+import re, sys
+path, origin = sys.argv[1], sys.argv[2]
+html = open(path, encoding="utf-8", errors="replace").read()
+# Absolute SAME-origin asset URLs become relative, so the mirror step below
+# fetches them and both browsers load the styled page (mozilla.org's CSS links
+# are absolute; without this the page compared unstyled).
+host = origin.split('//', 1)[1]
+html = re.sub(r'(src|href)\s*=\s*(["\'])(?:https?:)?//' + re.escape(host) + r'/', r'\1=\2/', html, flags=re.I)
+html = re.sub(r'<script\s[^>]*src\s*=\s*["\'](?:https?:)?//[^"\']*["\'][^>]*>\s*</script>', '', html, flags=re.I)
+html = re.sub(r'<link\s[^>]*href\s*=\s*["\'](?:https?:)?//[^"\']*["\'][^>]*>', '', html, flags=re.I)
+html = re.sub(r'<iframe\s[^>]*src\s*=\s*["\'](?:https?:)?//[^"\']*["\'][^>]*>\s*</iframe>', '', html, flags=re.I)
+# Cross-origin images (CDNs) hang Chrome's load event in the sandbox; drop the
+# elements so both browsers lay out the same imageless document.
+html = re.sub(r'<img\s[^>]*src\s*=\s*["\'](?:https?:)?//[^"\']*["\'][^>]*>', '', html, flags=re.I)
+open(path, "w", encoding="utf-8").write(html)
+PYSTRIP
+
   # Mirror same-origin relative assets referenced in the HTML (best-effort). The
   # `|| true` keeps a no-match `grep` (a page with no assets, e.g. example.com)
   # from tripping `pipefail` and aborting the run.
@@ -90,10 +112,16 @@ PYHIDE
       curl -fsSL -A "Mozilla/5.0" "$origin/$p" -o "$mir/$p" 2>/dev/null || true
     done
 
-  local port; port=$(( (RANDOM % 2000) + 8300 ))
+  # Sequential ports from 8300 (clear of Chrome's unsafe-port list; 10080 =
+  # ERR_UNSAFE_PORT). Random ports collided across pages when a previous
+  # page's server lingered — the next page then screenshotted the OLD mirror
+  # (wikipedia scored against a served HN), so each page gets a unique port
+  # and the server is awaited dead before returning.
+  PORT_SEQ=$(( ${PORT_SEQ:-8299} + 1 ))
+  local port=$PORT_SEQ
   ( cd "$mir" && python3 -m http.server "$port" --bind 127.0.0.1 >/dev/null 2>&1 ) &
   local srv=$!
-  trap 'kill "$srv" 2>/dev/null || true' RETURN
+  trap 'kill "$srv" 2>/dev/null || true; wait "$srv" 2>/dev/null || true' RETURN
   # Wait for the server to accept connections.
   local local_url="http://127.0.0.1:$port/index.html" i
   for i in 1 2 3 4 5 6 7 8 9 10; do

@@ -6,7 +6,7 @@
 //! reimplemented without touching layout. Layout consumes only these types.
 
 use cerberus_dom::{Document, NodeId};
-use cerberus_types::{Color, FontStyle, ImageFit, ImagePos, Point};
+use cerberus_types::{Color, FontStyle, GenericFamily, ImageFit, ImagePos, Point};
 
 /// CSS `position`. `Static` is normal flow; the rest are positioned.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
@@ -98,6 +98,11 @@ pub enum VerticalAlign {
     Baseline,
     Sub,
     Super,
+    /// `top` / `middle` / `bottom` / `text-top` / `text-bottom` — alignments
+    /// that take a replaced box OFF the baseline. Not positioned distinctly
+    /// (boxes stay top-aligned), but they must suppress the baseline strut
+    /// descent an inline image otherwise reserves below itself.
+    OffBaseline,
 }
 
 /// CSS `white-space`: how whitespace and newlines in inline content collapse,
@@ -164,6 +169,19 @@ impl LineHeight {
             LineHeight::Normal => default_px,
             LineHeight::Factor(f) => (f * font_size as f32).round().max(0.0) as i32,
             LineHeight::Px(px) => px,
+        }
+    }
+
+    /// [`resolve`](Self::resolve) without the rounding. Chrome keeps used
+    /// line-height fractional (`line-height: 1.15` on 16px text is 18.4px, and
+    /// `normal` is the face's exact metric ratio); the inline flow accumulates
+    /// this and rounds per line, so line N lands at `round(N × pitch)` instead
+    /// of drifting by the rounding error each line.
+    pub fn resolve_f(self, font_size: u32, default: f32) -> f32 {
+        match self {
+            LineHeight::Normal => default,
+            LineHeight::Factor(f) => (f * font_size as f32).max(0.0),
+            LineHeight::Px(px) => px as f32,
         }
     }
 }
@@ -250,6 +268,11 @@ pub enum TextAlign {
     Left,
     Center,
     Right,
+    /// The legacy `<center>` value (`-webkit-center`): centers inline content
+    /// like `center` AND centers child table boxes — but does NOT survive into
+    /// table cells (their text stays left unless the cell sets its own
+    /// alignment), matching how the reference renders `<center><table>`.
+    WebkitCenter,
 }
 
 /// CSS `flex-direction` (v1: the two main axes).
@@ -340,6 +363,16 @@ pub struct ComputedStyle {
     pub background_image: Option<String>,
     pub font_size: u32,
     pub font: FontStyle,
+    /// Whether `font-size` is still the initial `medium` keyword (no explicit
+    /// length/keyword set on this element or an ancestor). Inherited. Chrome
+    /// resolves `medium` to 13px for the monospace generic and 16px otherwise
+    /// (the "monospace renders smaller" quirk), so the cascade applies that once
+    /// both `font-size` and `font-family` are known.
+    pub font_size_medium: bool,
+    /// The generic family this element's `font-family` resolves to (serif /
+    /// sans-serif / monospace / …). Inherited. Selects the bundled face at
+    /// rasterization; the named fonts themselves are never shipped.
+    pub font_family: GenericFamily,
     pub text_align: TextAlign,
     pub underline: bool,
     /// `text-decoration: line-through` (strikethrough). Inherited alongside
@@ -408,6 +441,10 @@ pub struct ComputedStyle {
     /// (`hidden`/`clip`/`scroll`/`auto` — we clip rather than scroll) — ADR-0043.
     /// Not inherited.
     pub overflow_clip: bool,
+    /// `text-overflow: ellipsis`: when a non-wrapping line is clipped by the box,
+    /// truncate it and append an ellipsis (`…`) instead of a hard cut. Applies
+    /// with `overflow` clipping and `white-space: nowrap`. Not inherited.
+    pub text_overflow_ellipsis: bool,
     /// `border-radius` (px, uniform), `background: linear-gradient(...)`, and
     /// `box-shadow` (ADR-0041). The rare gradient/shadow are boxed so the common
     /// element (neither) pays only a null pointer. Not inherited.
@@ -433,8 +470,21 @@ pub struct ComputedStyle {
     /// `white-space`: whitespace collapsing, newline preservation, and wrapping.
     /// Inherited.
     pub white_space: WhiteSpace,
+    /// `display: inline-flex` / `inline-grid`: the container is an ATOMIC
+    /// INLINE box (flows on the current line, like an inline-block) whose
+    /// inside establishes the flex/grid formatting context. `display` keeps
+    /// the Flex/Grid variant for the inner context; this flag carries the
+    /// outer inline level. Not inherited.
+    pub display_inline_level: bool,
     /// `visibility: hidden` — laid out but not painted. Inherited.
     pub visibility: Visibility,
+    /// SVG `fill` from the CSS cascade (inherited, as in SVG): the computed
+    /// paint an inline `<svg>`'s content inherits — `currentColor` resolves to
+    /// the element's `color` at cascade time. The app injects this into the
+    /// pre-rasterized payload's root, since resvg never sees author CSS
+    /// (mozilla's flag is `fill: var(--m24-green)` on a root with
+    /// `fill="none"`). `None` = no CSS fill; the markup's own attrs apply.
+    pub fill: Option<Color>,
     /// `opacity` in `[0.0, 1.0]`, composited in paint. Not inherited.
     pub opacity: f32,
     /// Flex/grid container properties (meaningful only when `display` is
@@ -470,6 +520,14 @@ pub struct ComputedStyle {
     /// 1 unless the item spans multiple tracks. Reset per element (ADR-0038).
     pub grid_column_span: u32,
     pub grid_row_span: u32,
+    /// Explicit numeric grid-line placement (`grid-column: 2 / 9`, `1 / -1`):
+    /// CSS line numbers, 1-based, negative counting from the end (`-1` is the
+    /// line after the last track), resolved against the real track count at
+    /// layout. `None` = auto-placed.
+    pub grid_column_start: Option<i32>,
+    pub grid_column_end: Option<i32>,
+    pub grid_row_start: Option<i32>,
+    pub grid_row_end: Option<i32>,
     /// The item used named-line/area placement we don't resolve (e.g.
     /// `grid-column: content`); layout places it in the container's widest
     /// (content) track rather than dumping it into a leading gutter (ADR-0038).
@@ -494,6 +552,11 @@ impl ComputedStyle {
             background_image: None,
             font_size: 16,
             font: FontStyle::REGULAR,
+            font_size_medium: true,
+            // Chrome's UA default for a page that never sets `font-family` is a
+            // serif (Times), not a sans — an unstyled page must render serif or
+            // every wrap point and heading drifts from the reference.
+            font_family: GenericFamily::Serif,
             text_align: TextAlign::Left,
             underline: false,
             line_through: false,
@@ -529,6 +592,7 @@ impl ComputedStyle {
             border_color: Color::BLACK,
             box_sizing: BoxSizing::ContentBox,
             overflow_clip: false,
+            text_overflow_ellipsis: false,
             border_radius: 0,
             background_gradient: None,
             box_shadow: None,
@@ -538,7 +602,9 @@ impl ComputedStyle {
             background_position: ImagePos::TOP_LEFT,
             background_position_px: Point::ZERO,
             white_space: WhiteSpace::Normal,
+            display_inline_level: false,
             visibility: Visibility::Visible,
+            fill: None,
             opacity: 1.0,
             flex_direction: FlexDirection::Row,
             flex_reverse: false,
@@ -558,6 +624,10 @@ impl ComputedStyle {
             grid_cols_named: false,
             grid_column_span: 1,
             grid_row_span: 1,
+            grid_column_start: None,
+            grid_column_end: None,
+            grid_row_start: None,
+            grid_row_end: None,
             grid_named_place: false,
             position: Position::Static,
             inset_top: Len::Auto,
@@ -575,6 +645,8 @@ impl ComputedStyle {
             color: self.color,
             font_size: self.font_size,
             font: self.font,
+            font_size_medium: self.font_size_medium,
+            font_family: self.font_family,
             text_align: self.text_align,
             underline: self.underline,
             line_through: self.line_through,
@@ -586,7 +658,9 @@ impl ComputedStyle {
             vertical_align: VerticalAlign::Baseline,
             text_indent: self.text_indent,
             white_space: self.white_space,
+            display_inline_level: false,
             visibility: self.visibility,
+            fill: self.fill,
             // Reset per element:
             display: Display::Inline,
             background: None,
@@ -617,6 +691,7 @@ impl ComputedStyle {
             border_color: Color::BLACK,
             box_sizing: BoxSizing::ContentBox,
             overflow_clip: false,
+            text_overflow_ellipsis: false,
             border_radius: 0,
             background_gradient: None,
             box_shadow: None,
@@ -645,6 +720,10 @@ impl ComputedStyle {
             grid_cols_named: false,
             grid_column_span: 1,
             grid_row_span: 1,
+            grid_column_start: None,
+            grid_column_end: None,
+            grid_row_start: None,
+            grid_row_end: None,
             grid_named_place: false,
             // Positioning is not inherited; every element starts in normal flow.
             position: Position::Static,

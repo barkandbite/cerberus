@@ -16,3 +16,5 @@ cerberus-types = { path = "../cerberus-types" }
 cerberus-paint = { path = "../cerberus-paint" }
 ab_glyph = "0.2"
 rustybuzz = "0.20.1"
+skrifa = "0.44.0"
+ab_glyph_rasterizer = "0.1.10"

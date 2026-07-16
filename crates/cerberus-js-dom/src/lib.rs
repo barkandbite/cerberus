@@ -2500,10 +2500,29 @@ pub const DOM_MODEL_PRELUDE: &str = r##"
       hasFocus: function () { return true; },
     };
     // FontFaceSet + DOMImplementation: present on every document; sensors read
-    // document.fonts.ready and implementation.createHTMLDocument.
+    // document.fonts.ready and implementation.createHTMLDocument, and probe
+    // document.fonts.check("<size> '<Family>'") to enumerate installed fonts.
+    // check() consults this head's presented font set so it agrees with the
+    // measureText-based enumeration defense (both keyed off the same per-head
+    // list) — a generic family, or a name in __CERBERUS_PROFILE__.fonts, is
+    // "available"; anything else is not. size stays 0 (it counts page @font-face
+    // loads, not system fonts) to match a real FontFaceSet.
     document.fonts = {
       ready: Promise.resolve(), status: "loaded", size: 0,
-      check: function () { return true; },
+      check: function (font) {
+        var s = String(font || "");
+        var m = /(?:\d*\.?\d+)(?:px|pt|pc|em|rem|ex|ch|vw|vh|%)\s+(.+)$/.exec(s);
+        var fam = (m ? m[1] : s).split(",")[0].trim().replace(/^["']|["']$/g, "").toLowerCase();
+        if (!fam) return true;
+        var GEN = { "serif":1,"sans-serif":1,"monospace":1,"cursive":1,"fantasy":1,
+          "system-ui":1,"ui-serif":1,"ui-sans-serif":1,"ui-monospace":1,"ui-rounded":1,
+          "math":1,"emoji":1,"-apple-system":1,"blinkmacsystemfont":1 };
+        if (GEN[fam]) return true;
+        var p = g.__CERBERUS_PROFILE__, list = (p && p.fonts) || null;
+        if (!list) return true; // no persona wired: don't leak "nothing installed"
+        for (var i = 0; i < list.length; i++) { if (String(list[i]).toLowerCase() === fam) return true; }
+        return false;
+      },
       load: function () { return Promise.resolve([]); },
       values: function () { return [][Symbol.iterator](); },
       forEach: function () {},

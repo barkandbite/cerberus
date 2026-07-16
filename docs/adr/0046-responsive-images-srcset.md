@@ -54,11 +54,10 @@ disagree, layout looks up a URL that was never fetched and the image is blank.
 
 ## Limitations (follow-ups)
 
-- **`<picture>` `<source srcset media>` is not selected** — the `<img>` fallback
-  child renders (it always has a valid `src`). This is often *preferable* for us:
-  art-direction sources are frequently `avif`/`webp`, which our decoder may not
-  handle, whereas the fallback is `jpg`/`png`. A future pass can pick a `<source>`
-  when its `type`/`media` are supported.
+- ~~**`<picture>` `<source srcset media>` is not selected**~~ — **done in
+  ADR-0048.** `pick_picture_url` now selects the first `<source>` whose `type` we
+  can decode and whose `media` matches, resolving through the same `select_srcset`,
+  and falls back to the `<img>` otherwise.
 - Length positions in `sizes` beyond `px`/`vw`/`%` (e.g. `calc()`, `em`) fall back
   to the default width.
 - DPR is fixed at 1, so density `2x`/`3x` assets are never chosen (by design — the

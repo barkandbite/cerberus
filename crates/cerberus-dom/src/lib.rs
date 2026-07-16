@@ -75,6 +75,28 @@ impl Document {
     pub fn title(&self) -> Option<String> {
         find_title(self.root())
     }
+
+    /// Replace the node at `id` **in place** with a childless element carrying
+    /// `tag` and `attrs`. Every other node keeps its id, so id-keyed side tables
+    /// (e.g. the JS-realm correlation map) stay valid. The old subtree's arena
+    /// entries become unreachable but are not freed — callers swap small
+    /// subtrees (the app rewrites an inline `<svg>` into a synthetic replaced
+    /// element after serializing it), so the residue is negligible.
+    /// Out-of-range ids are ignored.
+    pub fn replace_element(
+        &mut self,
+        id: NodeId,
+        tag: impl Into<String>,
+        attrs: Vec<(String, String)>,
+    ) {
+        if let Some(slot) = self.nodes.get_mut(id as usize) {
+            *slot = NodeData::Element {
+                tag: tag.into(),
+                attrs,
+                children: Vec::new(),
+            };
+        }
+    }
 }
 
 /// Depth-first search for the first `<title>` with non-empty trimmed text.
@@ -731,11 +753,15 @@ fn find_ci(haystack: &str, needle: &str) -> Option<usize> {
     })
 }
 
-/// Decode HTML entities, collapse runs of *collapsible* whitespace to single
-/// spaces, and trim. Only ASCII whitespace collapses: `&nbsp;` (U+00A0) is a
+/// Decode HTML entities and collapse runs of *collapsible* whitespace to
+/// single spaces — INCLUDING a leading/trailing run, which collapses to one
+/// space rather than being trimmed. That boundary space is meaningful across
+/// inline elements (`provided by <a>…` keeps its word gap; `<a>RFC 6761</a>,`
+/// has none — issue #137); layout's whitespace processing decides whether it
+/// renders. Only ASCII whitespace collapses: `&nbsp;` (U+00A0) is a
 /// non-breaking space that CSS whitespace processing preserves verbatim, so it
-/// must survive collapsing and trimming — hence `is_ascii_whitespace` rather than
-/// the Unicode `is_whitespace`, which would fold NBSP into a plain breakable space.
+/// must survive collapsing — hence `is_ascii_whitespace` rather than the
+/// Unicode `is_whitespace`, which would fold NBSP into a plain breakable space.
 fn clean_text(raw: &str) -> String {
     let decoded = decode_entities(raw);
     let mut out = String::with_capacity(decoded.len());
@@ -751,8 +777,7 @@ fn clean_text(raw: &str) -> String {
             prev_space = false;
         }
     }
-    out.trim_matches(|c: char| c.is_ascii_whitespace())
-        .to_string()
+    out
 }
 
 fn decode_entities(s: &str) -> String {
@@ -1228,6 +1253,26 @@ mod tests {
         assert!(kids[1].is_element());
         assert_eq!(kids[1].tag(), "b");
         assert_eq!(kids[1].text_content(), "there");
+    }
+
+    #[test]
+    fn replace_element_swaps_in_place_and_keeps_sibling_ids() {
+        let mut doc = parse_html("<p>before</p><svg width='10'><path d='M0 0'/></svg><p>after</p>");
+        let svg = find_tag(doc.root(), "svg").expect("svg").id();
+        let before = find_tag(doc.root(), "p").expect("p").id();
+        doc.replace_element(svg, "img", vec![("src".into(), "cerb-inline-svg:0".into())]);
+        // The node is now a childless <img> with the new attrs...
+        let img = doc.node(svg).expect("node still addressable");
+        assert_eq!(img.tag(), "img");
+        assert_eq!(img.attr("src"), Some("cerb-inline-svg:0"));
+        assert_eq!(img.attr("width"), None, "old attrs dropped");
+        assert_eq!(img.children().count(), 0, "subtree detached");
+        // ...siblings keep their ids and content.
+        assert_eq!(doc.node(before).expect("p").text_content(), "before");
+        assert!(find_tag(doc.root(), "path").is_none(), "path unreachable");
+        assert!(doc.root().text_content().contains("after"));
+        // An out-of-range id is a no-op, not a panic.
+        doc.replace_element(u32::MAX, "img", Vec::new());
     }
 
     #[test]

@@ -2292,3 +2292,39 @@ fn set_value_then_input_event_sees_and_can_change_value() {
         "the handler's value rewrite is reflected in the serialized DOM"
     );
 }
+
+#[test]
+fn document_fonts_check_consults_the_persona_font_list() {
+    // document.fonts.check enumerates installed fonts. With a per-head font set
+    // injected (as the profile prologue does), a generic family and a listed
+    // family resolve; an unlisted family does not — so check() agrees with the
+    // measureText-based enumeration defense on one per-head-random list.
+    let (mut engine, realm) = engine_and_realm();
+    engine
+        .eval(
+            realm,
+            "globalThis.__CERBERUS_PROFILE__ = { fonts: ['Georgia', 'Consolas'] };",
+        )
+        .expect("set profile");
+    let doc = doc_with_div_x();
+    let scripts = vec!["var x = document.getElementById('x'); \
+         x.setAttribute('c-generic', String(document.fonts.check('12px monospace'))); \
+         x.setAttribute('c-listed', String(document.fonts.check(\"12px 'Georgia'\"))); \
+         x.setAttribute('c-stack', String(document.fonts.check('italic bold 14px \"Consolas\", monospace'))); \
+         x.setAttribute('c-absent', String(document.fonts.check(\"12px 'No Such Font 9000'\")));"
+        .to_string()];
+    let out = run_page_scripts(engine.as_mut(), realm, &doc, &scripts, &env()).expect("run");
+    let x = find_id(out.root(), "x").expect("#x present");
+    assert_eq!(x.attr("c-generic"), Some("true"), "generic family resolves");
+    assert_eq!(x.attr("c-listed"), Some("true"), "listed family resolves");
+    assert_eq!(
+        x.attr("c-stack"),
+        Some("true"),
+        "first family in a stack is listed"
+    );
+    assert_eq!(
+        x.attr("c-absent"),
+        Some("false"),
+        "unlisted family does not resolve"
+    );
+}

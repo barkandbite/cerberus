@@ -6,9 +6,16 @@
 //! `:nth-last-child(an+b)`, the `*-of-type` family (`:first-of-type`,
 //! `:last-of-type`, `:only-of-type`, `:nth-of-type(an+b)`,
 //! `:nth-last-of-type(an+b)`), `:not(…)`,
+//! `:is(…)`/`:where(…)` over simple-compound argument lists, `:has(…)` as a
+//! direct-child subset,
 //! `:root`), grouping `,`, and the descendant / child (`>`) / adjacent-sibling
-//! (`+`) / general-sibling (`~`) combinators. State pseudo-classes (`:hover`,
-//! `:focus`, `:active`, `:visited`, `:link`) parse but never match in the static
+//! (`+`) / general-sibling (`~`) combinators. Statically answerable state
+//! pseudo-classes match from attributes: `:link`/`:any-link` (an `<a>`/`<area>`
+//! with `href` — nothing is visited in a fresh head), `:disabled`/`:enabled`
+//! (the `disabled` attribute on a form control), `:checked` (`input[checked]`,
+//! `option[selected]`). Interaction pseudo-classes (`:hover`, `:focus`,
+//! `:active`, `:visited`) and any unknown/unsupported pseudo parse but never
+//! match in the static
 //! cascade. `@media` blocks are parsed and gated on the viewport plus the fixed
 //! desktop persona (`prefers-color-scheme: light`, no reduced-motion/contrast,
 //! `hover`/`pointer: fine`, no forced colors) — matching what JS `matchMedia`
@@ -34,6 +41,9 @@ pub struct SiblingRef {
     pub id: Option<String>,
     pub classes: Vec<String>,
     pub attrs: Vec<(String, String)>,
+    /// The element's direct element children, one level deep (the children's
+    /// own lists are empty), so `:has(...)` can check them during the cascade.
+    pub children: Rc<[SiblingRef]>,
 }
 
 /// An element on the match path: its parent's element children (shared via `Rc`
@@ -73,6 +83,13 @@ enum AttrOp {
     Substr,  // *=
 }
 
+/// A renderable pseudo-element (`::before`/`::after`, either colon form).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PseudoElement {
+    Before,
+    After,
+}
+
 #[derive(Clone, Debug)]
 enum Pseudo {
     FirstChild,
@@ -88,7 +105,29 @@ enum Pseudo {
     NthOfType(i32, i32),
     NthLastOfType(i32, i32), // an+b among same-tag siblings, counting from the end
     Root,
-    Never, // :hover/:focus/:active/:visited/:link — no static match
+    /// `:link` / `:any-link` — an `<a>`/`<area>` carrying `href`. Nothing is
+    /// ever visited in a fresh sealed head, so `:link` covers every hyperlink,
+    /// exactly like Chrome with empty history (and `a:link{…}` is how a large
+    /// share of sites style their links — dropping it left them UA blue).
+    Link,
+    /// `:disabled` / `:enabled` — a form control with/without the `disabled`
+    /// attribute (rest state; fieldset inheritance not modelled).
+    Disabled,
+    Enabled,
+    /// `:checked` — `input[checked]` / `option[selected]` (rest state).
+    Checked,
+    /// `:is(...)`/`:where(...)`: matches when ANY argument compound matches
+    /// the element itself. They differ only in specificity — `:where` adds
+    /// nothing, `:is` its most specific argument (CSS Selectors 4).
+    Is(Vec<Compound>),
+    Where(Vec<Compound>),
+    /// `:has(...)` restricted to DIRECT children: matches when any element
+    /// child matches any argument compound. Both `:has(> x)` and `:has(x)`
+    /// check children only — `SiblingRef` carries one level of children, so
+    /// deeper descent isn't reachable from the match path. This under-matches
+    /// Chrome for descendant arguments but never over-matches.
+    HasChild(Vec<Compound>),
+    Never, // :hover/:focus/unknown/unsupported — no static match
 }
 
 #[derive(Clone, Debug, Default)]
@@ -101,18 +140,42 @@ struct Compound {
     attrs: Vec<AttrSel>,
     pseudos: Vec<Pseudo>,
     not: Vec<Compound>,
+    /// `::before`/`::after` on this compound. Only meaningful on a selector's
+    /// LAST compound: the selector then targets the generated box, never the
+    /// real element ([`Selector::matches`] refuses it; the cascade queries it
+    /// through [`Rule::matches_pseudo`]).
+    pseudo_element: Option<PseudoElement>,
 }
 
 impl Compound {
     fn specificity(&self) -> Specificity {
+        fn add(s: &mut Specificity, o: Specificity) {
+            s.0 += o.0;
+            s.1 += o.1;
+            s.2 += o.2;
+        }
         let mut s = (
             u32::from(self.id.is_some()),
-            self.classes.len() as u32 + self.attrs.len() as u32 + self.pseudos.len() as u32,
-            u32::from(self.tag.is_some()),
+            self.classes.len() as u32 + self.attrs.len() as u32,
+            // A pseudo-element counts at type level (CSS 2.1 §6.4.3).
+            u32::from(self.tag.is_some()) + u32::from(self.pseudo_element.is_some()),
         );
+        for p in &self.pseudos {
+            match p {
+                // `:is()`/`:has()` contribute their most specific argument;
+                // `:where()` contributes zero (CSS Selectors 4).
+                Pseudo::Is(args) | Pseudo::HasChild(args) => {
+                    if let Some(m) = args.iter().map(Compound::specificity).max() {
+                        add(&mut s, m);
+                    }
+                }
+                Pseudo::Where(_) => {}
+                // Every other pseudo-class counts at class level.
+                _ => s.1 += 1,
+            }
+        }
         for n in &self.not {
-            let inner = n.specificity();
-            s = (s.0 + inner.0, s.1 + inner.1, s.2 + inner.2);
+            add(&mut s, n.specificity());
         }
         s
     }
@@ -205,8 +268,34 @@ fn pseudo_matches(
         Pseudo::NthOfType(a, b) => nth_matches(*a, *b, type_pos()),
         Pseudo::NthLastOfType(a, b) => nth_matches(*a, *b, type_total() as i32 - type_pos() + 1),
         Pseudo::Root => el.tag == "html",
+        Pseudo::Link => (el.tag == "a" || el.tag == "area") && has_attr(el, "href"),
+        Pseudo::Disabled => is_form_control(&el.tag) && has_attr(el, "disabled"),
+        Pseudo::Enabled => is_form_control(&el.tag) && !has_attr(el, "disabled"),
+        Pseudo::Checked => {
+            (el.tag == "input" && has_attr(el, "checked"))
+                || (el.tag == "option" && has_attr(el, "selected"))
+        }
+        Pseudo::Is(args) | Pseudo::Where(args) => {
+            args.iter().any(|a| a.matches(el, index, total, siblings))
+        }
+        Pseudo::HasChild(args) => el.children.iter().enumerate().any(|(i, child)| {
+            args.iter()
+                .any(|a| a.matches(child, i, el.children.len(), &el.children))
+        }),
         Pseudo::Never => false,
     }
+}
+
+fn has_attr(el: &SiblingRef, name: &str) -> bool {
+    el.attrs.iter().any(|(k, _)| k == name)
+}
+
+/// The tags `:enabled`/`:disabled` apply to (form-associated elements).
+fn is_form_control(tag: &str) -> bool {
+    matches!(
+        tag,
+        "button" | "input" | "select" | "textarea" | "option" | "optgroup" | "fieldset"
+    )
 }
 
 /// Whether `pos` (1-based) satisfies `an + b` for some integer n ≥ 0.
@@ -233,8 +322,30 @@ impl Selector {
     }
 
     /// Match against an ancestor path (root … element); the element is last.
+    /// A selector targeting a pseudo-element never matches the element itself.
     fn matches(&self, path: &[ElemRef]) -> bool {
-        if self.compounds.is_empty() || path.is_empty() {
+        if self.compounds.is_empty()
+            || path.is_empty()
+            || self.compounds.iter().any(|c| c.pseudo_element.is_some())
+        {
+            return false;
+        }
+        let last = path.len() - 1;
+        self.match_at(self.compounds.len() - 1, path, last, path[last].index)
+    }
+
+    /// Match this selector's BASE (originating-element part) against `path`,
+    /// for a selector whose last compound targets the given pseudo-element.
+    fn matches_pseudo(&self, path: &[ElemRef], which: PseudoElement) -> bool {
+        let Some(last_c) = self.compounds.last() else {
+            return false;
+        };
+        if last_c.pseudo_element != Some(which)
+            || path.is_empty()
+            || self.compounds[..self.compounds.len() - 1]
+                .iter()
+                .any(|c| c.pseudo_element.is_some())
+        {
             return false;
         }
         let last = path.len() - 1;
@@ -344,6 +455,17 @@ impl Rule {
     /// Whether this rule applies under `ctx` (no `@media`, or it matches).
     pub fn applies(&self, ctx: MediaContext) -> bool {
         self.media.as_ref().is_none_or(|m| m.matches(ctx))
+    }
+
+    /// The highest specificity among this rule's selectors that target the
+    /// given pseudo-element of the element at `path`, if any — how the cascade
+    /// finds the declarations for a generated `::before`/`::after` box.
+    pub fn matches_pseudo(&self, path: &[ElemRef], which: PseudoElement) -> Option<Specificity> {
+        self.selectors
+            .iter()
+            .filter(|s| s.matches_pseudo(path, which))
+            .map(Selector::specificity)
+            .max()
     }
 }
 
@@ -519,7 +641,10 @@ fn parse_media_query(text: &str) -> MediaQuery {
             for part in branch.split(" and ") {
                 let part = part.trim().trim_start_matches("only ").trim();
                 if let Some(inner) = part.strip_prefix('(').and_then(|p| p.strip_suffix(')')) {
-                    if let Some(f) = parse_media_feature(inner.trim()) {
+                    let inner = inner.trim();
+                    if let Some(fs) = parse_range_media_feature(inner) {
+                        feats.extend(fs);
+                    } else if let Some(f) = parse_media_feature(inner) {
                         feats.push(f);
                     }
                 } else if !part.is_empty() {
@@ -540,6 +665,117 @@ fn parse_media_query(text: &str) -> MediaQuery {
         })
         .collect();
     MediaQuery { branches }
+}
+
+/// Media Queries Level 4 range syntax: `(width <= 1000px)`, `(width < 1200px)`,
+/// the reversed `(1000px >= width)`, and the double-bounded
+/// `(400px <= width <= 1000px)`. Standard on newly-built sites — iana.org alone
+/// has 64 such blocks; treating them as unrecognized (AlwaysFalse) silently
+/// dropped every responsive tier, so pages rendered their desktop-widest CSS
+/// at every viewport. Returns `None` when `text` isn't range syntax (so the
+/// plain `name: value` path runs), and `[AlwaysFalse]` for range syntax over a
+/// feature we can't evaluate (per spec: unknown → not matching).
+fn parse_range_media_feature(text: &str) -> Option<Vec<MediaFeature>> {
+    if text.contains(':') || !text.contains(['<', '>', '=']) {
+        return None;
+    }
+    // Tokenize into operands separated by comparison operators.
+    let mut ops: Vec<&str> = Vec::new();
+    let mut operands: Vec<&str> = Vec::new();
+    let mut rest = text;
+    while let Some(i) = rest.find(['<', '>', '=']) {
+        operands.push(rest[..i].trim());
+        let len = if rest.as_bytes()[i] != b'=' && rest.as_bytes().get(i + 1) == Some(&b'=') {
+            2
+        } else {
+            1
+        };
+        ops.push(&rest[i..i + len]);
+        rest = &rest[i + len..];
+    }
+    operands.push(rest.trim());
+
+    // `500px <= width` reads as `width >= 500px`: normalize name-on-left.
+    fn flip(op: &str) -> &str {
+        match op {
+            "<=" => ">=",
+            ">=" => "<=",
+            "<" => ">",
+            ">" => "<",
+            other => other,
+        }
+    }
+    // One comparison as Min/Max features (`=` pins both bounds). `<`/`>` are
+    // exclusive; the viewport is integer px, so ±1 is exact.
+    fn feats(name: &str, op: &str, value: &str) -> Option<Vec<MediaFeature>> {
+        let px = media_len_px(value)?;
+        let width = match name.trim().to_ascii_lowercase().as_str() {
+            "width" => true,
+            "height" => false,
+            _ => return None,
+        };
+        let min = |px: u32| {
+            if width {
+                MediaFeature::MinWidth(px)
+            } else {
+                MediaFeature::MinHeight(px)
+            }
+        };
+        let max = |px: u32| {
+            if width {
+                MediaFeature::MaxWidth(px)
+            } else {
+                MediaFeature::MaxHeight(px)
+            }
+        };
+        Some(match op {
+            "<=" => vec![max(px)],
+            "<" => vec![max(px.saturating_sub(1))],
+            ">=" => vec![min(px)],
+            ">" => vec![min(px.saturating_add(1))],
+            "=" => vec![min(px), max(px)],
+            _ => return None,
+        })
+    }
+    let parsed = match (operands.as_slice(), ops.as_slice()) {
+        // `width <= 1000px` / `1000px >= width`
+        ([a, b], [op]) => {
+            if a.eq_ignore_ascii_case("width") || a.eq_ignore_ascii_case("height") {
+                feats(a, op, b)
+            } else {
+                feats(b, flip(op), a)
+            }
+        }
+        // `400px <= width <= 1000px` (each bound normalized name-on-left).
+        ([lo, name, hi], [op1, op2]) => match (feats(name, flip(op1), lo), feats(name, op2, hi)) {
+            (Some(mut a), Some(b)) => {
+                a.extend(b);
+                Some(a)
+            }
+            _ => None,
+        },
+        _ => None,
+    };
+    // Range syntax we couldn't evaluate (unknown feature/unit) is still range
+    // syntax: unknown → false, not a fall-through to the `name: value` parser.
+    Some(parsed.unwrap_or_else(|| vec![MediaFeature::AlwaysFalse]))
+}
+
+/// A `<length>` in a media-feature range, in px. Media-query `em`/`rem` resolve
+/// against the initial font size (16px), never the element's.
+fn media_len_px(v: &str) -> Option<u32> {
+    let v = v.trim().to_ascii_lowercase();
+    let num_end = v
+        .find(|c: char| !c.is_ascii_digit() && c != '.')
+        .unwrap_or(v.len());
+    let n: f32 = v[..num_end].parse().ok()?;
+    let px = match v[num_end..].trim() {
+        "px" => n,
+        "em" | "rem" => n * 16.0,
+        "" if n == 0.0 => 0.0,
+        _ => return None,
+    };
+    Some(px.round().max(0.0) as u32)
 }
 
 fn parse_media_feature(text: &str) -> Option<MediaFeature> {
@@ -582,7 +818,10 @@ fn parse_media_feature(text: &str) -> Option<MediaFeature> {
 }
 
 fn parse_selectors(text: &str) -> Vec<Selector> {
-    text.split(',')
+    // Split at top-level commas only, so the comma inside a functional
+    // pseudo-class argument (`:is(a, b)`) doesn't split the selector itself.
+    crate::split_top_commas(text)
+        .iter()
         .filter_map(|s| {
             let sel = parse_selector(s.trim());
             (!sel.compounds.is_empty()).then_some(sel)
@@ -593,13 +832,15 @@ fn parse_selectors(text: &str) -> Vec<Selector> {
 fn parse_selector(text: &str) -> Selector {
     let mut compounds = Vec::new();
     let mut pending = Combinator::Descendant;
-    for token in text.split_whitespace() {
-        match token {
+    // Top-level whitespace split: spaces inside a functional pseudo argument
+    // (`:has(> a)`, `:nth-child(2n + 1)`) don't break the compound apart.
+    for token in crate::split_top(text) {
+        match token.as_str() {
             ">" => pending = Combinator::Child,
             "+" => pending = Combinator::Adjacent,
             "~" => pending = Combinator::General,
             _ => {
-                if let Some(mut c) = parse_compound(token) {
+                if let Some(mut c) = parse_compound(&token) {
                     // The first compound's combinator is unused; the rest carry
                     // their relation to the compound on their left.
                     c.combinator = if compounds.is_empty() {
@@ -700,7 +941,8 @@ fn parse_compound(token: &str) -> Option<Compound> {
         || !c.classes.is_empty()
         || !c.attrs.is_empty()
         || !c.pseudos.is_empty()
-        || !c.not.is_empty();
+        || !c.not.is_empty()
+        || c.pseudo_element.is_some();
     any.then_some(c)
 }
 
@@ -739,12 +981,104 @@ fn apply_pseudo(c: &mut Compound, name: &str, arg: &str) {
                 c.not.push(inner);
             }
         }
-        // State pseudo-classes have no static answer; force a non-match so we
-        // never wrongly apply (e.g.) :hover styles at rest.
-        "hover" | "focus" | "active" | "visited" | "link" | "focus-within" | "focus-visible"
-        | "checked" | "disabled" | "enabled" => c.pseudos.push(Pseudo::Never),
-        _ => {} // unknown pseudo — ignore (matches nothing extra)
+        // Statically answerable state: every hyperlink is unvisited in a fresh
+        // sealed head, so `:link`/`:any-link` = "an <a>/<area> with href", and
+        // disabled/checked read straight off the attributes (rest state).
+        "link" | "any-link" => c.pseudos.push(Pseudo::Link),
+        "disabled" => c.pseudos.push(Pseudo::Disabled),
+        "enabled" => c.pseudos.push(Pseudo::Enabled),
+        "checked" => c.pseudos.push(Pseudo::Checked),
+        // `:is(...)`/`:where(...)` over a selector list of simple compounds.
+        // The list is forgiving (CSS Selectors 4): arguments we can't parse or
+        // evaluate (combinators) are dropped; an empty result matches nothing.
+        "is" | "where" => {
+            let args = parse_compound_list(arg);
+            c.pseudos.push(match (args.is_empty(), name == "is") {
+                (true, _) => Pseudo::Never,
+                (false, true) => Pseudo::Is(args),
+                (false, false) => Pseudo::Where(args),
+            });
+        }
+        // `:has(...)` with single-compound arguments and an optional leading
+        // `>`; both forms check direct children (see `Pseudo::HasChild`).
+        "has" => {
+            let args = parse_has_args(arg);
+            c.pseudos.push(if args.is_empty() {
+                Pseudo::Never
+            } else {
+                Pseudo::HasChild(args)
+            });
+        }
+        // Interaction state has no static answer; force a non-match so we never
+        // wrongly apply (e.g.) :hover styles at rest. `:visited` is genuinely
+        // empty (fresh profile), matching Chrome with no history.
+        "hover" | "focus" | "active" | "visited" | "focus-within" | "focus-visible" => {
+            c.pseudos.push(Pseudo::Never)
+        }
+        // The renderable pseudo-elements (either colon form): mark the
+        // compound so the cascade can generate the box; Selector::matches
+        // refuses these for the real element.
+        "before" => c.pseudo_element = Some(PseudoElement::Before),
+        "after" => c.pseudo_element = Some(PseudoElement::After),
+        // Any OTHER pseudo — an unrendered pseudo-element (`:marker`,
+        // `:placeholder`, ...) or an unrecognized class — must make the selector
+        // match NOTHING. Ignoring it instead degraded
+        // `.x:before{position:absolute;top:-1px;background:...}` to `.x{...}`,
+        // absolutely positioning the real element to the viewport top and
+        // painting the pseudo's decoration band across the page (measured on
+        // mozilla.org's `.m24-c-transition:before` staircase bands).
+        _ => c.pseudos.push(Pseudo::Never),
     }
+}
+
+/// Parse a `:is()`/`:where()` argument list: top-level-comma-separated simple
+/// compounds. An argument with top-level combinators/whitespace (not
+/// evaluable against a single element) or that fails to parse is dropped.
+fn parse_compound_list(arg: &str) -> Vec<Compound> {
+    crate::split_top_commas(arg)
+        .iter()
+        .filter_map(|part| {
+            let part = part.trim();
+            (!has_top_level_structure(part))
+                .then(|| parse_compound(part))
+                .flatten()
+        })
+        .collect()
+}
+
+/// Parse `:has()` arguments: each a single compound with an optional leading
+/// `>` combinator. Descendant/sibling arguments are dropped (under-match).
+fn parse_has_args(arg: &str) -> Vec<Compound> {
+    crate::split_top_commas(arg)
+        .iter()
+        .filter_map(|part| {
+            let part = part.trim();
+            let rest = match part.strip_prefix('>') {
+                Some(r) => r.trim_start(),
+                None => part,
+            };
+            (!has_top_level_structure(rest))
+                .then(|| parse_compound(rest))
+                .flatten()
+        })
+        .collect()
+}
+
+/// Whether `s` has top-level (outside parentheses) whitespace or a combinator —
+/// i.e. it is more than one simple compound.
+fn has_top_level_structure(s: &str) -> bool {
+    let mut depth = 0i32;
+    for ch in s.chars() {
+        match ch {
+            '(' => depth += 1,
+            ')' => depth = (depth - 1).max(0),
+            c if depth == 0 && (c.is_whitespace() || matches!(c, '>' | '+' | '~')) => {
+                return true;
+            }
+            _ => {}
+        }
+    }
+    false
 }
 
 /// Parse the `An+B` microsyntax: `odd`, `even`, `3`, `2n`, `2n+1`, `-n+3`, `n`.
@@ -873,7 +1207,13 @@ mod tests {
                 .iter()
                 .map(|(k, v)| (k.to_string(), v.to_string()))
                 .collect(),
+            children: Rc::from([]),
         }
+    }
+
+    fn with_children(mut r: SiblingRef, kids: Vec<SiblingRef>) -> SiblingRef {
+        r.children = kids.into();
+        r
     }
 
     /// Build a path where each level is a single only-child (no siblings).
@@ -1013,8 +1353,173 @@ mod tests {
 
     #[test]
     fn state_pseudos_never_match_statically() {
-        let path = chain(vec![sref("a", None, &[], &[])]);
+        let path = chain(vec![sref("a", None, &[], &[("href", "/x")])]);
         assert!(!matches("a:hover { a: b }", &path));
+        assert!(!matches("a:visited { a: b }", &path));
+        assert!(!matches("a:focus { a: b }", &path));
+    }
+
+    #[test]
+    fn link_pseudo_matches_hyperlinks_with_href() {
+        // Every hyperlink is unvisited in a fresh head, so `a:link` (how a large
+        // share of sites style links) must match an <a href> — dropping it left
+        // links UA-blue on styled pages (the iana regression).
+        let with_href = chain(vec![sref("a", None, &[], &[("href", "/x")])]);
+        let no_href = chain(vec![sref("a", None, &[], &[])]);
+        assert!(matches("a:link { color: green }", &with_href));
+        assert!(matches("a:any-link { color: green }", &with_href));
+        assert!(
+            !matches("a:link { color: green }", &no_href),
+            "a placeholder <a> without href is not a link"
+        );
+        // The classic pair applies through its :link branch.
+        assert!(matches("a:link, a:visited { color: green }", &with_href));
+        // A non-anchor with href is not a hyperlink.
+        let div = chain(vec![sref("div", None, &[], &[("href", "/x")])]);
+        assert!(!matches("div:link { color: green }", &div));
+    }
+
+    #[test]
+    fn form_state_pseudos_read_attributes() {
+        let disabled = chain(vec![sref("button", None, &[], &[("disabled", "")])]);
+        let enabled = chain(vec![sref("button", None, &[], &[])]);
+        assert!(matches("button:disabled { opacity: 0.5 }", &disabled));
+        assert!(!matches("button:disabled { opacity: 0.5 }", &enabled));
+        assert!(matches("button:enabled { color: red }", &enabled));
+        assert!(!matches("button:enabled { color: red }", &disabled));
+        // :enabled applies only to form controls, not arbitrary elements.
+        let div = chain(vec![sref("div", None, &[], &[])]);
+        assert!(!matches("div:enabled { color: red }", &div));
+
+        let checked = chain(vec![sref("input", None, &[], &[("checked", "")])]);
+        let unchecked = chain(vec![sref("input", None, &[], &[])]);
+        assert!(matches("input:checked { outline: x }", &checked));
+        assert!(!matches("input:checked { outline: x }", &unchecked));
+        let selected = chain(vec![sref("option", None, &[], &[("selected", "")])]);
+        assert!(matches("option:checked { font-weight: bold }", &selected));
+    }
+
+    #[test]
+    fn pseudo_element_selectors_never_match_the_real_element() {
+        // `.x:before { position:absolute; background:… }` styles a PSEUDO
+        // element we don't render. Ignoring the `:before` degraded the selector
+        // to `.x{…}` — absolutely positioning the real element to the viewport
+        // top and painting its decoration band across the page (measured on
+        // mozilla.org's `.m24-c-transition:before`). Both colon forms must
+        // match nothing, as must unrecognized pseudo-classes.
+        let div = chain(vec![sref("div", None, &["x"], &[])]);
+        assert!(!matches(".x:before { background: red }", &div));
+        assert!(!matches(".x::before { background: red }", &div));
+        assert!(!matches(".x::after { background: red }", &div));
+        assert!(!matches(".x:some-future-pseudo { color: red }", &div));
+        // The plain selector still matches, and a GROUP still applies through
+        // its valid member.
+        assert!(matches(".x { background: red }", &div));
+        assert!(matches(".y:before, .x { background: red }", &div));
+    }
+
+    #[test]
+    fn unknown_pseudos_never_match() {
+        // A rule guarded by a pseudo we can't evaluate must not apply to the
+        // element itself (Chrome drops such rules entirely).
+        let path = chain(vec![sref("p", None, &[], &[])]);
+        assert!(!matches("p:target { a: b }", &path));
+        assert!(!matches("p::first-line { a: b }", &path));
+        // ...while `:not(<never-matching>)` stays vacuously true.
+        assert!(matches("p:not(:target) { a: b }", &path));
+    }
+
+    #[test]
+    fn is_and_where_match_any_argument_compound() {
+        let at = |classes: &[&str]| chain(vec![sref("p", None, classes, &[])]);
+        assert!(matches("p:is(.a, .b) { x: y }", &at(&["b"])));
+        assert!(!matches("p:is(.a, .b) { x: y }", &at(&["c"])));
+        assert!(matches(":where(.a, p) { x: y }", &at(&[])));
+        // The list is forgiving: an argument we can't evaluate (combinators)
+        // is dropped while the rest still match…
+        assert!(matches("p:is(div span, .b) { x: y }", &at(&["b"])));
+        // …and with no usable argument the pseudo never matches.
+        assert!(!matches("p:is(div span) { x: y }", &at(&["b"])));
+        // A top-level comma inside :is() must not split the selector list.
+        let sheet = parse_stylesheet("p:is(.a, .b), h1 { x: y }");
+        assert_eq!(sheet.rules[0].selectors.len(), 2);
+        assert!(sheet.rules[0]
+            .matches(&chain(vec![sref("h1", None, &[], &[])]))
+            .is_some());
+    }
+
+    #[test]
+    fn is_takes_max_argument_specificity_where_takes_none() {
+        let spec = |css: &str| parse_stylesheet(css).rules[0].selectors[0].specificity();
+        assert_eq!(
+            spec("p:is(#a, .b) { x: y }"),
+            (1, 0, 1),
+            ":is contributes its most specific argument"
+        );
+        assert_eq!(
+            spec("p:where(#a, .b) { x: y }"),
+            (0, 0, 1),
+            ":where contributes zero"
+        );
+        assert_eq!(
+            spec("div:has(.b) { x: y }"),
+            (0, 1, 1),
+            ":has contributes its most specific argument"
+        );
+    }
+
+    #[test]
+    fn has_matches_direct_children_only() {
+        let a = sref("a", None, &[], &[("href", "#")]);
+        let div_direct = with_children(sref("div", None, &[], &[]), vec![a.clone()]);
+        let span_with_a = with_children(sref("span", None, &[], &[]), vec![a.clone()]);
+        let div_nested = with_children(sref("div", None, &[], &[]), vec![span_with_a]);
+        assert!(matches(
+            "div:has(> a) { x: y }",
+            &chain(vec![div_direct.clone()])
+        ));
+        assert!(matches(
+            "div:has(a[href]) { x: y }",
+            &chain(vec![div_direct.clone()])
+        ));
+        assert!(!matches(
+            "div:has(> a) { x: y }",
+            &chain(vec![div_nested.clone()])
+        ));
+        // Documented subset: Chrome's `:has(a)` also matches via a grandchild;
+        // `SiblingRef` carries one level of children, so we under-match here
+        // (never over-match).
+        assert!(!matches("div:has(a) { x: y }", &chain(vec![div_nested])));
+        // No matching child, no match; a descendant argument is unsupported
+        // and never matches.
+        assert!(!matches(
+            "div:has(> p) { x: y }",
+            &chain(vec![div_direct.clone()])
+        ));
+        assert!(!matches(
+            "div:has(span a) { x: y }",
+            &chain(vec![div_direct])
+        ));
+    }
+
+    #[test]
+    fn has_evaluates_structural_pseudos_of_children() {
+        let li = |cls: &[&str]| sref("li", None, cls, &[]);
+        let ul = with_children(sref("ul", None, &[], &[]), vec![li(&[]), li(&["x"])]);
+        // The second child is :nth-child(2) — and `2n + 1` style spaces inside
+        // the argument survive the (now paren-aware) selector tokenizer.
+        assert!(matches(
+            "ul:has(> li:nth-child(2).x) { a: b }",
+            &chain(vec![ul.clone()])
+        ));
+        assert!(matches(
+            "ul:has(> li:nth-child(2n + 1)) { a: b }",
+            &chain(vec![ul.clone()])
+        ));
+        assert!(!matches(
+            "ul:has(> li:nth-child(3)) { a: b }",
+            &chain(vec![ul])
+        ));
     }
 
     #[test]
@@ -1029,6 +1534,41 @@ mod tests {
             width: 1200,
             height: 800
         }));
+    }
+
+    #[test]
+    fn media_query_range_syntax() {
+        // MQ4 range syntax — iana.org alone has 64 such blocks; treating them
+        // as unrecognized dropped every responsive tier, so pages rendered
+        // their desktop-widest CSS at every viewport.
+        let at = |css: &str, width: u32| {
+            parse_stylesheet(css).rules[0].applies(MediaContext { width, height: 700 })
+        };
+        let css = "@media (width <= 1000px) { p { color: red } }";
+        assert!(at(css, 1000), "inclusive bound");
+        assert!(!at(css, 1001));
+        let css = "@media (width < 1200px) { p { color: red } }";
+        assert!(at(css, 1199), "exclusive bound");
+        assert!(!at(css, 1200));
+        let css = "@media (width >= 800px) { p { color: red } }";
+        assert!(at(css, 800));
+        assert!(!at(css, 799));
+        // Reversed operand order.
+        let css = "@media (1000px >= width) { p { color: red } }";
+        assert!(at(css, 1000));
+        assert!(!at(css, 1001));
+        // Double-bounded.
+        let css = "@media (400px <= width <= 1000px) { p { color: red } }";
+        assert!(at(css, 400));
+        assert!(at(css, 1000));
+        assert!(!at(css, 399));
+        assert!(!at(css, 1001));
+        // Range syntax over a feature we can't evaluate: false, not vacuous.
+        assert!(!at("@media (aspect-ratio > 1) { p { color: red } }", 1000));
+        // Combined with `screen and`.
+        let css = "@media screen and (width <= 1000px) { p { color: red } }";
+        assert!(at(css, 900));
+        assert!(!at(css, 1100));
     }
 
     #[test]

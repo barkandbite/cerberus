@@ -17,7 +17,7 @@ use cerberus_style::{
     AlignItems, ComputedStyle, Display, FlexDirection, JustifyContent, Len, ListStyleType,
     StyledChild, StyledDom, StyledNode, TextAlign, TextTransform, Track, TrackMax, VerticalAlign,
 };
-use cerberus_types::{Color, FontStyle, Point, Rect, Size};
+use cerberus_types::{Color, FontStyle, GenericFamily, Point, Rect, Size};
 use std::sync::Arc;
 
 /// A clickable link region produced by layout (in layout-local coordinates).
@@ -281,11 +281,51 @@ impl FormState for NoForms {
     }
 }
 
+/// How an `<img>` is presented: as its decoded graphic, or as its text
+/// alternative (alt/title/caption). Text-only saves memory, CPU, and network —
+/// the bytes are never fetched or decoded — and is a per-image user option (the
+/// app maps a global default plus per-image overrides onto the provider).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub enum ImageDisplayMode {
+    /// Decode and paint the image (the browser default).
+    #[default]
+    Graphical,
+    /// Render the image's text alternative instead of the graphic.
+    TextOnly,
+}
+
+impl ImageDisplayMode {
+    /// Parse a mode name (`graphical` / `text-only`, `text` accepted); unknown
+    /// names fall back to `Graphical`.
+    pub fn parse(s: &str) -> Self {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "text-only" | "text" | "textonly" | "caption" => ImageDisplayMode::TextOnly,
+            _ => ImageDisplayMode::Graphical,
+        }
+    }
+
+    /// Read the default from the `CERB_IMAGES` env var (default `Graphical`), so
+    /// a session can run text-only without a rebuild.
+    pub fn from_env() -> Self {
+        std::env::var("CERB_IMAGES")
+            .map(|v| Self::parse(&v))
+            .unwrap_or_default()
+    }
+}
+
 /// Supplies decoded images to layout, keyed by an element's `src`/`data-src`.
 /// Resolution/fetching/decoding all happen inside the implementation.
 pub trait ImageProvider {
     /// The decoded image for `src`, if available.
     fn get(&self, src: &str) -> Option<Arc<DecodedImage>>;
+
+    /// Whether this image should render as its text alternative (alt/caption)
+    /// instead of the graphic — the resource-saving text-only option. Default
+    /// `false` (always graphical). When `true`, layout draws the text chip and
+    /// never asks for the decoded bytes.
+    fn render_as_text(&self, _src: &str) -> bool {
+        false
+    }
 }
 
 /// An image provider with nothing (placeholders / alt text only).
@@ -353,16 +393,13 @@ pub trait LayoutEngine: Send {
 
 /// Block/inline flow layout. The only knob is the page margin; everything else
 /// comes from the cascade.
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, Default)]
 pub struct BlockLayout {
-    /// Page margin in pixels.
+    /// Extra page margin in pixels. Defaults to 0: the page inset is the UA
+    /// stylesheet's `body { margin: 8px }` (as in Chrome), so a page that sets
+    /// `body{margin:0}` really reaches the viewport edge — a fixed engine inset
+    /// shifted every such page by 8px on both axes.
     pub margin: i32,
-}
-
-impl Default for BlockLayout {
-    fn default() -> Self {
-        Self { margin: 8 }
-    }
 }
 
 impl LayoutEngine for BlockLayout {
@@ -381,6 +418,9 @@ impl LayoutEngine for BlockLayout {
         let mut ctx = Ctx::new(self.margin, max_width, viewport, shaper, images, forms);
         ctx.walk(&styled.root, None);
         ctx.flush_line();
+        // Realize the last block's deferred bottom margin so the document height
+        // still includes a trailing margin, as before collapsing was deferred.
+        ctx.flush_vmargin();
         ctx.finish_positioned();
         LaidOut {
             display: ctx.display,
@@ -398,6 +438,11 @@ type CellLayout = (Vec<DisplayItem>, Vec<LinkBox>, Vec<FormFieldBox>, i32);
 /// One placed run of text on the current (not-yet-aligned) line.
 struct LinePiece {
     x: i32,
+    /// Sub-pixel remainder of the piece's TRUE x origin (`x + frac_x` is the
+    /// exact fractional position captured from the inline cursor). Emitted
+    /// into `DisplayItem::Glyphs::frac_x` so the rasterizer starts the pen at
+    /// Chrome's fractional run position.
+    frac_x: f32,
     y: i32,
     w: u32,
     px: u32,
@@ -463,6 +508,38 @@ struct Ctx<'a> {
     max_x: i32,
     /// Tallest content on the current line (text or image), in pixels.
     line_h: i32,
+    /// The current line's tallest *fractional* line-height. Chrome keeps used
+    /// line-height fractional (16px Arial-metric `normal` is 18.398px, not 18)
+    /// and rounds only where each line lands, so line N sits at
+    /// `round(N × pitch)`. `newline` advances by this, carrying the sub-pixel
+    /// remainder in `line_frac`; `line_h` (its rounding) still sizes boxes.
+    line_hf: f32,
+    /// Sub-pixel line-pitch debt carried across `newline`s (see `line_hf`).
+    line_frac: f32,
+    /// Sub-pixel inline-cursor debt within the current line. Inter-word gaps
+    /// are fractional (a Liberation Sans space at 16px advances 4.453px, not
+    /// 4); the flow carries the remainder across gaps and rounds per
+    /// placement, and the wrap test compares the fractional total — otherwise
+    /// a 20-space line runs ~9px narrow, fits one extra word, and flips the
+    /// wrap point Chrome takes (shifting everything below). Reset at each
+    /// line start; glyph runs already carry their own remainder internally.
+    x_frac: f32,
+    /// Flowing inside a table cell. Legacy `<center>` (`-webkit-center`)
+    /// centering does NOT propagate across a cell boundary (measured on the
+    /// reference: HN's `<center><table>…<td><table>` leaves the inner
+    /// item-list table at the cell's LEFT edge, ~187px left of where
+    /// re-centering would put it) — `table()` only honors an inherited
+    /// WebkitCenter when this is false.
+    in_cell: bool,
+    /// A collapsible space from the SOURCE text is pending before the next
+    /// word/run (issue #137). Whitespace state must cross inline-element
+    /// boundaries: `<a>RFC 6761</a>, a` has NO space before the comma (the
+    /// old x-position heuristic invented one → "6761 , a"), while
+    /// `by <span nowrap>Public…` has a real one that the nowrap fast path
+    /// dropped → "byPublic". Set by `add_text` from each text node's actual
+    /// leading/inter-word/trailing whitespace; consumed by the next
+    /// `add_word`/`add_run` placement.
+    pending_space: bool,
     line: Vec<LinePiece>,
     line_align: TextAlign,
     /// Output-buffer lengths at the start of the current line, so `text-align`
@@ -516,6 +593,18 @@ struct Ctx<'a> {
     /// Pending `text-indent` (px) for the current block's first line, consumed as
     /// the leading offset of the first word placed and then zeroed.
     pending_indent: i32,
+    /// The `<source>` candidates of the `<picture>` currently being laid out, so
+    /// its child `<img>` resolves its URL through them (type/media selection)
+    /// rather than through its own `src`/`srcset` alone. Set while walking a
+    /// `<picture>`, cleared immediately after its `<img>` — never leaks to a
+    /// sibling image (ADR-0046: fetch and paint pick the same candidate).
+    cur_picture: Option<Vec<OwnedPictureSource>>,
+    /// The bottom margin of the most recently closed block, deferred so it can
+    /// collapse with the NEXT block sibling's top margin (CSS 2.1 §8.3.1: the
+    /// separation is max(positives)+min(negatives), not the sum — without this
+    /// every `p+p` gap doubled and text pages drifted ever farther down).
+    /// Realized as-is by `flush_vmargin` when non-block content follows.
+    pending_vmargin: i32,
 }
 
 impl<'a> Ctx<'a> {
@@ -543,6 +632,11 @@ impl<'a> Ctx<'a> {
             y: margin,
             max_x: margin,
             line_h: 0,
+            line_hf: 0.0,
+            line_frac: 0.0,
+            x_frac: 0.0,
+            in_cell: false,
+            pending_space: false,
             line: Vec::new(),
             line_align: TextAlign::Left,
             line_disp0: 0,
@@ -562,6 +656,8 @@ impl<'a> Ctx<'a> {
             as_block_once: false,
             list_ordinal: 0,
             pending_indent: 0,
+            cur_picture: None,
+            pending_vmargin: 0,
         }
     }
 
@@ -606,6 +702,11 @@ impl<'a> Ctx<'a> {
             y,
             max_x: left,
             line_h: 0,
+            line_hf: 0.0,
+            line_frac: 0.0,
+            x_frac: 0.0,
+            in_cell: false,
+            pending_space: false,
             line: Vec::new(),
             line_align: TextAlign::Left,
             line_disp0: 0,
@@ -625,6 +726,8 @@ impl<'a> Ctx<'a> {
             as_block_once: false,
             list_ordinal: 0,
             pending_indent: 0,
+            cur_picture: None,
+            pending_vmargin: 0,
         }
     }
 
@@ -641,7 +744,7 @@ impl<'a> Ctx<'a> {
         let visible = !subtree_hidden && style.visibility == cerberus_style::Visibility::Visible;
         match node.tag.as_str() {
             "br" => {
-                self.line_break(style.font_size.max(1));
+                self.line_break(style.font_size.max(1), style.font_family);
                 return;
             }
             "hr" => {
@@ -665,6 +768,62 @@ impl<'a> Ctx<'a> {
                     }
                 }
                 return;
+            }
+            // An inline `<svg>` the app pre-rasterized keeps its tag (so author
+            // `svg{…}` tag selectors size/hide it) and carries a synthetic
+            // `src` — treat it as the replaced image it now is. A RAW svg
+            // subtree (no `src`; a path that skipped the rewrite) renders
+            // nothing: its `<text>`/`<title>` must not leak as page text.
+            "svg" => {
+                if visible && node.attr("src").is_some() {
+                    let base = self.positioned_base(style);
+                    self.image(node, in_link);
+                    if let Some(base) = base {
+                        self.apply_positioning(style, base);
+                    }
+                }
+                return;
+            }
+            "picture" => {
+                // A <picture> with a direct <img> selects one URL from its
+                // <source> children (by `type`/`media`) and renders that <img>
+                // with it (WHATWG "select an image source"); its <source>/other
+                // children paint nothing. With NO direct <img> (invalid, but
+                // possible) fall through to normal container layout so any nested
+                // content still renders — matching the fetch collector.
+                if let Some(img) = node.children.iter().find_map(|c| match c {
+                    StyledChild::Element(e) if e.tag == "img" => Some(e.as_ref()),
+                    _ => None,
+                }) {
+                    // Honor the <img>'s OWN box-suppression, exactly as the bare
+                    // "img" arm does: `display:none`, `visibility:hidden`, or an
+                    // `opacity:0` (here or via the group) draws nothing.
+                    let img_style = &img.style;
+                    let img_hidden = self.opacity_hidden || img_style.opacity == 0.0;
+                    let img_visible = !img_hidden
+                        && img_style.visibility == cerberus_style::Visibility::Visible
+                        && img_style.display != Display::None;
+                    if visible && img_visible {
+                        // Honor a block-level <picture> (e.g. `picture{display:block}`)
+                        // by breaking the line around its image.
+                        let block = style.display == Display::Block;
+                        if block {
+                            self.flush_line();
+                        }
+                        self.cur_picture = Some(collect_picture_sources(node));
+                        let base = self.positioned_base(&img.style);
+                        self.image(img, in_link);
+                        if let Some(base) = base {
+                            self.apply_positioning(&img.style, base);
+                        }
+                        self.cur_picture = None;
+                        if block {
+                            self.flush_line();
+                        }
+                    }
+                    return;
+                }
+                // No direct <img>: fall through to the generic container path.
             }
             "input" => {
                 if visible {
@@ -792,16 +951,29 @@ impl<'a> Ctx<'a> {
             None
         };
 
+        // `display: inline-flex`/`inline-grid`: an ATOMIC INLINE box (flows on
+        // the current line like an inline-block) whose inside is the flex/grid
+        // context — block-level promotion broke the surrounding line, putting
+        // each such box on its own row. The atom's own sub-layout re-enters
+        // with `as_block_once` set and falls through to the container match.
+        if style.display_inline_level && !self.as_block_once {
+            self.add_inline_block(node, href);
+            self.cur_link_node = saved_link_node;
+            return;
+        }
         // Flex/grid containers lay their items out and return; everything else
         // falls through to block/inline flow.
         match style.display {
             Display::Flex => {
-                self.flex_layout(node);
+                // `href` (not the raw in_link): an <a> wrapping the container
+                // keeps its links clickable inside the items — the common
+                // brand-page card pattern (<a><div class=grid>headline…).
+                self.flex_layout(node, href);
                 self.cur_link_node = saved_link_node;
                 return;
             }
             Display::Grid => {
-                self.grid_layout(node);
+                self.grid_layout(node, href);
                 self.cur_link_node = saved_link_node;
                 return;
             }
@@ -838,7 +1010,23 @@ impl<'a> Ctx<'a> {
             self.flush_line();
             self.line_align = style.text_align;
             let avail = (self.right - self.left).max(1);
-            self.y += self.resolve_margin(style.margin_top, avail);
+            // Adjacent-sibling margin collapsing (CSS 2.1 §8.3.1): this block's
+            // top margin and the previous block sibling's deferred bottom margin
+            // join as max(positives) + min(negatives), not their sum.
+            let mt = self.resolve_margin(style.margin_top, avail);
+            let prev = std::mem::take(&mut self.pending_vmargin);
+            let joined = prev.max(mt).max(0) + prev.min(mt).min(0);
+            if style.border_top + style.padding_top == 0 {
+                // Parent/first-child collapse-through (§8.3.1): with no top
+                // border/padding, this box's top margin keeps collapsing with
+                // its first block child's — so DEFER it (the border-box top
+                // below projects the gap known so far; a deeper child margin
+                // that enlarges it shifts content but not this box's painted
+                // top, an accepted v1 approximation).
+                self.pending_vmargin = joined;
+            } else {
+                self.y += joined;
+            }
             let (pl, pr) = (style.padding_left, style.padding_right);
             let (bl, br) = (style.border_left, style.border_right);
             let h_extra = pl + pr + bl + br;
@@ -880,7 +1068,9 @@ impl<'a> Ctx<'a> {
             bbox = Some(BorderBox {
                 left: box_left,
                 right: box_left + box_w,
-                top: self.y,
+                // Projected top: any still-deferred margin sits ABOVE this box
+                // (it collapses through), so the painted box starts below it.
+                top: self.y + self.pending_vmargin,
                 bt: style.border_top,
                 br,
                 bb: style.border_bottom,
@@ -902,7 +1092,7 @@ impl<'a> Ctx<'a> {
                     .unwrap_or(self.vh);
                 self.cb_stack.push(ContainingBlock {
                     x: box_left,
-                    y: self.y,
+                    y: self.y + self.pending_vmargin,
                     w: box_w,
                     h: cb_h,
                 });
@@ -917,8 +1107,26 @@ impl<'a> Ctx<'a> {
             self.mark_line_start();
             if visible && style.display == Display::ListItem {
                 if let Some(m) = list_marker(style.list_style_type, self.list_ordinal) {
-                    self.add_run(&m, style, None);
-                    self.x += space_width(self.shaper, style.font_size.max(1)) as i32;
+                    // `list-style-position: outside` (the CSS default): the
+                    // marker hangs in the list's padding with its right edge a
+                    // gap before the content edge, and the first line starts
+                    // AT the content edge — flowing it inline instead shifted
+                    // every list line right by marker+space (~14px) and let a
+                    // block-level first child push the marker onto its own
+                    // line. Drawn directly (not via the line buffer), so it
+                    // never participates in wrapping or text-align.
+                    self.flush_vmargin();
+                    let px = style.font_size.max(1);
+                    let (glyphs, w) = self.shape_run(&m, px, style);
+                    let gap = space_width(self.shaper, px, style.font_family) as i32;
+                    let x = (self.left - w as i32 - gap).max(0);
+                    self.display.push(DisplayItem::Glyphs {
+                        origin: Point::new(x, self.y),
+                        frac_x: 0.0,
+                        glyphs,
+                        color: style.color,
+                        style: style.font,
+                    });
                 }
             }
             // Arm `text-indent` for this block's first line: it is consumed as the
@@ -957,9 +1165,21 @@ impl<'a> Ctx<'a> {
         for child in &node.children {
             match child {
                 StyledChild::Text(t) => {
-                    self.flush_floats(&mut fb);
-                    if visible {
-                        self.add_text(t, style, href);
+                    // A whitespace-only node (source indentation between
+                    // elements) is not content: it only arms the
+                    // inter-element space (#137). It must NOT close the float
+                    // band — the newline between a float-left logo and a
+                    // float-right nav would otherwise push the nav below the
+                    // logo (iana's header/footer stacked exactly that way).
+                    if t.trim().is_empty() {
+                        if visible && !t.is_empty() {
+                            self.pending_space = true;
+                        }
+                    } else {
+                        self.flush_floats(&mut fb);
+                        if visible {
+                            self.add_text(t, style, href);
+                        }
                     }
                 }
                 StyledChild::Element(e)
@@ -997,6 +1217,17 @@ impl<'a> Ctx<'a> {
 
         if is_block {
             self.flush_line();
+            // A bottom margin still pending from our LAST block child is
+            // contained by our bottom padding/border (it adds to our height);
+            // with neither, it escapes and collapses with our own bottom margin
+            // instead (CSS 2.1 §8.3.1 parent/last-child), contributing nothing
+            // to this box's auto height.
+            let escaped = if style.padding_bottom + style.border_bottom > 0 {
+                self.flush_vmargin();
+                0
+            } else {
+                std::mem::take(&mut self.pending_vmargin)
+            };
             // Close the box: bottom padding + border, then apply height/min-height/
             // max-height (ADR-0042) before painting the border box (ADR-0040).
             self.y += style.padding_bottom + style.border_bottom;
@@ -1026,7 +1257,10 @@ impl<'a> Ctx<'a> {
             if self.measuring {
                 self.max_x += style.padding_right + style.border_right;
             }
-            self.y += self.resolve_margin(style.margin_bottom, (saved_right0 - saved_left).max(1));
+            // Defer our bottom margin (joined with any escaped last-child
+            // margin) so it can collapse with the next sibling's top margin.
+            let mb = self.resolve_margin(style.margin_bottom, (saved_right0 - saved_left).max(1));
+            self.pending_vmargin = escaped.max(mb).max(0) + escaped.min(mb).min(0);
             self.left = saved_left;
             self.right = saved_right0;
             self.x = self.left;
@@ -1219,12 +1453,17 @@ impl<'a> Ctx<'a> {
     }
 
     /// Shape a run and apply `letter-spacing` (px, may be negative) to advances,
-    /// returning the glyphs and their total width (ADR-0041).
+    /// returning the glyphs and their total width (ADR-0041). Shaping is styled:
+    /// a bold/italic run measures with the real variant face when the shaper
+    /// bundles one (Times bold is wider than regular), so wrap points match.
     fn shape_run(&self, text: &str, px: u32, style: &ComputedStyle) -> (Vec<GlyphBox>, u32) {
-        let mut glyphs = self.shaper.shape(text, px);
+        let mut glyphs = self
+            .shaper
+            .shape_styled(text, px, style.font_family, style.font);
         if style.letter_spacing != 0 {
             for g in &mut glyphs {
                 g.advance = (g.advance as i32 + style.letter_spacing).max(0) as u32;
+                g.advance_f = (g.advance_f + style.letter_spacing as f32).max(0.0);
             }
         }
         let w = glyphs.iter().map(|g| g.advance).sum();
@@ -1250,6 +1489,14 @@ impl<'a> Ctx<'a> {
             }
         };
         let ws = style.white_space;
+        // Collapsible whitespace state crosses element boundaries (#137):
+        // leading whitespace arms `pending_space` for the first word, inter-word
+        // whitespace re-arms it between words, and after the node it reflects
+        // the node's TRAILING whitespace — so `provided by <a>…` keeps its real
+        // space and `<a>RFC 6761</a>,` gets none. A whitespace-only node
+        // (`</a> <a>`) arms the flag without placing anything.
+        let starts_ws = text.starts_with(|c: char| c.is_ascii_whitespace());
+        let ends_ws = text.ends_with(|c: char| c.is_ascii_whitespace());
         if ws.preserves_newlines() {
             // `pre`/`pre-wrap`/`pre-line`: an explicit `\n` is a hard break. Each
             // resulting line then either preserves its spaces (and maybe wraps) or
@@ -1257,7 +1504,7 @@ impl<'a> Ctx<'a> {
             let mut first = true;
             for line in text.split('\n') {
                 if !first {
-                    self.line_break(style.font_size.max(1));
+                    self.line_break(style.font_size.max(1), style.font_family);
                 }
                 first = false;
                 if line.is_empty() {
@@ -1277,23 +1524,41 @@ impl<'a> Ctx<'a> {
                     // are preserved and the collapsed words still wrap.
                     for word in line.split_ascii_whitespace() {
                         self.add_word(word, style, href);
+                        self.pending_space = true;
                     }
                 }
             }
+            // Preserved-space content manages its own spacing literally.
+            self.pending_space = false;
         } else if !ws.wraps() {
             // `white-space: nowrap`: collapse runs of whitespace to single spaces
             // like normal text, but place the whole thing as one atomic run so it
             // never wraps (it may overflow the container, per spec).
+            if starts_ws {
+                self.pending_space = true;
+            }
             let collapsed = text.split_ascii_whitespace().collect::<Vec<_>>().join(" ");
             if !collapsed.is_empty() {
                 self.add_run(&collapsed, style, href);
+                self.pending_space = ends_ws;
+            } else if !text.is_empty() {
+                self.pending_space = true;
             }
         } else {
             // Split on ASCII whitespace only, so a non-breaking space (`&nbsp;`,
             // U+00A0) keeps the words it joins on the same line rather than
             // becoming a wrap opportunity.
+            if starts_ws {
+                self.pending_space = true;
+            }
+            let mut placed_any = false;
             for word in text.split_ascii_whitespace() {
                 self.add_word(word, style, href);
+                self.pending_space = true;
+                placed_any = true;
+            }
+            if placed_any {
+                self.pending_space = ends_ws;
             }
         }
     }
@@ -1306,9 +1571,13 @@ impl<'a> Ctx<'a> {
     /// counted as one space each — a small simplification, noted here.
     fn add_pre_wrap_line(&mut self, line: &str, style: &ComputedStyle, href: Option<&str>) {
         let px = style.font_size.max(1);
-        let sw = space_width(self.shaper, px) as i32;
-        // Accumulated leading-whitespace width for the next word.
-        let mut lead = 0i32;
+        let sw = self
+            .shaper
+            .space_advance_styled_f(px, style.font_family, style.font);
+        // Accumulated leading-whitespace width for the next word (fractional —
+        // a preserved space run's width is `count × exact advance`; see
+        // `x_frac`).
+        let mut lead = 0.0f32;
         let mut chars = line.chars().peekable();
         while let Some(&c) = chars.peek() {
             // Only ASCII whitespace is a break opportunity / collapsible gap; a
@@ -1329,23 +1598,24 @@ impl<'a> Ctx<'a> {
             }
             let (glyphs, w) = self.shape_run(&word, px, style);
             let at_line_start = self.x == self.left;
-            if !at_line_start && self.x + lead + w as i32 > self.right {
+            if !at_line_start && self.x as f32 + self.x_frac + lead + w as f32 > self.right as f32 {
                 // Wrap: the pending space run hangs at the end of the old line.
                 self.newline();
             } else {
-                self.x += lead;
+                self.advance_x_f(lead);
             }
-            lead = 0;
+            lead = 0.0;
             self.push_piece(px, w, glyphs, style, href);
         }
         // Trailing spaces hang past the last word (kept for width fidelity).
-        if lead > 0 {
-            self.x += lead;
+        if lead > 0.0 {
+            self.advance_x_f(lead);
             self.max_x = self.max_x.max(self.x);
         }
     }
 
     fn add_word(&mut self, word: &str, style: &ComputedStyle, href: Option<&str>) {
+        self.flush_vmargin();
         let px = style.font_size.max(1);
         let (glyphs, w) = self.shape_run(word, px, style);
         let at_line_start = self.x == self.left;
@@ -1355,20 +1625,44 @@ impl<'a> Ctx<'a> {
         // reverse the cursor). A negative `text-indent` is honored (it is the
         // classic image-replacement trick — `text-indent:-9999px` pushes the
         // fallback text off-screen so only the background sprite shows).
-        let gap = if at_line_start {
-            std::mem::take(&mut self.pending_indent)
+        // The gap is FRACTIONAL (`x_frac` carries the sub-pixel remainder) and
+        // the wrap test compares the fractional total, matching how Chrome
+        // accumulates advances across the line.
+        // A gap only where the SOURCE text had whitespace (`pending_space`,
+        // #137): `<a>RFC 6761</a>,` has no space before the comma, and the old
+        // x-position heuristic invented one ("6761 , a"), misrendering and
+        // flipping wrap points.
+        let gap_f = if at_line_start {
+            std::mem::take(&mut self.pending_indent) as f32
+        } else if self.pending_space {
+            (self
+                .shaper
+                .space_advance_styled_f(px, style.font_family, style.font)
+                + style.word_spacing as f32)
+                .max(0.0)
         } else {
-            (space_width(self.shaper, px) as i32 + style.word_spacing).max(0)
+            0.0
         };
-        if !at_line_start && self.x + gap + w as i32 > self.right {
+        self.pending_space = false;
+        if !at_line_start && self.x as f32 + self.x_frac + gap_f + w as f32 > self.right as f32 {
             self.newline();
         } else {
-            self.x += gap;
+            self.advance_x_f(gap_f);
         }
         self.push_piece(px, w, glyphs, style, href);
     }
 
+    /// Advance the inline cursor by a fractional width: `x` gets the rounded
+    /// position and `x_frac` keeps the sub-pixel remainder for the next gap.
+    fn advance_x_f(&mut self, w: f32) {
+        let t = self.x as f32 + self.x_frac + w;
+        let xi = t.round();
+        self.x = xi as i32;
+        self.x_frac = t - xi;
+    }
+
     fn add_run(&mut self, text: &str, style: &ComputedStyle, href: Option<&str>) {
+        self.flush_vmargin();
         let px = style.font_size.max(1);
         let (glyphs, w) = self.shape_run(text, px, style);
         // Consume this block's one-shot `text-indent` at the start of a line, as
@@ -1378,6 +1672,40 @@ impl<'a> Ctx<'a> {
         // trick that hides a button's fallback label behind its sprite icon.
         if self.x == self.left {
             self.x += std::mem::take(&mut self.pending_indent);
+        } else if self.pending_space {
+            // A real space precedes this run in the source (`by <span
+            // nowrap>Public…` — the nowrap fast path used to eat it: #137).
+            self.advance_x_f(
+                (self
+                    .shaper
+                    .space_advance_styled_f(px, style.font_family, style.font)
+                    + style.word_spacing as f32)
+                    .max(0.0),
+            );
+        }
+        self.pending_space = false;
+        // `text-overflow: ellipsis`: when this clipped, non-wrapping run would
+        // overflow the box, drop the tail glyphs and append `…` so the visible
+        // text ends within the box.
+        if style.text_overflow_ellipsis && style.overflow_clip {
+            let avail = self.right - self.x;
+            if avail > 0 && w as i32 > avail {
+                let (ell, ell_w) = self.shape_run("\u{2026}", px, style);
+                let target = (avail - ell_w as i32).max(0);
+                let mut acc = 0i32;
+                let mut kept: Vec<GlyphBox> = Vec::with_capacity(glyphs.len());
+                for g in glyphs {
+                    if acc + g.advance as i32 > target {
+                        break;
+                    }
+                    acc += g.advance as i32;
+                    kept.push(g);
+                }
+                kept.extend(ell);
+                let total = (acc + ell_w as i32).max(0) as u32;
+                self.push_piece(px, total, kept, style, href);
+                return;
+            }
         }
         self.push_piece(px, w, glyphs, style, href);
     }
@@ -1474,10 +1802,17 @@ impl<'a> Ctx<'a> {
         let voffset = match style.vertical_align {
             VerticalAlign::Super => -(px as i32 / 3),
             VerticalAlign::Sub => px as i32 / 3,
-            VerticalAlign::Baseline => 0,
+            VerticalAlign::Baseline | VerticalAlign::OffBaseline => 0,
         };
+        // The TRUE fractional width of the run (the integer `w` is its
+        // error-diffused rounding, kept for link/underline/wrap box math).
+        let w_f: f32 = glyphs.iter().map(|g| g.advance_f).sum();
         self.line.push(LinePiece {
             x: self.x,
+            // The exact fractional origin: the cursor's sub-pixel debt at this
+            // moment. `x + frac_x` equals the exact f32 advance accumulation
+            // since line start, which is where Chrome places this run.
+            frac_x: self.x_frac,
             y: self.y + voffset,
             w,
             px,
@@ -1489,25 +1824,65 @@ impl<'a> Ctx<'a> {
             href: href.map(str::to_string),
             link_node: self.cur_link_node,
         });
-        self.x += w as i32;
+        // Advance the cursor. In the PAINT flow, advance by the TRUE width so
+        // `x + x_frac` tracks Chrome's exact fractional origins (the plain
+        // `+= w` discarded each word's fractional width, phase-shifting every
+        // later run — the root cause behind the reverted spacer attempt).
+        //
+        // In a MEASURE scratch (intrinsic/min-content width for table columns,
+        // flex/grid items), advance by the INTEGER width instead: `max_x` sizes
+        // those boxes, and `round(Σ w_f)` differs from the historical
+        // `Σ round(w)` by up to a couple px over a long run — enough to resize
+        // a table column and shift the whole layout (measured: HN's item list
+        // jumped 5px). The scratch's `frac_x`/display output is discarded, so
+        // only `max_x` matters there, and it must stay integer-stable.
+        if self.measuring {
+            self.x += w as i32;
+        } else {
+            self.advance_x_f(w_f);
+        }
         self.max_x = self.max_x.max(self.x);
         // Resolve `line-height` against this piece's own font size, so a unitless
         // factor inherited from an ancestor scales to this element (not the
-        // ancestor's font size). `Normal` falls back to the font's natural leading.
-        let lh = style.line_height.resolve(px, line_height(px));
-        self.line_h = self.line_h.max(lh);
+        // ancestor's font size). `Normal` uses the face's real vertical metrics
+        // via the shaper (~1.15× for the Times/Arial-metric faces, ~1.17× for
+        // Roboto) — the flat 1.2 drifted a pixel every couple of lines.
+        let lhf = style
+            .line_height
+            .resolve_f(px, self.shaper.natural_leading_f(px, style.font_family));
+        self.line_hf = self.line_hf.max(lhf);
+        self.line_h = self.line_h.max(lhf.round() as i32);
     }
 
     /// Lay out an `<img>`: draw the decoded image if ready, else a sized
     /// placeholder, else the alt text. Lazy-loading is ignored (raw render).
     fn image(&mut self, node: &StyledNode, in_link: Option<&str>) {
         // Resolve srcset/sizes/data-src to one URL (ADR-0046), using the same
-        // viewport width the fetch-time collector used, so the lookup hits.
-        let Some(src) = pick_img_url(|n| node.attr(n), self.vw.max(0) as u32) else {
+        // viewport width the fetch-time collector used, so the lookup hits. Inside
+        // a <picture>, resolve through its <source> candidates first (type/media),
+        // falling back to this <img>'s own src.
+        let vw = self.vw.max(0) as u32;
+        let vh = self.vh.max(0) as u32;
+        let picked = match &self.cur_picture {
+            Some(sources) => {
+                let borrowed: Vec<PictureSource<'_>> =
+                    sources.iter().map(OwnedPictureSource::borrow).collect();
+                pick_picture_url(&borrowed, |n| node.attr(n), vw, vh)
+            }
+            None => pick_img_url(|n| node.attr(n), vw),
+        };
+        let Some(src) = picked else {
             self.image_alt(node, in_link);
             return;
         };
         let src = src.as_str();
+        // Text-only option: render the image's text alternative instead of the
+        // graphic (its bytes were never fetched). Checked before any decoded-byte
+        // lookup so it needs none.
+        if self.images.render_as_text(src) {
+            self.image_text_chip(node, in_link);
+            return;
+        }
         let attr_w = node.attr("width").and_then(parse_dim);
         let attr_h = node.attr("height").and_then(parse_dim);
         // CSS `width`/`height` (px, %, vw/vh) override the presentational
@@ -1548,17 +1923,65 @@ impl<'a> Ctx<'a> {
                 pos,
                 pos_px: Point::ZERO,
             });
-            self.advance_box(w, h);
+            self.link_image_box(rect, in_link);
+            // The line box reserves the strut descent below a baseline-aligned
+            // image; the painted rect stays `h`.
+            let below = self.strut_descent_below(&node.style);
+            self.advance_box(w, h.saturating_add(below.max(0) as u32));
         } else if let (Some(w), Some(h)) = (spec_w, spec_h) {
             // Not decoded yet: reserve the declared box so layout doesn't reflow.
             self.place_box(w, h.max(1));
+            let rect = Rect::new(self.x, self.y, w, h.max(1));
             self.display.push(DisplayItem::Rect {
-                rect: Rect::new(self.x, self.y, w, h.max(1)),
+                rect,
                 color: Color::rgb(0xDD, 0xDD, 0xDD),
             });
-            self.advance_box(w, h);
+            self.link_image_box(rect, in_link);
+            let below = self.strut_descent_below(&node.style);
+            self.advance_box(w, h.saturating_add(below.max(0) as u32));
         } else {
             self.image_alt(node, in_link);
+        }
+    }
+
+    /// How far the line box extends BELOW a baseline-aligned inline replaced
+    /// box: the image's bottom edge sits on the text baseline, so the strut's
+    /// descent plus the below-baseline share of the leading is reserved under
+    /// it (the classic "gap below image"). Measured against Chrome: a 72px
+    /// image in a 16px-Arial div makes a 76px line box (descent 3 + gap-share
+    /// 1), 82px with `line-height:30px` (descent 3 + 7 of the 13px leading —
+    /// the below share is the leading minus the floored above share). Zero for
+    /// `display:block` images (no line box) and for `vertical-align:
+    /// top/middle/bottom` (off the baseline — Chrome reports exactly 72px).
+    fn strut_descent_below(&self, style: &ComputedStyle) -> i32 {
+        if style.vertical_align != VerticalAlign::Baseline
+            || matches!(style.display, Display::Block | Display::ListItem)
+        {
+            return 0;
+        }
+        let px = style.font_size.max(1);
+        let (a, d) = self.shaper.ascent_descent(px, style.font_family);
+        let lh = style
+            .line_height
+            .resolve_f(px, self.shaper.natural_leading_f(px, style.font_family));
+        let leading = lh - (a + d) as f32;
+        let above = (leading / 2.0).floor();
+        let below = leading - above;
+        ((d as f32 + below).round() as i32).max(0)
+    }
+
+    /// An image inside an `<a>` is itself the click target (logo links, product
+    /// cards): emit a link hit box over the image rect — text pieces are boxed
+    /// at line commit, but a replaced box never flows through that path.
+    fn link_image_box(&mut self, rect: Rect, in_link: Option<&str>) {
+        if let Some(href) = in_link {
+            if let Some(node) = self.cur_link_node {
+                self.elements.push(ElementBox { rect, node });
+            }
+            self.links.push(LinkBox {
+                rect,
+                href: href.to_string(),
+            });
         }
     }
 
@@ -1568,6 +1991,16 @@ impl<'a> Ctx<'a> {
                 self.add_text(&format!("[{alt}]"), &node.style, in_link);
             }
         }
+    }
+
+    /// Render the text-only substitute for an image: its `alt` caption, else its
+    /// `title` tooltip, else a label derived from the file name — bracketed as
+    /// inline text so it flows, wraps, aligns, and positions like the surrounding
+    /// content. Always emits something (never vanishes on an empty `alt`), so the
+    /// user sees what the suppressed image was.
+    fn image_text_chip(&mut self, node: &StyledNode, in_link: Option<&str>) {
+        let label = image_text_label(node, self.vw.max(0) as u32);
+        self.add_text(&format!("[{label}]"), &node.style, in_link);
     }
 
     /// Lay out an `<input>` as the right inline-block control for its `type`.
@@ -1844,6 +2277,7 @@ impl<'a> Ctx<'a> {
         let glyphs = self.shaper.shape(text, px);
         self.display.push(DisplayItem::Glyphs {
             origin: Point::new(self.x + pad_x, self.y + pad_y),
+            frac_x: 0.0,
             glyphs,
             color,
             style: FontStyle::REGULAR,
@@ -1870,7 +2304,15 @@ impl<'a> Ctx<'a> {
     }
 
     /// Wrap to a new line if a `w`-wide box wouldn't fit on the current one.
+    /// Realize a block bottom margin still pending from a previous sibling,
+    /// as-is: non-block content (text, atoms, rules, floats, tables, flex/grid)
+    /// has no top margin for it to collapse with.
+    fn flush_vmargin(&mut self) {
+        self.y += std::mem::take(&mut self.pending_vmargin);
+    }
+
     fn place_box(&mut self, w: u32, _h: u32) {
+        self.flush_vmargin();
         if self.x != self.left && self.x + w as i32 > self.right {
             self.newline();
         }
@@ -1888,16 +2330,29 @@ impl<'a> Ctx<'a> {
         }
     }
 
-    fn line_break(&mut self, px: u32) {
-        self.line_h = self.line_h.max(line_height(px));
+    fn line_break(&mut self, px: u32, family: GenericFamily) {
+        let lf = self.shaper.natural_leading_f(px, family);
+        self.line_hf = self.line_hf.max(lf);
+        self.line_h = self.line_h.max(lf.round() as i32);
         self.newline();
     }
 
     fn newline(&mut self) {
         self.commit_line();
-        self.y += self.line_h.max(1);
+        // Advance by the *fractional* line pitch, carrying the sub-pixel
+        // remainder into the next line — so line N lands at `round(N × pitch)`
+        // exactly as Chrome places it, instead of drifting by the per-line
+        // rounding error (0.4px/line ≈ a full line's offset 40 lines down).
+        // Atomic boxes (images, inline-blocks) only feed integer `line_h`, so
+        // the max with `line_hf` keeps them exact.
+        let adv_f = self.line_hf.max(self.line_h as f32).max(1.0) + self.line_frac;
+        let adv = (adv_f.round() as i32).max(1);
+        self.line_frac = (adv_f - adv as f32).clamp(-1.0, 1.0);
+        self.y += adv;
         self.x = self.left;
+        self.x_frac = 0.0;
         self.line_h = 0;
+        self.line_hf = 0.0;
         // text-indent is a first-line-only effect; once we wrap it no longer
         // applies (it is normally already consumed by the first word).
         self.pending_indent = 0;
@@ -1910,6 +2365,9 @@ impl<'a> Ctx<'a> {
         self.line_links0 = self.links.len();
         self.line_fields0 = self.fields.len();
         self.line_elems0 = self.elements.len();
+        // A fresh line starts at an integer x; sub-pixel debt never crosses
+        // lines (each line accumulates its own, as Chrome does).
+        self.x_frac = 0.0;
     }
 
     /// Apply text-align to the buffered line, then emit it.
@@ -1918,7 +2376,7 @@ impl<'a> Ctx<'a> {
         let available = ((self.right - self.left) - used).max(0);
         let offset = match self.line_align {
             TextAlign::Left => 0,
-            TextAlign::Center => available / 2,
+            TextAlign::Center | TextAlign::WebkitCenter => available / 2,
             TextAlign::Right => available,
         };
         // Shift the atomic inline boxes added during this line (inline-blocks,
@@ -1940,21 +2398,41 @@ impl<'a> Ctx<'a> {
                 e.rect = offset_rect(e.rect, offset, 0);
             }
         }
+        // Underline continuity (#137): a multi-word link underlines its
+        // inter-word gaps too — Chrome rules the whole anchor, not word
+        // islands. Extend each underlined piece's rule to the start of the
+        // next piece when it continues the same link on the same baseline.
+        let mut under_w: Vec<u32> = Vec::with_capacity(self.line.len());
+        for i in 0..self.line.len() {
+            let p = &self.line[i];
+            let mut w = p.w;
+            if p.underline && p.href.is_some() {
+                if let Some(n) = self.line.get(i + 1) {
+                    if n.underline && n.y == p.y && n.href == p.href {
+                        w = w.max((n.x - p.x).max(0) as u32);
+                    }
+                }
+            }
+            under_w.push(w);
+        }
         // Drain through a moved-out buffer so the line `Vec`'s capacity is kept
         // for the next line instead of being dropped each commit (`mem::take`
         // would leave a zero-capacity `Vec`).
         let mut line = std::mem::take(&mut self.line);
-        for piece in line.drain(..) {
+        for (i, piece) in line.drain(..).enumerate() {
             let x = piece.x + offset;
             self.display.push(DisplayItem::Glyphs {
                 origin: Point::new(x, piece.y),
+                // The run's true sub-pixel origin survives the (integer)
+                // text-align shift untouched.
+                frac_x: piece.frac_x,
                 glyphs: piece.glyphs,
                 color: piece.color,
                 style: piece.font,
             });
             if piece.underline {
                 self.display.push(DisplayItem::Rect {
-                    rect: Rect::new(x, piece.y + piece.px as i32, piece.w, 1),
+                    rect: Rect::new(x, piece.y + piece.px as i32, under_w[i], 1),
                     color: piece.color,
                 });
             }
@@ -1983,6 +2461,7 @@ impl<'a> Ctx<'a> {
     }
 
     fn rule(&mut self) {
+        self.flush_vmargin();
         self.display.push(DisplayItem::Rect {
             rect: Rect::new(self.left, self.y, (self.right - self.left).max(0) as u32, 1),
             color: Color::rgb(0xCC, 0xCC, 0xCC),
@@ -2007,6 +2486,10 @@ impl<'a> Ctx<'a> {
         self.y = 0;
         self.max_x = 0;
         self.line_h = 0;
+        self.line_hf = 0.0;
+        self.line_frac = 0.0;
+        self.x_frac = 0.0;
+        self.pending_space = false;
         self.line.clear();
         self.line_align = TextAlign::Left;
         self.cur_link_node = None;
@@ -2042,8 +2525,12 @@ impl<'a> Ctx<'a> {
         // `add_inline_block`, which would recurse here) — ADR-0042. An
         // element-children `<button>` takes the same block path, else the walk
         // re-dispatches to `form_button` and recurses back into measurement.
-        scratch.as_block_once =
-            matches!(node.style.display, Display::InlineBlock) || button_wants_block(node);
+        scratch.as_block_once = matches!(node.style.display, Display::InlineBlock)
+            // Inline-level flex/grid measures as its block content too — the
+            // scratch walk would otherwise re-route into add_inline_block,
+            // which re-enters measurement and recurses unboundedly.
+            || node.style.display_inline_level
+            || button_wants_block(node);
         scratch.walk(node, None);
         scratch.flush_line();
         let width = scratch.max_x.max(1);
@@ -2072,8 +2559,12 @@ impl<'a> Ctx<'a> {
         });
         scratch.reset_for_measure(field_id);
         scratch.right = 1; // force a wrap at every opportunity
-        scratch.as_block_once =
-            matches!(node.style.display, Display::InlineBlock) || button_wants_block(node);
+        scratch.as_block_once = matches!(node.style.display, Display::InlineBlock)
+            // Inline-level flex/grid measures as its block content too — the
+            // scratch walk would otherwise re-route into add_inline_block,
+            // which re-enters measurement and recurses unboundedly.
+            || node.style.display_inline_level
+            || button_wants_block(node);
         scratch.walk(node, None);
         scratch.flush_line();
         let width = scratch.max_x.max(1);
@@ -2237,6 +2728,7 @@ impl<'a> Ctx<'a> {
     /// packs from the left, `float:right` from the right; text wrap-around is not
     /// modeled (following in-flow content drops below the band).
     fn place_float(&mut self, e: &StyledNode, in_link: Option<&str>, fb: &mut FloatBand) {
+        self.flush_vmargin();
         let is_right = e.style.float == cerberus_style::Float::Right;
         let avail = (self.right - self.left).max(1);
         let explicit = resolve_block_width(&e.style, avail, self.vw, self.vh);
@@ -2340,8 +2832,9 @@ impl<'a> Ctx<'a> {
     /// `order`, wrap, and flexible item sizing (`flex-grow`/`-shrink`/`-basis`).
     /// Free space along a row is distributed by grow; overflow is taken back by
     /// shrink (floored at each item's min-content); the cross axis aligns/stretches.
-    fn flex_layout(&mut self, node: &StyledNode) {
+    fn flex_layout(&mut self, node: &StyledNode, in_link: Option<&str>) {
         self.flush_line();
+        self.flush_vmargin();
         let s = &node.style;
         // The container border box; items lay inside it inset by border + padding
         // (ADR-0040).
@@ -2355,15 +2848,10 @@ impl<'a> Ctx<'a> {
         let gap = s.gap as i32;
         let bg_index = self.display.items.len();
 
-        // Flex items in `order` (stable sort keeps document order within a group).
-        let mut items: Vec<&StyledNode> = node
-            .children
-            .iter()
-            .filter_map(|c| match c {
-                StyledChild::Element(e) if is_flex_grid_item(e) => Some(e.as_ref()),
-                _ => None,
-            })
-            .collect();
+        // Flex items in `order` (stable sort keeps document order within a
+        // group); bare text children become anonymous items (Flexbox §4).
+        let anon = anon_text_items(node);
+        let mut items = collect_flex_grid_items(node, &anon);
         items.sort_by_key(|e| e.style.order);
 
         let (ds, ls, fs, es) = (
@@ -2374,9 +2862,11 @@ impl<'a> Ctx<'a> {
         );
         if !items.is_empty() {
             match node.style.flex_direction {
-                FlexDirection::Row => self.flex_row(&items, left, right, gap, start_y, &node.style),
+                FlexDirection::Row => {
+                    self.flex_row(&items, left, right, gap, start_y, &node.style, in_link)
+                }
                 FlexDirection::Column => {
-                    self.flex_column(&items, left, right, gap, start_y, &node.style)
+                    self.flex_column(&items, left, right, gap, start_y, &node.style, in_link)
                 }
             }
         }
@@ -2457,6 +2947,7 @@ impl<'a> Ctx<'a> {
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn flex_row(
         &mut self,
         items: &[&StyledNode],
@@ -2465,6 +2956,7 @@ impl<'a> Ctx<'a> {
         gap: i32,
         start_y: i32,
         style: &ComputedStyle,
+        in_link: Option<&str>,
     ) {
         let avail = (right - left).max(1);
         let basis: Vec<i32> = items
@@ -2575,7 +3067,7 @@ impl<'a> Ctx<'a> {
                     self.vh,
                 );
                 sub.measuring = self.measuring;
-                sub.walk(items[i], None);
+                sub.walk(items[i], in_link);
                 sub.flush_line();
                 self.field_id = sub.field_id;
                 let h = (sub.y - y).max(1);
@@ -2604,6 +3096,7 @@ impl<'a> Ctx<'a> {
         self.y = (y - gap).max(start_y);
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn flex_column(
         &mut self,
         items: &[&StyledNode],
@@ -2612,6 +3105,7 @@ impl<'a> Ctx<'a> {
         gap: i32,
         start_y: i32,
         style: &ComputedStyle,
+        in_link: Option<&str>,
     ) {
         // The main axis (height) is content-sized (the container has no definite
         // height), so grow/shrink along it are no-ops; we stack items and align /
@@ -2659,7 +3153,7 @@ impl<'a> Ctx<'a> {
                 self.vh,
             );
             sub.measuring = self.measuring;
-            sub.walk(it, None);
+            sub.walk(it, in_link);
             sub.flush_line();
             self.field_id = sub.field_id;
             let h = (sub.y - y).max(1);
@@ -2675,8 +3169,9 @@ impl<'a> Ctx<'a> {
     /// honoring `grid-column`/`grid-row` spans, size rows from
     /// `grid-template-rows`/`grid-auto-rows` or content, and place each item
     /// (spanning the union of its tracks).
-    fn grid_layout(&mut self, node: &StyledNode) {
+    fn grid_layout(&mut self, node: &StyledNode, in_link: Option<&str>) {
         self.flush_line();
+        self.flush_vmargin();
         let s = &node.style;
         // Container border box; cells lay inside it inset by border+padding (0040).
         let box_left = self.left;
@@ -2689,14 +3184,9 @@ impl<'a> Ctx<'a> {
         let bg_index = self.display.items.len();
         let avail = (right - left).max(1);
 
-        let items: Vec<&StyledNode> = node
-            .children
-            .iter()
-            .filter_map(|c| match c {
-                StyledChild::Element(e) if is_flex_grid_item(e) => Some(e.as_ref()),
-                _ => None,
-            })
-            .collect();
+        // Element items plus anonymous items for bare text children (Grid §6.1).
+        let anon = anon_text_items(node);
+        let items = collect_flex_grid_items(node, &anon);
 
         // While measuring (huge probe width), don't expand the template (auto-fill
         // would create thousands of columns); use one content-wide column so the
@@ -2734,8 +3224,40 @@ impl<'a> Ctx<'a> {
             .map(|(i, _)| i)
             .unwrap_or(0);
         for it in &items {
-            let rs = (it.style.grid_row_span as usize).max(1);
-            let (r0, c0, cs) = if it.style.grid_named_place {
+            let rs = match (it.style.grid_row_start, it.style.grid_row_end) {
+                // Explicit numeric row lines fix the span too (`grid-row: 1/3`).
+                (Some(a), Some(b)) => {
+                    let a = resolve_grid_line(a, usize::MAX / 2);
+                    let b = resolve_grid_line(b, usize::MAX / 2);
+                    b.saturating_sub(a).max(1)
+                }
+                _ => (it.style.grid_row_span as usize).max(1),
+            };
+            let (r0, c0, cs) = if let Some(start) = it.style.grid_column_start {
+                // Explicit numeric line placement (`grid-column: 2/9`, `1/-1`):
+                // anchor the column to the resolved line — mozilla's hero
+                // anchors its flag text at line 2 of a 12-track grid, a whole
+                // track off under auto-placement. The row takes its own
+                // explicit line when given, else the first row where the
+                // column block is free.
+                let c0 = resolve_grid_line(start, ncols).min(ncols - 1);
+                let cs = match it.style.grid_column_end {
+                    Some(end) => resolve_grid_line(end, ncols).saturating_sub(c0),
+                    None => it.style.grid_column_span as usize,
+                }
+                .clamp(1, ncols - c0);
+                let r0 = match it.style.grid_row_start {
+                    Some(rn) => {
+                        let r0 = resolve_grid_line(rn, usize::MAX / 2);
+                        while occ.len() < r0 + rs {
+                            occ.push(vec![false; ncols]);
+                        }
+                        r0
+                    }
+                    None => find_free_at(&mut occ, ncols, c0, cs, rs),
+                };
+                (r0, c0, cs)
+            } else if it.style.grid_named_place {
                 let c0 = content_col;
                 (find_free_in_col(&mut occ, ncols, c0, rs), c0, 1)
             } else {
@@ -2771,7 +3293,7 @@ impl<'a> Ctx<'a> {
                 self.vh,
             );
             sub.measuring = self.measuring;
-            sub.walk(it, None);
+            sub.walk(it, in_link);
             sub.flush_line();
             self.field_id = sub.field_id;
             let h = (sub.y - start_y).max(1);
@@ -2891,6 +3413,7 @@ impl<'a> Ctx<'a> {
 
     fn table(&mut self, node: &StyledNode) {
         self.flush_line();
+        self.flush_vmargin();
         let left = self.left;
         let right = self.right.max(left + 1);
         self.line_align = node.style.text_align;
@@ -2909,7 +3432,7 @@ impl<'a> Ctx<'a> {
         let rows = collect_rows(node);
         let num_cols = rows
             .iter()
-            .map(|r| cell_children(r).count())
+            .map(|r| cell_children(r).map(cell_colspan).sum::<usize>())
             .max()
             .unwrap_or(0);
 
@@ -2928,13 +3451,30 @@ impl<'a> Ctx<'a> {
         // the target width proportionally. `col_x` holds the column left edges;
         // `col_x[num_cols]` is the table's right edge.
         let avail = (right - left).max(num_cols as i32);
+        // `cellpadding` (HTML presentational) sets every cell's padding; the
+        // engine default stands in for the UA's when absent.
+        let pad = node
+            .attr("cellpadding")
+            .and_then(parse_dim)
+            .map(|v| (v as i32).clamp(0, 40))
+            .unwrap_or(CELL_PAD);
         let mut col_max = vec![1i32; num_cols];
         for row in &rows {
-            for (col, cell) in cell_children(row).enumerate() {
-                if col < num_cols {
-                    let w = (self.measure_cell_width(cell) + 2 * CELL_PAD).max(1);
-                    col_max[col] = col_max[col].max(w);
+            let mut col = 0usize;
+            for cell in cell_children(row) {
+                if col >= num_cols {
+                    break;
                 }
+                let span = cell_colspan(cell).min(num_cols - col);
+                let w = (self.measure_cell_width(cell) + 2 * pad).max(1);
+                // A spanning cell contributes its width divided across its
+                // columns (adequate stand-in for the spec's proportional
+                // distribution).
+                let per = (w / span as i32).max(1);
+                for m in col_max.iter_mut().skip(col).take(span) {
+                    *m = (*m).max(per);
+                }
+                col += span;
             }
         }
         let total: i64 = col_max.iter().map(|&w| w as i64).sum();
@@ -2948,7 +3488,22 @@ impl<'a> Ctx<'a> {
         } else {
             col_max
         };
-        let mut col_x = vec![left; num_cols + 1];
+        // A table narrower than its containing block centers when the legacy
+        // `<center>` (`-webkit-center`) is in effect or `align=center` set auto
+        // margins — the HN shell pattern (`<center><table width=85%>`): the
+        // BOX centers while cell text stays left (see flow_cell).
+        let table_w: i32 = col_widths.iter().sum();
+        // Inherited `<center>` stops at a cell boundary (`in_cell`): the inner
+        // table sits at the cell's left edge in the reference, even though the
+        // outer table centered. `align=center`/auto margins still center.
+        let centered = (matches!(node.style.text_align, TextAlign::WebkitCenter) && !self.in_cell)
+            || (node.style.margin_left_auto && node.style.margin_right_auto);
+        let x0 = if centered {
+            left + ((avail - table_w) / 2).max(0)
+        } else {
+            left
+        };
+        let mut col_x = vec![x0; num_cols + 1];
         for col in 0..num_cols {
             col_x[col + 1] = col_x[col] + col_widths[col];
         }
@@ -2962,31 +3517,70 @@ impl<'a> Ctx<'a> {
             .and_then(parse_dim)
             .is_some_and(|b| b > 0);
 
+        // The table's own background (e.g. `<table bgcolor=…>`, the HN beige)
+        // paints under all rows: reserve its display slot now, fill it once the
+        // total height is known.
+        let table_top = self.y;
+        let table_bg_index = self.display.items.len();
         let mut row_y = self.y;
 
         for row in rows {
-            let cells: Vec<&StyledNode> = cell_children(row).collect();
-            if cells.is_empty() {
+            // Resolve each cell's column start + span once (colspan-aware), so
+            // laying, box-painting, and advancing all agree — a `colspan=2`
+            // title cell (the HN pattern) spans its columns instead of pushing
+            // later cells into the wrong ones.
+            let mut placed: Vec<(&StyledNode, usize, usize)> = Vec::new();
+            let mut col = 0usize;
+            for cell in cell_children(row) {
+                if col >= num_cols {
+                    break;
+                }
+                let span = cell_colspan(cell).min(num_cols - col);
+                placed.push((cell, col, span));
+                col += span;
+            }
+            if placed.is_empty() {
+                // A cell-less spacer row (`<tr style="height:5px">` — HN
+                // separates stories with these) still contributes its declared
+                // height; it used to contribute nothing, compressing the list
+                // by ~5px per item.
+                let h = row
+                    .style
+                    .height
+                    .resolve_vp(0, self.vw, self.vh)
+                    .or_else(|| row.attr("height").and_then(parse_dim).map(|v| v as i32))
+                    .unwrap_or(0);
+                row_y += h.max(0);
                 continue;
             }
 
             // Sub-lay every cell, capturing its items/links/fields and height.
-            let mut laid: Vec<CellLayout> = Vec::with_capacity(cells.len());
-            let mut row_h = line_height(node.style.font_size.max(1));
-            for (col, cell) in cells.iter().enumerate() {
-                let cell_x = col_x[col.min(num_cols - 1)];
-                let cell_w = (col_x[(col + 1).min(num_cols)] - cell_x).max(1);
+            // The row is as tall as its tallest CELL (plus padding) — flooring
+            // at the TABLE font's line height inflated small-print rows (HN's
+            // 7pt subtext measures 10px in Chrome, not the table's 15px line).
+            // An explicit `<tr height>` still sets a minimum.
+            let mut laid: Vec<CellLayout> = Vec::with_capacity(placed.len());
+            let mut row_h = 0;
+            for &(cell, col, span) in &placed {
+                let cell_x = col_x[col];
+                let cell_w = (col_x[(col + span).min(num_cols)] - cell_x).max(1);
                 let (items, links, fields, h) =
-                    self.flow_cell(cell, cell_x, cell_x + cell_w, row_y);
+                    self.flow_cell(cell, cell_x, cell_x + cell_w, row_y, pad);
                 row_h = row_h.max(h);
                 laid.push((items, links, fields, h));
             }
-            row_h = (row_h + 2 * CELL_PAD).max(1);
+            let tr_min = row
+                .style
+                .height
+                .resolve_vp(0, self.vw, self.vh)
+                .or_else(|| row.attr("height").and_then(parse_dim).map(|v| v as i32))
+                .unwrap_or(0);
+            row_h = (row_h + 2 * pad).max(tr_min).max(1);
 
             // Emit each cell's box (fill + border) under its content.
-            for (col, cell) in cells.iter().enumerate() {
-                let cell_x = col_x[col.min(num_cols - 1)];
-                let cell_w = (col_x[(col + 1).min(num_cols)] - cell_x).max(1) as u32;
+            for &(cell, col, span) in &placed {
+                let cell_x = col_x[col];
+                let cell_w = (col_x[(col + span).min(num_cols)] - cell_x).max(1) as u32;
                 let is_header = cell.tag == "th";
                 let fill = cell
                     .style
@@ -3005,6 +3599,18 @@ impl<'a> Ctx<'a> {
             row_y += row_h;
         }
 
+        if let Some(bg) = node.style.background {
+            let h = (row_y - table_top).max(0) as u32;
+            if h > 0 && bg.a > 0 {
+                self.display.items.insert(
+                    table_bg_index,
+                    DisplayItem::Rect {
+                        rect: Rect::new(x0, table_top, table_w.max(0) as u32, h),
+                        color: bg,
+                    },
+                );
+            }
+        }
         self.y = row_y + TABLE_MARGIN;
         self.x = self.left;
     }
@@ -3024,10 +3630,11 @@ impl<'a> Ctx<'a> {
         cell_x: i32,
         cell_right: i32,
         cell_y: i32,
+        pad: i32,
     ) -> CellLayout {
-        let content_left = cell_x + CELL_PAD;
-        let content_right = (cell_right - CELL_PAD).max(content_left + 1);
-        let content_top = cell_y + CELL_PAD;
+        let content_left = cell_x + pad;
+        let content_right = (cell_right - pad).max(content_left + 1);
+        let content_top = cell_y + pad;
         let mut sub = Ctx::sub(
             content_left,
             content_right,
@@ -3039,11 +3646,18 @@ impl<'a> Ctx<'a> {
             self.vw,
             self.vh,
         );
+        // Legacy `<center>` block-centering stops here (see `in_cell`).
+        sub.in_cell = true;
 
         let is_header = cell.tag == "th";
-        // Headers centre their text; cells inherit the cell's own alignment.
+        // Headers centre their text; cells take their own alignment — except
+        // the legacy `<center>` value, which centers the TABLE BOX but not the
+        // text inside its cells (measured against the reference: HN's titles
+        // are left-aligned inside a `<center>`ed table).
         sub.line_align = if is_header {
             TextAlign::Center
+        } else if cell.style.text_align == TextAlign::WebkitCenter {
+            TextAlign::Left
         } else {
             cell.style.text_align
         };
@@ -3063,11 +3677,22 @@ impl<'a> Ctx<'a> {
             }
         }
         sub.flush_line();
+        // A last child's deferred bottom margin is contained by the cell (a
+        // table cell establishes its own formatting context; margins never
+        // escape it) — HN's votearrow div (`margin: 3px 2px 6px`) lost its
+        // bottom 6px here, shorting every item row.
+        sub.flush_vmargin();
 
         // Carry the advanced control counter back to the parent.
         self.field_id = sub.field_id;
-        // After flush, `sub.y` already includes the last line; floor at one line.
-        let height = (sub.y - content_top).max(line_height(cell.style.font_size.max(1)));
+        // After flush, `sub.y` already includes the last line; a cell WITH
+        // content is floored at one line of its own font, an empty cell
+        // contributes nothing (Chrome: an empty row is padding-tall).
+        let height = if sub.y > content_top || !sub.display.items.is_empty() {
+            (sub.y - content_top).max(line_height(cell.style.font_size.max(1)))
+        } else {
+            0
+        };
         (sub.display.items, sub.links, sub.fields, height)
     }
 
@@ -3339,6 +3964,62 @@ fn is_flex_grid_item(e: &StyledNode) -> bool {
         )
 }
 
+/// Bare text children of a flex/grid container form ANONYMOUS items (CSS
+/// Flexbox §4 / Grid §6.1) — `<div style="display:flex">Products<span>…`
+/// must lay "Products" out as its own item, not drop it. Each non-whitespace
+/// text run is wrapped in a synthesized block inheriting the container's text
+/// style; returns `(child_index, node)` storage that
+/// [`collect_flex_grid_items`] interleaves back in document order.
+fn anon_text_items(node: &StyledNode) -> Vec<(usize, StyledNode)> {
+    node.children
+        .iter()
+        .enumerate()
+        .filter_map(|(i, c)| match c {
+            StyledChild::Text(t) if !t.trim().is_empty() => {
+                let mut style = node.style.inherit();
+                style.display = Display::Block;
+                Some((
+                    i,
+                    StyledNode {
+                        tag: String::new(),
+                        attrs: Vec::new(),
+                        style,
+                        children: vec![StyledChild::Text(t.clone())],
+                        node_id: node.node_id,
+                    },
+                ))
+            }
+            _ => None,
+        })
+        .collect()
+}
+
+/// The flex/grid items of `node` in document order: element children that are
+/// in-flow items, with the anonymous text items from [`anon_text_items`]
+/// spliced back at their original child positions.
+fn collect_flex_grid_items<'n>(
+    node: &'n StyledNode,
+    anon: &'n [(usize, StyledNode)],
+) -> Vec<&'n StyledNode> {
+    let mut ai = anon.iter().peekable();
+    let mut items = Vec::new();
+    for (i, c) in node.children.iter().enumerate() {
+        if let Some((j, n)) = ai.peek() {
+            if *j == i {
+                items.push(n);
+                ai.next();
+                continue;
+            }
+        }
+        if let StyledChild::Element(e) = c {
+            if is_flex_grid_item(e) {
+                items.push(e.as_ref());
+            }
+        }
+    }
+    items
+}
+
 /// A `<button>` with element children (icon `<i>`/`<span>` sprites, not just a
 /// text label) is laid as an atomic block-model box so its children paint —
 /// `form_button` routes it through `add_inline_block`. During intrinsic-width
@@ -3389,6 +4070,35 @@ fn find_free_cell(
             c = 0;
             r += 1;
         }
+    }
+}
+
+/// Resolve a CSS grid line number against the track count: line `n > 0` is
+/// track index `n − 1`; a negative line counts from the END of the explicit
+/// grid (`-1` is the line after the last track, so `1 / -1` spans all tracks).
+fn resolve_grid_line(n: i32, ncols: usize) -> usize {
+    if n > 0 {
+        (n as usize).saturating_sub(1).min(ncols)
+    } else {
+        (ncols as i64 + 1 + n as i64).max(0) as usize
+    }
+}
+
+/// The first row where columns `[c0, c0+cs)` are free for `rs` rows (row
+/// auto-placement of an explicitly column-anchored item), growing the
+/// occupancy grid as needed.
+fn find_free_at(occ: &mut Vec<Vec<bool>>, ncols: usize, c0: usize, cs: usize, rs: usize) -> usize {
+    let c0 = c0.min(ncols.saturating_sub(1));
+    let end = (c0 + cs).min(ncols);
+    let mut r = 0;
+    loop {
+        while occ.len() < r + rs {
+            occ.push(vec![false; ncols]);
+        }
+        if (r..r + rs).all(|rr| (c0..end).all(|cc| !occ[rr][cc])) {
+            return r;
+        }
+        r += 1;
     }
 }
 
@@ -3666,11 +4376,15 @@ fn roman_ordinal(n: u32, upper: bool) -> String {
     }
 }
 
-fn space_width(shaper: &dyn TextShaper, px: u32) -> u32 {
-    // Delegates to the shaper's `space_advance`, which real shapers implement
+fn space_width(shaper: &dyn TextShaper, px: u32, family: GenericFamily) -> u32 {
+    // Delegates to the shaper's `space_advance_with`, which real shapers implement
     // without the per-call `Vec` allocation `shape(" ", …)` would incur — this
-    // runs once per word in the inline loop.
-    shaper.space_advance(px)
+    // runs once per word in the inline loop. The family matters for `<pre>`/
+    // `<code>`: a monospace space is wider than a proportional one. Inter-word
+    // gaps on the inline path use `space_advance_styled_f` directly (fractional,
+    // and styled — a bold face's space can differ); this rounded helper serves
+    // the list-marker gap, where no run style applies.
+    shaper.space_advance_with(px, family)
 }
 
 /// Parse an `<img width/height>` attribute (a bare number or `Npx`).
@@ -3709,6 +4423,40 @@ fn replaced_size(attr_w: Option<u32>, attr_h: Option<u32>, intrinsic: Size) -> (
     }
 }
 
+/// The label for an image rendered as text (the text-only option): its `alt`
+/// caption, else its `title` tooltip, else the file name from its `src`, else the
+/// generic word "image". Never empty, so a suppressed image is always visible as
+/// text.
+fn image_text_label(node: &StyledNode, viewport_w: u32) -> String {
+    let attr_nonempty = |name: &str| node.attr(name).map(str::trim).filter(|s| !s.is_empty());
+    if let Some(alt) = attr_nonempty("alt") {
+        return alt.to_string();
+    }
+    if let Some(title) = attr_nonempty("title") {
+        return title.to_string();
+    }
+    if let Some(src) = pick_img_url(|n| node.attr(n), viewport_w) {
+        if let Some(name) = image_file_name(&src) {
+            return name;
+        }
+    }
+    "image".to_string()
+}
+
+/// The trailing file-name segment of an image URL (minus query/fragment), for a
+/// text-only label. `None` for a `data:` URI or an implausible name.
+fn image_file_name(src: &str) -> Option<String> {
+    if src.starts_with("data:") {
+        return None;
+    }
+    let path = src.split(['?', '#']).next().unwrap_or(src);
+    let seg = path.rsplit('/').next().unwrap_or(path).trim();
+    if seg.is_empty() || seg.len() > 64 {
+        return None;
+    }
+    Some(seg.to_string())
+}
+
 /// Choose the URL to fetch and draw for an `<img>` (ADR-0046): the explicit
 /// `data-src` lazy alias wins; otherwise the best `srcset` candidate (honoring
 /// `sizes`); otherwise plain `src`. Both the fetch-time collector and layout call
@@ -3723,6 +4471,161 @@ pub fn pick_img_url<'a>(attr: impl Fn(&str) -> Option<&'a str>, viewport_w: u32)
         }
     }
     attr("src").map(str::to_string)
+}
+
+/// A `<source>` candidate inside a `<picture>`, borrowed from the DOM/styled
+/// tree: its optional `type` (MIME) and `media` query, plus `srcset`/`sizes`. A
+/// `<source>` without a `srcset` is invalid and never contributes a URL.
+pub struct PictureSource<'a> {
+    pub type_: Option<&'a str>,
+    pub media: Option<&'a str>,
+    pub srcset: Option<&'a str>,
+    pub sizes: Option<&'a str>,
+}
+
+/// An owned [`PictureSource`], so the layout walker can stash a `<picture>`'s
+/// candidates on the context across the recursion into its `<img>` child.
+#[derive(Clone, Debug)]
+pub struct OwnedPictureSource {
+    pub type_: Option<String>,
+    pub media: Option<String>,
+    pub srcset: Option<String>,
+    pub sizes: Option<String>,
+}
+
+impl OwnedPictureSource {
+    fn borrow(&self) -> PictureSource<'_> {
+        PictureSource {
+            type_: self.type_.as_deref(),
+            media: self.media.as_deref(),
+            srcset: self.srcset.as_deref(),
+            sizes: self.sizes.as_deref(),
+        }
+    }
+}
+
+/// Collect the `<source>` candidates of a `<picture>` in document order.
+fn collect_picture_sources(picture: &StyledNode) -> Vec<OwnedPictureSource> {
+    picture
+        .children
+        .iter()
+        .filter_map(|c| match c {
+            StyledChild::Element(e) if e.tag == "source" => Some(OwnedPictureSource {
+                type_: e.attr("type").map(str::to_string),
+                media: e.attr("media").map(str::to_string),
+                srcset: e.attr("srcset").map(str::to_string),
+                sizes: e.attr("sizes").map(str::to_string),
+            }),
+            _ => None,
+        })
+        .collect()
+}
+
+/// Whether the bundled image codec can decode `mime`. Mirrors the formats
+/// enabled on the `image` crate in cerberus-image (png/jpeg/gif/webp/bmp) plus
+/// SVG via resvg — a `<source type=...>` naming anything else (e.g. AVIF) is
+/// skipped so selection falls through to a format we can actually paint, per the
+/// WHATWG "picture" source-selection steps.
+pub fn image_type_supported(mime: &str) -> bool {
+    matches!(
+        mime.trim().to_ascii_lowercase().as_str(),
+        "image/png"
+            | "image/jpeg"
+            | "image/jpg"
+            | "image/gif"
+            | "image/webp"
+            | "image/bmp"
+            | "image/svg+xml"
+    )
+}
+
+/// Evaluate a `<source media>` query against a `vw`×`vh` viewport. Supports the
+/// dimension/orientation features responsive `<picture>` art direction uses
+/// (`min/max-width`, `min/max-height`, `orientation`) and the `screen`/`all`
+/// media types; every other type or feature (`print`, `prefers-*`, …) does not
+/// match, so that `<source>` is skipped and selection falls through to the next
+/// candidate (ultimately the `<img>`). This tracks the CSS engine's fixed
+/// desktop-screen persona: a `<source>` gated on a preference we don't advertise
+/// simply yields to the plain `<img>`, which is the safe, visible default.
+pub fn picture_media_matches(query: &str, vw: u32, vh: u32) -> bool {
+    // OR over comma-separated queries; AND over ` and `-separated parts.
+    query.split(',').any(|branch| {
+        branch.split(" and ").all(|part| {
+            let part = part.trim().trim_start_matches("only ").trim();
+            if part.is_empty() {
+                // An empty media attribute (or branch) matches everything.
+                return true;
+            }
+            if let Some(inner) = part.strip_prefix('(').and_then(|p| p.strip_suffix(')')) {
+                picture_media_feature(inner.trim(), vw, vh)
+            } else {
+                // A bare media type, optionally negated. Only screen/all match.
+                let (ty, negated) = match part.strip_prefix("not ") {
+                    Some(rest) => (rest.trim(), true),
+                    None => (part, false),
+                };
+                let is_screen = ty.eq_ignore_ascii_case("screen") || ty.eq_ignore_ascii_case("all");
+                is_screen != negated
+            }
+        })
+    })
+}
+
+/// Evaluate one `(feature: value)` from a `<source media>` query. An unknown or
+/// malformed feature is false (spec: it makes the query fail), so the candidate
+/// is skipped rather than matched by accident.
+fn picture_media_feature(feat: &str, vw: u32, vh: u32) -> bool {
+    let (name, value) = match feat.split_once(':') {
+        Some((n, v)) => (n.trim().to_ascii_lowercase(), v.trim().to_ascii_lowercase()),
+        None => (feat.trim().to_ascii_lowercase(), String::new()),
+    };
+    let px = || -> Option<u32> {
+        value
+            .chars()
+            .take_while(|c| c.is_ascii_digit())
+            .collect::<String>()
+            .parse()
+            .ok()
+    };
+    match name.as_str() {
+        "min-width" => px().is_some_and(|p| vw >= p),
+        "max-width" => px().is_some_and(|p| vw <= p),
+        "min-height" => px().is_some_and(|p| vh >= p),
+        "max-height" => px().is_some_and(|p| vh <= p),
+        "orientation" => match value.as_str() {
+            "portrait" => vh >= vw,
+            "landscape" => vw > vh,
+            _ => false,
+        },
+        _ => false,
+    }
+}
+
+/// Choose the URL a `<picture>`'s `<img>` should load (WHATWG "select an image
+/// source"): the first `<source>`, in document order, whose `type` we can decode
+/// and whose `media` matches, resolved through its `srcset`/`sizes`; otherwise
+/// the `<img>`'s own [`pick_img_url`]. The fetch-time collector and layout both
+/// call this with the same viewport, so they agree on the chosen candidate.
+pub fn pick_picture_url<'a>(
+    sources: &[PictureSource<'_>],
+    img_attr: impl Fn(&str) -> Option<&'a str>,
+    vw: u32,
+    vh: u32,
+) -> Option<String> {
+    for s in sources {
+        if s.type_.is_some_and(|t| !image_type_supported(t)) {
+            continue;
+        }
+        if s.media.is_some_and(|m| !picture_media_matches(m, vw, vh)) {
+            continue;
+        }
+        // A <source> must carry a srcset; without one it contributes nothing.
+        let Some(ss) = s.srcset else { continue };
+        if let Some(u) = select_srcset(ss, s.sizes, vw) {
+            return Some(u);
+        }
+    }
+    pick_img_url(img_attr, vw)
 }
 
 /// Tokenize a `srcset` attribute value into `(url, descriptor)` candidates per the
@@ -3977,6 +4880,15 @@ fn cell_children(row: &StyledNode) -> impl Iterator<Item = &StyledNode> {
     })
 }
 
+/// A cell's `colspan` (1 when absent/invalid; capped to keep col math sane).
+fn cell_colspan(cell: &StyledNode) -> usize {
+    cell.attr("colspan")
+        .and_then(|v| v.trim().parse::<usize>().ok())
+        .filter(|&s| s >= 1)
+        .unwrap_or(1)
+        .min(64)
+}
+
 /// The first direct element child of `node` whose tag is `tag`.
 fn find_child<'a>(node: &'a StyledNode, tag: &str) -> Option<&'a StyledNode> {
     node.children.iter().find_map(|c| match c {
@@ -4033,6 +4945,295 @@ mod tests {
             &NoImages,
             &NoForms,
         )
+    }
+
+    fn img_node(attrs: &[(&str, &str)]) -> StyledNode {
+        StyledNode {
+            tag: "img".into(),
+            attrs: attrs
+                .iter()
+                .map(|(k, v)| (k.to_string(), v.to_string()))
+                .collect(),
+            style: ComputedStyle::initial(),
+            children: Vec::new(),
+            node_id: 0,
+        }
+    }
+
+    #[test]
+    fn adjacent_sibling_margins_collapse_to_the_larger() {
+        // Two paragraphs with explicit 20px margins: the gap between their glyph
+        // baselines must reflect ONE 20px margin (collapsed), not 40px stacked.
+        // The control pair uses margin-bottom only, so its gap is the yardstick.
+        let collapsed = lay(
+            "<p style='margin:20px 0'>a</p><p style='margin:20px 0'>b</p>",
+            600,
+        );
+        let control = lay(
+            "<p style='margin:0 0 20px 0'>a</p><p style='margin:0'>b</p>",
+            600,
+        );
+        let cy = glyph_ys(&collapsed);
+        let ky = glyph_ys(&control);
+        assert_eq!(cy.len(), 2);
+        assert_eq!(ky.len(), 2);
+        assert_eq!(
+            cy[1] - cy[0],
+            ky[1] - ky[0],
+            "20/20 collapses to the same separation as a lone 20"
+        );
+
+        // Unequal margins: max(30, 10) = 30 — same separation as a lone 30.
+        let unequal = lay(
+            "<p style='margin:0 0 30px 0'>a</p><p style='margin:10px 0 0 0'>b</p>",
+            600,
+        );
+        let lone30 = lay(
+            "<p style='margin:0 0 30px 0'>a</p><p style='margin:0'>b</p>",
+            600,
+        );
+        assert_eq!(
+            glyph_ys(&unequal)[1] - glyph_ys(&unequal)[0],
+            glyph_ys(&lone30)[1] - glyph_ys(&lone30)[0],
+            "max(30,10) = 30"
+        );
+    }
+
+    #[test]
+    fn negative_margins_collapse_as_most_positive_plus_most_negative() {
+        // 30px bottom then -10px top: separation = 30 + (-10) = 20 — identical
+        // to a lone 20px margin between the same two paragraphs.
+        let mixed = lay(
+            "<p style='margin:0 0 30px 0'>a</p><p style='margin:-10px 0 0 0'>b</p>",
+            600,
+        );
+        let lone20 = lay(
+            "<p style='margin:0 0 20px 0'>a</p><p style='margin:0'>b</p>",
+            600,
+        );
+        assert_eq!(
+            glyph_ys(&mixed)[1] - glyph_ys(&mixed)[0],
+            glyph_ys(&lone20)[1] - glyph_ys(&lone20)[0],
+            "30 + (-10) = 20"
+        );
+    }
+
+    #[test]
+    fn block_then_text_realizes_the_pending_margin() {
+        // A block followed by bare inline text at the same level: the block's
+        // bottom margin has nothing to collapse with and applies in full.
+        let with_margin = lay("<div><p style='margin:0 0 24px 0'>a</p>text</div>", 600);
+        let without = lay("<div><p style='margin:0'>a</p>text</div>", 600);
+        let wy = glyph_ys(&with_margin);
+        let ny = glyph_ys(&without);
+        assert_eq!(
+            (wy[1] - wy[0]) - (ny[1] - ny[0]),
+            24,
+            "the full 24px margin separates block from following text"
+        );
+    }
+
+    #[test]
+    fn center_centers_a_narrow_table_box_but_not_its_cell_text() {
+        // The HN shell: <center><table width=50%> — the table BOX centers in
+        // the containing block, while text inside cells stays left-aligned
+        // (measured against the reference).
+        let laid = lay(
+            "<center><table width='50%' bgcolor='#ffdddd' cellpadding='0'>             <tr><td>x</td></tr></table></center>",
+            600,
+        );
+        let bg = laid
+            .display
+            .items
+            .iter()
+            .find_map(|i| match i {
+                DisplayItem::Rect { rect, color } if color.r > 240 && color.g < 240 => Some(*rect),
+                _ => None,
+            })
+            .expect("table background painted");
+        // 50% of 600 = 300 wide, centered → x ≈ 150.
+        assert!(
+            (bg.x - 150).abs() <= 8 && (bg.w as i32 - 300).abs() <= 8,
+            "table box centered at ~150 width ~300, got x={} w={}",
+            bg.x,
+            bg.w
+        );
+        // The cell text is LEFT inside the box (near the box's left edge, not
+        // centered within the 300px cell).
+        let gx = glyph_xs(&laid);
+        assert!(!gx.is_empty());
+        assert!(
+            gx[0] <= bg.x + 12,
+            "cell text left-aligned at the cell edge, got x={} (box x={})",
+            gx[0],
+            bg.x
+        );
+    }
+
+    #[test]
+    fn table_colspan_spans_columns_and_keeps_later_rows_aligned() {
+        // Row 1: a colspan=2 cell + one cell (3 columns total). Row 2: three
+        // cells. The colspan cell must span columns 0-1, and row 2's cells must
+        // land in columns 0/1/2 — not shifted (the HN rank/title interleave).
+        let laid = lay(
+            "<table cellpadding='0'>\
+             <tr><td colspan='2' style='background:#ff0000'>wide</td>\
+                 <td style='background:#00ff00'>c</td></tr>\
+             <tr><td style='background:#0000ff'>a</td>\
+                 <td style='background:#ffff00'>b</td>\
+                 <td style='background:#ff00ff'>c</td></tr>\
+             </table>",
+            600,
+        );
+        let r = fill_rects(&laid);
+        assert_eq!(r.len(), 5, "five cell boxes painted");
+        // The spanning cell covers exactly the width of columns 0+1, from col 0.
+        let wide = r.iter().find(|rc| rc.w >= 30).expect("span box");
+        let narrow: Vec<_> = r.iter().filter(|rc| rc.w < 30 && rc.x < 30).collect();
+        assert_eq!(wide.x, 0, "span starts at column 0");
+        assert_eq!(
+            wide.w,
+            narrow.iter().map(|rc| rc.w).sum::<u32>(),
+            "span width = col0 + col1"
+        );
+        // Both rows' third-column cells share one x — later rows aren't shifted.
+        let col2: Vec<_> = r.iter().filter(|rc| rc.x as u32 == wide.w).collect();
+        assert_eq!(col2.len(), 2, "one column-2 cell per row");
+        assert_ne!(col2[0].y, col2[1].y, "one per row");
+    }
+
+    #[test]
+    fn links_inside_flex_and_grid_containers_keep_hit_boxes() {
+        // The brand-page card pattern: an <a> WRAPPING a flex/grid container
+        // (and links nested in items) must still emit link hit boxes — flex/
+        // grid item sub-layouts previously dropped the enclosing href.
+        let laid = lay(
+            "<a href='/card'><div style='display:flex'>\
+               <div>Headline</div><div>Blurb</div>\
+             </div></a>\
+             <div style='display:grid;grid-template-columns:1fr 1fr'>\
+               <div><a href='/g1'>One</a></div><div><a href='/g2'>Two</a></div>\
+             </div>",
+            600,
+        );
+        let hrefs: Vec<&str> = laid.links.iter().map(|l| l.href.as_str()).collect();
+        assert!(
+            hrefs.contains(&"/card"),
+            "anchor wrapping a flex container is clickable: {hrefs:?}"
+        );
+        assert!(hrefs.contains(&"/g1") && hrefs.contains(&"/g2"));
+        assert!(
+            laid.links.iter().all(|l| l.rect.w > 0 && l.rect.h > 0),
+            "no degenerate link boxes"
+        );
+    }
+
+    #[test]
+    fn image_only_anchor_is_clickable() {
+        // A logo link (<a> wrapping only an <img>) must emit a link hit box
+        // over the image rect — there is no text piece to box at line commit.
+        let styled = CssEngine::new().style(&parse_html(
+            "<a href='/home'><img src='logo.png' alt='logo'></a>",
+        ));
+        let img = Arc::new(DecodedImage {
+            size: Size::new(40, 20),
+            rgba: vec![255; 40 * 20 * 4],
+        });
+        let laid = BlockLayout::default().layout(
+            &styled,
+            Size::new(600, 400),
+            &MonoShaper,
+            &OneImage(img),
+            &NoForms,
+        );
+        let link = laid
+            .links
+            .iter()
+            .find(|l| l.href == "/home")
+            .expect("image link boxed");
+        assert!(
+            link.rect.w >= 40 && link.rect.h >= 20,
+            "box covers the image"
+        );
+    }
+
+    #[test]
+    fn table_cellpadding_zero_tightens_rows() {
+        // cellpadding=0 rows are tighter than the engine-default padding.
+        let padded = lay("<table><tr><td>a</td></tr><tr><td>b</td></tr></table>", 400);
+        let tight = lay(
+            "<table cellpadding='0'><tr><td>a</td></tr><tr><td>b</td></tr></table>",
+            400,
+        );
+        let py = glyph_ys(&padded);
+        let ty = glyph_ys(&tight);
+        assert_eq!(py.len(), 2);
+        assert_eq!(ty.len(), 2);
+        assert!(
+            ty[1] - ty[0] < py[1] - py[0],
+            "cellpadding=0 row pitch {} < default {}",
+            ty[1] - ty[0],
+            py[1] - py[0]
+        );
+    }
+
+    #[test]
+    fn image_text_label_prefers_alt_then_title_then_filename() {
+        // alt wins.
+        assert_eq!(
+            image_text_label(
+                &img_node(&[("alt", "a lake"), ("title", "tip"), ("src", "/p.png")]),
+                1000
+            ),
+            "a lake"
+        );
+        // title when alt is empty/missing.
+        assert_eq!(
+            image_text_label(&img_node(&[("title", "tip"), ("src", "/p.png")]), 1000),
+            "tip"
+        );
+        // file name when neither alt nor title.
+        assert_eq!(
+            image_text_label(
+                &img_node(&[("src", "https://x.test/a/b/logo-v2.png?q=1")]),
+                1000
+            ),
+            "logo-v2.png"
+        );
+        // generic word when nothing usable.
+        assert_eq!(image_text_label(&img_node(&[]), 1000), "image");
+    }
+
+    #[test]
+    fn text_overflow_ellipsis_truncates_a_clipped_nowrap_line() {
+        let long = "the quick brown fox jumps over the lazy dog again and again";
+        let base = "<div style='width:120px;white-space:nowrap;overflow:hidden";
+        let ellip = lay(&format!("{base};text-overflow:ellipsis'>{long}</div>"), 400);
+        let clip = lay(&format!("{base}'>{long}</div>"), 400);
+        // The clipped line keeps every glyph (clipping happens in paint); the
+        // ellipsis line drops the overflowing tail, so it has strictly fewer.
+        assert!(
+            total_glyphs(&ellip) < total_glyphs(&clip),
+            "ellipsis truncates: {} vs {}",
+            total_glyphs(&ellip),
+            total_glyphs(&clip)
+        );
+        // A short line that fits is untouched (no truncation).
+        let short = lay(&format!("{base};text-overflow:ellipsis'>hi</div>"), 400);
+        assert_eq!(total_glyphs(&short), 2, "short line keeps all glyphs");
+    }
+
+    #[test]
+    fn image_file_name_extracts_the_segment() {
+        assert_eq!(
+            image_file_name("https://x/a/b/pic.jpg").as_deref(),
+            Some("pic.jpg")
+        );
+        assert_eq!(
+            image_file_name("/logo.png?v=2#x").as_deref(),
+            Some("logo.png")
+        );
+        assert_eq!(image_file_name("data:image/png;base64,AAAA"), None);
     }
 
     /// Wraps `MonoShaper` but counts how many times a bare `" "` is shaped, and
@@ -4199,7 +5400,7 @@ mod tests {
             "equal grow -> equal widths: {w0} vs {w1}"
         );
         assert!(
-            (w0 + w1 - 784).abs() <= 4,
+            (w0 + w1 - 800).abs() <= 4,
             "items fill the container: {}",
             w0 + w1
         );
@@ -4235,7 +5436,7 @@ mod tests {
         let r = fill_rects(&laid);
         assert_eq!(r.len(), 2);
         let total = r[0].w as i32 + r[1].w as i32;
-        assert!(total <= 788, "shrunk to fit the container: total {total}");
+        assert!(total <= 804, "shrunk to fit the container: total {total}");
         assert!((r[0].w as i32 - r[1].w as i32).abs() <= 3, "equal shrink");
     }
 
@@ -4250,13 +5451,13 @@ mod tests {
         let r = fill_rects(&laid);
         assert_eq!(r.len(), 2);
         assert!(
-            (r[0].w as i32 - 196).abs() <= 3,
-            "25% of 784 ~ 196: {}",
+            (r[0].w as i32 - 200).abs() <= 3,
+            "25% of 800 ~ 200: {}",
             r[0].w
         );
         assert!(
-            (r[1].w as i32 - 392).abs() <= 3,
-            "50% of 784 ~ 392: {}",
+            (r[1].w as i32 - 400).abs() <= 3,
+            "50% of 800 ~ 400: {}",
             r[1].w
         );
     }
@@ -4381,8 +5582,7 @@ mod tests {
 
     #[test]
     fn grid_auto_fill_minmax_derives_column_count_from_width() {
-        // avail 784 with minmax(200px, 1fr) auto-fill -> 3 columns; the 4th item
-        // wraps to a second row.
+        // avail 800 with minmax(200px, 1fr) auto-fill -> 4 columns fit exactly.
         let laid = lay(
             "<div style='display:grid;grid-template-columns:repeat(auto-fill, minmax(200px, 1fr))'>\
              <div style='background:#ff0000'>A</div><div style='background:#00ff00'>B</div>\
@@ -4392,13 +5592,11 @@ mod tests {
         let r = fill_rects(&laid);
         assert_eq!(r.len(), 4);
         let xs: Vec<i32> = r.iter().map(|rc| rc.x).collect();
-        assert_eq!(distinct(&xs), 3, "three columns at 800px wide");
-        let ys: Vec<i32> = r.iter().map(|rc| rc.y).collect();
-        assert!(distinct(&ys) >= 2, "the 4th item wraps to a second row");
+        assert_eq!(distinct(&xs), 4, "four columns fit at 800px content width");
         for rc in &r {
             assert!(
-                (rc.w as i32 - 261).abs() <= 4,
-                "column width ~261: {}",
+                (rc.w as i32 - 195).abs() <= 6,
+                "column width ~195: {}",
                 rc.w
             );
         }
@@ -4416,17 +5614,17 @@ mod tests {
         let r = fill_rects(&laid);
         assert_eq!(r.len(), 2);
         assert!(
-            (r[0].w as i32 - 392).abs() <= 6,
-            "span-2 cell ~392: {}",
+            (r[0].w as i32 - 400).abs() <= 6,
+            "span-2 cell ~400: {}",
             r[0].w
         );
         assert!(
-            (r[1].w as i32 - 196).abs() <= 4,
-            "single cell ~196: {}",
+            (r[1].w as i32 - 200).abs() <= 4,
+            "single cell ~200: {}",
             r[1].w
         );
         // B is placed in the third column (after the 2-col span), not overlapping.
-        assert!(r[1].x >= r[0].x + 380, "B starts after the spanned cell");
+        assert!(r[1].x >= r[0].x + 388, "B starts after the spanned cell");
     }
 
     #[test]
@@ -4442,7 +5640,7 @@ mod tests {
         let r = fill_rects(&laid);
         assert_eq!(r.len(), 1, "only the in-flow item paints a background");
         assert!(
-            (r[0].w as i32 - 384).abs() <= 4,
+            (r[0].w as i32 - 400).abs() <= 4,
             "flex:1 item fills the row despite the absolute sibling: {}",
             r[0].w
         );
@@ -4500,7 +5698,7 @@ mod tests {
         let r = fill_rects(&laid);
         assert_eq!(r.len(), 2);
         assert!(
-            (r[0].w as i32 - 292).abs() <= 4,
+            (r[0].w as i32 - 300).abs() <= 4,
             "first column ~50%: {}",
             r[0].w
         );
@@ -4844,6 +6042,473 @@ mod tests {
     }
 
     #[test]
+    fn fractional_line_pitch_accumulates_like_chrome() {
+        // Chrome keeps line pitch fractional: 16px Arial-metric text advances
+        // 18.398px per line, and line N is painted at round(N × pitch). A shaper
+        // with 1.15× leading (18.4 @ 16px) must place five lines at cumulative
+        // offsets 18, 37, 55, 74 — not the drifting 18, 36, 54, 72 an
+        // integer-rounded pitch produces.
+        struct FractionalShaper;
+        impl TextShaper for FractionalShaper {
+            fn shape(&self, text: &str, px: u32) -> Vec<GlyphBox> {
+                MonoShaper.shape(text, px)
+            }
+            fn natural_leading_f(&self, px: u32, _family: GenericFamily) -> f32 {
+                px.max(1) as f32 * 1.15
+            }
+        }
+        let styled =
+            CssEngine::new().style(&parse_html("<p style='margin:0'>a<br>b<br>c<br>d<br>e</p>"));
+        let laid = BlockLayout::default().layout(
+            &styled,
+            Size::new(400, 2000),
+            &FractionalShaper,
+            &NoImages,
+            &NoForms,
+        );
+        let mut ys = glyph_ys(&laid);
+        ys.sort_unstable();
+        ys.dedup();
+        assert_eq!(ys.len(), 5, "five lines: {ys:?}");
+        let rel: Vec<i32> = ys.iter().map(|y| y - ys[0]).collect();
+        let want: Vec<i32> = (0..5).map(|n| (n as f32 * 18.4).round() as i32).collect();
+        assert_eq!(rel, want, "lines land at round(N × 18.4)");
+    }
+
+    #[test]
+    fn fractional_space_advance_flips_wrap_point_like_chrome() {
+        // Real faces have fractional space advances (Liberation Sans @16px is
+        // 4.453px). Chrome accumulates them across the line, so a line that
+        // fits with integer-rounded gaps can overflow with the true widths and
+        // wrap a word earlier. Three 50px words + two 10.45px gaps = 170.9px
+        // in a 170px box: integer gaps (10px → 170 total) kept it on one line;
+        // the fractional total must wrap.
+        struct FracSpaceShaper;
+        impl TextShaper for FracSpaceShaper {
+            fn shape(&self, text: &str, px: u32) -> Vec<GlyphBox> {
+                MonoShaper.shape(text, px)
+            }
+            fn space_advance_with_f(&self, px: u32, _family: GenericFamily) -> f32 {
+                px.max(2) as f32 + 0.45
+            }
+        }
+        let styled = CssEngine::new().style(&parse_html(
+            "<body style='margin:0'><p style='margin:0;font-size:10px'>\
+             aaaaaaaaaa bbbbbbbbbb cccccccccc</p></body>",
+        ));
+        let laid = BlockLayout::default().layout(
+            &styled,
+            Size::new(170, 500),
+            &FracSpaceShaper,
+            &NoImages,
+            &NoForms,
+        );
+        let mut ys = glyph_ys(&laid);
+        ys.sort_unstable();
+        ys.dedup();
+        assert_eq!(
+            ys.len(),
+            2,
+            "fractional gaps (320.9px total) must wrap the third word: {ys:?}"
+        );
+    }
+
+    #[test]
+    fn inline_image_line_box_reserves_strut_descent() {
+        // A baseline-aligned inline image sits with its bottom ON the text
+        // baseline, so the line box extends descent + below-leading past it
+        // (Chrome: 72px img in a 16px-Arial div → 76px box; 82px with
+        // line-height:30px). The stub shaper's rounded metrics at 16px are
+        // ascent 13 / descent 3; with line-height:30px the leading is
+        // 30 − 16 = 14, splitting 7 above / 7 below → 3 + 7 = 10px under the
+        // image: the box must be 82px tall.
+        let with_lh = lay(
+            "<div style='background:#ff0000;font-size:16px;line-height:30px;margin:0'>\
+             <img src='x.png' width=72 height=72></div>",
+            400,
+        );
+        let box_h = |laid: &LaidOut| {
+            fill_rects(laid)
+                .iter()
+                .map(|r| r.h)
+                .max()
+                .expect("div paints a background")
+        };
+        assert_eq!(box_h(&with_lh), 82, "descent 3 + below-leading 7");
+        // vertical-align: middle takes the image off the baseline — no strut
+        // descent (Chrome reports exactly the image height).
+        let middle = lay(
+            "<div style='background:#ff0000;font-size:16px;line-height:30px;margin:0'>\
+             <img src='x.png' width=72 height=72 style='vertical-align:middle'></div>",
+            400,
+        );
+        assert_eq!(box_h(&middle), 72, "off-baseline image: no descent");
+        // display:block has no line box at all.
+        let block = lay(
+            "<div style='background:#ff0000;font-size:16px;line-height:30px;margin:0'>\
+             <img src='x.png' width=72 height=72 style='display:block'></div>",
+            400,
+        );
+        assert_eq!(box_h(&block), 72, "block image: no strut");
+    }
+
+    #[test]
+    fn flex_and_grid_lay_out_bare_text_children_as_anonymous_items() {
+        // CSS Flexbox §4 / Grid §6.1: contiguous text directly inside a flex or
+        // grid container wraps in an anonymous item. These were silently
+        // dropped (mozilla.org's nav menu titles are `<div
+        // style=display:flex>Products<svg…>` — the word vanished).
+        let count_glyph_items = |laid: &LaidOut| {
+            laid.display
+                .items
+                .iter()
+                .filter(|i| matches!(i, DisplayItem::Glyphs { .. }))
+                .count()
+        };
+        let flex = lay(
+            "<div style='display:flex'>Products<span>About</span></div>",
+            400,
+        );
+        assert!(
+            count_glyph_items(&flex) >= 2,
+            "flex: both the bare text and the span render"
+        );
+        let grid = lay(
+            "<div style='display:grid;grid-template-columns:1fr 1fr'>\
+             Cell-text<span>Elem</span></div>",
+            400,
+        );
+        assert!(
+            count_glyph_items(&grid) >= 2,
+            "grid: both the bare text and the span render"
+        );
+    }
+
+    #[test]
+    fn whitespace_state_crosses_inline_boundaries() {
+        // #137: spacing must come from the SOURCE text, not the x-position
+        // heuristic. An inline element boundary adds nothing by itself, so
+        // `<a>RFC 6761</a>, a` must render pixel-identically to the plain text
+        // `RFC 6761, a` (no phantom space before the comma), and a real space
+        // before a nowrap span must survive the atomic-run fast path.
+        let glyph_xs = |laid: &LaidOut| {
+            let mut xs: Vec<i32> = laid
+                .display
+                .items
+                .iter()
+                .filter_map(|i| match i {
+                    DisplayItem::Glyphs { origin, .. } => Some(origin.x),
+                    _ => None,
+                })
+                .collect();
+            xs.sort_unstable();
+            xs
+        };
+        let linked = lay("<p style='margin:0'><a href='#x'>RFC 6761</a>, a</p>", 600);
+        let plain = lay("<p style='margin:0'>RFC 6761, a</p>", 600);
+        // The linked version splits into more pieces, but every piece must sit
+        // where the plain text's words sit: the union of x-origins of the
+        // plain render must be a subset of the linked one at identical x.
+        let (lx, px) = (glyph_xs(&linked), glyph_xs(&plain));
+        assert_eq!(
+            lx.first(),
+            px.first(),
+            "first word starts at the same x: {lx:?} vs {px:?}"
+        );
+        assert_eq!(
+            lx.last(),
+            px.last(),
+            "no phantom space shifts the tail: {lx:?} vs {px:?}"
+        );
+
+        let nowrap = lay(
+            "<p style='margin:0'>by <span style='white-space:nowrap'>Public</span></p>",
+            600,
+        );
+        let nowrap_plain = lay("<p style='margin:0'>by Public</p>", 600);
+        assert_eq!(
+            glyph_xs(&nowrap).last(),
+            glyph_xs(&nowrap_plain).last(),
+            "the space before a nowrap span is kept (was eaten: 'byPublic')"
+        );
+    }
+
+    #[test]
+    fn multi_word_link_underline_is_continuous() {
+        // #137 facet: Chrome underlines the whole anchor including inter-word
+        // gaps; per-word rules left gaps ('RFC 2606' underlined only '2606').
+        let laid = lay("<p style='margin:0'><a href='#x'>two words</a></p>", 600);
+        let mut rules: Vec<Rect> = laid
+            .display
+            .items
+            .iter()
+            .filter_map(|i| match i {
+                DisplayItem::Rect { rect, .. } if rect.h == 1 => Some(*rect),
+                _ => None,
+            })
+            .collect();
+        rules.sort_by_key(|r| r.x);
+        assert_eq!(rules.len(), 2, "one rule per piece: {rules:?}");
+        assert_eq!(
+            rules[0].x + rules[0].w as i32,
+            rules[1].x,
+            "first word's rule extends across the gap to the second: {rules:?}"
+        );
+    }
+
+    #[test]
+    fn center_does_not_recenter_tables_inside_cells() {
+        // The HN shell: `<center><table width=85%>` centers the OUTER table
+        // box, but an auto-width table nested inside one of its cells stays at
+        // the cell's LEFT edge in the reference — inherited -webkit-center
+        // must not cross the cell boundary (it displaced HN's item list
+        // ~187px right).
+        let laid = lay(
+            "<center><table width='500'><tr><td>\
+             <table><tr><td>inner</td></tr></table>\
+             </td></tr></table></center>",
+            600,
+        );
+        let min_glyph_x = laid
+            .display
+            .items
+            .iter()
+            .filter_map(|i| match i {
+                DisplayItem::Glyphs { origin, .. } => Some(origin.x),
+                _ => None,
+            })
+            .min()
+            .expect("inner text renders");
+        // Outer table: centered 500px box in 600px → starts ~x=50; the inner
+        // table must hug the cell's left padding (well under the ~300px a
+        // re-centering would produce).
+        assert!(
+            min_glyph_x < 120,
+            "inner table stays at the cell's left edge, got x={min_glyph_x}"
+        );
+    }
+
+    #[test]
+    fn grid_explicit_line_placement_anchors_columns() {
+        // `grid-column: 3 / 5` anchors at track 3 (index 2) spanning 2 tracks;
+        // `1 / -1` spans the whole explicit grid. Auto-placement put both in
+        // the first free cell — mozilla's hero text (grid-column: 2/9 of 12)
+        // sat a full track off.
+        let laid = lay(
+            "<div style='display:grid;grid-template-columns:100px 100px 100px 100px'>\
+             <div style='grid-column:3/5;background:#ff0000'>a</div>\
+             <div style='grid-column:1/-1;background:#00ff00'>b</div>\
+             </div>",
+            420,
+        );
+        let rects = fill_rects(&laid);
+        let red = rects.iter().find(|r| r.w > 150 && r.w < 260).copied();
+        let green = rects.iter().find(|r| r.w > 350).copied();
+        let red = red.expect("3/5 spans two 100px tracks");
+        assert!(
+            red.x >= 200,
+            "anchored at line 3 (x≥200 with two tracks before it): {red:?}"
+        );
+        let green = green.expect("1/-1 spans all four tracks");
+        assert!(green.x <= 8, "full-bleed row starts at the left: {green:?}");
+    }
+
+    #[test]
+    fn table_row_heights_follow_cells_spacers_and_margins() {
+        // Three HN-measured behaviors in one table: (1) a cell-less spacer row
+        // contributes its declared height; (2) a small-font row is its own
+        // content height, not the table font's line; (3) a last child's
+        // bottom margin is contained by its cell.
+        let spaced = lay(
+            "<table><tr><td>a</td></tr>\
+             <tr style='height:20px'></tr>\
+             <tr><td>b</td></tr></table>",
+            400,
+        );
+        let flat = lay(
+            "<table><tr><td>a</td></tr>\
+             <tr><td>b</td></tr></table>",
+            400,
+        );
+        let ys = |laid: &LaidOut| {
+            let mut v = glyph_ys(laid);
+            v.sort_unstable();
+            v
+        };
+        let (sy, fy) = (ys(&spaced), ys(&flat));
+        assert_eq!(
+            sy[1] - sy[0],
+            (fy[1] - fy[0]) + 20,
+            "spacer row adds exactly its 20px: {sy:?} vs {fy:?}"
+        );
+
+        // Small-font row: the gap between two 10px-font rows is smaller than
+        // between two default(16px)-font rows in the same table.
+        let small = lay(
+            "<table style='font-size:16px'>\
+             <tr><td style='font-size:10px'>a</td></tr>\
+             <tr><td style='font-size:10px'>b</td></tr></table>",
+            400,
+        );
+        let big = lay(
+            "<table style='font-size:16px'><tr><td>a</td></tr><tr><td>b</td></tr></table>",
+            400,
+        );
+        assert!(
+            ys(&small)[1] - ys(&small)[0] < ys(&big)[1] - ys(&big)[0],
+            "a small-print row is shorter than the table font's line"
+        );
+
+        // Bottom margin of a cell's last block child extends the row.
+        let margined = lay(
+            "<table><tr><td><div style='margin:0 0 6px 0'>a</div></td></tr>\
+             <tr><td>b</td></tr></table>",
+            400,
+        );
+        let plain = lay(
+            "<table><tr><td><div style='margin:0'>a</div></td></tr>\
+             <tr><td>b</td></tr></table>",
+            400,
+        );
+        assert_eq!(
+            ys(&margined)[1] - ys(&margined)[0],
+            (ys(&plain)[1] - ys(&plain)[0]) + 6,
+            "trailing cell margin contained (adds 6px to the row)"
+        );
+    }
+
+    #[test]
+    fn list_markers_hang_outside_the_content_edge() {
+        // `list-style-position: outside` (default): the li's text starts at
+        // the SAME x as a plain block at the list's content edge — the marker
+        // hangs in the ul's 40px padding and never displaces the text (inline
+        // flow used to shift every list line right by marker+space), nor does
+        // a block-level first child push the marker onto its own line.
+        let listed = lay(
+            "<ul style='margin:0;padding-left:40px'><li><div>item</div></li></ul>",
+            400,
+        );
+        let plain = lay(
+            "<div style='margin:0;padding-left:40px'><div>item</div></div>",
+            400,
+        );
+        let text_xs = |laid: &LaidOut| {
+            laid.display
+                .items
+                .iter()
+                .filter_map(|i| match i {
+                    DisplayItem::Glyphs { origin, glyphs, .. } if glyphs.len() > 1 => {
+                        Some((origin.x, origin.y))
+                    }
+                    _ => None,
+                })
+                .collect::<Vec<_>>()
+        };
+        let (lx, px) = (text_xs(&listed), text_xs(&plain));
+        assert_eq!(lx.len(), 1);
+        assert_eq!(lx[0].0, px[0].0, "text starts at the content edge");
+        // The marker (single glyph) sits left of the text, on the same line.
+        let marker = listed
+            .display
+            .items
+            .iter()
+            .find_map(|i| match i {
+                DisplayItem::Glyphs { origin, glyphs, .. } if glyphs.len() == 1 => Some(*origin),
+                _ => None,
+            })
+            .expect("marker drawn");
+        assert!(marker.x < lx[0].0, "marker left of text: {marker:?}");
+        assert_eq!(marker.y, lx[0].1, "marker on the first line, not its own");
+    }
+
+    #[test]
+    fn inline_flex_flows_on_the_line_and_table_cells_sit_side_by_side() {
+        // `display: inline-flex` is an atomic inline box — the text before and
+        // after it shares its line (block-level promotion put the container on
+        // its own row). CSS `display: table-cell` siblings sit beside each
+        // other on one row, not stacked.
+        let flexline = lay(
+            "<p style='margin:0'>a <span style='display:inline-flex'>\
+             <span>x</span></span> b</p>",
+            600,
+        );
+        let mut ys = glyph_ys(&flexline);
+        ys.sort_unstable();
+        ys.dedup();
+        assert_eq!(ys.len(), 1, "one shared line: {ys:?}");
+
+        let cells = lay(
+            "<div><div style='display:table-cell'>left</div>\
+             <div style='display:table-cell'>right</div></div>",
+            600,
+        );
+        let mut cys = glyph_ys(&cells);
+        cys.sort_unstable();
+        cys.dedup();
+        assert_eq!(cys.len(), 1, "cells share a row: {cys:?}");
+    }
+
+    #[test]
+    fn word_origins_carry_exact_fractional_positions() {
+        // The plan's worked arithmetic: gaps 4.453px, fractional glyph
+        // advances. Each emitted run's `origin.x + frac_x` must equal the
+        // exact f32 accumulation since line start (Chrome's fractional word
+        // origins), and |frac| stays ≤ 0.5. The old `x += w` (integer) lost
+        // each word's fractional width and phase-shifted every later run.
+        struct FracShaper;
+        impl TextShaper for FracShaper {
+            fn shape(&self, text: &str, px: u32) -> Vec<GlyphBox> {
+                let mut v = MonoShaper.shape(text, px);
+                for g in &mut v {
+                    g.advance_f = 5.13; // fractional per-glyph advance
+                    g.advance = 5;
+                }
+                v
+            }
+            fn space_advance_with_f(&self, _px: u32, _family: GenericFamily) -> f32 {
+                4.453
+            }
+        }
+        let styled = CssEngine::new().style(&parse_html(
+            "<body style='margin:0'><p style='margin:0;font-size:10px'>aaaaa bbbbb ccccc</p></body>",
+        ));
+        let laid = BlockLayout::default().layout(
+            &styled,
+            Size::new(400, 200),
+            &FracShaper,
+            &NoImages,
+            &NoForms,
+        );
+        let runs: Vec<(i32, f32)> = laid
+            .display
+            .items
+            .iter()
+            .filter_map(|i| match i {
+                DisplayItem::Glyphs {
+                    origin,
+                    frac_x,
+                    glyphs,
+                    ..
+                } if glyphs.len() > 1 => Some((origin.x, *frac_x)),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(runs.len(), 3, "three words: {runs:?}");
+        // Exact accumulation: word width 5×5.13 = 25.65, gap 4.453.
+        let w = 25.65f32;
+        let g = 4.453f32;
+        let want = [0.0, w + g, 2.0 * (w + g)];
+        for ((x, f), want) in runs.iter().zip(want) {
+            let true_x = *x as f32 + f;
+            assert!(
+                (true_x - want).abs() < 1e-3,
+                "run at {x}+{f} = {true_x}, want {want}"
+            );
+            assert!(f.abs() <= 0.5, "|frac| bounded: {f}");
+        }
+    }
+
+    #[test]
     fn letter_spacing_widens_a_run() {
         let normal = lay(
             "<div style='display:flex'><div style='background:#ff0000'>iiiii</div></div>",
@@ -5149,17 +6814,18 @@ mod tests {
                 _ => None,
             })
             .expect("image emitted");
-        // Relative container sits at y≈108 (100px spacer + body's 8px margin);
-        // top:40 → ~148, left:20 → ~28 (+8px body margin). Without the fix the
-        // image would land at the flow origin (~top of the relative box).
+        // Relative container sits at y≈100 (100px spacer; the fragment has no
+        // <body>, so no UA body margin applies); top:40 → ~140, left:20 → ~20.
+        // Without the fix the image would land at the flow origin (~top of the
+        // relative box).
         assert!(
-            (140..=156).contains(&rect.y),
+            (132..=150).contains(&rect.y),
             "img at ancestor.y + top:40px, got y={}",
             rect.y
         );
         assert!(
-            (24..=32).contains(&rect.x),
-            "img at left:20px (+ body margin), got x={}",
+            (16..=26).contains(&rect.x),
+            "img at left:20px, got x={}",
             rect.x
         );
     }
@@ -5379,6 +7045,218 @@ mod tests {
         );
     }
 
+    #[test]
+    fn image_type_supported_matches_bundled_codecs() {
+        for ok in [
+            "image/png",
+            "image/jpeg",
+            "image/gif",
+            "image/webp",
+            "image/bmp",
+            "image/svg+xml",
+            "IMAGE/PNG",
+        ] {
+            assert!(image_type_supported(ok), "{ok} should decode");
+        }
+        for no in ["image/avif", "image/jxl", "image/tiff", "video/mp4", ""] {
+            assert!(!image_type_supported(no), "{no} should not decode");
+        }
+    }
+
+    #[test]
+    fn picture_media_matches_dimensions_and_orientation() {
+        // width features against a 500-wide viewport
+        assert!(picture_media_matches("(max-width: 600px)", 500, 800));
+        assert!(!picture_media_matches("(max-width: 400px)", 500, 800));
+        assert!(picture_media_matches("(min-width: 500px)", 500, 800));
+        // AND / OR, media type, and orientation
+        assert!(picture_media_matches(
+            "screen and (min-width: 400px)",
+            500,
+            800
+        ));
+        assert!(!picture_media_matches(
+            "print and (min-width: 400px)",
+            500,
+            800
+        ));
+        assert!(picture_media_matches(
+            "(max-width: 100px), (min-width: 400px)",
+            500,
+            800
+        ));
+        assert!(picture_media_matches("(orientation: portrait)", 500, 800));
+        assert!(!picture_media_matches("(orientation: landscape)", 500, 800));
+        // Empty query matches everything; unknown/preference features don't.
+        assert!(picture_media_matches("", 500, 800));
+        assert!(!picture_media_matches(
+            "(prefers-color-scheme: dark)",
+            500,
+            800
+        ));
+    }
+
+    #[test]
+    fn pick_picture_url_skips_undecodable_types_then_falls_back() {
+        let img = |n: &str| match n {
+            "src" => Some("fallback.jpg"),
+            _ => None,
+        };
+        // AVIF can't decode → skip; WebP can → win.
+        let sources = [
+            PictureSource {
+                type_: Some("image/avif"),
+                media: None,
+                srcset: Some("a.avif"),
+                sizes: None,
+            },
+            PictureSource {
+                type_: Some("image/webp"),
+                media: None,
+                srcset: Some("a.webp"),
+                sizes: None,
+            },
+        ];
+        assert_eq!(
+            pick_picture_url(&sources, img, 800, 600).as_deref(),
+            Some("a.webp")
+        );
+        // Only an undecodable source → fall back to the <img>.
+        let only_avif = [PictureSource {
+            type_: Some("image/avif"),
+            media: None,
+            srcset: Some("a.avif"),
+            sizes: None,
+        }];
+        assert_eq!(
+            pick_picture_url(&only_avif, img, 800, 600).as_deref(),
+            Some("fallback.jpg")
+        );
+    }
+
+    #[test]
+    fn picture_source_selected_by_media_is_drawn() {
+        // A narrow (500px) viewport → the (max-width:600px) mobile source wins;
+        // the provider serves only that key, so an Image item proves selection.
+        let styled = CssEngine::new().style(&parse_html(
+            "<picture>\
+               <source media='(min-width: 900px)' srcset='desktop.png'>\
+               <source media='(max-width: 600px)' srcset='mobile.png'>\
+               <img src='fallback.png' alt='hero'>\
+             </picture>",
+        ));
+        let img = Arc::new(DecodedImage {
+            size: Size::new(20, 10),
+            rgba: vec![255; 20 * 10 * 4],
+        });
+        let laid = BlockLayout::default().layout(
+            &styled,
+            Size::new(500, 2000),
+            &MonoShaper,
+            &KeyedImage("mobile.png", img),
+            &NoForms,
+        );
+        assert!(
+            laid.display
+                .items
+                .iter()
+                .any(|i| matches!(i, DisplayItem::Image { .. })),
+            "the (max-width:600px) source (mobile.png) was selected and drawn"
+        );
+    }
+
+    #[test]
+    fn picture_falls_back_to_img_when_no_source_matches() {
+        // A wide (1000px) viewport: neither the undecodable AVIF nor the
+        // max-width:600 source qualifies → the <img> fallback is drawn.
+        let styled = CssEngine::new().style(&parse_html(
+            "<picture>\
+               <source type='image/avif' srcset='a.avif'>\
+               <source media='(max-width: 600px)' srcset='mobile.png'>\
+               <img src='fallback.png' alt='hero'>\
+             </picture>",
+        ));
+        let img = Arc::new(DecodedImage {
+            size: Size::new(20, 10),
+            rgba: vec![255; 20 * 10 * 4],
+        });
+        let laid = BlockLayout::default().layout(
+            &styled,
+            Size::new(1000, 2000),
+            &MonoShaper,
+            &KeyedImage("fallback.png", img),
+            &NoForms,
+        );
+        assert!(
+            laid.display
+                .items
+                .iter()
+                .any(|i| matches!(i, DisplayItem::Image { .. })),
+            "no source qualified, so the <img> fallback (fallback.png) was drawn"
+        );
+    }
+
+    #[test]
+    fn picture_honors_the_inner_img_display_none() {
+        // A display:none <img> inside a <picture> paints nothing, exactly as a
+        // bare display:none <img> would (the picture arm must not override the
+        // image's own box suppression).
+        let styled = CssEngine::new().style(&parse_html(
+            "<picture>\
+               <source srcset='mobile.png'>\
+               <img src='fallback.png' style='display:none' alt='hero'>\
+             </picture>",
+        ));
+        let img = Arc::new(DecodedImage {
+            size: Size::new(20, 10),
+            rgba: vec![255; 20 * 10 * 4],
+        });
+        let laid = BlockLayout::default().layout(
+            &styled,
+            Size::new(500, 2000),
+            &MonoShaper,
+            &OneImage(img),
+            &NoForms,
+        );
+        assert!(
+            !laid
+                .display
+                .items
+                .iter()
+                .any(|i| matches!(i, DisplayItem::Image { .. })),
+            "a display:none <img> in a <picture> draws nothing"
+        );
+    }
+
+    #[test]
+    fn picture_without_a_direct_img_still_renders_nested_content() {
+        // Invalid nesting (<img> under a <figure> inside <picture>): with no
+        // direct <img>, the picture arm falls through to normal container layout
+        // so the nested image still draws, matching browsers (and the fetch
+        // collector, which likewise falls through to collect it).
+        let styled = CssEngine::new().style(&parse_html(
+            "<picture><figure><img src='nested.png' alt='x'></figure></picture>",
+        ));
+        let img = Arc::new(DecodedImage {
+            size: Size::new(20, 10),
+            rgba: vec![255; 20 * 10 * 4],
+        });
+        let laid = BlockLayout::default().layout(
+            &styled,
+            Size::new(800, 2000),
+            &MonoShaper,
+            &KeyedImage("nested.png", img),
+            &NoForms,
+        );
+        assert!(
+            laid.display
+                .items
+                .iter()
+                .any(|i| matches!(i, DisplayItem::Image { .. })),
+            "the nested <img> renders even though it is not a direct <picture> child"
+        );
+    }
+
     /// Lay out an `<img>` backed by a decoded image of `intrinsic` size and return
     /// the emitted `Image` rect (w, h). Used by the replaced-sizing tests below.
     fn img_box(html: &str, intrinsic: Size, container_w: u32) -> (u32, u32) {
@@ -5491,9 +7369,9 @@ mod tests {
         // width=600 on a 400×300 image derives height 450; a container whose content
         // area is 500px then clamps width→500 and scales height proportionally
         // (450 * 500/600 = 375). Proves the overflow clamp runs AFTER the ratio
-        // derivation. Content area = container - 2*8px page margin, so 516 → 500.
+        // derivation. (No engine page margin: the content area IS the container.)
         assert_eq!(
-            img_box("<img src='p.png' width='600'>", Size::new(400, 300), 516),
+            img_box("<img src='p.png' width='600'>", Size::new(400, 300), 500),
             (500, 375)
         );
     }
@@ -5550,7 +7428,7 @@ mod tests {
             .expect("background image emitted");
         // The background fills the block width (here the full content area).
         assert!(bg.w >= 300, "bg image stretched to the box: {}", bg.w);
-        assert_eq!(bg.x, 8, "bg starts at the page margin");
+        assert_eq!(bg.x, 0, "bg starts at the content edge (no engine margin)");
     }
 
     #[test]

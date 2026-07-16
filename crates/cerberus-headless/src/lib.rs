@@ -9,7 +9,7 @@
 mod encode;
 pub use encode::{pdf_bytes, png_bytes, write_pdf, write_png};
 
-use cerberus_layout::{FormState, ImageProvider, LayoutEngine};
+use cerberus_layout::{FormState, ImageProvider, LaidOut, LayoutEngine};
 use cerberus_paint::{Framebuffer, Rasterizer, TextShaper};
 use cerberus_style::StyledDom;
 use cerberus_types::{Color, Size};
@@ -31,11 +31,32 @@ pub fn render_document(
     images: &dyn ImageProvider,
     forms: &dyn FormState,
 ) -> Framebuffer {
+    render_document_laid(
+        styled, viewport, background, layout, shaper, rasterizer, images, forms,
+    )
+    .0
+}
+
+/// Like [`render_document`], but also returns the laid-out interaction geometry
+/// (link hit-boxes, form fields, element boxes) — the clickability surface, so
+/// headless callers can audit that visible anchors/controls really produced
+/// dispatchable hit rects.
+#[allow(clippy::too_many_arguments)]
+pub fn render_document_laid(
+    styled: &StyledDom,
+    viewport: Size,
+    background: Color,
+    layout: &mut dyn LayoutEngine,
+    shaper: &dyn TextShaper,
+    rasterizer: &dyn Rasterizer,
+    images: &dyn ImageProvider,
+    forms: &dyn FormState,
+) -> (Framebuffer, LaidOut) {
     let laid = layout.layout(styled, viewport, shaper, images, forms);
     let mut fb = Framebuffer::new(viewport);
     fb.clear(background);
     rasterizer.rasterize(&laid.display, &mut fb);
-    fb
+    (fb, laid)
 }
 
 /// Write a framebuffer as a binary PPM (P6) file. PPM keeps the scaffold

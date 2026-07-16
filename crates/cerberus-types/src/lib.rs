@@ -260,6 +260,41 @@ impl FontStyle {
     }
 }
 
+/// The CSS generic font family a run of text resolves to, after mapping the
+/// `font-family` list (named faces included) to one of the five generics. The
+/// renderer bundles one metric-compatible face per generic (a serif ≈ Times, a
+/// monospace ≈ Courier, a sans ≈ Arial/Roboto), so text presents the right shape
+/// class without shipping — or fingerprinting against — the actual named fonts.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default, Hash)]
+pub enum GenericFamily {
+    /// Times-class serif: generic `serif`, named Times New Roman (and its
+    /// metric aliases) → the bundled Liberation Serif. Also the reference
+    /// browser's STANDARD font — the fallback for a wholly unresolvable
+    /// `font-family` stack.
+    Serif,
+    /// Generic `sans-serif` → the Arial-metric bundled sans (the reference's
+    /// generic sans requests Arial, substituted with Liberation Sans).
+    #[default]
+    SansSerif,
+    /// Named Arial/Helvetica (and metric aliases) — same face as the generic
+    /// sans on this persona, kept distinct for farbling and future personas.
+    SansArial,
+    /// The `system-ui` UI-font class → the bundled DejaVu Sans (what the
+    /// reference resolves its system font to).
+    SansSystem,
+    /// Generic `monospace` (`<pre>`/`<code>` default) → the bundled
+    /// DejaVu Sans Mono, the reference's fixed-font resolution.
+    Monospace,
+    /// Named Courier New (and metric aliases) → the bundled Liberation Mono —
+    /// distinct from the generic monospace face.
+    MonoCourier,
+    /// Handwriting/script; the reference's cursive preference is uninstalled,
+    /// so it falls back to the standard (serif) face.
+    Cursive,
+    /// Decorative/display; falls back to the standard (serif) face likewise.
+    Fantasy,
+}
+
 /// A web origin (scheme, host, optional port) used for site-boundary checks.
 #[derive(Clone, PartialEq, Eq, Hash, Debug)]
 pub struct Origin {

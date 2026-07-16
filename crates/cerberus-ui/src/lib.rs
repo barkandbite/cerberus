@@ -308,6 +308,7 @@ impl Toolbar {
         }
         list.push(DisplayItem::Glyphs {
             origin: Point::new(tx, y),
+            frac_x: 0.0,
             glyphs: shaper.shape(label, LABEL_PX),
             color,
             style: FontStyle::REGULAR,
@@ -422,6 +423,7 @@ impl DrivenBadge {
                 rect.x + BADGE_PAD + BADGE_DOT as i32 + BADGE_PAD,
                 rect.y + (BADGE_H as i32 - BADGE_PX as i32) / 2,
             ),
+            frac_x: 0.0,
             glyphs,
             color: Color::WHITE,
             style: FontStyle::REGULAR,
@@ -741,6 +743,7 @@ impl ConsentBanner {
         let msg = format!("{} wants third-party access{more}", self.request_site);
         list.push(DisplayItem::Glyphs {
             origin: Point::new(PAD + 4, strip.y + 19),
+            frac_x: 0.0,
             glyphs: shaper.shape(&msg, 13),
             color: Color::rgb(0x40, 0x38, 0x10),
             style: FontStyle::REGULAR,
@@ -871,6 +874,7 @@ fn push_centered(
     let y = rect.y + (rect.h as i32 - px as i32) / 2;
     list.push(DisplayItem::Glyphs {
         origin: Point::new(x, y),
+        frac_x: 0.0,
         glyphs,
         color,
         style: FontStyle::REGULAR,
@@ -970,6 +974,7 @@ fn push_icon(
     let y = rect.y + (rect.h as i32 - px as i32) / 2;
     list.push(DisplayItem::Glyphs {
         origin: Point::new(x, y),
+        frac_x: 0.0,
         glyphs,
         color,
         style: FontStyle::ICON,
@@ -1019,6 +1024,7 @@ fn push_count_badge(list: &mut DisplayList, shaper: &dyn TextShaper, rect: Rect,
             bx + ((bw as i32 - tw) / 2).max(0),
             by + (bh as i32 - px as i32) / 2,
         ),
+        frac_x: 0.0,
         glyphs,
         color: Color::WHITE,
         style: FontStyle::REGULAR,
@@ -1152,6 +1158,7 @@ impl CookieManager {
         // Title + count.
         list.push(DisplayItem::Glyphs {
             origin: Point::new(p.x + 12, p.y + 26),
+            frac_x: 0.0,
             glyphs: shaper.shape(&format!("Cookies ({})", rows.len()), 20),
             color: Color::BLACK,
             style: FontStyle::REGULAR,
@@ -1170,6 +1177,7 @@ impl CookieManager {
         // Global default chip.
         list.push(DisplayItem::Glyphs {
             origin: Point::new(p.x + 12, p.y + 63),
+            frac_x: 0.0,
             glyphs: shaper.shape("global default:", 13),
             color: Color::rgb(0x50, 0x50, 0x50),
             style: FontStyle::REGULAR,
@@ -1187,6 +1195,7 @@ impl CookieManager {
         // Legend: explains the per-cookie chip so it isn't a mystery cycle.
         list.push(DisplayItem::Glyphs {
             origin: Point::new(p.x + 12, p.y + 88),
+            frac_x: 0.0,
             glyphs: shaper.shape(
                 "allow = keep   ·   session = forget on close   ·   block = never store",
                 12,
@@ -1208,12 +1217,14 @@ impl CookieManager {
             }
             list.push(DisplayItem::Glyphs {
                 origin: Point::new(p.x + 12, y + 17),
+                frac_x: 0.0,
                 glyphs: shaper.shape(&row.primary, 13),
                 color: Color::BLACK,
                 style: FontStyle::REGULAR,
             });
             list.push(DisplayItem::Glyphs {
                 origin: Point::new(p.x + 12 + 260, y + 17),
+                frac_x: 0.0,
                 glyphs: shaper.shape(&row.detail, 11),
                 color: Color::rgb(0x80, 0x80, 0x80),
                 style: FontStyle::REGULAR,
@@ -1542,6 +1553,7 @@ impl MircPanel {
         // Title + subtitle.
         list.push(DisplayItem::Glyphs {
             origin: Point::new(p.x + 16, p.y + 30),
+            frac_x: 0.0,
             glyphs: shaper.shape("MIRC — Multi-Identity Remote Control", 19),
             color: Color::BLACK,
             style: FontStyle::REGULAR,
@@ -1558,6 +1570,7 @@ impl MircPanel {
         };
         list.push(DisplayItem::Glyphs {
             origin: Point::new(p.x + 16, p.y + 54),
+            frac_x: 0.0,
             glyphs: shaper.shape(&subtitle, 13),
             color: Color::rgb(0x60, 0x60, 0x60),
             style: FontStyle::REGULAR,
@@ -1607,12 +1620,14 @@ impl MircPanel {
         // Column headers + a hairline divider above the list.
         list.push(DisplayItem::Glyphs {
             origin: Point::new(p.x + 34, p.y + MIRC_LIST_TOP - 10),
+            frac_x: 0.0,
             glyphs: shaper.shape("identity", 11),
             color: Color::rgb(0x90, 0x90, 0x90),
             style: FontStyle::REGULAR,
         });
         list.push(DisplayItem::Glyphs {
             origin: Point::new(p.x + MIRC_ACCOUNT_X, p.y + MIRC_LIST_TOP - 10),
+            frac_x: 0.0,
             glyphs: shaper.shape("account", 11),
             color: Color::rgb(0x90, 0x90, 0x90),
             style: FontStyle::REGULAR,
@@ -1642,12 +1657,14 @@ impl MircPanel {
             // they line up with the chips/pills (which center in their boxes).
             list.push(DisplayItem::Glyphs {
                 origin: Point::new(p.x + 34, y + (MIRC_ROW_H as i32 - 14) / 2),
+                frac_x: 0.0,
                 glyphs: shaper.shape(&row.label, 14),
                 color: Color::rgb(0x18, 0x18, 0x18),
                 style: FontStyle::REGULAR,
             });
             list.push(DisplayItem::Glyphs {
                 origin: Point::new(p.x + MIRC_ACCOUNT_X, y + (MIRC_ROW_H as i32 - 12) / 2),
+                frac_x: 0.0,
                 glyphs: shaper.shape(&row.account, 12),
                 color: Color::rgb(0x78, 0x78, 0x78),
                 style: FontStyle::REGULAR,
@@ -1691,6 +1708,7 @@ impl MircPanel {
         // Legend.
         list.push(DisplayItem::Glyphs {
             origin: Point::new(p.x + 16, p.y + p.h as i32 - 16),
+            frac_x: 0.0,
             glyphs: shaper.shape(
                 "live = on screen   ·   dormant = sealed & paused   ·   diverged = needs attention",
                 12,
@@ -1842,6 +1860,7 @@ impl PerfHud {
         });
         list.push(DisplayItem::Glyphs {
             origin: Point::new(x + HUD_PAD, y + HUD_PAD + 12),
+            frac_x: 0.0,
             glyphs: shaper.shape("performance", 12),
             color: Color::rgb(0x9A, 0xD0, 0xFF),
             style: FontStyle::REGULAR,
@@ -1850,6 +1869,7 @@ impl PerfHud {
             let ry = y + HUD_PAD + HUD_ROW_H * (i as i32 + 1) + 12;
             list.push(DisplayItem::Glyphs {
                 origin: Point::new(x + HUD_PAD, ry),
+                frac_x: 0.0,
                 glyphs: shaper.shape(label, 12),
                 color: Color::rgb(0xD8, 0xD8, 0xD8),
                 style: FontStyle::REGULAR,
@@ -1859,6 +1879,7 @@ impl PerfHud {
             let vx = x + HUD_W as i32 - HUD_PAD - vw as i32;
             list.push(DisplayItem::Glyphs {
                 origin: Point::new(vx, ry),
+                frac_x: 0.0,
                 glyphs: shaper.shape(value, 12),
                 color: Color::rgb(0x86, 0xE3, 0x9A),
                 style: FontStyle::REGULAR,

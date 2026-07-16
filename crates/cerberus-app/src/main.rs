@@ -127,6 +127,12 @@ fn cmd_render(args: &[String]) -> ExitCode {
     if let Some(engine) = flag(args, "--engine") {
         config.layout_engine = cerberus_app::LayoutEngineKind::parse(&engine);
     }
+    if let Some(mode) = flag(args, "--images") {
+        config.image_mode = cerberus_app::ImageDisplayMode::parse(&mode);
+    }
+    // Per-image text-only overrides: `--text-only-image <substr>` (repeatable),
+    // matched against each resolved image URL.
+    config.text_only_images = flags(args, "--text-only-image");
     config.background = Color::WHITE;
 
     let outcome = match render(&config) {
@@ -136,6 +142,32 @@ fn cmd_render(args: &[String]) -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
+
+    // Clickability audit: dump the link + form-control hit boxes as JSON lines
+    // (one object per box, content coordinates), for scripts/clickcheck.sh.
+    if let Some(path) = flag(args, "--dump-links") {
+        let mut buf = String::new();
+        for l in &outcome.links {
+            buf.push_str(&format!(
+                "{{\"kind\":\"link\",\"href\":{},\"x\":{},\"y\":{},\"w\":{},\"h\":{}}}\n",
+                json_str(&l.href),
+                l.rect.x,
+                l.rect.y,
+                l.rect.w,
+                l.rect.h
+            ));
+        }
+        for f in &outcome.fields {
+            buf.push_str(&format!(
+                "{{\"kind\":\"field\",\"field\":\"{:?}\",\"x\":{},\"y\":{},\"w\":{},\"h\":{}}}\n",
+                f.kind, f.rect.x, f.rect.y, f.rect.w, f.rect.h
+            ));
+        }
+        if let Err(e) = std::fs::write(&path, buf) {
+            eprintln!("could not write {path}: {e}");
+            return ExitCode::FAILURE;
+        }
+    }
 
     // Output format follows the file extension: .png / .pdf / anything-else=PPM.
     let write_result = match out.rsplit('.').next() {
@@ -667,8 +699,14 @@ fn print_usage() {
          \x20 --system-roots      trust the OS cert store (TLS-inspecting proxies)\n\
          \x20 --data-dir <DIR>    persistent profile (cookies survive runs)\n\
          \x20 --dump-text         print the page's text content (automation)\n\
+         \x20 --dump-links FILE   write link/control hit-boxes as JSON lines (audit)\n\
          \x20 --timers            collect + print per-stage performance timings\n\
          \x20 --proxy <HOST:PORT> single egress proxy (CONNECT tunnel, no DNS leak)\n\
+         \x20 --engine <ENGINE>   layout engine: block (default) | taffy\n\
+         \x20 --images <MODE>     image display: graphical (default) | text-only\n\
+         \x20                     (text-only renders alt/caption, skips the fetch)\n\
+         \x20 --text-only-image <SUBSTR>  force just images whose URL contains\n\
+         \x20                     SUBSTR to text-only (repeatable; per-image option)\n\
          \x20 (--out extension selects the format: .ppm, .png, or .pdf)\n\n\
          MEM-GATE OPTIONS:\n\
          \x20 --budget-mb <MB>     default: 64\n\
@@ -693,6 +731,22 @@ const fn default_command() -> &'static str {
 }
 
 /// Read `--key value` from args.
+/// Minimal JSON string escaping for hrefs (quotes, backslashes, control chars).
+fn json_str(s: &str) -> String {
+    let mut out = String::with_capacity(s.len() + 2);
+    out.push('"');
+    for c in s.chars() {
+        match c {
+            '"' => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            c if (c as u32) < 0x20 => out.push_str(&format!("\\u{:04x}", c as u32)),
+            c => out.push(c),
+        }
+    }
+    out.push('"');
+    out
+}
+
 fn flag(args: &[String], key: &str) -> Option<String> {
     args.iter()
         .position(|a| a == key)
@@ -703,4 +757,13 @@ fn flag(args: &[String], key: &str) -> Option<String> {
 /// Whether a boolean `--flag` is present.
 fn has_flag(args: &[String], key: &str) -> bool {
     args.iter().any(|a| a == key)
+}
+
+/// Read every `--key value` occurrence (a repeatable flag).
+fn flags(args: &[String], key: &str) -> Vec<String> {
+    args.iter()
+        .enumerate()
+        .filter(|(_, a)| a.as_str() == key)
+        .filter_map(|(i, _)| args.get(i + 1).cloned())
+        .collect()
 }
