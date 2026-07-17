@@ -99,6 +99,30 @@ globalThis.__trap = new Proxy(Object.create(null), {
 });
 "#;
 
+/// Simulate a little user interaction — reese84 gathers behavioral entropy
+/// (pointer/mouse/key/touch/scroll) and may hold its submission until it has
+/// some. Dispatch a burst of plausible events to both `document` and `window`.
+const INTERACTION_SIM: &str = r#"
+(function () {
+  var types = ['pointermove','mousemove','pointerdown','mousedown','mouseup','click',
+               'keydown','keyup','touchstart','touchmove','touchend','scroll','wheel','focus','blur'];
+  var fired = 0;
+  for (var round = 0; round < 6; round++) {
+    types.forEach(function (t) {
+      var ev = { type: t, bubbles: true, cancelable: true, isTrusted: true, timeStamp: round * 16,
+                 clientX: 80 + round * 11, clientY: 140 + round * 7, pageX: 80, pageY: 140,
+                 screenX: 90, screenY: 160, movementX: 4, movementY: 3, button: 0, buttons: 1,
+                 key: 'a', code: 'KeyA', keyCode: 65, which: 65, target: globalThis.document,
+                 touches: [{ clientX: 80, clientY: 140 }], changedTouches: [{ clientX: 80, clientY: 140 }] };
+      try { if (globalThis.document && globalThis.document.dispatchEvent) globalThis.document.dispatchEvent(ev); } catch (e) {}
+      try { if (globalThis.dispatchEvent) globalThis.dispatchEvent(ev); } catch (e) {}
+      fired++;
+    });
+  }
+  globalThis.__simFired = fired;
+})();
+"#;
+
 #[test]
 #[ignore = "needs a locally-fetched sensor via CERB_SENSOR; run explicitly"]
 fn reese84_sensor_api_surface_probe() {
@@ -167,6 +191,12 @@ fn reese84_sensor_api_surface_probe() {
         .ok();
     eprintln!("readyState {readystate_before:?} -> {readystate_after:?}");
 
+    // Behavioral-entropy path: simulate input, then pump again.
+    let _ = engine.eval(realm, INTERACTION_SIM);
+    for _ in 0..8 {
+        let _ = run_event_loop(&mut engine, realm, EventLoopBudget::default());
+    }
+
     let report = engine
         .eval(
             realm,
@@ -183,8 +213,19 @@ fn reese84_sensor_api_surface_probe() {
                  fetch: typeof globalThis.fetch, \
                  sendBeacon: (globalThis.navigator && typeof globalThis.navigator.sendBeacon) || 'none', \
                  WebSocket: typeof globalThis.WebSocket, \
-                 Image: typeof globalThis.Image \
-               } \
+                 Image: typeof globalThis.Image, \
+                 Blob: typeof globalThis.Blob, \
+                 Worker: typeof globalThis.Worker \
+               }, \
+               workerScripts: globalThis.__cerberusWorkerScripts || [], \
+               workerImports: globalThis.__cerberusWorkerImports || [], \
+               simFired: globalThis.__simFired || 0, \
+               storage: (function () { \
+                 function dump(s) { var o = {}; try { for (var i = 0; i < s.length; i++) { \
+                   var k = s.key(i); var v = s.getItem(k); o[k] = (v == null ? null : String(v).slice(0, 120)); } } catch (e) { o.__err = '' + e; } return o; } \
+                 return { local: dump(globalThis.localStorage || {length:0,key:function(){},getItem:function(){}}), \
+                          session: dump(globalThis.sessionStorage || {length:0,key:function(){},getItem:function(){}}) }; \
+               })() \
              }, null, 0)",
         )
         .expect("read report");

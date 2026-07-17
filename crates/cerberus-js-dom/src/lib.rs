@@ -2956,7 +2956,13 @@ pub const DOM_MODEL_PRELUDE: &str = r##"
         dispatchEvent: function () { return false; },
       });
     };
-    g.navigator.sendBeacon = function () { return true; };
+    g.navigator.sendBeacon = function (url, data) {
+      // A real beacon is a keep-alive POST; route it through the shared fetch
+      // queue (defined later in the prelude) so telemetry actually goes out and
+      // is observable, instead of silently dropping it.
+      try { if (typeof g.__cerberusBeacon === "function") g.__cerberusBeacon(url, "POST", data != null ? data : ""); } catch (e) {}
+      return true;
+    };
     g.navigator.storage = {
       estimate: function () { return Promise.resolve({ quota: 299977129984, usage: 0 }); },
       persisted: function () { return Promise.resolve(false); },
@@ -4083,6 +4089,163 @@ pub const DOM_MODEL_PRELUDE: &str = r##"
       this.status = 0;
     };
     g.XMLHttpRequest = XMLHttpRequest;
+
+    // ---- Blob + object URLs + Worker + Image + WebSocket ----------------
+    // Speed-first, single-thread shims. Modern sites (and anti-bot sensors)
+    // routinely offload work to a Blob-backed Worker, or beacon telemetry via
+    // `new Image().src` / `navigator.sendBeacon`. A real Worker runs off-thread;
+    // we run its code synchronously in-realm and route `postMessage` both ways
+    // through the existing timer queue. Network from a Worker or a beacon reuses
+    // the page's fetch queue + sealed jar, so it stays first-party and consented.
+    (function () {
+      // Fire-and-forget request onto the shared fetch queue (beacons: no caller
+      // awaits the response). Reuses the same drain + sealed jar as fetch/XHR.
+      function beacon(url, method, body) {
+        try {
+          var id = g.__cerberusFetchId++;
+          g.__cerberusFetchQueue.push({
+            id: id, url: String(url), method: method || "GET",
+            headers: [], body: body != null ? String(body) : ""
+          });
+          g.__cerberusFetchPending[id] = { resolve: function () {}, reject: function () {} };
+          return id;
+        } catch (e) { return -1; }
+      }
+      g.__cerberusBeacon = beacon;
+
+      if (typeof g.Blob !== "function") {
+        g.Blob = function (parts, opts) {
+          this.__parts = [];
+          if (parts && parts.length) for (var i = 0; i < parts.length; i++) this.__parts.push(String(parts[i]));
+          this.type = (opts && opts.type) ? String(opts.type) : "";
+          var n = 0; for (var j = 0; j < this.__parts.length; j++) n += this.__parts[j].length;
+          this.size = n;
+        };
+        g.Blob.prototype.slice = function () { return new g.Blob(this.__parts, { type: this.type }); };
+        g.Blob.prototype.text = function () { return Promise.resolve(this.__parts.join("")); };
+        g.Blob.prototype.arrayBuffer = function () {
+          var s = this.__parts.join(""), buf = new ArrayBuffer(s.length), v = new Uint8Array(buf);
+          for (var i = 0; i < s.length; i++) v[i] = s.charCodeAt(i) & 0xff;
+          return Promise.resolve(buf);
+        };
+      }
+
+      // object URLs: map blob: URLs back to their Blob so Worker() reads source.
+      var __blobs = Object.create(null), __blobSeq = 1;
+      if (!g.URL) g.URL = {};
+      if (typeof g.URL.createObjectURL !== "function") {
+        g.URL.createObjectURL = function (blob) {
+          var origin = (g.location && g.location.origin) || "null";
+          var id = "blob:" + origin + "/cerberus-" + (__blobSeq++);
+          __blobs[id] = blob;
+          return id;
+        };
+        g.URL.revokeObjectURL = function (id) { delete __blobs[String(id)]; };
+      }
+      function blobSource(u) {
+        var b = __blobs[String(u)];
+        return b && b.__parts ? b.__parts.join("") : null;
+      }
+
+      if (typeof g.Worker !== "function") {
+        g.Worker = function (scriptUrl) {
+          var outer = this;
+          outer.onmessage = null; outer.onerror = null; outer.onmessageerror = null;
+          outer.__ls = { message: [], error: [] };
+          outer.addEventListener = function (t, fn) { if (outer.__ls[t]) outer.__ls[t].push(fn); };
+          outer.removeEventListener = function (t, fn) { var a = outer.__ls[t]; if (a) { var i = a.indexOf(fn); if (i >= 0) a.splice(i, 1); } };
+          outer.terminate = function () { outer.__dead = true; };
+
+          var scope = { onmessage: null, name: "", __ls: { message: [], error: [] } };
+          scope.self = scope;
+          scope.location = g.location; scope.navigator = g.navigator;
+          scope.setTimeout = g.setTimeout; scope.clearTimeout = g.clearTimeout;
+          scope.setInterval = g.setInterval; scope.clearInterval = g.clearInterval;
+          scope.queueMicrotask = g.queueMicrotask;
+          scope.fetch = g.fetch; scope.XMLHttpRequest = g.XMLHttpRequest;
+          scope.crypto = g.crypto; scope.atob = g.atob; scope.btoa = g.btoa;
+          scope.TextEncoder = g.TextEncoder; scope.TextDecoder = g.TextDecoder;
+          scope.performance = g.performance; scope.Blob = g.Blob; scope.URL = g.URL;
+          scope.addEventListener = function (t, fn) { if (scope.__ls[t]) scope.__ls[t].push(fn); };
+          scope.removeEventListener = function (t, fn) { var a = scope.__ls[t]; if (a) { var i = a.indexOf(fn); if (i >= 0) a.splice(i, 1); } };
+          scope.close = function () { scope.__dead = true; };
+          scope.importScripts = function () {
+            for (var i = 0; i < arguments.length; i++) (g.__cerberusWorkerImports = g.__cerberusWorkerImports || []).push(String(arguments[i]));
+          };
+          function deliver(target, ls, data) {
+            if (target && target.__dead) return;
+            g.setTimeout(function () {
+              var ev = { data: data, type: "message" };
+              var h = target.onmessage; if (typeof h === "function") { try { h.call(target, ev); } catch (e) {} }
+              ls.message.forEach(function (fn) { try { fn.call(target, ev); } catch (e) {} });
+            }, 0);
+          }
+          scope.postMessage = function (data) { deliver(outer, outer.__ls, data); };  // worker -> main
+          outer.postMessage = function (data) { deliver(scope, scope.__ls, data); };   // main -> worker
+
+          var src = blobSource(scriptUrl);
+          if (src == null) { (g.__cerberusWorkerScripts = g.__cerberusWorkerScripts || []).push(String(scriptUrl)); return; }
+          try {
+            var run = new Function(
+              "self", "postMessage", "importScripts", "addEventListener", "removeEventListener",
+              "close", "location", "navigator", "setTimeout", "clearTimeout", "setInterval",
+              "clearInterval", "queueMicrotask", "fetch", "XMLHttpRequest", "crypto", "atob",
+              "btoa", "TextEncoder", "TextDecoder", "performance", "Blob", "URL", src);
+            run.call(scope, scope, scope.postMessage, scope.importScripts, scope.addEventListener,
+              scope.removeEventListener, scope.close, scope.location, scope.navigator, scope.setTimeout,
+              scope.clearTimeout, scope.setInterval, scope.clearInterval, scope.queueMicrotask, scope.fetch,
+              scope.XMLHttpRequest, scope.crypto, scope.atob, scope.btoa, scope.TextEncoder, scope.TextDecoder,
+              scope.performance, scope.Blob, scope.URL);
+          } catch (e) {
+            g.setTimeout(function () {
+              var ev = { type: "error", message: String(e), error: e };
+              if (typeof outer.onerror === "function") { try { outer.onerror(ev); } catch (_) {} }
+              outer.__ls.error.forEach(function (fn) { try { fn(ev); } catch (_) {} });
+            }, 0);
+          }
+        };
+      }
+
+      if (typeof g.Image !== "function") {
+        g.Image = function (w, h) {
+          var self = this;
+          self.width = w || 0; self.height = h || 0;
+          self.naturalWidth = 0; self.naturalHeight = 0;
+          self.complete = false; self.onload = null; self.onerror = null;
+          var _src = "";
+          Object.defineProperty(self, "src", {
+            configurable: true, enumerable: true,
+            get: function () { return _src; },
+            set: function (v) {
+              _src = String(v);
+              // An <img> load is a GET; route non-data beacons like the network
+              // does so sensor pixel beacons actually go out and are observable.
+              if (_src && _src.indexOf("data:") !== 0) g.__cerberusBeacon(_src, "GET", null);
+              self.complete = true;
+              g.setTimeout(function () { if (typeof self.onload === "function") { try { self.onload({ type: "load" }); } catch (e) {} } }, 0);
+            }
+          });
+        };
+      }
+
+      if (typeof g.WebSocket !== "function") {
+        g.WebSocket = function (url, protocols) {
+          var self = this;
+          self.url = String(url); self.readyState = 0; // CONNECTING
+          self.onopen = null; self.onmessage = null; self.onerror = null; self.onclose = null;
+          self.protocol = protocols ? String([].concat(protocols)[0]) : "";
+          self.bufferedAmount = 0; self.extensions = "";
+          self.send = function () {};
+          self.addEventListener = function () {};
+          self.removeEventListener = function () {};
+          self.close = function () { self.readyState = 3; if (typeof self.onclose === "function") { try { self.onclose({ type: "close", code: 1000, wasClean: true }); } catch (e) {} } };
+          // Report open so feature-detection passes; no messages arrive (a live
+          // socket to the sensor is out of scope for this speed-first shim).
+          g.setTimeout(function () { self.readyState = 1; if (typeof self.onopen === "function") { try { self.onopen({ type: "open" }); } catch (e) {} } }, 0);
+        };
+        g.WebSocket.CONNECTING = 0; g.WebSocket.OPEN = 1; g.WebSocket.CLOSING = 2; g.WebSocket.CLOSED = 3;
+      }
+    })();
 
     // ---- serialize: JS tree -> wire JSON -------------------------------
     g.__cerberusSerializeDOM = function () {
