@@ -171,6 +171,7 @@ impl<A: FrameApp> State<A> {
                 self.set_fullscreen(false);
                 true
             }
+            Key::Named(NamedKey::F12) => self.app.dev_console_toggle(),
             Key::Named(NamedKey::ArrowDown) => self.app.scroll_by(ARROW_STEP_PX),
             Key::Named(NamedKey::ArrowUp) => self.app.scroll_by(-ARROW_STEP_PX),
             Key::Named(NamedKey::PageDown) => self.app.scroll_page(true),

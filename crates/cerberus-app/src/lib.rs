@@ -2599,6 +2599,9 @@ pub struct BrowserApp {
     /// A transient status line shown under the MIRC control bar (e.g. the result
     /// of a bulk action), cleared on the next panel interaction.
     mirc_status: Option<String>,
+    /// Whether the developer console overlay is open (the F12 key). Shows page
+    /// stats and the page's captured `console.*` output.
+    console_open: bool,
     /// Remaining script-initiated navigations before further ones are ignored.
     /// A user gesture refills it to [`SCRIPT_NAV_CAP`]; each `location.*`/
     /// `location.href =` reload spends one. Caps a page that reloads on every
@@ -2787,6 +2790,7 @@ impl BrowserApp {
             mirc_open: false,
             mirc_scroll: 0,
             mirc_status: None,
+            console_open: false,
             script_nav_budget: SCRIPT_NAV_CAP,
         };
         // The SYNC button shows how many identities/sessions it can drive.
@@ -3367,6 +3371,26 @@ impl BrowserApp {
                 let _ = run_event_loop(engine, realm, EventLoopBudget::default());
             }
             self.reconcile_realm();
+        }
+    }
+
+    /// Read the page's captured `console.*` output for the developer console.
+    /// Page script writes each formatted line into `globalThis.__cerberusConsole`
+    /// (see the DOM prelude); we join with a control char that can't appear in a
+    /// line and split it back. Empty for script-less pages (no realm/console).
+    fn read_console_lines(&mut self) -> Vec<String> {
+        if self.node_to_js.is_empty() {
+            return Vec::new();
+        }
+        let realm = RealmId(self.heads.active().id.0);
+        let Ok(engine) = self.heads.engine() else {
+            return Vec::new();
+        };
+        match engine.eval(realm, "(globalThis.__cerberusConsole||[]).join('\\u0001')") {
+            Ok(cerberus_js::JsValue::Str(s)) if !s.is_empty() => {
+                s.split('\u{1}').map(str::to_string).collect()
+            }
+            _ => Vec::new(),
         }
     }
 
@@ -4991,6 +5015,26 @@ impl FrameApp for BrowserApp {
                 self.text.rasterize(&list.scaled(scale), &mut fb);
             }
         }
+        // Developer console drawer (F12), under the HUD. Gather stats + the
+        // captured console output before borrowing the text engine to paint.
+        if self.console_open {
+            let url = self
+                .current_url
+                .as_ref()
+                .map(|u| u.to_string())
+                .unwrap_or_else(|| self.toolbar.url_text.clone());
+            let stats = format!(
+                "DOM {} nodes · {} links · {} fields · cookies {}",
+                self.elements.len(),
+                self.links.len(),
+                self.form_fields.len(),
+                self.cookie_rows().len(),
+            );
+            let lines = self.read_console_lines();
+            paint_dev_console(
+                &mut fb, logical, &self.text, &self.text, &url, &stats, &lines, scale,
+            );
+        }
         // Performance HUD on top of everything, when enabled (M11).
         if self.hud_on {
             let rows = self.timings.display_rows();
@@ -5010,6 +5054,12 @@ impl FrameApp for BrowserApp {
                     return true;
                 }
             }
+        }
+        // The developer console drawer swallows clicks that land on it, so page
+        // content painted behind it isn't activated by a click meant for the
+        // console.
+        if self.console_open && point_in_rect(dev_console_rect(self.last_size), x, y) {
+            return true;
         }
         if self.mirc_open {
             // The MIRC panel owns all clicks while open; a click outside it (but
@@ -5257,6 +5307,11 @@ impl FrameApp for BrowserApp {
         } else {
             false
         }
+    }
+
+    fn dev_console_toggle(&mut self) -> bool {
+        self.console_open = !self.console_open;
+        true
     }
 }
 
@@ -6052,6 +6107,95 @@ fn paint_settings_overlay(
     raster.rasterize(&list.scaled(scale), fb);
 }
 
+/// The developer-console drawer: the bottom ~45% of the window.
+fn dev_console_rect(size: Size) -> Rect {
+    let h = (size.h * 9 / 20).max(120).min(size.h);
+    Rect::new(0, (size.h - h) as i32, size.w.max(1), h)
+}
+
+/// Paint the developer console (F12): a dark bottom drawer with a stats header
+/// and the page's captured `console.*` output (most recent last, tail-clipped to
+/// what fits). A read-only inspector for "what is the page actually doing".
+#[allow(clippy::too_many_arguments)]
+fn paint_dev_console(
+    fb: &mut Framebuffer,
+    size: Size,
+    shaper: &dyn TextShaper,
+    raster: &dyn Rasterizer,
+    url: &str,
+    stats: &str,
+    lines: &[String],
+    scale: f32,
+) {
+    let panel = dev_console_rect(size);
+    let mut list = DisplayList::new();
+    list.push(DisplayItem::Rect {
+        rect: panel,
+        color: Color::rgb(0x1E, 0x1E, 0x1E),
+    });
+    // Top border + title bar.
+    list.push(DisplayItem::Rect {
+        rect: Rect::new(panel.x, panel.y, panel.w, 2),
+        color: Color::rgb(0x3C, 0x3C, 0x3C),
+    });
+    list.push(DisplayItem::Glyphs {
+        origin: Point::new(panel.x + 10, panel.y + 8),
+        frac_x: 0.0,
+        glyphs: shaper.shape("Developer Console", 13),
+        color: Color::rgb(0xE0, 0xE0, 0xE0),
+        style: FontStyle::REGULAR,
+    });
+    list.push(DisplayItem::Glyphs {
+        origin: Point::new(panel.x + 10, panel.y + 28),
+        frac_x: 0.0,
+        glyphs: shaper.shape(url, 12),
+        color: Color::rgb(0x9C, 0xC4, 0xE4),
+        style: FontStyle::REGULAR,
+    });
+    list.push(DisplayItem::Glyphs {
+        origin: Point::new(panel.x + 10, panel.y + 46),
+        frac_x: 0.0,
+        glyphs: shaper.shape(stats, 12),
+        color: Color::rgb(0xA8, 0xA8, 0xA8),
+        style: FontStyle::REGULAR,
+    });
+    // Close hint, right-aligned.
+    let hint = "F12 to close";
+    let hint_w: u32 = shaper.shape(hint, 12).iter().map(|g| g.advance).sum();
+    list.push(DisplayItem::Glyphs {
+        origin: Point::new(panel.x + panel.w as i32 - hint_w as i32 - 10, panel.y + 8),
+        frac_x: 0.0,
+        glyphs: shaper.shape(hint, 12),
+        color: Color::rgb(0x80, 0x80, 0x80),
+        style: FontStyle::REGULAR,
+    });
+    // Console output area, below the header. Show the tail that fits.
+    let top = panel.y + 68;
+    let line_h = 16;
+    let avail = ((panel.y + panel.h as i32 - 8 - top) / line_h).max(0) as usize;
+    let start = lines.len().saturating_sub(avail);
+    let shown = &lines[start..];
+    if lines.is_empty() {
+        list.push(DisplayItem::Glyphs {
+            origin: Point::new(panel.x + 10, top),
+            frac_x: 0.0,
+            glyphs: shaper.shape("(no console output on this page)", 12),
+            color: Color::rgb(0x70, 0x70, 0x70),
+            style: FontStyle::REGULAR,
+        });
+    }
+    for (i, line) in shown.iter().enumerate() {
+        list.push(DisplayItem::Glyphs {
+            origin: Point::new(panel.x + 10, top + i as i32 * line_h),
+            frac_x: 0.0,
+            glyphs: shaper.shape(line, 12),
+            color: Color::rgb(0xD4, 0xD4, 0xD4),
+            style: FontStyle::REGULAR,
+        });
+    }
+    raster.rasterize(&list.scaled(scale), fb);
+}
+
 /// One pipeline-stage benchmark result.
 pub struct BenchStage {
     pub name: &'static str,
@@ -6520,6 +6664,40 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn dev_console_toggles_and_captures_page_console_output() {
+        // F12 opens a read-only drawer that surfaces the page's console.* output
+        // — the "see what the page is doing" inspector the browser was missing.
+        let mut b = loaded(
+            vec![(
+                "https://site.test/",
+                Ok(page(
+                    "https://site.test/",
+                    200,
+                    None,
+                    "<div id='x'>hi</div><script>console.log('hello', 42);</script>",
+                )),
+            )],
+            "https://site.test/",
+        );
+        assert!(!b.console_open, "starts closed");
+        assert!(b.dev_console_toggle(), "F12 opens and asks for a redraw");
+        assert!(b.console_open);
+
+        let lines = b.read_console_lines();
+        assert!(
+            lines.iter().any(|l| l.contains("hello 42")),
+            "captured page console output, got {lines:?}"
+        );
+
+        // Painting with the console open produces a full frame without panicking.
+        let fb = b.render_frame(Size::new(800, 600));
+        assert_eq!(fb.size, Size::new(800, 600));
+
+        assert!(b.dev_console_toggle(), "F12 again closes it");
+        assert!(!b.console_open);
     }
 
     #[test]

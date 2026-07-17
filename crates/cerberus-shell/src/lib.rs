@@ -130,6 +130,12 @@ pub trait FrameApp {
         let _ = end;
         false
     }
+
+    /// Toggle the developer console overlay (the F12 key). Returns true if a
+    /// redraw is needed. Default: no console.
+    fn dev_console_toggle(&mut self) -> bool {
+        false
+    }
 }
 
 /// An application that drives **multiple** surfaces (windows) at once — the

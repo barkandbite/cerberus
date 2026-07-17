@@ -6,6 +6,12 @@ browser is pre-1.0; this is the first tagged preview.
 ## [Unreleased]
 
 ### Added
+- **Developer console (F12).** A read-only bottom drawer that surfaces what the
+  page is actually doing: the current URL, live DOM/link/field/cookie counts,
+  and the page's captured `console.*` output (most recent last). Toggle with
+  F12; the drawer swallows clicks so content behind it isn't activated. First
+  step toward the full inspector — an interactive command line, network, and
+  storage panels follow.
 - **Settings: working "images" toggle.** The settings panel now has a real
   images control (graphical ↔ text-only) alongside the existing cookie-manager
   and performance-HUD rows, replacing greyed-out placeholder text with a live
