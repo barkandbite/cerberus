@@ -31,7 +31,8 @@ browser is pre-1.0; this is the first tagged preview.
   accent, spacing, radii, and type scale: a titled tab strip (Console active;
   Elements/Network/Storage signposted for later), a row of live stat chips
   (DOM nodes · links · fields · cookies), the page URL, and the page's captured
-  `console.*` output (most recent last, tail-clipped). Toggle with F12; the
+  `console.*` output (most recent last, tail-clipped) **colour-coded by level**
+  (`console.error` red, `console.warn` amber). Toggle with F12; the
   drawer swallows clicks so content behind it isn't activated. `DevConsole`
   (`drawer_rect`/`paint`) is a pure view. Next: an interactive command line and
   populated Elements/Network/Storage panels.

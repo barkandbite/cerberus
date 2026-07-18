@@ -104,9 +104,9 @@ use cerberus_text::TextEngine;
 use cerberus_tls_rustls::RustlsProvider;
 use cerberus_types::{Color, FontStyle, HeadId, InstanceId, Origin, Point, RealmId, Rect, Size};
 use cerberus_ui::{
-    BannerAction, ConsentBanner, CookieAction, CookieManager, CookieRow, DevConsole,
-    DevConsoleModel, MircAction, MircPanel, MircRow, MircState, PerfHud, SettingsAction,
-    SettingsModel, SettingsPanel, Toolbar, ToolbarAction, BANNER_HEIGHT,
+    BannerAction, ConsentBanner, ConsoleLevel, ConsoleLine, CookieAction, CookieManager, CookieRow,
+    DevConsole, DevConsoleModel, MircAction, MircPanel, MircRow, MircState, PerfHud,
+    SettingsAction, SettingsModel, SettingsPanel, Toolbar, ToolbarAction, BANNER_HEIGHT,
 };
 use cerberus_url::{join as join_url, parse as parse_url, Url};
 use std::collections::HashMap;
@@ -3376,10 +3376,11 @@ impl BrowserApp {
     }
 
     /// Read the page's captured `console.*` output for the developer console.
-    /// Page script writes each formatted line into `globalThis.__cerberusConsole`
-    /// (see the DOM prelude); we join with a control char that can't appear in a
-    /// line and split it back. Empty for script-less pages (no realm/console).
-    fn read_console_lines(&mut self) -> Vec<String> {
+    /// Page script writes each console record into `globalThis.__cerberusConsole`
+    /// (see the DOM prelude) as `"level\u0002text"`; we join records with `\u0001`
+    /// (neither can appear in a line) and split them back into typed entries.
+    /// Empty for script-less pages (no realm/console).
+    fn read_console_entries(&mut self) -> Vec<ConsoleLine> {
         if self.node_to_js.is_empty() {
             return Vec::new();
         }
@@ -3389,7 +3390,7 @@ impl BrowserApp {
         };
         match engine.eval(realm, "(globalThis.__cerberusConsole||[]).join('\\u0001')") {
             Ok(cerberus_js::JsValue::Str(s)) if !s.is_empty() => {
-                s.split('\u{1}').map(str::to_string).collect()
+                s.split('\u{1}').map(parse_console_record).collect()
             }
             _ => Vec::new(),
         }
@@ -5041,7 +5042,7 @@ impl FrameApp for BrowserApp {
                 self.form_fields.len(),
                 self.cookie_rows().len(),
             );
-            let lines = self.read_console_lines();
+            let lines = self.read_console_entries();
             let model = DevConsoleModel {
                 url: &url,
                 dom_nodes,
@@ -5539,6 +5540,28 @@ fn simple_document(heading: &str, line: &str, note: Option<&str>) -> Document {
 
 fn point_in_rect(r: Rect, x: i32, y: i32) -> bool {
     x >= r.x && y >= r.y && x < r.x + r.w as i32 && y < r.y + r.h as i32
+}
+
+/// Parse one `"leveltext"` console record (see the DOM prelude) into a
+/// typed [`ConsoleLine`]. An untagged record (legacy or hand-written) is treated
+/// as a plain `log`.
+fn parse_console_record(record: &str) -> ConsoleLine {
+    match record.split_once('\u{2}') {
+        Some((level, text)) => ConsoleLine {
+            level: match level {
+                "warn" => ConsoleLevel::Warn,
+                "error" => ConsoleLevel::Error,
+                "info" => ConsoleLevel::Info,
+                "debug" => ConsoleLevel::Debug,
+                _ => ConsoleLevel::Log,
+            },
+            text: text.to_string(),
+        },
+        None => ConsoleLine {
+            level: ConsoleLevel::Log,
+            text: record.to_string(),
+        },
+    }
 }
 
 // --- Form controls: the id convention + GET submission. ---
@@ -6443,9 +6466,9 @@ mod tests {
         assert!(b.dev_console_toggle(), "F12 opens and asks for a redraw");
         assert!(b.console_open);
 
-        let lines = b.read_console_lines();
+        let lines = b.read_console_entries();
         assert!(
-            lines.iter().any(|l| l.contains("hello 42")),
+            lines.iter().any(|l| l.text.contains("hello 42")),
             "captured page console output, got {lines:?}"
         );
 

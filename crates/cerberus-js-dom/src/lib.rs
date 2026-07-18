@@ -1391,16 +1391,22 @@ pub const DOM_MODEL_PRELUDE: &str = r##"
 
     // ---- console (capture, never throw) --------------------------------
     if (!Array.isArray(g.__cerberusConsole)) g.__cerberusConsole = [];
-    function consoleSink() {
-      var parts = [];
-      for (var i = 0; i < arguments.length; i++) {
-        try { parts.push(String(arguments[i])); } catch (e) { parts.push(""); }
-      }
-      try { g.__cerberusConsole.push(parts.join(" ")); } catch (e) {}
+    // Each record is "level\u0002text"; the host splits records on \u0001 and
+    // the level tag on \u0002, so the developer console can colour by severity.
+    // The message still contains the formatted text, so callers that only look
+    // for a substring keep working.
+    function makeSink(level) {
+      return function () {
+        var parts = [];
+        for (var i = 0; i < arguments.length; i++) {
+          try { parts.push(String(arguments[i])); } catch (e) { parts.push(""); }
+        }
+        try { g.__cerberusConsole.push(level + "\u0002" + parts.join(" ")); } catch (e) {}
+      };
     }
     g.console = {
-      log: consoleSink, warn: consoleSink, error: consoleSink,
-      info: consoleSink, debug: consoleSink,
+      log: makeSink("log"), warn: makeSink("warn"), error: makeSink("error"),
+      info: makeSink("info"), debug: makeSink("debug"),
     };
 
     // ---- node model ----------------------------------------------------

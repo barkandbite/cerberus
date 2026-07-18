@@ -1998,6 +1998,10 @@ pub mod theme {
     pub const ON_INK_MUTED: Color = Color::rgb(0x99, 0xA2, 0xAE);
     /// A brighter accent that reads on a dark surface.
     pub const ACCENT_ON_INK: Color = Color::rgb(0x5B, 0x9C, 0xFF);
+    /// Console error line (red that reads on `INK`).
+    pub const CONSOLE_ERROR: Color = Color::rgb(0xFF, 0x74, 0x74);
+    /// Console warning line (amber that reads on `INK`).
+    pub const CONSOLE_WARN: Color = Color::rgb(0xE7, 0xB4, 0x53);
 
     // — Spacing scale (device px) —
     pub const SP_1: i32 = 4;
@@ -2673,6 +2677,30 @@ const DEV_STATS_H: i32 = 36;
 /// A console log line's height.
 const DEV_LINE_H: i32 = 16;
 
+/// The severity of a captured `console.*` line, so the console can colour it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ConsoleLevel {
+    /// `console.log`.
+    Log,
+    /// `console.info`.
+    Info,
+    /// `console.warn`.
+    Warn,
+    /// `console.error`.
+    Error,
+    /// `console.debug`.
+    Debug,
+}
+
+/// One captured console line: its severity and formatted text.
+#[derive(Clone, Debug)]
+pub struct ConsoleLine {
+    /// Severity, for colouring.
+    pub level: ConsoleLevel,
+    /// The formatted message text.
+    pub text: String,
+}
+
 /// A read-only snapshot of what the page is doing, rendered by the console.
 pub struct DevConsoleModel<'a> {
     /// The current page URL.
@@ -2686,7 +2714,7 @@ pub struct DevConsoleModel<'a> {
     /// Stored-cookie count.
     pub cookies: usize,
     /// Captured `console.*` output, oldest first.
-    pub lines: &'a [String],
+    pub lines: &'a [ConsoleLine],
 }
 
 /// The F12 developer console: a dark bottom drawer that reads as a developer
@@ -2823,14 +2851,20 @@ impl DevConsole {
         } else {
             let start = model.lines.len().saturating_sub(avail);
             for (i, line) in model.lines[start..].iter().enumerate() {
+                let color = match line.level {
+                    ConsoleLevel::Error => theme::CONSOLE_ERROR,
+                    ConsoleLevel::Warn => theme::CONSOLE_WARN,
+                    ConsoleLevel::Debug => theme::ON_INK_MUTED,
+                    ConsoleLevel::Log | ConsoleLevel::Info => theme::ON_INK,
+                };
                 push_text(
                     &mut list,
                     shaper,
                     d.x + pad,
                     log_top + i as i32 * DEV_LINE_H,
-                    line,
+                    &line.text,
                     theme::TYPE_CAPTION,
-                    theme::ON_INK,
+                    color,
                 );
             }
         }
@@ -2894,6 +2928,13 @@ mod dev_console_tests {
         assert!(d.h >= 140);
     }
 
+    fn line(level: ConsoleLevel, text: &str) -> ConsoleLine {
+        ConsoleLine {
+            level,
+            text: text.to_string(),
+        }
+    }
+
     #[test]
     fn paint_shows_placeholder_when_no_output() {
         let w = Size::new(1000, 800);
@@ -2922,7 +2963,9 @@ mod dev_console_tests {
         // A short drawer with many lines shows only the most recent that fit,
         // and never panics slicing.
         let w = Size::new(600, 320);
-        let lines: Vec<String> = (0..200).map(|i| format!("log line {i}")).collect();
+        let lines: Vec<ConsoleLine> = (0..200)
+            .map(|i| line(ConsoleLevel::Log, &format!("log line {i}")))
+            .collect();
         let model = DevConsoleModel {
             url: "https://x/",
             dom_nodes: 1,
@@ -2939,5 +2982,31 @@ mod dev_console_tests {
             .count();
         // Bounded by the drawer height, not the 200 input lines.
         assert!(glyph_runs < 60, "tail-clipped (got {glyph_runs} runs)");
+    }
+
+    #[test]
+    fn error_and_warn_lines_use_their_level_colours() {
+        let w = Size::new(1000, 800);
+        let lines = vec![
+            line(ConsoleLevel::Log, "ordinary log"),
+            line(ConsoleLevel::Warn, "a warning"),
+            line(ConsoleLevel::Error, "an error"),
+        ];
+        let model = DevConsoleModel {
+            url: "https://x/",
+            dom_nodes: 0,
+            links: 0,
+            fields: 0,
+            cookies: 0,
+            lines: &lines,
+        };
+        let list = DevConsole::paint(w, &MonoShaper, &model);
+        let has = |c: Color| {
+            list.items
+                .iter()
+                .any(|i| matches!(i, DisplayItem::Glyphs { color, .. } if *color == c))
+        };
+        assert!(has(theme::CONSOLE_ERROR), "error line is red");
+        assert!(has(theme::CONSOLE_WARN), "warning line is amber");
     }
 }

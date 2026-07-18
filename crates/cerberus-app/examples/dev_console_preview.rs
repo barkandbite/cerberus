@@ -9,20 +9,27 @@ use cerberus_headless::write_png;
 use cerberus_paint::{DisplayItem, DisplayList, Framebuffer, Rasterizer, TextShaper};
 use cerberus_text::TextEngine;
 use cerberus_types::{Color, FontStyle, Point, Rect, Size};
-use cerberus_ui::{DevConsole, DevConsoleModel, Toolbar};
+use cerberus_ui::{ConsoleLevel, ConsoleLine, DevConsole, DevConsoleModel, Toolbar};
 
 /// Render scale (physical ÷ logical); 2× keeps the preview crisp when viewed.
 const SCALE: f32 = 2.0;
 
+fn line(level: ConsoleLevel, text: &str) -> ConsoleLine {
+    ConsoleLine {
+        level,
+        text: text.to_string(),
+    }
+}
+
 fn main() {
     let logical = Size::new(1080, 720);
-    let lines: Vec<String> = vec![
-        "[log] app boot: hydrating 3 components".to_string(),
-        "[log] fetch /api/session → 200 (42ms)".to_string(),
-        "[warn] deprecated: use requestIdleCallback".to_string(),
-        "[log] worker spawned: analytics".to_string(),
-        "[error] TypeError: cannot read 'id' of null".to_string(),
-        "[log] render committed in 8.1ms".to_string(),
+    let lines: Vec<ConsoleLine> = vec![
+        line(ConsoleLevel::Log, "app boot: hydrating 3 components"),
+        line(ConsoleLevel::Log, "fetch /api/session → 200 (42ms)"),
+        line(ConsoleLevel::Warn, "deprecated: use requestIdleCallback"),
+        line(ConsoleLevel::Log, "worker spawned: analytics"),
+        line(ConsoleLevel::Error, "TypeError: cannot read 'id' of null"),
+        line(ConsoleLevel::Log, "render committed in 8.1ms"),
     ];
     let model = DevConsoleModel {
         url: "https://example.com/account",
