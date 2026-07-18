@@ -149,6 +149,118 @@ fn wpt_testharness_runs_in_our_worker() {
     );
 }
 
+/// Run `worker_body` in a fresh engine with testharness available via
+/// importScripts, and return `(completed, passed, total, detail)` parsed from a
+/// compact JS-side summary (avoids a Rust JSON dep).
+fn run_wpt_body(testharness: &str, worker_body: &str) -> (bool, u32, u32, String) {
+    let mut engine = QuickJsEngineFactory.instantiate().expect("engine");
+    let realm = RealmId::from_u64_pair(0, 1);
+    engine.create_realm(realm).expect("realm");
+    let env = PageEnv {
+        url: "https://wpt.test/workers/test.html".into(),
+        viewport: (1280, 800),
+        user_agent: "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 \
+                     (KHTML, like Gecko) Chrome/141.0.0.0 Safari/537.36"
+            .into(),
+        cookie: String::new(),
+    };
+    install_page(engine.as_mut(), realm, &blank_document(), &env).expect("install");
+
+    let setup = format!(
+        "globalThis.__cerberusScriptCache = {{}};\n\
+         globalThis.__cerberusScriptCache['/resources/testharness.js'] = {};\n\
+         globalThis.__complete = null; globalThis.__spawnErr = null;",
+        js_string_literal(testharness)
+    );
+    engine.eval(realm, &setup).expect("setup");
+
+    let driver = format!(
+        r#"try {{
+             var w = new Worker(URL.createObjectURL(new Blob([{body}])));
+             w.onmessage = function (e) {{ if (e.data && e.data.type === 'complete') globalThis.__complete = e.data; }};
+             w.onerror = function (e) {{ globalThis.__spawnErr = (e && (e.message || e.error)) || 'worker error'; }};
+           }} catch (e) {{ globalThis.__spawnErr = '' + e; }}"#,
+        body = js_string_literal(worker_body),
+    );
+    engine.eval(realm, &driver).expect("driver");
+    for _ in 0..120 {
+        let _ = run_event_loop(engine.as_mut(), realm, EventLoopBudget::default());
+    }
+
+    let summary = engine
+        .eval(
+            realm,
+            r#"(function () {
+                 var c = globalThis.__complete;
+                 if (!c) return 'INCOMPLETE|0|0|' + (globalThis.__spawnErr || 'no complete message');
+                 var ts = c.tests || [];
+                 var pass = ts.filter(function (t) { return t.status === 0; }).length;
+                 var fails = ts.filter(function (t) { return t.status !== 0; })
+                               .map(function (t) { return t.name + '#' + t.status; });
+                 return 'OK|' + pass + '|' + ts.length + '|' + fails.join(', ');
+               })()"#,
+        )
+        .ok();
+    let s = match summary {
+        Some(JsValue::Str(s)) => s,
+        _ => "INCOMPLETE|0|0|eval failed".into(),
+    };
+    let parts: Vec<&str> = s.splitn(4, '|').collect();
+    let completed = parts.first() == Some(&"OK");
+    let passed = parts.get(1).and_then(|x| x.parse().ok()).unwrap_or(0);
+    let total = parts.get(2).and_then(|x| x.parse().ok()).unwrap_or(0);
+    let detail = parts.get(3).unwrap_or(&"").to_string();
+    (completed, passed, total, detail)
+}
+
+#[test]
+#[ignore = "needs testharness.js (CERB_TESTHARNESS) + a dir of real WPT .js tests (CERB_WPT_TESTS)"]
+fn wpt_real_test_files_run_in_our_worker() {
+    let (Ok(th_path), Ok(dir)) = (
+        std::env::var("CERB_TESTHARNESS"),
+        std::env::var("CERB_WPT_TESTS"),
+    ) else {
+        eprintln!("CERB_TESTHARNESS / CERB_WPT_TESTS not set; skipping");
+        return;
+    };
+    let testharness = std::fs::read_to_string(&th_path).expect("read testharness");
+    let mut files: Vec<_> = std::fs::read_dir(&dir)
+        .expect("read wpt dir")
+        .filter_map(|e| e.ok().map(|e| e.path()))
+        .filter(|p| p.extension().is_some_and(|x| x == "js"))
+        .collect();
+    files.sort();
+
+    let (mut agg_pass, mut agg_total, mut files_ok) = (0u32, 0u32, 0u32);
+    eprintln!("\n===== real WPT worker tests =====");
+    for f in &files {
+        let body = format!(
+            "importScripts('/resources/testharness.js');\n{}\n;done();",
+            std::fs::read_to_string(f).unwrap_or_default()
+        );
+        let (completed, pass, total, detail) = run_wpt_body(&testharness, &body);
+        let name = f.file_name().unwrap().to_string_lossy();
+        let mark = if completed && pass == total && total > 0 {
+            "PASS"
+        } else if completed {
+            "PART"
+        } else {
+            "FAIL"
+        };
+        eprintln!("  [{mark}] {name}: {pass}/{total}  {detail}");
+        agg_pass += pass;
+        agg_total += total;
+        if completed && total > 0 && pass == total {
+            files_ok += 1;
+        }
+    }
+    eprintln!(
+        "  ---- {files_ok}/{} files fully pass; {agg_pass}/{agg_total} subtests pass ----",
+        files.len()
+    );
+    eprintln!("=================================");
+}
+
 /// Encode `s` as a JS double-quoted string literal safe to embed in eval source.
 fn js_string_literal(s: &str) -> String {
     let mut out = String::with_capacity(s.len() + 2);
