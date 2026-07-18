@@ -3079,6 +3079,212 @@ pub const DOM_MODEL_PRELUDE: &str = r##"
     // it; now() reports elapsed time since the anchor, forced strictly
     // increasing. If Date were ever neutralized we fall back to a fixed
     // plausible epoch and the old counter, still never emitting a zero clock.
+    // ---- Web IDL basics: DOMException, Event/CustomEvent, EventTarget ---
+    // QuickJS ships none of these. They are load-bearing for conformance:
+    // crypto.getRandomValues throws DOMExceptions, real code constructs Events,
+    // and objects like `performance` are EventTargets. Guarded so any native
+    // impl wins.
+    if (typeof g.DOMException !== "function") {
+      var DOM_CODES = {
+        IndexSizeError: 1, HierarchyRequestError: 3, WrongDocumentError: 4,
+        InvalidCharacterError: 5, NoModificationAllowedError: 7, NotFoundError: 8,
+        NotSupportedError: 9, InUseAttributeError: 10, InvalidStateError: 11,
+        SyntaxError: 12, InvalidModificationError: 13, NamespaceError: 14,
+        InvalidAccessError: 15, TypeMismatchError: 17, SecurityError: 18,
+        NetworkError: 19, AbortError: 20, URLMismatchError: 21,
+        QuotaExceededError: 22, TimeoutError: 23, InvalidNodeTypeError: 24,
+        DataCloneError: 25
+      };
+      var DOMExceptionCtor = function DOMException(message, name) {
+        var e = this instanceof DOMExceptionCtor ? this : Object.create(DOMExceptionCtor.prototype);
+        var nm = name === undefined ? "Error" : String(name);
+        var msg = message === undefined ? "" : String(message);
+        Object.defineProperty(e, "message", { value: msg, configurable: true, writable: true });
+        Object.defineProperty(e, "name", { value: nm, configurable: true, writable: true });
+        Object.defineProperty(e, "code", { value: DOM_CODES[nm] || 0, configurable: true, writable: true });
+        var st = ""; try { st = new Error(msg).stack || ""; } catch (x) {}
+        Object.defineProperty(e, "stack", { value: nm + ": " + msg + "\n" + st, configurable: true, writable: true });
+        return e;
+      };
+      DOMExceptionCtor.prototype = Object.create(Error.prototype);
+      DOMExceptionCtor.prototype.constructor = DOMExceptionCtor;
+      DOMExceptionCtor.prototype.name = "Error";
+      DOMExceptionCtor.prototype.message = "";
+      DOMExceptionCtor.prototype.toString = function () { return this.name + ": " + this.message; };
+      g.DOMException = DOMExceptionCtor;
+    }
+    if (typeof g.QuotaExceededError !== "function") {
+      // Modern interface (a DOMException subclass) that
+      // assert_throws_quotaexceedederror and storage/crypto APIs check against.
+      var QEE = function QuotaExceededError(message, options) {
+        var e = this instanceof QEE ? this : Object.create(QEE.prototype);
+        g.DOMException.call(e, message, "QuotaExceededError");
+        var q = (options && options.quota != null) ? Number(options.quota) : null;
+        var r = (options && options.requested != null) ? Number(options.requested) : null;
+        Object.defineProperty(e, "quota", { value: q, configurable: true });
+        Object.defineProperty(e, "requested", { value: r, configurable: true });
+        return e;
+      };
+      QEE.prototype = Object.create(g.DOMException.prototype);
+      QEE.prototype.constructor = QEE;
+      g.QuotaExceededError = QEE;
+    }
+    if (typeof g.Event !== "function") {
+      g.Event = function Event(type, init) {
+        init = init || {};
+        this.type = String(type);
+        this.bubbles = !!init.bubbles; this.cancelable = !!init.cancelable; this.composed = !!init.composed;
+        this.defaultPrevented = false; this.target = null; this.currentTarget = null;
+        this.eventPhase = 0; this.timeStamp = 0; this.isTrusted = false;
+      };
+      g.Event.prototype.preventDefault = function () { if (this.cancelable) this.defaultPrevented = true; };
+      g.Event.prototype.stopPropagation = function () {};
+      g.Event.prototype.stopImmediatePropagation = function () {};
+      g.Event.NONE = 0; g.Event.CAPTURING_PHASE = 1; g.Event.AT_TARGET = 2; g.Event.BUBBLING_PHASE = 3;
+    }
+    if (typeof g.CustomEvent !== "function") {
+      g.CustomEvent = function CustomEvent(type, init) {
+        g.Event.call(this, type, init);
+        this.detail = (init && "detail" in init) ? init.detail : null;
+      };
+      g.CustomEvent.prototype = Object.create(g.Event.prototype);
+      g.CustomEvent.prototype.constructor = g.CustomEvent;
+    }
+    if (typeof g.URLSearchParams !== "function") {
+      var USP = function URLSearchParams(init) {
+        this.__p = [];
+        var self = this;
+        if (typeof init === "string") {
+          var q = init.charAt(0) === "?" ? init.slice(1) : init;
+          if (q) q.split("&").forEach(function (pair) {
+            if (!pair) return;
+            var i = pair.indexOf("=");
+            var k = i < 0 ? pair : pair.slice(0, i);
+            var v = i < 0 ? "" : pair.slice(i + 1);
+            try { self.__p.push([decodeURIComponent(k.replace(/\+/g, " ")), decodeURIComponent(v.replace(/\+/g, " "))]); }
+            catch (e) { self.__p.push([k, v]); }
+          });
+        } else if (init && typeof init.forEach === "function" && !Array.isArray(init)) {
+          init.forEach(function (v, k) { self.__p.push([String(k), String(v)]); });
+        } else if (Array.isArray(init)) {
+          init.forEach(function (e) { self.__p.push([String(e[0]), String(e[1])]); });
+        } else if (init && typeof init === "object") {
+          for (var kk in init) if (Object.prototype.hasOwnProperty.call(init, kk)) self.__p.push([String(kk), String(init[kk])]);
+        }
+      };
+      USP.prototype.append = function (k, v) { this.__p.push([String(k), String(v)]); };
+      USP.prototype.set = function (k, v) {
+        k = String(k); v = String(v); var seen = false;
+        this.__p = this.__p.filter(function (e) { if (e[0] !== k) return true; if (!seen) { e[1] = v; seen = true; return true; } return false; });
+        if (!seen) this.__p.push([k, v]);
+      };
+      USP.prototype.get = function (k) { k = String(k); for (var i = 0; i < this.__p.length; i++) if (this.__p[i][0] === k) return this.__p[i][1]; return null; };
+      USP.prototype.getAll = function (k) { k = String(k); return this.__p.filter(function (e) { return e[0] === k; }).map(function (e) { return e[1]; }); };
+      USP.prototype.has = function (k) { return this.get(String(k)) !== null; };
+      USP.prototype["delete"] = function (k) { k = String(k); this.__p = this.__p.filter(function (e) { return e[0] !== k; }); };
+      USP.prototype.forEach = function (fn, thisArg) { var self = this; this.__p.slice().forEach(function (e) { fn.call(thisArg, e[1], e[0], self); }); };
+      USP.prototype.toString = function () { return this.__p.map(function (e) { return encodeURIComponent(e[0]) + "=" + encodeURIComponent(e[1]); }).join("&"); };
+      g.URLSearchParams = USP;
+    }
+    if (typeof g.URL !== "function") {
+      // A pragmatic URL parser (absolute + relative resolution + special-scheme
+      // origins). Not full-WHATWG (that torture-tests thousands of edge cases),
+      // but correct for the URLs real pages use. `createObjectURL`/`revokeObjectURL`
+      // statics are attached later in the Blob section.
+      var SPECIAL = { "http:": "80", "https:": "443", "ws:": "80", "wss:": "443", "ftp:": "21" };
+      // RFC 3986 remove_dot_segments: resolve "." and ".." in a path.
+      var normPath = function (input) {
+        var output = [];
+        while (input.length) {
+          if (input.slice(0, 3) === "../") input = input.slice(3);
+          else if (input.slice(0, 2) === "./") input = input.slice(2);
+          else if (input.slice(0, 3) === "/./") input = "/" + input.slice(3);
+          else if (input === "/.") input = "/";
+          else if (input.slice(0, 4) === "/../") { input = "/" + input.slice(4); output.pop(); }
+          else if (input === "/..") { input = "/"; output.pop(); }
+          else if (input === "." || input === "..") input = "";
+          else {
+            var seg, rest = input.charAt(0) === "/" ? input.indexOf("/", 1) : input.indexOf("/");
+            seg = rest < 0 ? input : input.slice(0, rest);
+            output.push(seg); input = input.slice(seg.length);
+          }
+        }
+        return output.join("");
+      };
+      var __oldURL = (typeof g.URL === "object") ? g.URL : null;
+      var URLCtor = function URL(url, base) {
+        var input = String(url == null ? "" : url).replace(/^[\x00-\x20]+|[\x00-\x20]+$/g, "");
+        var abs, hasScheme = /^[a-zA-Z][a-zA-Z0-9+.\-]*:/.test(input);
+        if (hasScheme) {
+          abs = input;
+        } else {
+          if (base == null) throw new TypeError("Failed to construct 'URL': Invalid URL");
+          var b = (base && base.__isURL) ? base : new URLCtor(base);
+          if (input === "") abs = b.href;
+          else if (input.slice(0, 2) === "//") abs = b.protocol + input;
+          else if (input.charAt(0) === "/") abs = b.protocol + "//" + b.__auth + input;
+          else if (input.charAt(0) === "?") abs = b.protocol + "//" + b.__auth + b.pathname + input;
+          else if (input.charAt(0) === "#") abs = b.protocol + "//" + b.__auth + b.pathname + b.search + input;
+          else {
+            var dir = b.pathname.slice(0, b.pathname.lastIndexOf("/") + 1);
+            abs = b.protocol + "//" + b.__auth + (dir || "/") + input;
+          }
+        }
+        var pm = /^([a-zA-Z][a-zA-Z0-9+.\-]*:)(\/\/([^\/?#]*))?([^?#]*)(\?[^#]*)?(#.*)?$/.exec(abs);
+        if (!pm) throw new TypeError("Failed to construct 'URL': Invalid URL");
+        this.__isURL = true;
+        this.protocol = pm[1].toLowerCase();
+        var hasAuthority = pm[2] != null;
+        var authority = pm[3] || "";
+        var at = authority.lastIndexOf("@");
+        var userinfo = at >= 0 ? authority.slice(0, at) : "";
+        var hostport = at >= 0 ? authority.slice(at + 1) : authority;
+        var ci = userinfo.indexOf(":");
+        this.username = userinfo ? (ci >= 0 ? userinfo.slice(0, ci) : userinfo) : "";
+        this.password = (userinfo && ci >= 0) ? userinfo.slice(ci + 1) : "";
+        if (hostport.charAt(0) === "[") { var rb = hostport.indexOf("]"); this.hostname = hostport.slice(0, rb + 1).toLowerCase(); this.port = hostport.slice(rb + 2) || ""; }
+        else { var c = hostport.lastIndexOf(":"); if (c >= 0) { this.hostname = hostport.slice(0, c).toLowerCase(); this.port = hostport.slice(c + 1); } else { this.hostname = hostport.toLowerCase(); this.port = ""; } }
+        if (this.port && SPECIAL[this.protocol] === this.port) this.port = "";
+        this.host = this.hostname + (this.port ? ":" + this.port : "");
+        this.__auth = (userinfo ? userinfo + "@" : "") + this.host;
+        this.pathname = hasAuthority ? normPath(pm[4] || "/") : (pm[4] || "");
+        this.search = pm[5] || "";
+        this.hash = pm[6] || "";
+        this.searchParams = new g.URLSearchParams(this.search);
+        this.origin = (SPECIAL[this.protocol] && this.host) ? (this.protocol + "//" + this.host) : "null";
+        this.href = hasAuthority
+          ? this.protocol + "//" + this.__auth + this.pathname + this.search + this.hash
+          : this.protocol + this.pathname + this.search + this.hash;
+      };
+      URLCtor.prototype.toString = function () { return this.href; };
+      URLCtor.prototype.toJSON = function () { return this.href; };
+      if (__oldURL) { for (var __uk in __oldURL) { try { URLCtor[__uk] = __oldURL[__uk]; } catch (e) {} } }
+      g.URL = URLCtor;
+    }
+    if (typeof g.EventTarget !== "function") {
+      g.EventTarget = function EventTarget() { this.__ls = Object.create(null); };
+      g.EventTarget.prototype.addEventListener = function (type, fn, opts) {
+        if (typeof fn !== "function" && !(fn && typeof fn.handleEvent === "function")) return;
+        type = String(type); if (!this.__ls) this.__ls = Object.create(null);
+        (this.__ls[type] = this.__ls[type] || []).push({ fn: fn, once: !!(opts && opts.once) });
+      };
+      g.EventTarget.prototype.removeEventListener = function (type, fn) {
+        type = String(type); var a = this.__ls && this.__ls[type]; if (!a) return;
+        for (var i = a.length - 1; i >= 0; i--) if (a[i].fn === fn) a.splice(i, 1);
+      };
+      g.EventTarget.prototype.dispatchEvent = function (ev) {
+        var a = this.__ls && this.__ls[ev && ev.type]; if (!a) return true;
+        if (ev) { ev.target = this; ev.currentTarget = this; }
+        var copy = a.slice();
+        for (var i = 0; i < copy.length; i++) {
+          var l = copy[i], h = (l.fn && typeof l.fn.handleEvent === "function") ? l.fn.handleEvent : l.fn;
+          try { h.call(this, ev); } catch (x) {}
+          if (l.once) { var j = a.indexOf(l); if (j >= 0) a.splice(j, 1); }
+        }
+        return !(ev && ev.defaultPrevented);
+      };
+    }
+
     (function () {
       var __rawNow = (typeof Date === "function" && Date.now) ? Date.now() : 0;
       var __hasClock = __rawNow > 1000000000000;
@@ -3118,6 +3324,11 @@ pub const DOM_MODEL_PRELUDE: &str = r##"
         setResourceTimingBufferSize: function () {},
         toJSON: function () { return {}; },
       };
+      // Performance is an EventTarget (WPT hr-time checks event dispatch works).
+      window.performance.__ls = Object.create(null);
+      window.performance.addEventListener = g.EventTarget.prototype.addEventListener;
+      window.performance.removeEventListener = g.EventTarget.prototype.removeEventListener;
+      window.performance.dispatchEvent = g.EventTarget.prototype.dispatchEvent;
     })();
     // TextEncoder / TextDecoder — real UTF-8 (QuickJS may ship none). Anti-bot
     // payloads are encoded/decoded with these; a throwing or absent impl breaks
@@ -3168,8 +3379,26 @@ pub const DOM_MODEL_PRELUDE: &str = r##"
       };
       g.TextDecoder.prototype.decode = function (buf) {
         if (buf == null) return "";
+        // Accept a Uint8Array, any ArrayBufferView (honouring its offset/length),
+        // or a bare ArrayBuffer.
         var bytes = (buf instanceof Uint8Array) ? buf
-          : (buf && buf.buffer) ? new Uint8Array(buf.buffer) : new Uint8Array(buf);
+          : (buf && buf.buffer && typeof buf.byteOffset === "number")
+            ? new Uint8Array(buf.buffer, buf.byteOffset, buf.byteLength)
+            : new Uint8Array(buf);
+        var enc = this.encoding;
+        if (enc === "utf-16le" || enc === "utf-16" || enc === "utf-16be") {
+          var le = (enc !== "utf-16be");
+          var s = "", k = 0, m = bytes.length;
+          var first = true;
+          while (k + 1 < m) {
+            var unit = le ? (bytes[k] | (bytes[k + 1] << 8)) : ((bytes[k] << 8) | bytes[k + 1]);
+            k += 2;
+            // Strip a leading BOM (U+FEFF) unless ignoreBOM is set.
+            if (first) { first = false; if (!this.ignoreBOM && unit === 0xFEFF) continue; }
+            s += String.fromCharCode(unit);
+          }
+          return s;
+        }
         var out = "", i = 0, n = bytes.length;
         while (i < n) {
           var b0 = bytes[i++];
@@ -3663,7 +3892,7 @@ pub const DOM_MODEL_PRELUDE: &str = r##"
         var b2 = i < s.length ? s.charCodeAt(i++) : NaN;
         var b3 = i < s.length ? s.charCodeAt(i++) : NaN;
         if (b1 > 255 || (b2 === b2 && b2 > 255) || (b3 === b3 && b3 > 255)) {
-          throw new Error("btoa: string contains characters outside of the Latin1 range");
+          throw new g.DOMException("The string to be encoded contains characters outside of the Latin1 range.", "InvalidCharacterError");
         }
         var e1 = b1 >> 2;
         var e2 = ((b1 & 3) << 4) | (b2 === b2 ? b2 >> 4 : 0);
@@ -3677,12 +3906,12 @@ pub const DOM_MODEL_PRELUDE: &str = r##"
     };
     g.atob = function (input) {
       var s = String(input).replace(/[ \t\n\f\r]/g, "");
-      if (s.length % 4 === 1) throw new Error("atob: invalid base64 length");
+      if (s.length % 4 === 1) throw new g.DOMException("The string to be decoded is not correctly encoded.", "InvalidCharacterError");
       s = s.replace(/=+$/, "");
       var out = "", bits = 0, buffer = 0;
       for (var i = 0; i < s.length; i++) {
         var idx = B64.indexOf(s.charAt(i));
-        if (idx === -1) throw new Error("atob: invalid base64 character");
+        if (idx === -1) throw new g.DOMException("The string to be decoded is not correctly encoded.", "InvalidCharacterError");
         buffer = (buffer << 6) | idx;
         bits += 6;
         if (bits >= 8) { bits -= 8; out += String.fromCharCode((buffer >> bits) & 0xff); }
@@ -3705,11 +3934,37 @@ pub const DOM_MODEL_PRELUDE: &str = r##"
       var __seedLo = (typeof g.__FARBLE_LO === "number") ? (g.__FARBLE_LO >>> 0) : 0x9e3779b9;
       var __cs = ((__seedHi ^ __seedLo ^ 0x9e3779b9) >>> 0) || 0x2545F491;
       var __crypto = g.crypto || {};
+      var __INT_VIEWS = {
+        Int8Array: 1, Uint8Array: 1, Uint8ClampedArray: 1, Int16Array: 1,
+        Uint16Array: 1, Int32Array: 1, Uint32Array: 1, BigInt64Array: 1, BigUint64Array: 1
+      };
       __crypto.getRandomValues = function (a) {
+        // WHATWG: only integer typed arrays are allowed; Float*/DataView reject
+        // with TypeMismatchError, and > 65536 bytes with QuotaExceededError.
+        // Use the [[TypedArrayName]] tag (not constructor.name) so subclasses
+        // of an integer view — whose constructor name differs — are accepted.
+        var tag = Object.prototype.toString.call(a);
+        var kind = (tag.slice(0, 8) === "[object " && tag.charAt(tag.length - 1) === "]")
+          ? tag.slice(8, -1) : "";
+        if (!a || !(kind in __INT_VIEWS)) {
+          throw new g.DOMException("The provided ArrayBufferView is not an integer-typed view", "TypeMismatchError");
+        }
+        if (a.byteLength > 65536) {
+          // Per spec this QuotaExceededError leaves quota/requested null (they
+          // are meaningful for storage quotas, not the entropy cap).
+          throw new g.QuotaExceededError(
+            "The ArrayBufferView's byte length (" + a.byteLength + ") exceeds the number of bytes of entropy available (65536)");
+        }
+        var big = (kind === "BigInt64Array" || kind === "BigUint64Array");
         for (var i = 0; i < a.length; i++) {
           __cs ^= __cs << 13; __cs ^= __cs >>> 17; __cs ^= __cs << 5; __cs >>>= 0;
-          a[i] = (a.BYTES_PER_ELEMENT === 1) ? (__cs & 0xff)
-               : (a.BYTES_PER_ELEMENT === 2) ? (__cs & 0xffff) : (__cs >>> 0);
+          if (big) {
+            __cs ^= __cs << 13; __cs ^= __cs >>> 17; __cs ^= __cs << 5; __cs >>>= 0;
+            a[i] = BigInt(__cs >>> 0);
+          } else {
+            a[i] = (a.BYTES_PER_ELEMENT === 1) ? (__cs & 0xff)
+                 : (a.BYTES_PER_ELEMENT === 2) ? (__cs & 0xffff) : (__cs >>> 0);
+          }
         }
         return a;
       };
@@ -4174,6 +4429,11 @@ pub const DOM_MODEL_PRELUDE: &str = r##"
           scope.crypto = g.crypto; scope.atob = g.atob; scope.btoa = g.btoa;
           scope.TextEncoder = g.TextEncoder; scope.TextDecoder = g.TextDecoder;
           scope.performance = g.performance; scope.Blob = g.Blob; scope.URL = g.URL;
+          // Web IDL constructors a worker exposes on `self` — code (and the WPT
+          // testharness) reaches them via `self.X`, and they must be the SAME
+          // objects the real global throws/constructs so `instanceof` holds.
+          scope.DOMException = g.DOMException; scope.QuotaExceededError = g.QuotaExceededError;
+          scope.Event = g.Event; scope.CustomEvent = g.CustomEvent; scope.EventTarget = g.EventTarget;
           scope.addEventListener = function (t, fn) { if (scope.__ls[t]) scope.__ls[t].push(fn); };
           scope.removeEventListener = function (t, fn) { var a = scope.__ls[t]; if (a) { var i = a.indexOf(fn); if (i >= 0) a.splice(i, 1); } };
           scope.close = function () { scope.__dead = true; };
