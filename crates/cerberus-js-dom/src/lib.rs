@@ -3211,17 +3211,49 @@ pub const DOM_MODEL_PRELUDE: &str = r##"
         }
         return output.join("");
       };
+      // Percent-encode the ASCII path/query encode sets (space, C0, and the
+      // unsafe punctuation browsers escape). Non-ASCII is left as-is (pragmatic).
+      var pctEnc = function (s, unsafe) {
+        return s.replace(/[\x00-\x20\x7f"<>`{}#?]/g, function (ch) {
+          if (unsafe.indexOf(ch) < 0) return ch;
+          var cc = ch.charCodeAt(0);
+          return "%" + (cc < 16 ? "0" : "") + cc.toString(16).toUpperCase();
+        });
+      };
+      var encPath = function (s) { return pctEnc(s, "\x00\x01\x02\x03\x04\x05\x06\x07\x08\x09\x0a\x0b\x0c\x0d\x0e\x0f\x10\x11\x12\x13\x14\x15\x16\x17\x18\x19\x1a\x1b\x1c\x1d\x1e\x1f \x7f\"<>`{}"); };
+      var encQuery = function (s) { return pctEnc(s, "\x00\x01\x02\x03\x04\x05\x06\x07\x08\x09\x0a\x0b\x0c\x0d\x0e\x0f\x10\x11\x12\x13\x14\x15\x16\x17\x18\x19\x1a\x1b\x1c\x1d\x1e\x1f \x7f\"<>#`"); };
       var __oldURL = (typeof g.URL === "object") ? g.URL : null;
       var URLCtor = function URL(url, base) {
         var input = String(url == null ? "" : url).replace(/^[\x00-\x20]+|[\x00-\x20]+$/g, "");
-        var abs, hasScheme = /^[a-zA-Z][a-zA-Z0-9+.\-]*:/.test(input);
-        if (hasScheme) {
-          abs = input;
-        } else {
-          if (base == null) throw new TypeError("Failed to construct 'URL': Invalid URL");
-          var b = (base && base.__isURL) ? base : new URLCtor(base);
-          if (input === "") abs = b.href;
-          else if (input.slice(0, 2) === "//") abs = b.protocol + input;
+        var b = null;
+        if (base != null) b = (base && base.__isURL) ? base : new URLCtor(base);
+        var schemeM = /^([a-zA-Z][a-zA-Z0-9+.\-]*):/.exec(input);
+        var scheme = schemeM ? (schemeM[1].toLowerCase() + ":") : null;
+        // A URL is "special" (http/https/ws/wss/ftp) by its own scheme, or by the
+        // base's when the input is scheme-relative. Special URLs treat \ as /.
+        var special = scheme ? !!SPECIAL[scheme] : (b ? !!SPECIAL[b.protocol] : false);
+        if (special) input = input.replace(/\\/g, "/");
+
+        var abs;
+        if (scheme) {
+          // Special same-scheme relative ("http:foo" against an http base):
+          // resolve against the base rather than treating it as opaque.
+          if (special && b && scheme === b.protocol && input.charAt(scheme.length) !== "/") {
+            input = input.slice(scheme.length);
+          } else {
+            abs = input;
+          }
+        }
+        if (abs == null) {
+          if (b == null) throw new TypeError("Failed to construct 'URL': Invalid URL");
+          if (input.slice(0, 2) === "//") abs = b.protocol + input;
+          else if (b.__opaque) {
+            // Opaque base (mailto:/data:/blob:…): don't fabricate an authority.
+            if (input === "") abs = b.protocol + b.pathname + b.search;
+            else if (input.charAt(0) === "#") abs = b.protocol + b.pathname + b.search + input;
+            else if (input.charAt(0) === "?") abs = b.protocol + b.pathname + input;
+            else abs = b.protocol + input;
+          } else if (input === "") abs = b.protocol + "//" + b.__auth + b.pathname + b.search;
           else if (input.charAt(0) === "/") abs = b.protocol + "//" + b.__auth + input;
           else if (input.charAt(0) === "?") abs = b.protocol + "//" + b.__auth + b.pathname + input;
           else if (input.charAt(0) === "#") abs = b.protocol + "//" + b.__auth + b.pathname + b.search + input;
@@ -3235,6 +3267,7 @@ pub const DOM_MODEL_PRELUDE: &str = r##"
         this.__isURL = true;
         this.protocol = pm[1].toLowerCase();
         var hasAuthority = pm[2] != null;
+        this.__opaque = !hasAuthority;
         var authority = pm[3] || "";
         var at = authority.lastIndexOf("@");
         var userinfo = at >= 0 ? authority.slice(0, at) : "";
@@ -3244,14 +3277,21 @@ pub const DOM_MODEL_PRELUDE: &str = r##"
         this.password = (userinfo && ci >= 0) ? userinfo.slice(ci + 1) : "";
         if (hostport.charAt(0) === "[") { var rb = hostport.indexOf("]"); this.hostname = hostport.slice(0, rb + 1).toLowerCase(); this.port = hostport.slice(rb + 2) || ""; }
         else { var c = hostport.lastIndexOf(":"); if (c >= 0) { this.hostname = hostport.slice(0, c).toLowerCase(); this.port = hostport.slice(c + 1); } else { this.hostname = hostport.toLowerCase(); this.port = ""; } }
+        // Numeric-normalize the port (drop leading zeros) then drop it if it is
+        // the scheme's default.
+        if (this.port !== "") { var pn = parseInt(this.port, 10); this.port = isNaN(pn) ? "" : String(pn); }
         if (this.port && SPECIAL[this.protocol] === this.port) this.port = "";
         this.host = this.hostname + (this.port ? ":" + this.port : "");
         this.__auth = (userinfo ? userinfo + "@" : "") + this.host;
-        this.pathname = hasAuthority ? normPath(pm[4] || "/") : (pm[4] || "");
-        this.search = pm[5] || "";
+        this.pathname = hasAuthority ? encPath(normPath(pm[4] || "/")) : (pm[4] || "");
+        this.search = encQuery(pm[5] || "");
         this.hash = pm[6] || "";
         this.searchParams = new g.URLSearchParams(this.search);
-        this.origin = (SPECIAL[this.protocol] && this.host) ? (this.protocol + "//" + this.host) : "null";
+        if (this.protocol === "blob:") {
+          try { this.origin = new URLCtor(this.pathname).origin; } catch (e) { this.origin = "null"; }
+        } else {
+          this.origin = (SPECIAL[this.protocol] && this.host) ? (this.protocol + "//" + this.host) : "null";
+        }
         this.href = hasAuthority
           ? this.protocol + "//" + this.__auth + this.pathname + this.search + this.hash
           : this.protocol + this.pathname + this.search + this.hash;
@@ -3266,21 +3306,35 @@ pub const DOM_MODEL_PRELUDE: &str = r##"
       g.EventTarget.prototype.addEventListener = function (type, fn, opts) {
         if (typeof fn !== "function" && !(fn && typeof fn.handleEvent === "function")) return;
         type = String(type); if (!this.__ls) this.__ls = Object.create(null);
-        (this.__ls[type] = this.__ls[type] || []).push({ fn: fn, once: !!(opts && opts.once) });
+        var cap = !!(opts && (opts === true || opts.capture));
+        var list = (this.__ls[type] = this.__ls[type] || []);
+        // DOM "add an event listener" step 4: identical (callback, capture) is a
+        // no-op — don't register duplicates.
+        for (var i = 0; i < list.length; i++) if (list[i].fn === fn && list[i].capture === cap) return;
+        list.push({ fn: fn, once: !!(opts && opts.once), capture: cap });
       };
-      g.EventTarget.prototype.removeEventListener = function (type, fn) {
+      g.EventTarget.prototype.removeEventListener = function (type, fn, opts) {
         type = String(type); var a = this.__ls && this.__ls[type]; if (!a) return;
-        for (var i = a.length - 1; i >= 0; i--) if (a[i].fn === fn) a.splice(i, 1);
+        var cap = !!(opts && (opts === true || opts.capture));
+        for (var i = a.length - 1; i >= 0; i--) if (a[i].fn === fn && a[i].capture === cap) a.splice(i, 1);
       };
       g.EventTarget.prototype.dispatchEvent = function (ev) {
-        var a = this.__ls && this.__ls[ev && ev.type]; if (!a) return true;
-        if (ev) { ev.target = this; ev.currentTarget = this; }
-        var copy = a.slice();
-        for (var i = 0; i < copy.length; i++) {
-          var l = copy[i], h = (l.fn && typeof l.fn.handleEvent === "function") ? l.fn.handleEvent : l.fn;
-          try { h.call(this, ev); } catch (x) {}
-          if (l.once) { var j = a.indexOf(l); if (j >= 0) a.splice(j, 1); }
+        var a = this.__ls && this.__ls[ev && ev.type];
+        if (ev) { ev.target = this; ev.currentTarget = this; ev.eventPhase = 2; }
+        if (a) {
+          var copy = a.slice();
+          for (var i = 0; i < copy.length; i++) {
+            var l = copy[i];
+            // Skip a listener removed by an earlier one during this dispatch.
+            if (a.indexOf(l) < 0) continue;
+            var isHE = l.fn && typeof l.fn.handleEvent === "function";
+            var h = isHE ? l.fn.handleEvent : l.fn;
+            try { h.call(isHE ? l.fn : this, ev); } catch (x) {}
+            if (l.once) { var j = a.indexOf(l); if (j >= 0) a.splice(j, 1); }
+          }
         }
+        // DOM "dispatch" final steps: clear currentTarget / eventPhase.
+        if (ev) { ev.currentTarget = null; ev.eventPhase = 0; }
         return !(ev && ev.defaultPrevented);
       };
     }
@@ -3373,9 +3427,10 @@ pub const DOM_MODEL_PRELUDE: &str = r##"
       };
     }
     if (typeof g.TextDecoder !== "function") {
-      g.TextDecoder = function (label) {
+      g.TextDecoder = function (label, options) {
         this.encoding = label ? String(label).toLowerCase() : "utf-8";
-        this.fatal = false; this.ignoreBOM = false;
+        this.fatal = !!(options && options.fatal);
+        this.ignoreBOM = !!(options && options.ignoreBOM);
       };
       g.TextDecoder.prototype.decode = function (buf) {
         if (buf == null) return "";
@@ -3389,17 +3444,29 @@ pub const DOM_MODEL_PRELUDE: &str = r##"
         if (enc === "utf-16le" || enc === "utf-16" || enc === "utf-16be") {
           var le = (enc !== "utf-16be");
           var s = "", k = 0, m = bytes.length;
-          var first = true;
+          var first = true, lead = 0;
           while (k + 1 < m) {
             var unit = le ? (bytes[k] | (bytes[k + 1] << 8)) : ((bytes[k] << 8) | bytes[k + 1]);
             k += 2;
             // Strip a leading BOM (U+FEFF) unless ignoreBOM is set.
             if (first) { first = false; if (!this.ignoreBOM && unit === 0xFEFF) continue; }
-            s += String.fromCharCode(unit);
+            if (lead) {
+              if (unit >= 0xDC00 && unit <= 0xDFFF) { s += String.fromCharCode(lead, unit); lead = 0; continue; }
+              // Pending lead with no trail → U+FFFD, then reprocess this unit.
+              s += "�"; lead = 0;
+            }
+            if (unit >= 0xD800 && unit <= 0xDBFF) { lead = unit; }
+            else if (unit >= 0xDC00 && unit <= 0xDFFF) { s += "�"; } // lone trail surrogate
+            else { s += String.fromCharCode(unit); }
           }
+          if (lead) s += "�";          // unpaired lead at end
+          if (k < m) s += "�";         // dangling odd byte
           return s;
         }
-        var out = "", i = 0, n = bytes.length;
+        // utf-8: strip a leading BOM (EF BB BF) unless ignoreBOM is set.
+        var start = 0;
+        if (!this.ignoreBOM && bytes.length >= 3 && bytes[0] === 0xEF && bytes[1] === 0xBB && bytes[2] === 0xBF) start = 3;
+        var out = "", i = start, n = bytes.length;
         while (i < n) {
           var b0 = bytes[i++];
           if (b0 < 0x80) {
@@ -3905,9 +3972,14 @@ pub const DOM_MODEL_PRELUDE: &str = r##"
       return out;
     };
     g.atob = function (input) {
+      // WHATWG forgiving-base64: strip ASCII whitespace, then remove AT MOST two
+      // trailing '=' and ONLY when the length is a multiple of 4; a length ≡ 1
+      // (mod 4) fails, and any surviving '=' (or non-alphabet char) fails via the
+      // -1 lookup below. Stripping all padding unconditionally would wrongly
+      // decode "ab=", "====", etc.
       var s = String(input).replace(/[ \t\n\f\r]/g, "");
+      if (s.length % 4 === 0) s = s.replace(/={1,2}$/, "");
       if (s.length % 4 === 1) throw new g.DOMException("The string to be decoded is not correctly encoded.", "InvalidCharacterError");
-      s = s.replace(/=+$/, "");
       var out = "", bits = 0, buffer = 0;
       for (var i = 0; i < s.length; i++) {
         var idx = B64.indexOf(s.charAt(i));

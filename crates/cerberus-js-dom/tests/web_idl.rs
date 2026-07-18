@@ -124,6 +124,28 @@ fn text_decoder_utf16() {
         r,
         "new TextDecoder('utf-16le').decode(new Uint8Array([0xFF,0xFE,0x7A,0x00])) === 'z'",
     );
+    // {ignoreBOM:true} preserves the BOM.
+    ok(e.as_mut(), r, "new TextDecoder('utf-16le', { ignoreBOM: true }).decode(new Uint8Array([0xFF,0xFE,0x41,0x00])) === '\\uFEFFA'");
+    // utf-8 leading BOM (EF BB BF) is stripped.
+    ok(
+        e.as_mut(),
+        r,
+        "new TextDecoder().decode(new Uint8Array([0xEF,0xBB,0xBF,0x41])) === 'A'",
+    );
+    // A dangling odd byte becomes U+FFFD.
+    ok(
+        e.as_mut(),
+        r,
+        "new TextDecoder('utf-16le').decode(new Uint8Array([0x41,0x00,0x42])) === 'A\\uFFFD'",
+    );
+    // A lone (unpaired) lead surrogate becomes U+FFFD.
+    ok(
+        e.as_mut(),
+        r,
+        "new TextDecoder('utf-16le').decode(new Uint8Array([0x3D,0xD8,0x41,0x00])) === '\\uFFFDA'",
+    );
+    // A valid surrogate pair round-trips.
+    ok(e.as_mut(), r, "new TextDecoder('utf-16le').decode(new Uint8Array([0x3D,0xD8,0x1E,0xDD])) === '\\uD83D\\uDD1E'");
 }
 
 #[test]
@@ -142,6 +164,25 @@ fn atob_throws_invalid_character_error() {
     ok(e.as_mut(), r, "atob('aGVsbG8=') === 'hello'");
     ok(e.as_mut(), r, "(function () { try { atob('a===='); return false; } catch (x) { return x.name === 'InvalidCharacterError'; } })()");
     ok(e.as_mut(), r, "(function () { try { btoa('\\u{1F600}'); return false; } catch (x) { return x.name === 'InvalidCharacterError'; } })()");
+    // Forgiving-base64: padded strings that aren't length%4==0 (or have surplus
+    // '=') must FAIL, not silently decode.
+    ok(e.as_mut(), r, "(function () { try { atob('ab='); return false; } catch (x) { return x.name === 'InvalidCharacterError'; } })()");
+    ok(e.as_mut(), r, "(function () { try { atob('===='); return false; } catch (x) { return x.name === 'InvalidCharacterError'; } })()");
+    ok(e.as_mut(), r, "(function () { try { atob('YQ======'); return false; } catch (x) { return x.name === 'InvalidCharacterError'; } })()");
+    ok(e.as_mut(), r, "atob('YQ==') === 'a'");
+}
+
+#[test]
+fn event_target_dom_semantics() {
+    let (mut e, r) = engine();
+    // Duplicate identical listener is a no-op.
+    ok(e.as_mut(), r, "(function () { var t = new EventTarget(); var n = 0; function h() { n++; } t.addEventListener('x', h); t.addEventListener('x', h); t.dispatchEvent(new Event('x')); return n === 1; })()");
+    // handleEvent objects are called with `this` = the listener object.
+    ok(e.as_mut(), r, "(function () { var t = new EventTarget(); var got; var o = { id: 42, handleEvent: function () { got = this && this.id; } }; t.addEventListener('x', o); t.dispatchEvent(new Event('x')); return got === 42; })()");
+    // A listener removed during dispatch by an earlier one is not invoked.
+    ok(e.as_mut(), r, "(function () { var t = new EventTarget(); var order = []; function a() { order.push('a'); t.removeEventListener('x', b); } function b() { order.push('b'); } t.addEventListener('x', a); t.addEventListener('x', b); t.dispatchEvent(new Event('x')); return order.join(',') === 'a'; })()");
+    // currentTarget is cleared after dispatch.
+    ok(e.as_mut(), r, "(function () { var t = new EventTarget(); var ev = new Event('x'); t.addEventListener('x', function () {}); t.dispatchEvent(ev); return ev.currentTarget === null; })()");
 }
 
 #[test]
@@ -185,5 +226,47 @@ fn url_parses_and_resolves() {
         e.as_mut(),
         r,
         "new URLSearchParams('a=1&b=2').toString() === 'a=1&b=2'",
+    );
+    // Backslashes normalize to slashes for special schemes.
+    ok(
+        e.as_mut(),
+        r,
+        "new URL('http://example.com\\\\foo\\\\bar').pathname === '/foo/bar'",
+    );
+    // Relative against an opaque base doesn't fabricate an authority.
+    ok(
+        e.as_mut(),
+        r,
+        "new URL('#x', 'mailto:a@b.com').href === 'mailto:a@b.com#x'",
+    );
+    // Empty-string relative drops the base fragment.
+    ok(
+        e.as_mut(),
+        r,
+        "new URL('', 'http://example.com/a?b#c').href === 'http://example.com/a?b'",
+    );
+    // blob: origin comes from the inner URL.
+    ok(
+        e.as_mut(),
+        r,
+        "new URL('blob:https://example.com/uuid').origin === 'https://example.com'",
+    );
+    // A special same-scheme relative reference resolves against the base.
+    ok(
+        e.as_mut(),
+        r,
+        "new URL('http:foo', 'http://example.com/bar').href === 'http://example.com/foo'",
+    );
+    // Leading-zero ports are numerically normalized (and dropped when default).
+    ok(
+        e.as_mut(),
+        r,
+        "new URL('https://example.com:00443/').host === 'example.com'",
+    );
+    // Space is percent-encoded in the path.
+    ok(
+        e.as_mut(),
+        r,
+        "new URL('http://example.com/foo bar').href === 'http://example.com/foo%20bar'",
     );
 }
