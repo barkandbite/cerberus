@@ -6,6 +6,16 @@ browser is pre-1.0; this is the first tagged preview.
 ## [Unreleased]
 
 ### Added
+- **Web Workers + more Web platform APIs.** Page script can now spawn `Worker`s
+  (from `Blob` object URLs, with `postMessage`/`importScripts`), validated
+  against Google's Comlink SDK and the real Web Platform Tests `testharness.js`
+  running end-to-end in a worker. Also new/upgraded: `Blob`, `URL` +
+  `URLSearchParams` (relative resolution, dot-segment normalization,
+  special-scheme origins), `Image`/`WebSocket`, `DOMException` +
+  `QuotaExceededError`, `Event`/`CustomEvent`/`EventTarget` (with `performance`
+  as an EventTarget), `TextDecoder` utf-16, spec-correct `crypto.getRandomValues`
+  validation, and `atob`/`btoa` `InvalidCharacterError`. Real `<img>`/beacon and
+  `navigator.sendBeacon` requests now go out through the sealed network path.
 - **Developer console (F12).** A read-only bottom drawer that surfaces what the
   page is actually doing: the current URL, live DOM/link/field/cookie counts,
   and the page's captured `console.*` output (most recent last). Toggle with
