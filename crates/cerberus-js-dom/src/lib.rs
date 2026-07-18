@@ -4158,6 +4158,14 @@ pub const DOM_MODEL_PRELUDE: &str = r##"
 
           var scope = { onmessage: null, name: "", __ls: { message: [], error: [] } };
           scope.self = scope;
+          // Give the scope a WorkerGlobalScope/DedicatedWorkerGlobalScope identity
+          // so code that branches on `self instanceof DedicatedWorkerGlobalScope`
+          // (e.g. the WPT testharness, and real libraries feature-detecting the
+          // worker context) takes the worker path.
+          scope.WorkerGlobalScope = function WorkerGlobalScope() {};
+          scope.DedicatedWorkerGlobalScope = function DedicatedWorkerGlobalScope() {};
+          scope.DedicatedWorkerGlobalScope.prototype = Object.create(scope.WorkerGlobalScope.prototype);
+          try { Object.setPrototypeOf(scope, scope.DedicatedWorkerGlobalScope.prototype); } catch (e) {}
           scope.location = g.location; scope.navigator = g.navigator;
           scope.setTimeout = g.setTimeout; scope.clearTimeout = g.clearTimeout;
           scope.setInterval = g.setInterval; scope.clearInterval = g.clearInterval;
@@ -4169,8 +4177,34 @@ pub const DOM_MODEL_PRELUDE: &str = r##"
           scope.addEventListener = function (t, fn) { if (scope.__ls[t]) scope.__ls[t].push(fn); };
           scope.removeEventListener = function (t, fn) { var a = scope.__ls[t]; if (a) { var i = a.indexOf(fn); if (i >= 0) a.splice(i, 1); } };
           scope.close = function () { scope.__dead = true; };
+          // Run `source` in the worker scope: bare globals resolve to `self`
+          // (via `with (this)`), which is the invariant real worker code and
+          // test harnesses rely on (they assign their API onto `self`).
+          function runInScope(source) {
+            var f = new Function(
+              "self", "postMessage", "importScripts", "addEventListener", "removeEventListener",
+              "close", "location", "navigator", "setTimeout", "clearTimeout", "setInterval",
+              "clearInterval", "queueMicrotask", "fetch", "XMLHttpRequest", "crypto", "atob",
+              "btoa", "TextEncoder", "TextDecoder", "performance", "Blob", "URL",
+              "with (this) {\n" + source + "\n}");
+            return f.call(scope, scope, scope.postMessage, scope.importScripts, scope.addEventListener,
+              scope.removeEventListener, scope.close, scope.location, scope.navigator, scope.setTimeout,
+              scope.clearTimeout, scope.setInterval, scope.clearInterval, scope.queueMicrotask, scope.fetch,
+              scope.XMLHttpRequest, scope.crypto, scope.atob, scope.btoa, scope.TextEncoder, scope.TextDecoder,
+              scope.performance, scope.Blob, scope.URL);
+          }
+          // importScripts: synchronous script loading. Real workers hit the
+          // network here; our arch avoids sync network, so resolve from a
+          // prefetched cache (host- or test-populated `__cerberusScriptCache`).
+          // Unknown scripts are recorded for diagnostics and skipped.
           scope.importScripts = function () {
-            for (var i = 0; i < arguments.length; i++) (g.__cerberusWorkerImports = g.__cerberusWorkerImports || []).push(String(arguments[i]));
+            for (var i = 0; i < arguments.length; i++) {
+              var u = String(arguments[i]);
+              (g.__cerberusWorkerImports = g.__cerberusWorkerImports || []).push(u);
+              var cache = g.__cerberusScriptCache;
+              var s = cache ? (cache[u] || cache[u.replace(/^.*\/\/[^/]+/, "")]) : null;
+              if (s != null) runInScope(s);
+            }
           };
           function deliver(target, ls, data) {
             if (target && target.__dead) return;
@@ -4184,18 +4218,15 @@ pub const DOM_MODEL_PRELUDE: &str = r##"
           outer.postMessage = function (data) { deliver(scope, scope.__ls, data); };   // main -> worker
 
           var src = blobSource(scriptUrl);
-          if (src == null) { (g.__cerberusWorkerScripts = g.__cerberusWorkerScripts || []).push(String(scriptUrl)); return; }
+          if (src == null) {
+            // Not a blob URL — try the prefetched script cache (real workers are
+            // often `new Worker('/path.js')`), else record and give up.
+            var c = g.__cerberusScriptCache;
+            src = c ? (c[String(scriptUrl)] || c[String(scriptUrl).replace(/^.*\/\/[^/]+/, "")]) : null;
+            if (src == null) { (g.__cerberusWorkerScripts = g.__cerberusWorkerScripts || []).push(String(scriptUrl)); return; }
+          }
           try {
-            var run = new Function(
-              "self", "postMessage", "importScripts", "addEventListener", "removeEventListener",
-              "close", "location", "navigator", "setTimeout", "clearTimeout", "setInterval",
-              "clearInterval", "queueMicrotask", "fetch", "XMLHttpRequest", "crypto", "atob",
-              "btoa", "TextEncoder", "TextDecoder", "performance", "Blob", "URL", src);
-            run.call(scope, scope, scope.postMessage, scope.importScripts, scope.addEventListener,
-              scope.removeEventListener, scope.close, scope.location, scope.navigator, scope.setTimeout,
-              scope.clearTimeout, scope.setInterval, scope.clearInterval, scope.queueMicrotask, scope.fetch,
-              scope.XMLHttpRequest, scope.crypto, scope.atob, scope.btoa, scope.TextEncoder, scope.TextDecoder,
-              scope.performance, scope.Blob, scope.URL);
+            runInScope(src);
           } catch (e) {
             g.setTimeout(function () {
               var ev = { type: "error", message: String(e), error: e };
