@@ -105,7 +105,8 @@ use cerberus_tls_rustls::RustlsProvider;
 use cerberus_types::{Color, FontStyle, HeadId, InstanceId, Origin, Point, RealmId, Rect, Size};
 use cerberus_ui::{
     BannerAction, ConsentBanner, CookieAction, CookieManager, CookieRow, MircAction, MircPanel,
-    MircRow, MircState, PerfHud, Toolbar, ToolbarAction, BANNER_HEIGHT,
+    MircRow, MircState, PerfHud, SettingsAction, SettingsModel, SettingsPanel, Toolbar,
+    ToolbarAction, BANNER_HEIGHT,
 };
 use cerberus_url::{join as join_url, parse as parse_url, Url};
 use std::collections::HashMap;
@@ -4370,6 +4371,26 @@ impl BrowserApp {
         self.text.rasterize(&list.scaled(scale), page);
     }
 
+    /// Snapshot the state the settings panel renders and hit-tests against.
+    fn settings_model(&self) -> SettingsModel<'_> {
+        SettingsModel {
+            vault_locked: self.storage.locked().vault_locked(),
+            passphrase_len: self.vault_input.chars().count(),
+            vault_msg: self.vault_msg.as_deref(),
+            hud_on: self.hud_on,
+            images_on: self.image_policy.default != ImageDisplayMode::TextOnly,
+        }
+    }
+
+    /// Dismiss the settings overlay, clearing its transient state. The typed
+    /// passphrase is scrubbed (`zeroize`, not just dropped — issue #30) so it
+    /// never lingers in the backing buffer.
+    fn close_settings(&mut self) {
+        self.settings_open = false;
+        self.vault_msg = None;
+        self.vault_input.zeroize();
+    }
+
     /// Attempt a vault unlock with the passphrase typed into the settings
     /// overlay. The input is wiped either way: `vault_input.zeroize()` scrubs
     /// the backing buffer (not just its length, unlike `String::clear()`), and
@@ -4637,11 +4658,10 @@ impl BrowserApp {
                 true
             }
             ToolbarAction::OpenSettings => {
-                self.settings_open = !self.settings_open;
-                if !self.settings_open {
-                    // Closing the overlay must wipe any typed-but-unsubmitted
-                    // passphrase, not just drop the reference to it (issue #30).
-                    self.vault_input.zeroize();
+                if self.settings_open {
+                    self.close_settings();
+                } else {
+                    self.settings_open = true;
                 }
                 true
             }
@@ -4949,18 +4969,10 @@ impl FrameApp for BrowserApp {
             self.insecure_button = Some(paint_insecure_button(&mut fb, &self.text, scale));
         }
         if self.settings_open {
-            let vault_locked = self.storage.locked().vault_locked();
-            paint_settings_overlay(
+            let model = self.settings_model();
+            self.text.rasterize(
+                &SettingsPanel::paint(logical, &self.text, &model).scaled(scale),
                 &mut fb,
-                logical,
-                &self.text,
-                &self.text,
-                vault_locked,
-                self.vault_input.chars().count(),
-                self.vault_msg.as_deref(),
-                self.hud_on,
-                self.image_policy.default == ImageDisplayMode::TextOnly,
-                scale,
             );
         }
         if self.cookie_manager_open {
@@ -5089,41 +5101,32 @@ impl FrameApp for BrowserApp {
             return true;
         }
         if self.settings_open {
-            // A click on the "manage cookies" row opens the inspector.
-            if point_in_rect(settings_cookies_rect(self.last_size), x, y) {
-                self.settings_open = false;
-                self.vault_msg = None;
-                // Leaving the overlay wipes any typed-but-unsubmitted passphrase
-                // (issue #30) — `zeroize()`, not `clear()`, actually scrubs it.
-                self.vault_input.zeroize();
-                self.cookie_manager_open = true;
-                self.cookie_scroll = 0;
-                return true;
-            }
-            // Toggle the performance HUD.
-            if point_in_rect(settings_timers_rect(self.last_size), x, y) {
-                self.hud_on = !self.hud_on;
-                return true;
-            }
-            // Toggle image loading (graphical <-> text-only) and reload the
-            // current page so the new policy takes full effect — text-only skips
-            // the fetch entirely, graphical needs the bytes it may have skipped.
-            if point_in_rect(settings_images_rect(self.last_size), x, y) {
-                self.image_policy.default = match self.image_policy.default {
-                    ImageDisplayMode::Graphical => ImageDisplayMode::TextOnly,
-                    ImageDisplayMode::TextOnly => ImageDisplayMode::Graphical,
-                };
-                if let Some(url) = self.current_url.clone() {
-                    self.begin_load(&url.to_string(), None, true);
+            // Resolve the click first so the borrow of `self` (via the model)
+            // ends before the arms mutate `self`.
+            let action = SettingsPanel::hit_test(self.last_size, &self.settings_model(), x, y);
+            match action {
+                SettingsAction::OpenCookies => {
+                    self.close_settings();
+                    self.cookie_manager_open = true;
+                    self.cookie_scroll = 0;
                 }
-                return true;
-            }
-            // Clicks inside the panel stay in the panel (passphrase entry);
-            // clicking outside dismisses it.
-            if !point_in_rect(settings_panel_rect(self.last_size), x, y) {
-                self.settings_open = false;
-                self.vault_msg = None;
-                self.vault_input.zeroize();
+                SettingsAction::ToggleHud => self.hud_on = !self.hud_on,
+                // Flip image loading (graphical <-> text-only) and reload the
+                // current page so the new policy takes full effect — text-only
+                // skips the fetch entirely, graphical needs the bytes it skipped.
+                SettingsAction::ToggleImages => {
+                    self.image_policy.default = match self.image_policy.default {
+                        ImageDisplayMode::Graphical => ImageDisplayMode::TextOnly,
+                        ImageDisplayMode::TextOnly => ImageDisplayMode::Graphical,
+                    };
+                    if let Some(url) = self.current_url.clone() {
+                        self.begin_load(&url.to_string(), None, true);
+                    }
+                }
+                SettingsAction::Close => self.close_settings(),
+                // A click inside the panel that hit no control (e.g. the
+                // passphrase field) stays in the panel.
+                SettingsAction::None => {}
             }
             return true;
         }
@@ -5940,173 +5943,6 @@ fn paint_insecure_button(fb: &mut Framebuffer, text: &TextEngine, scale: f32) ->
     rect
 }
 
-/// The settings panel's window rect (shared by paint and hit-testing).
-fn settings_panel_rect(size: Size) -> Rect {
-    let pw = size.w * 3 / 5;
-    let ph = size.h * 3 / 5;
-    let px = (size.w.saturating_sub(pw) / 2) as i32;
-    let py = (size.h.saturating_sub(ph) / 2) as i32;
-    Rect::new(px, py, pw, ph)
-}
-
-/// The clickable "manage cookies" row inside the settings overlay.
-fn settings_cookies_rect(size: Size) -> Rect {
-    let p = settings_panel_rect(size);
-    Rect::new(p.x + 12, p.y + 176, 220, 22)
-}
-
-/// The clickable "performance HUD" toggle row inside the settings overlay.
-fn settings_timers_rect(size: Size) -> Rect {
-    let p = settings_panel_rect(size);
-    Rect::new(p.x + 12, p.y + 204, 220, 22)
-}
-
-/// The clickable "images" toggle row inside the settings overlay.
-fn settings_images_rect(size: Size) -> Rect {
-    let p = settings_panel_rect(size);
-    Rect::new(p.x + 12, p.y + 232, 220, 22)
-}
-
-/// Paint the centered settings panel: vault state + passphrase entry.
-#[allow(clippy::too_many_arguments)]
-fn paint_settings_overlay(
-    fb: &mut Framebuffer,
-    size: Size,
-    shaper: &dyn TextShaper,
-    raster: &dyn Rasterizer,
-    vault_locked: bool,
-    input_chars: usize,
-    vault_msg: Option<&str>,
-    hud_on: bool,
-    images_text_only: bool,
-    scale: f32,
-) {
-    let panel = settings_panel_rect(size);
-    let (px, py, pw, ph) = (panel.x, panel.y, panel.w, panel.h);
-
-    let mut list = DisplayList::new();
-    list.push(DisplayItem::Rect {
-        rect: Rect::new(px - 1, py - 1, pw + 2, ph + 2),
-        color: Color::rgb(0x40, 0x40, 0x40),
-    });
-    list.push(DisplayItem::Rect {
-        rect: Rect::new(px, py, pw, ph),
-        color: Color::rgb(0xFA, 0xFA, 0xFA),
-    });
-    list.push(DisplayItem::Glyphs {
-        origin: Point::new(px + 12, py + 20),
-        frac_x: 0.0,
-        glyphs: shaper.shape("Settings", 22),
-        color: Color::BLACK,
-        style: FontStyle::REGULAR,
-    });
-    list.push(DisplayItem::Glyphs {
-        origin: Point::new(px + 12, py + 52),
-        frac_x: 0.0,
-        glyphs: shaper.shape("identities | vault | consent | farbling (coming soon)", 14),
-        color: Color::rgb(0x50, 0x50, 0x50),
-        style: FontStyle::REGULAR,
-    });
-    let vault_line = if vault_locked {
-        "vault: locked (quarantined cookies are dropped)"
-    } else {
-        "vault: unlocked"
-    };
-    list.push(DisplayItem::Glyphs {
-        origin: Point::new(px + 12, py + 78),
-        frac_x: 0.0,
-        glyphs: shaper.shape(vault_line, 14),
-        color: Color::rgb(0x50, 0x50, 0x50),
-        style: FontStyle::REGULAR,
-    });
-    if vault_locked {
-        // Masked passphrase entry: type + Enter while the panel is open.
-        let mask = "\u{2022}".repeat(input_chars);
-        list.push(DisplayItem::Glyphs {
-            origin: Point::new(px + 12, py + 104),
-            frac_x: 0.0,
-            glyphs: shaper.shape(&format!("passphrase: {mask}_"), 14),
-            color: Color::BLACK,
-            style: FontStyle::REGULAR,
-        });
-        list.push(DisplayItem::Glyphs {
-            origin: Point::new(px + 12, py + 126),
-            frac_x: 0.0,
-            glyphs: shaper.shape("(type, then Enter to unlock)", 12),
-            color: Color::rgb(0x80, 0x80, 0x80),
-            style: FontStyle::REGULAR,
-        });
-    }
-    if let Some(msg) = vault_msg {
-        list.push(DisplayItem::Glyphs {
-            origin: Point::new(px + 12, py + 150),
-            frac_x: 0.0,
-            glyphs: shaper.shape(msg, 14),
-            color: Color::rgb(0x90, 0x30, 0x30),
-            style: FontStyle::REGULAR,
-        });
-    }
-    // A glyph's origin.y is the TOP of the text box, so a label is vertically
-    // centered in an `h`-tall row at `y + (h - px) / 2` — the same formula the
-    // toolbar buttons use. (The old `+ 16` was a baseline-style offset that left
-    // the 14px label hanging below the 22px row.)
-    let row_label_dy = (settings_cookies_rect(size).h as i32 - 14) / 2;
-    // Entry point to the cookie inspector.
-    let cr = settings_cookies_rect(size);
-    list.push(DisplayItem::Rect {
-        rect: cr,
-        color: Color::rgb(0xE6, 0xEE, 0xF6),
-    });
-    list.push(DisplayItem::Glyphs {
-        origin: Point::new(cr.x + 8, cr.y + row_label_dy),
-        frac_x: 0.0,
-        glyphs: shaper.shape("manage cookies  >", 14),
-        color: Color::rgb(0x20, 0x40, 0x70),
-        style: FontStyle::REGULAR,
-    });
-    // Performance HUD toggle.
-    let tr = settings_timers_rect(size);
-    list.push(DisplayItem::Rect {
-        rect: tr,
-        color: Color::rgb(0xE6, 0xEE, 0xF6),
-    });
-    list.push(DisplayItem::Glyphs {
-        origin: Point::new(tr.x + 8, tr.y + row_label_dy),
-        frac_x: 0.0,
-        glyphs: shaper.shape(
-            if hud_on {
-                "performance HUD: on"
-            } else {
-                "performance HUD: off"
-            },
-            14,
-        ),
-        color: Color::rgb(0x20, 0x40, 0x70),
-        style: FontStyle::REGULAR,
-    });
-    // Images: graphical vs text-only (privacy + speed — skips image fetches).
-    let ir = settings_images_rect(size);
-    list.push(DisplayItem::Rect {
-        rect: ir,
-        color: Color::rgb(0xE6, 0xEE, 0xF6),
-    });
-    list.push(DisplayItem::Glyphs {
-        origin: Point::new(ir.x + 8, ir.y + row_label_dy),
-        frac_x: 0.0,
-        glyphs: shaper.shape(
-            if images_text_only {
-                "images: text-only"
-            } else {
-                "images: on"
-            },
-            14,
-        ),
-        color: Color::rgb(0x20, 0x40, 0x70),
-        style: FontStyle::REGULAR,
-    });
-    raster.rasterize(&list.scaled(scale), fb);
-}
-
 /// The developer-console drawer: the bottom ~45% of the window.
 fn dev_console_rect(size: Size) -> Rect {
     let h = (size.h * 9 / 20).max(120).min(size.h);
@@ -6631,30 +6467,32 @@ mod tests {
     }
 
     #[test]
-    fn settings_row_labels_stay_inside_their_highlight_boxes() {
-        // Regression: a glyph's origin.y is the TOP of the text, so a 14px label
-        // in an `h`-tall clickable row must sit at `(h - 14)/2`, not the old `+16`
-        // baseline-style offset that pushed it below the box. Paint the overlay
-        // and assert the strip just below each row's highlight box is blank — no
-        // label ink spilled out the bottom.
+    fn settings_row_labels_stay_inside_their_rows() {
+        // Each row's two-line label (title + muted subtitle) must sit inside its
+        // rounded box. Paint the real panel with the real rasterizer and assert
+        // the strip just below each control row carries no dark label ink — only
+        // the panel's light surface (and its faint border).
         let size = Size::new(800, 650);
         let mut fb = Framebuffer::new(size);
         fb.clear(Color::WHITE);
         let text = TextEngine::new();
-        paint_settings_overlay(
-            &mut fb, size, &text, &text, true, 3, None, false, false, 1.0,
-        );
-        for row in [
-            settings_cookies_rect(size),
-            settings_timers_rect(size),
-            settings_images_rect(size),
-        ] {
-            let below = (row.y + row.h as i32) as u32;
-            for y in below..below + 5 {
-                for x in (row.x as u32)..(row.x as u32 + row.w) {
+        let model = SettingsModel {
+            vault_locked: true,
+            passphrase_len: 3,
+            vault_msg: None,
+            hud_on: false,
+            images_on: false,
+        };
+        text.rasterize(&SettingsPanel::paint(size, &text, &model), &mut fb);
+        let lay = SettingsPanel::layout(size, &model);
+        for row in [lay.cookies_row, lay.images_row, lay.hud_row] {
+            // Start two pixels below the row (clearing its 1px border ring).
+            let below = (row.y + row.h as i32) as u32 + 2;
+            for y in below..below + 4 {
+                for x in (row.x as u32 + 4)..(row.x as u32 + row.w - 4) {
                     if let Some(c) = fb.pixel(x, y) {
                         assert!(
-                            c.r > 0xC8 && c.g > 0xC8 && c.b > 0xC8,
+                            c.r > 0xB0 && c.g > 0xB0 && c.b > 0xB0,
                             "label ink spilled below the row box at ({x},{y}): #{:02x}{:02x}{:02x}",
                             c.r,
                             c.g,
@@ -6716,8 +6554,10 @@ mod tests {
         assert_eq!(b.image_policy.default, ImageDisplayMode::Graphical);
 
         b.settings_open = true;
-        let r = settings_images_rect(b.last_size);
-        let (cx, cy) = (r.x + r.w as i32 / 2, r.y + r.h as i32 / 2);
+        let (cx, cy) = {
+            let r = SettingsPanel::layout(b.last_size, &b.settings_model()).images_row;
+            (r.x + r.w as i32 / 2, r.y + r.h as i32 / 2)
+        };
         assert!(b.pointer_down(cx, cy), "clicking the images row is handled");
         assert_eq!(
             b.image_policy.default,

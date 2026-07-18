@@ -1928,3 +1928,721 @@ mod perf_hud_tests {
         assert_eq!(glyphs, 1 + 2 * 2);
     }
 }
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Design system
+//
+// A small, shared visual language — the "branding guidelines" for Cerberus
+// chrome. Every panel (settings today, the developer console next) draws from
+// the same tokens and widgets, so the UI reads as one product instead of a set
+// of hand-placed rectangles: one light surface palette, the toolbar's blue as
+// the single accent, one spacing rhythm, one type scale, one corner radius.
+// Keep new chrome on these primitives.
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Design tokens: colours, spacing, radii, and type sizes. Pure constants so a
+/// widget reads `theme::ACCENT`, not a magic hex, and a palette change happens
+/// in exactly one place.
+pub mod theme {
+    use cerberus_types::Color;
+
+    // — Surfaces —
+    /// Dimmed backdrop painted behind a modal (source-over tint, ~40%).
+    pub const SCRIM: Color = Color::rgba(0x14, 0x18, 0x1F, 0x66);
+    /// Panel / card background.
+    pub const SURFACE: Color = Color::rgb(0xFB, 0xFC, 0xFD);
+    /// Inset control (row / field) background.
+    pub const SUNKEN: Color = Color::rgb(0xF1, 0xF3, 0xF6);
+    /// Raised control (text field, primary button face).
+    pub const RAISED: Color = Color::rgb(0xFF, 0xFF, 0xFF);
+
+    // — Lines —
+    /// Hairline divider between regions.
+    pub const DIVIDER: Color = Color::rgb(0xE7, 0xEA, 0xEE);
+    /// Border around a control or the panel edge.
+    pub const BORDER: Color = Color::rgb(0xD4, 0xD9, 0xE0);
+
+    // — Text —
+    /// Primary text.
+    pub const TEXT: Color = Color::rgb(0x1B, 0x20, 0x27);
+    /// Secondary / supporting text.
+    pub const TEXT_MUTED: Color = Color::rgb(0x5C, 0x66, 0x72);
+    /// Faint text: section headers, placeholders.
+    pub const TEXT_FAINT: Color = Color::rgb(0x8B, 0x94, 0xA0);
+
+    // — Accent (matches the toolbar's SYNC blue) —
+    /// The single brand accent.
+    pub const ACCENT: Color = Color::rgb(0x1E, 0x66, 0xE0);
+    /// Text/icon on an accent fill.
+    pub const ON_ACCENT: Color = Color::WHITE;
+
+    // — Semantic —
+    /// Positive state (vault unlocked dot).
+    pub const SUCCESS: Color = Color::rgb(0x1E, 0xA5, 0x5B);
+    /// Error text.
+    pub const DANGER: Color = Color::rgb(0xC2, 0x38, 0x38);
+    /// A toggle's neutral off-state track.
+    pub const TRACK_OFF: Color = Color::rgb(0xC6, 0xCC, 0xD4);
+
+    // — Spacing scale (device px) —
+    pub const SP_1: i32 = 4;
+    pub const SP_2: i32 = 8;
+    pub const SP_3: i32 = 12;
+    pub const SP_4: i32 = 16;
+    pub const SP_5: i32 = 24;
+
+    // — Corner radii —
+    pub const RADIUS_SM: u16 = 6;
+    pub const RADIUS_MD: u16 = 8;
+    pub const RADIUS_LG: u16 = 12;
+
+    // — Type scale (px) —
+    pub const TYPE_TITLE: u32 = 20;
+    pub const TYPE_BODY: u32 = 14;
+    pub const TYPE_CAPTION: u32 = 12;
+    /// Section header (drawn faint + uppercase).
+    pub const TYPE_SECTION: u32 = 12;
+}
+
+// —— Reusable widgets (built on the design tokens) ——
+
+/// Fill a rounded rectangle in one colour.
+fn fill_round(list: &mut DisplayList, rect: Rect, color: Color, radius: u16) {
+    list.push(DisplayItem::RoundRect {
+        rect,
+        color,
+        radius,
+    });
+}
+
+/// A rounded rect with a crisp 1px border. The border is a rounded rect grown
+/// 1px on every side painted *behind* the fill, so corners stay clean (a square
+/// `stroke_rect` border would poke out past a rounded fill).
+fn bordered_round(list: &mut DisplayList, rect: Rect, fill: Color, border: Color, radius: u16) {
+    fill_round(
+        list,
+        Rect::new(rect.x - 1, rect.y - 1, rect.w + 2, rect.h + 2),
+        border,
+        radius + 1,
+    );
+    fill_round(list, rect, fill, radius);
+}
+
+/// Total advance width of `text` at `px`, in device pixels.
+fn text_width(shaper: &dyn TextShaper, text: &str, px: u32) -> i32 {
+    shaper
+        .shape(text, px)
+        .iter()
+        .map(|g| g.advance as i32)
+        .sum()
+}
+
+/// Push a left-anchored text run whose top-left is `(x, top)`. Empty text is a
+/// no-op (so an absent subtitle costs nothing).
+fn push_text(
+    list: &mut DisplayList,
+    shaper: &dyn TextShaper,
+    x: i32,
+    top: i32,
+    text: &str,
+    px: u32,
+    color: Color,
+) {
+    if text.is_empty() {
+        return;
+    }
+    list.push(DisplayItem::Glyphs {
+        origin: Point::new(x, top),
+        frac_x: 0.0,
+        glyphs: shaper.shape(text, px),
+        color,
+        style: FontStyle::REGULAR,
+    });
+}
+
+/// A faint, uppercase section label anchored at `(x, top)`.
+fn section_header(list: &mut DisplayList, shaper: &dyn TextShaper, x: i32, top: i32, text: &str) {
+    push_text(
+        list,
+        shaper,
+        x,
+        top,
+        text,
+        theme::TYPE_SECTION,
+        theme::TEXT_FAINT,
+    );
+}
+
+/// A right-pointing chevron centred on `(cx, cy)`, drawn from two round-capped
+/// strokes so it scales crisply — the "opens a sub-panel" affordance.
+fn chevron_right(list: &mut DisplayList, cx: i32, cy: i32, size: i32, color: Color) {
+    list.push(DisplayItem::Line {
+        a: Point::new(cx - size / 2, cy - size),
+        b: Point::new(cx + size / 2, cy),
+        width: 2,
+        color,
+    });
+    list.push(DisplayItem::Line {
+        a: Point::new(cx + size / 2, cy),
+        b: Point::new(cx - size / 2, cy + size),
+        width: 2,
+        color,
+    });
+}
+
+/// An iOS-style pill toggle inside `rect`: an accent track when `on` (neutral
+/// grey when off) with a white knob that slides to the lit side and casts a
+/// faint shadow for depth.
+fn toggle(list: &mut DisplayList, rect: Rect, on: bool) {
+    let track = if on { theme::ACCENT } else { theme::TRACK_OFF };
+    fill_round(list, rect, track, (rect.h / 2) as u16);
+    let d = rect.h.saturating_sub(6);
+    let ky = rect.y + 3;
+    let kx = if on {
+        rect.x + rect.w as i32 - 3 - d as i32
+    } else {
+        rect.x + 3
+    };
+    list.push(DisplayItem::Shadow {
+        rect: Rect::new(kx, ky + 1, d, d),
+        blur: 2,
+        color: Color::rgba(0, 0, 0, 0x33),
+    });
+    fill_round(list, Rect::new(kx, ky, d, d), Color::WHITE, (d / 2) as u16);
+}
+
+/// The two-line body of a settings row: a `title` and a muted `subtitle`,
+/// left-inset and vertically balanced in a [`SETTINGS_ROW_H`]-tall row.
+fn row_labels(
+    list: &mut DisplayList,
+    shaper: &dyn TextShaper,
+    x: i32,
+    row: Rect,
+    title: &str,
+    subtitle: &str,
+) {
+    push_text(
+        list,
+        shaper,
+        x,
+        row.y + 8,
+        title,
+        theme::TYPE_BODY,
+        theme::TEXT,
+    );
+    push_text(
+        list,
+        shaper,
+        x,
+        row.y + 25,
+        subtitle,
+        theme::TYPE_CAPTION,
+        theme::TEXT_MUTED,
+    );
+}
+
+// —— The settings panel ——
+
+/// The height of a settings control row.
+const SETTINGS_ROW_H: u32 = 44;
+const SETTINGS_PANEL_W: u32 = 460;
+const SETTINGS_SIDE: i32 = 24;
+const SETTINGS_SECTIONS_TOP: i32 = 66;
+const SETTINGS_HEADER_H: i32 = 24;
+const SETTINGS_ROW_GAP: i32 = 8;
+const SETTINGS_SECTION_GAP: i32 = 16;
+const SETTINGS_FIELD_H: u32 = 34;
+const SETTINGS_CAPTION_BLOCK: i32 = 22;
+const SETTINGS_BOTTOM: i32 = 18;
+const SETTINGS_TOGGLE_W: u32 = 40;
+const SETTINGS_TOGGLE_H: u32 = 22;
+const SETTINGS_CLOSE: u32 = 26;
+
+/// The state the settings panel renders. Borrowed from the app each frame; the
+/// panel owns no state of its own (it stays a pure view, like the rest of this
+/// crate).
+pub struct SettingsModel<'a> {
+    /// Whether the identity vault is locked (drives the passphrase field).
+    pub vault_locked: bool,
+    /// Number of passphrase characters typed so far (rendered as dots).
+    pub passphrase_len: usize,
+    /// A transient vault status/error message, if any.
+    pub vault_msg: Option<&'a str>,
+    /// Whether the performance HUD is on.
+    pub hud_on: bool,
+    /// Whether images load (graphical); false means text-only.
+    pub images_on: bool,
+}
+
+/// What a click on the settings panel means.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SettingsAction {
+    /// Dismiss the panel (the ✕ button or a click on the backdrop).
+    Close,
+    /// Open the cookie inspector.
+    OpenCookies,
+    /// Flip the image-loading policy (graphical ↔ text-only).
+    ToggleImages,
+    /// Flip the performance HUD.
+    ToggleHud,
+    /// A click inside the panel that hit no control — swallow it (stay open).
+    None,
+}
+
+/// The resolved rectangles for one frame of the settings panel. Computed once
+/// and shared by `paint` and `hit_test` so the picture and the click map can
+/// never drift apart.
+pub struct SettingsLayout {
+    /// The panel card.
+    pub panel: Rect,
+    /// The ✕ close button.
+    pub close: Rect,
+    /// The "Cookies" nav row.
+    pub cookies_row: Rect,
+    /// The "Load images" toggle row.
+    pub images_row: Rect,
+    /// The toggle within the images row.
+    pub images_toggle: Rect,
+    /// The "Performance HUD" toggle row.
+    pub hud_row: Rect,
+    /// The toggle within the HUD row.
+    pub hud_toggle: Rect,
+    /// The vault area: a passphrase field when locked, a status row when not.
+    pub vault: Rect,
+}
+
+/// The centred settings dialog: a modal card of grouped rows (cookies, images,
+/// performance) plus the identity-vault passphrase entry, built entirely from
+/// the design-system widgets above. Pure like the rest of the crate.
+pub struct SettingsPanel;
+
+impl SettingsPanel {
+    /// Content height for the card, which grows a little when the vault is
+    /// locked (a field + caption instead of a one-line status row).
+    fn content_height(locked: bool) -> u32 {
+        let mut h = SETTINGS_SECTIONS_TOP;
+        // Privacy & data: header + two rows.
+        h += SETTINGS_HEADER_H;
+        h += SETTINGS_ROW_H as i32 + SETTINGS_ROW_GAP;
+        h += SETTINGS_ROW_H as i32;
+        h += SETTINGS_SECTION_GAP;
+        // Performance: header + one row.
+        h += SETTINGS_HEADER_H;
+        h += SETTINGS_ROW_H as i32;
+        h += SETTINGS_SECTION_GAP;
+        // Identity vault: header + field/caption (locked) or status row.
+        h += SETTINGS_HEADER_H;
+        if locked {
+            h += SETTINGS_FIELD_H as i32 + SETTINGS_CAPTION_BLOCK;
+        } else {
+            h += SETTINGS_ROW_H as i32;
+        }
+        h += SETTINGS_BOTTOM;
+        h as u32
+    }
+
+    /// The panel card rect: a fixed comfortable width (clamped to the window),
+    /// content-sized height, centred.
+    fn panel_rect(window: Size, locked: bool) -> Rect {
+        let w = window.w.saturating_sub(48).clamp(280, SETTINGS_PANEL_W);
+        let h = Self::content_height(locked).min(window.h.saturating_sub(24).max(1));
+        let x = (window.w.saturating_sub(w) / 2) as i32;
+        let y = (window.h.saturating_sub(h) / 2) as i32;
+        Rect::new(x, y, w, h)
+    }
+
+    /// The toggle rect inside a control row (right-inset, vertically centred).
+    fn row_toggle(row: Rect) -> Rect {
+        Rect::new(
+            row.x + row.w as i32 - theme::SP_3 - SETTINGS_TOGGLE_W as i32,
+            row.y + (row.h as i32 - SETTINGS_TOGGLE_H as i32) / 2,
+            SETTINGS_TOGGLE_W,
+            SETTINGS_TOGGLE_H,
+        )
+    }
+
+    /// Resolve every rectangle for the current window and model.
+    pub fn layout(window: Size, model: &SettingsModel<'_>) -> SettingsLayout {
+        let panel = Self::panel_rect(window, model.vault_locked);
+        let ix = panel.x + SETTINGS_SIDE;
+        let iw = (panel.w as i32 - 2 * SETTINGS_SIDE).max(0) as u32;
+        let close = Rect::new(
+            panel.x + panel.w as i32 - theme::SP_4 - SETTINGS_CLOSE as i32,
+            panel.y + theme::SP_4,
+            SETTINGS_CLOSE,
+            SETTINGS_CLOSE,
+        );
+
+        let mut y = panel.y + SETTINGS_SECTIONS_TOP;
+        // Privacy & data.
+        y += SETTINGS_HEADER_H;
+        let cookies_row = Rect::new(ix, y, iw, SETTINGS_ROW_H);
+        y += SETTINGS_ROW_H as i32 + SETTINGS_ROW_GAP;
+        let images_row = Rect::new(ix, y, iw, SETTINGS_ROW_H);
+        y += SETTINGS_ROW_H as i32 + SETTINGS_SECTION_GAP;
+        // Performance.
+        y += SETTINGS_HEADER_H;
+        let hud_row = Rect::new(ix, y, iw, SETTINGS_ROW_H);
+        y += SETTINGS_ROW_H as i32 + SETTINGS_SECTION_GAP;
+        // Identity vault.
+        y += SETTINGS_HEADER_H;
+        let vault = if model.vault_locked {
+            Rect::new(ix, y, iw, SETTINGS_FIELD_H)
+        } else {
+            Rect::new(ix, y, iw, SETTINGS_ROW_H)
+        };
+
+        SettingsLayout {
+            panel,
+            close,
+            cookies_row,
+            images_row,
+            images_toggle: Self::row_toggle(images_row),
+            hud_row,
+            hud_toggle: Self::row_toggle(hud_row),
+            vault,
+        }
+    }
+
+    /// Paint the panel into its own display list (composited after the page).
+    pub fn paint(window: Size, shaper: &dyn TextShaper, model: &SettingsModel<'_>) -> DisplayList {
+        let mut list = DisplayList::new();
+        let lay = Self::layout(window, model);
+        let p = lay.panel;
+
+        // Dim the whole window, then float the card above it.
+        list.push(DisplayItem::Rect {
+            rect: Rect::new(0, 0, window.w, window.h),
+            color: theme::SCRIM,
+        });
+        list.push(DisplayItem::Shadow {
+            rect: Rect::new(p.x, p.y + 3, p.w, p.h),
+            blur: 26,
+            color: Color::rgba(0x10, 0x14, 0x1C, 0x59),
+        });
+        bordered_round(
+            &mut list,
+            p,
+            theme::SURFACE,
+            theme::BORDER,
+            theme::RADIUS_LG,
+        );
+
+        // Header: title, subtitle, hairline, and the ✕ close button.
+        push_text(
+            &mut list,
+            shaper,
+            p.x + SETTINGS_SIDE,
+            p.y + 18,
+            "Settings",
+            theme::TYPE_TITLE,
+            theme::TEXT,
+        );
+        push_text(
+            &mut list,
+            shaper,
+            p.x + SETTINGS_SIDE,
+            p.y + 44,
+            "Privacy, identity, and performance",
+            theme::TYPE_CAPTION,
+            theme::TEXT_MUTED,
+        );
+        list.push(DisplayItem::Rect {
+            rect: Rect::new(
+                p.x + SETTINGS_SIDE,
+                p.y + 60,
+                (p.w as i32 - 2 * SETTINGS_SIDE).max(0) as u32,
+                1,
+            ),
+            color: theme::DIVIDER,
+        });
+        draw_icon_button(
+            &mut list,
+            shaper,
+            lay.close,
+            IC_CLOSE,
+            12,
+            theme::SUNKEN,
+            theme::TEXT_MUTED,
+        );
+
+        // Section: privacy & data.
+        section_header(
+            &mut list,
+            shaper,
+            p.x + SETTINGS_SIDE,
+            lay.cookies_row.y - 18,
+            "PRIVACY & DATA",
+        );
+        // Cookies (nav → chevron).
+        bordered_round(
+            &mut list,
+            lay.cookies_row,
+            theme::SUNKEN,
+            theme::BORDER,
+            theme::RADIUS_MD,
+        );
+        row_labels(
+            &mut list,
+            shaper,
+            lay.cookies_row.x + 14,
+            lay.cookies_row,
+            "Cookies",
+            "Review and manage stored cookies",
+        );
+        chevron_right(
+            &mut list,
+            lay.cookies_row.x + lay.cookies_row.w as i32 - 18,
+            lay.cookies_row.y + lay.cookies_row.h as i32 / 2,
+            5,
+            theme::TEXT_FAINT,
+        );
+        // Load images (toggle).
+        bordered_round(
+            &mut list,
+            lay.images_row,
+            theme::SUNKEN,
+            theme::BORDER,
+            theme::RADIUS_MD,
+        );
+        row_labels(
+            &mut list,
+            shaper,
+            lay.images_row.x + 14,
+            lay.images_row,
+            "Load images",
+            if model.images_on {
+                "Fetching and rendering images"
+            } else {
+                "Text-only — faster and lighter"
+            },
+        );
+        toggle(&mut list, lay.images_toggle, model.images_on);
+
+        // Section: performance.
+        section_header(
+            &mut list,
+            shaper,
+            p.x + SETTINGS_SIDE,
+            lay.hud_row.y - 18,
+            "PERFORMANCE",
+        );
+        bordered_round(
+            &mut list,
+            lay.hud_row,
+            theme::SUNKEN,
+            theme::BORDER,
+            theme::RADIUS_MD,
+        );
+        row_labels(
+            &mut list,
+            shaper,
+            lay.hud_row.x + 14,
+            lay.hud_row,
+            "Performance HUD",
+            if model.hud_on {
+                "Frame-timing overlay is visible"
+            } else {
+                "Show the frame-timing overlay"
+            },
+        );
+        toggle(&mut list, lay.hud_toggle, model.hud_on);
+
+        // Section: identity vault.
+        section_header(
+            &mut list,
+            shaper,
+            p.x + SETTINGS_SIDE,
+            lay.vault.y - 18,
+            "IDENTITY VAULT",
+        );
+        if model.vault_locked {
+            // Masked passphrase field (keyboard-driven: type, then Enter).
+            bordered_round(
+                &mut list,
+                lay.vault,
+                theme::RAISED,
+                theme::BORDER,
+                theme::RADIUS_MD,
+            );
+            let px = theme::TYPE_BODY;
+            let fx = lay.vault.x + 14;
+            let top = lay.vault.y + (lay.vault.h as i32 - px as i32) / 2;
+            let dots = "\u{2022}".repeat(model.passphrase_len);
+            push_text(&mut list, shaper, fx, top, &dots, px, theme::TEXT);
+            // Caret after the last dot.
+            let caret_x = fx + text_width(shaper, &dots, px) + if dots.is_empty() { 0 } else { 1 };
+            list.push(DisplayItem::Rect {
+                rect: Rect::new(caret_x, top, 2, px),
+                color: theme::ACCENT,
+            });
+            // Caption: the hint, or an error in red.
+            let cap_y = lay.vault.y + lay.vault.h as i32 + 6;
+            match model.vault_msg {
+                Some(msg) => push_text(
+                    &mut list,
+                    shaper,
+                    lay.vault.x,
+                    cap_y,
+                    msg,
+                    theme::TYPE_CAPTION,
+                    theme::DANGER,
+                ),
+                None => push_text(
+                    &mut list,
+                    shaper,
+                    lay.vault.x,
+                    cap_y,
+                    "Type your passphrase, then press Enter to unlock",
+                    theme::TYPE_CAPTION,
+                    theme::TEXT_FAINT,
+                ),
+            }
+        } else {
+            // Unlocked status row with a green dot.
+            bordered_round(
+                &mut list,
+                lay.vault,
+                theme::SUNKEN,
+                theme::BORDER,
+                theme::RADIUS_MD,
+            );
+            let dot = 8u32;
+            let dx = lay.vault.x + 14;
+            let dy = lay.vault.y + lay.vault.h as i32 / 2 - dot as i32 / 2;
+            fill_round(
+                &mut list,
+                Rect::new(dx, dy, dot, dot),
+                theme::SUCCESS,
+                (dot / 2) as u16,
+            );
+            row_labels(
+                &mut list,
+                shaper,
+                dx + dot as i32 + 10,
+                lay.vault,
+                "Vault unlocked",
+                "Quarantined cookies are retained",
+            );
+        }
+
+        list
+    }
+
+    /// Map a click to a [`SettingsAction`]. A click inside the panel that misses
+    /// every control is swallowed ([`SettingsAction::None`]); a click on the
+    /// backdrop dismisses ([`SettingsAction::Close`]).
+    pub fn hit_test(window: Size, model: &SettingsModel<'_>, x: i32, y: i32) -> SettingsAction {
+        let lay = Self::layout(window, model);
+        if point_in(lay.close, x, y) {
+            return SettingsAction::Close;
+        }
+        if point_in(lay.cookies_row, x, y) {
+            return SettingsAction::OpenCookies;
+        }
+        if point_in(lay.images_row, x, y) {
+            return SettingsAction::ToggleImages;
+        }
+        if point_in(lay.hud_row, x, y) {
+            return SettingsAction::ToggleHud;
+        }
+        if point_in(lay.panel, x, y) {
+            return SettingsAction::None;
+        }
+        SettingsAction::Close
+    }
+}
+
+#[cfg(test)]
+mod settings_panel_tests {
+    use super::*;
+    use cerberus_paint::MonoShaper;
+
+    fn model(locked: bool) -> SettingsModel<'static> {
+        SettingsModel {
+            vault_locked: locked,
+            passphrase_len: 0,
+            vault_msg: None,
+            hud_on: false,
+            images_on: true,
+        }
+    }
+
+    #[test]
+    fn panel_is_centred_and_grows_when_locked() {
+        let w = Size::new(1000, 800);
+        let unlocked = SettingsPanel::panel_rect(w, false);
+        let locked = SettingsPanel::panel_rect(w, true);
+        // Horizontally centred, clamped to the fixed width.
+        assert_eq!(unlocked.w, SETTINGS_PANEL_W);
+        assert_eq!(unlocked.x, (1000 - SETTINGS_PANEL_W as i32) / 2);
+        // The locked card is taller (a field + caption vs a one-line row).
+        assert!(
+            locked.h > unlocked.h,
+            "locked panel reserves field + caption"
+        );
+    }
+
+    #[test]
+    fn each_control_maps_to_its_action() {
+        let w = Size::new(900, 720);
+        let m = model(true);
+        let lay = SettingsPanel::layout(w, &m);
+        let center = |r: Rect| (r.x + r.w as i32 / 2, r.y + r.h as i32 / 2);
+
+        let (cx, cy) = center(lay.close);
+        assert_eq!(
+            SettingsPanel::hit_test(w, &m, cx, cy),
+            SettingsAction::Close
+        );
+        let (cx, cy) = center(lay.cookies_row);
+        assert_eq!(
+            SettingsPanel::hit_test(w, &m, cx, cy),
+            SettingsAction::OpenCookies
+        );
+        let (cx, cy) = center(lay.images_row);
+        assert_eq!(
+            SettingsPanel::hit_test(w, &m, cx, cy),
+            SettingsAction::ToggleImages
+        );
+        let (cx, cy) = center(lay.hud_row);
+        assert_eq!(
+            SettingsPanel::hit_test(w, &m, cx, cy),
+            SettingsAction::ToggleHud
+        );
+    }
+
+    #[test]
+    fn inside_swallows_and_outside_dismisses() {
+        let w = Size::new(900, 720);
+        let m = model(true);
+        let lay = SettingsPanel::layout(w, &m);
+        // The vault field is inside the panel but is no action → swallowed.
+        let (vx, vy) = (lay.vault.x + 4, lay.vault.y + 4);
+        assert_eq!(SettingsPanel::hit_test(w, &m, vx, vy), SettingsAction::None);
+        // A click well outside the card dismisses it.
+        assert_eq!(SettingsPanel::hit_test(w, &m, 2, 2), SettingsAction::Close);
+    }
+
+    #[test]
+    fn paint_draws_toggles_and_field_when_locked() {
+        let w = Size::new(900, 720);
+        let m = model(true);
+        let list = SettingsPanel::paint(w, &MonoShaper, &m);
+        // At least a scrim, a rounded card, and several rounded rows/toggles.
+        let round = list
+            .items
+            .iter()
+            .filter(|i| matches!(i, DisplayItem::RoundRect { .. }))
+            .count();
+        assert!(
+            round >= 6,
+            "card + rows + toggles are rounded (got {round})"
+        );
+        // Some text was laid (title, sections, labels).
+        assert!(list
+            .items
+            .iter()
+            .any(|i| matches!(i, DisplayItem::Glyphs { .. })));
+    }
+}

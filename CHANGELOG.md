@@ -6,6 +6,16 @@ browser is pre-1.0; this is the first tagged preview.
 ## [Unreleased]
 
 ### Added
+- **UI design system + redesigned settings panel.** A small shared visual
+  language (`cerberus_ui::theme`) — one surface palette, the toolbar's blue as
+  the single accent, one spacing rhythm, type scale, and corner radius — plus
+  reusable widgets (rounded cards, iOS-style toggles, section headers, chevron
+  rows, a masked field) built on it. The settings menu is rebuilt on top: a
+  centred modal card that dims the page, with grouped sections (Privacy & data,
+  Performance, Identity vault) of real toggle/nav rows and a proper passphrase
+  field — replacing the old flat "clickable text" rows. `SettingsPanel`
+  (`layout`/`paint`/`hit_test`) is a pure view like the rest of the crate; the
+  developer console will adopt the same tokens next.
 - **Web Workers + more Web platform APIs.** Page script can now spawn `Worker`s
   (from `Blob` object URLs, with `postMessage`/`importScripts`), validated
   against Google's Comlink SDK and the real Web Platform Tests `testharness.js`
