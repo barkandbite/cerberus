@@ -1984,6 +1984,21 @@ pub mod theme {
     /// A toggle's neutral off-state track.
     pub const TRACK_OFF: Color = Color::rgb(0xC6, 0xCC, 0xD4);
 
+    // — Dark surfaces (developer tooling — the console reads as a tool, not a
+    //   page, but shares the accent, spacing, radii, and type scale) —
+    /// Console background.
+    pub const INK: Color = Color::rgb(0x1B, 0x1E, 0x24);
+    /// Raised element on `INK` (title bar, stat chip).
+    pub const INK_RAISED: Color = Color::rgb(0x25, 0x2A, 0x32);
+    /// Border/divider on a dark surface.
+    pub const INK_BORDER: Color = Color::rgb(0x39, 0x40, 0x4B);
+    /// Primary text on a dark surface.
+    pub const ON_INK: Color = Color::rgb(0xE6, 0xE9, 0xED);
+    /// Muted text on a dark surface.
+    pub const ON_INK_MUTED: Color = Color::rgb(0x99, 0xA2, 0xAE);
+    /// A brighter accent that reads on a dark surface.
+    pub const ACCENT_ON_INK: Color = Color::rgb(0x5B, 0x9C, 0xFF);
+
     // — Spacing scale (device px) —
     pub const SP_1: i32 = 4;
     pub const SP_2: i32 = 8;
@@ -2644,5 +2659,285 @@ mod settings_panel_tests {
             .items
             .iter()
             .any(|i| matches!(i, DisplayItem::Glyphs { .. })));
+    }
+}
+
+// —— The developer console ——
+
+/// The height of the console's title bar.
+const DEV_HEADER_H: i32 = 34;
+/// The height of the tab strip.
+const DEV_TABS_H: i32 = 30;
+/// The height of the stat-chip strip.
+const DEV_STATS_H: i32 = 36;
+/// A console log line's height.
+const DEV_LINE_H: i32 = 16;
+
+/// A read-only snapshot of what the page is doing, rendered by the console.
+pub struct DevConsoleModel<'a> {
+    /// The current page URL.
+    pub url: &'a str,
+    /// Live DOM node count.
+    pub dom_nodes: usize,
+    /// Live link count.
+    pub links: usize,
+    /// Live form-field count.
+    pub fields: usize,
+    /// Stored-cookie count.
+    pub cookies: usize,
+    /// Captured `console.*` output, oldest first.
+    pub lines: &'a [String],
+}
+
+/// The F12 developer console: a dark bottom drawer that reads as a developer
+/// tool while sharing the design system's accent, spacing, radii, and type
+/// scale. A titled tab strip (Console active; Elements/Network/Storage are
+/// signposted for later), a strip of live stat chips, and the page's captured
+/// `console.*` output. Read-only for now; a pure view like the rest of the
+/// crate.
+pub struct DevConsole;
+
+impl DevConsole {
+    /// The drawer rect: the bottom ~45% of the window (min 140px), full width.
+    pub fn drawer_rect(window: Size) -> Rect {
+        let h = (window.h * 9 / 20).clamp(140, window.h.max(1));
+        Rect::new(0, (window.h - h) as i32, window.w.max(1), h)
+    }
+
+    /// Paint the console into its own display list (composited after the page).
+    pub fn paint(
+        window: Size,
+        shaper: &dyn TextShaper,
+        model: &DevConsoleModel<'_>,
+    ) -> DisplayList {
+        let mut list = DisplayList::new();
+        let d = Self::drawer_rect(window);
+
+        // Drawer surface + a top accent hairline (the "attached to the bottom"
+        // edge) + a title bar.
+        list.push(DisplayItem::Rect {
+            rect: d,
+            color: theme::INK,
+        });
+        list.push(DisplayItem::Rect {
+            rect: Rect::new(d.x, d.y, d.w, 2),
+            color: theme::ACCENT_ON_INK,
+        });
+        list.push(DisplayItem::Rect {
+            rect: Rect::new(d.x, d.y + 2, d.w, DEV_HEADER_H as u32),
+            color: theme::INK_RAISED,
+        });
+        let pad = theme::SP_4;
+        push_text(
+            &mut list,
+            shaper,
+            d.x + pad,
+            d.y + 11,
+            "Developer Console",
+            theme::TYPE_CAPTION + 1,
+            theme::ON_INK,
+        );
+        // Right-aligned close hint.
+        let hint = "F12 to close";
+        let hw = text_width(shaper, hint, theme::TYPE_CAPTION);
+        push_text(
+            &mut list,
+            shaper,
+            d.x + d.w as i32 - pad - hw,
+            d.y + 12,
+            hint,
+            theme::TYPE_CAPTION,
+            theme::ON_INK_MUTED,
+        );
+
+        // Tab strip: Console is active (accent underline); the rest are
+        // signposted for later (dimmed, no underline).
+        let tabs_top = d.y + 2 + DEV_HEADER_H;
+        let mut tx = d.x + pad;
+        for (i, name) in ["Console", "Elements", "Network", "Storage"]
+            .iter()
+            .enumerate()
+        {
+            let active = i == 0;
+            let color = if active {
+                theme::ON_INK
+            } else {
+                theme::ON_INK_MUTED
+            };
+            let top = tabs_top + (DEV_TABS_H - theme::TYPE_CAPTION as i32) / 2 - 1;
+            push_text(&mut list, shaper, tx, top, name, theme::TYPE_CAPTION, color);
+            let w = text_width(shaper, name, theme::TYPE_CAPTION);
+            if active {
+                list.push(DisplayItem::Rect {
+                    rect: Rect::new(tx, tabs_top + DEV_TABS_H - 2, w.max(1) as u32, 2),
+                    color: theme::ACCENT_ON_INK,
+                });
+            }
+            tx += w + theme::SP_5;
+        }
+        // Divider under the tabs.
+        list.push(DisplayItem::Rect {
+            rect: Rect::new(d.x, tabs_top + DEV_TABS_H, d.w, 1),
+            color: theme::INK_BORDER,
+        });
+
+        // Stat chips: live DOM/link/field/cookie counts.
+        let stats_top = tabs_top + DEV_TABS_H + 1;
+        let chip_cy = stats_top + DEV_STATS_H / 2;
+        let mut cx = d.x + pad;
+        for (value, label) in [
+            (model.dom_nodes, "nodes"),
+            (model.links, "links"),
+            (model.fields, "fields"),
+            (model.cookies, "cookies"),
+        ] {
+            cx += Self::chip(&mut list, shaper, cx, chip_cy, value, label) + theme::SP_2;
+        }
+        // The URL, right of the chips if it fits, else on the far right muted.
+        let url_w = text_width(shaper, model.url, theme::TYPE_CAPTION);
+        let url_x = (d.x + d.w as i32 - pad - url_w).max(cx + theme::SP_3);
+        push_text(
+            &mut list,
+            shaper,
+            url_x,
+            chip_cy - theme::TYPE_CAPTION as i32 / 2,
+            model.url,
+            theme::TYPE_CAPTION,
+            theme::ACCENT_ON_INK,
+        );
+
+        // Console output area: the tail that fits, oldest first.
+        let log_top = stats_top + DEV_STATS_H + theme::SP_1;
+        let log_bottom = d.y + d.h as i32 - theme::SP_2;
+        let avail = ((log_bottom - log_top) / DEV_LINE_H).max(0) as usize;
+        if model.lines.is_empty() {
+            push_text(
+                &mut list,
+                shaper,
+                d.x + pad,
+                log_top,
+                "(no console output on this page)",
+                theme::TYPE_CAPTION,
+                theme::ON_INK_MUTED,
+            );
+        } else {
+            let start = model.lines.len().saturating_sub(avail);
+            for (i, line) in model.lines[start..].iter().enumerate() {
+                push_text(
+                    &mut list,
+                    shaper,
+                    d.x + pad,
+                    log_top + i as i32 * DEV_LINE_H,
+                    line,
+                    theme::TYPE_CAPTION,
+                    theme::ON_INK,
+                );
+            }
+        }
+        list
+    }
+
+    /// Draw one stat chip (a rounded `INK_RAISED` pill: bright value + muted
+    /// label) centred vertically on `cy`, returning its width so chips flow.
+    fn chip(
+        list: &mut DisplayList,
+        shaper: &dyn TextShaper,
+        x: i32,
+        cy: i32,
+        value: usize,
+        label: &str,
+    ) -> i32 {
+        let px = theme::TYPE_CAPTION;
+        let value_s = value.to_string();
+        let vw = text_width(shaper, &value_s, px);
+        let lw = text_width(shaper, label, px);
+        let inner = vw + theme::SP_1 + lw;
+        let w = inner + 2 * theme::SP_3;
+        let h = 22;
+        let rect = Rect::new(x, cy - h / 2, w.max(1) as u32, h as u32);
+        fill_round(list, rect, theme::INK_RAISED, theme::RADIUS_SM);
+        let top = cy - px as i32 / 2;
+        push_text(
+            list,
+            shaper,
+            x + theme::SP_3,
+            top,
+            &value_s,
+            px,
+            theme::ON_INK,
+        );
+        push_text(
+            list,
+            shaper,
+            x + theme::SP_3 + vw + theme::SP_1,
+            top,
+            label,
+            px,
+            theme::ON_INK_MUTED,
+        );
+        w
+    }
+}
+
+#[cfg(test)]
+mod dev_console_tests {
+    use super::*;
+    use cerberus_paint::MonoShaper;
+
+    #[test]
+    fn drawer_is_bottom_anchored_and_full_width() {
+        let w = Size::new(1000, 800);
+        let d = DevConsole::drawer_rect(w);
+        assert_eq!(d.x, 0);
+        assert_eq!(d.w, 1000);
+        assert_eq!(d.y + d.h as i32, 800, "flush with the window bottom");
+        assert!(d.h >= 140);
+    }
+
+    #[test]
+    fn paint_shows_placeholder_when_no_output() {
+        let w = Size::new(1000, 800);
+        let model = DevConsoleModel {
+            url: "https://example.test/",
+            dom_nodes: 128,
+            links: 12,
+            fields: 3,
+            cookies: 7,
+            lines: &[],
+        };
+        let list = DevConsole::paint(w, &MonoShaper, &model);
+        // Chips are rounded; the drawer + tab underline are plain rects; text ran.
+        assert!(list
+            .items
+            .iter()
+            .any(|i| matches!(i, DisplayItem::RoundRect { .. })));
+        assert!(list
+            .items
+            .iter()
+            .any(|i| matches!(i, DisplayItem::Glyphs { .. })));
+    }
+
+    #[test]
+    fn paint_tail_clips_to_what_fits() {
+        // A short drawer with many lines shows only the most recent that fit,
+        // and never panics slicing.
+        let w = Size::new(600, 320);
+        let lines: Vec<String> = (0..200).map(|i| format!("log line {i}")).collect();
+        let model = DevConsoleModel {
+            url: "https://x/",
+            dom_nodes: 1,
+            links: 0,
+            fields: 0,
+            cookies: 0,
+            lines: &lines,
+        };
+        let list = DevConsole::paint(w, &MonoShaper, &model);
+        let glyph_runs = list
+            .items
+            .iter()
+            .filter(|i| matches!(i, DisplayItem::Glyphs { .. }))
+            .count();
+        // Bounded by the drawer height, not the 200 input lines.
+        assert!(glyph_runs < 60, "tail-clipped (got {glyph_runs} runs)");
     }
 }

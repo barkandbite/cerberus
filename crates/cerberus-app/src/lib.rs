@@ -104,9 +104,9 @@ use cerberus_text::TextEngine;
 use cerberus_tls_rustls::RustlsProvider;
 use cerberus_types::{Color, FontStyle, HeadId, InstanceId, Origin, Point, RealmId, Rect, Size};
 use cerberus_ui::{
-    BannerAction, ConsentBanner, CookieAction, CookieManager, CookieRow, MircAction, MircPanel,
-    MircRow, MircState, PerfHud, SettingsAction, SettingsModel, SettingsPanel, Toolbar,
-    ToolbarAction, BANNER_HEIGHT,
+    BannerAction, ConsentBanner, CookieAction, CookieManager, CookieRow, DevConsole,
+    DevConsoleModel, MircAction, MircPanel, MircRow, MircState, PerfHud, SettingsAction,
+    SettingsModel, SettingsPanel, Toolbar, ToolbarAction, BANNER_HEIGHT,
 };
 use cerberus_url::{join as join_url, parse as parse_url, Url};
 use std::collections::HashMap;
@@ -5035,16 +5035,24 @@ impl FrameApp for BrowserApp {
                 .as_ref()
                 .map(|u| u.to_string())
                 .unwrap_or_else(|| self.toolbar.url_text.clone());
-            let stats = format!(
-                "DOM {} nodes · {} links · {} fields · cookies {}",
+            let (dom_nodes, links, fields, cookies) = (
                 self.elements.len(),
                 self.links.len(),
                 self.form_fields.len(),
                 self.cookie_rows().len(),
             );
             let lines = self.read_console_lines();
-            paint_dev_console(
-                &mut fb, logical, &self.text, &self.text, &url, &stats, &lines, scale,
+            let model = DevConsoleModel {
+                url: &url,
+                dom_nodes,
+                links,
+                fields,
+                cookies,
+                lines: &lines,
+            };
+            self.text.rasterize(
+                &DevConsole::paint(logical, &self.text, &model).scaled(scale),
+                &mut fb,
             );
         }
         // Performance HUD on top of everything, when enabled (M11).
@@ -5070,7 +5078,7 @@ impl FrameApp for BrowserApp {
         // The developer console drawer swallows clicks that land on it, so page
         // content painted behind it isn't activated by a click meant for the
         // console.
-        if self.console_open && point_in_rect(dev_console_rect(self.last_size), x, y) {
+        if self.console_open && point_in_rect(DevConsole::drawer_rect(self.last_size), x, y) {
             return true;
         }
         if self.mirc_open {
@@ -5941,95 +5949,6 @@ fn paint_insecure_button(fb: &mut Framebuffer, text: &TextEngine, scale: f32) ->
     });
     text.rasterize(&list.scaled(scale), fb);
     rect
-}
-
-/// The developer-console drawer: the bottom ~45% of the window.
-fn dev_console_rect(size: Size) -> Rect {
-    let h = (size.h * 9 / 20).max(120).min(size.h);
-    Rect::new(0, (size.h - h) as i32, size.w.max(1), h)
-}
-
-/// Paint the developer console (F12): a dark bottom drawer with a stats header
-/// and the page's captured `console.*` output (most recent last, tail-clipped to
-/// what fits). A read-only inspector for "what is the page actually doing".
-#[allow(clippy::too_many_arguments)]
-fn paint_dev_console(
-    fb: &mut Framebuffer,
-    size: Size,
-    shaper: &dyn TextShaper,
-    raster: &dyn Rasterizer,
-    url: &str,
-    stats: &str,
-    lines: &[String],
-    scale: f32,
-) {
-    let panel = dev_console_rect(size);
-    let mut list = DisplayList::new();
-    list.push(DisplayItem::Rect {
-        rect: panel,
-        color: Color::rgb(0x1E, 0x1E, 0x1E),
-    });
-    // Top border + title bar.
-    list.push(DisplayItem::Rect {
-        rect: Rect::new(panel.x, panel.y, panel.w, 2),
-        color: Color::rgb(0x3C, 0x3C, 0x3C),
-    });
-    list.push(DisplayItem::Glyphs {
-        origin: Point::new(panel.x + 10, panel.y + 8),
-        frac_x: 0.0,
-        glyphs: shaper.shape("Developer Console", 13),
-        color: Color::rgb(0xE0, 0xE0, 0xE0),
-        style: FontStyle::REGULAR,
-    });
-    list.push(DisplayItem::Glyphs {
-        origin: Point::new(panel.x + 10, panel.y + 28),
-        frac_x: 0.0,
-        glyphs: shaper.shape(url, 12),
-        color: Color::rgb(0x9C, 0xC4, 0xE4),
-        style: FontStyle::REGULAR,
-    });
-    list.push(DisplayItem::Glyphs {
-        origin: Point::new(panel.x + 10, panel.y + 46),
-        frac_x: 0.0,
-        glyphs: shaper.shape(stats, 12),
-        color: Color::rgb(0xA8, 0xA8, 0xA8),
-        style: FontStyle::REGULAR,
-    });
-    // Close hint, right-aligned.
-    let hint = "F12 to close";
-    let hint_w: u32 = shaper.shape(hint, 12).iter().map(|g| g.advance).sum();
-    list.push(DisplayItem::Glyphs {
-        origin: Point::new(panel.x + panel.w as i32 - hint_w as i32 - 10, panel.y + 8),
-        frac_x: 0.0,
-        glyphs: shaper.shape(hint, 12),
-        color: Color::rgb(0x80, 0x80, 0x80),
-        style: FontStyle::REGULAR,
-    });
-    // Console output area, below the header. Show the tail that fits.
-    let top = panel.y + 68;
-    let line_h = 16;
-    let avail = ((panel.y + panel.h as i32 - 8 - top) / line_h).max(0) as usize;
-    let start = lines.len().saturating_sub(avail);
-    let shown = &lines[start..];
-    if lines.is_empty() {
-        list.push(DisplayItem::Glyphs {
-            origin: Point::new(panel.x + 10, top),
-            frac_x: 0.0,
-            glyphs: shaper.shape("(no console output on this page)", 12),
-            color: Color::rgb(0x70, 0x70, 0x70),
-            style: FontStyle::REGULAR,
-        });
-    }
-    for (i, line) in shown.iter().enumerate() {
-        list.push(DisplayItem::Glyphs {
-            origin: Point::new(panel.x + 10, top + i as i32 * line_h),
-            frac_x: 0.0,
-            glyphs: shaper.shape(line, 12),
-            color: Color::rgb(0xD4, 0xD4, 0xD4),
-            style: FontStyle::REGULAR,
-        });
-    }
-    raster.rasterize(&list.scaled(scale), fb);
 }
 
 /// One pipeline-stage benchmark result.
