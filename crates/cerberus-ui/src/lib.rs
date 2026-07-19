@@ -2038,11 +2038,12 @@ mod perf_hud_tests {
 // Design system
 //
 // A small, shared visual language — the "branding guidelines" for Cerberus
-// chrome. Every panel (settings today, the developer console next) draws from
-// the same tokens and widgets, so the UI reads as one product instead of a set
-// of hand-placed rectangles: one light surface palette, the toolbar's blue as
-// the single accent, one spacing rhythm, one type scale, one corner radius.
-// Keep new chrome on these primitives.
+// chrome. Every surface (toolbar, consent banner, settings, developer console,
+// cookie inspector, MIRC roster, performance HUD) draws from the same tokens and
+// widgets, so the UI reads as one product instead of a set of hand-placed
+// rectangles: one light surface palette, the toolbar's blue as the single
+// accent, one spacing rhythm, one type scale, one corner radius. Keep new chrome
+// on these primitives — the guidelines are written up in docs/DESIGN_SYSTEM.md.
 // ─────────────────────────────────────────────────────────────────────────────
 
 /// Design tokens: colours, spacing, radii, and type sizes. Pure constants so a
