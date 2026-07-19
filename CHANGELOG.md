@@ -5,6 +5,8 @@ browser is pre-1.0; this is the first tagged preview.
 
 ## [Unreleased]
 
+## [0.0.13] - 2026-07-19
+
 ### Added
 - **Whole UI on the design system.** Every remaining chrome surface now draws
   from `cerberus_ui::theme` and its rounded widgets, so the browser reads as one
