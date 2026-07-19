@@ -7855,7 +7855,8 @@ mod tests {
         let mut b = fake_app(vec![]);
         let fb = b.render_frame(Size::new(400, 300));
         assert_eq!(fb.size, Size::new(400, 300));
-        assert_eq!(fb.pixel(200, 1), Some(Color::rgb(0xEC, 0xEC, 0xEC)));
+        // The toolbar bar is the design-system surface colour; the page below is white.
+        assert_eq!(fb.pixel(200, 1), Some(Color::rgb(0xFB, 0xFC, 0xFD)));
         assert_eq!(fb.pixel(380, 200), Some(Color::WHITE));
     }
 

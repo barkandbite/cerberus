@@ -6,6 +6,20 @@ browser is pre-1.0; this is the first tagged preview.
 ## [Unreleased]
 
 ### Added
+- **Whole UI on the design system.** Every remaining chrome surface now draws
+  from `cerberus_ui::theme` and its rounded widgets, so the browser reads as one
+  product instead of a set of hand-placed rectangles: the toolbar (rounded
+  buttons, an accent URL field with an accent caret, an accent-tint head chip),
+  the consent banner (an attention-amber strip with green "Allow" / red "Deny"
+  pills), the cookie inspector and the MIRC roster (scrim + rounded card + soft
+  shadow, uppercase section headers, zebra rows, and semantic disposition/state
+  **pills** — green allow/live, amber session/diverged, red block), the
+  performance HUD and the mirror "driven" badge (the rounded dark developer-
+  tooling `INK` surface with an accent header and green figures). New shared
+  tokens (semantic chip tints + inks, an attention/warning colour, a positive
+  on-dark value) and helpers (`round_button`, `round_icon_button`, `pill`) keep
+  every button and chip one shape. A `chrome_preview` example renders the
+  toolbar, banner, HUD, and cookie inspector to PNGs for review.
 - **UI design system + redesigned settings panel.** A small shared visual
   language (`cerberus_ui::theme`) — one surface palette, the toolbar's blue as
   the single accent, one spacing rhythm, type scale, and corner radius — plus

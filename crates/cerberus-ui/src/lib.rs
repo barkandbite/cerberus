@@ -225,35 +225,52 @@ impl Toolbar {
         // Toolbar background + a hairline separator at the bottom.
         list.push(DisplayItem::Rect {
             rect: Rect::new(0, 0, window.w, TOOLBAR_HEIGHT),
-            color: Color::rgb(0xEC, 0xEC, 0xEC),
+            color: theme::SURFACE,
         });
         list.push(DisplayItem::Rect {
             rect: Rect::new(0, TOOLBAR_HEIGHT as i32 - 1, window.w, 1),
-            color: Color::rgb(0xC8, 0xC8, 0xC8),
+            color: theme::BORDER,
         });
 
         for (control, rect) in self.layout(window) {
             let (bg, label, enabled) = self.style(control);
             let text = if enabled {
-                Color::rgb(0x20, 0x20, 0x20)
+                theme::TEXT
             } else {
-                Color::rgb(0xA0, 0xA0, 0xA0)
+                theme::TEXT_FAINT
             };
             // The URL box is a text field; the head chip keeps its text label;
             // the nav/reload/stop/settings buttons are icon-font glyphs.
             match control {
-                Control::UrlBox => self.paint_url_box(&mut list, shaper, rect, bg, &label, text),
-                Control::Head => draw_button(&mut list, shaper, rect, &label, bg, text, LABEL_PX),
+                Control::UrlBox => {
+                    // Dim the placeholder; real typed/edited text is full-strength.
+                    let c = if self.url_text.is_empty() && !self.url_focused {
+                        theme::TEXT_FAINT
+                    } else {
+                        theme::TEXT
+                    };
+                    self.paint_url_box(&mut list, shaper, rect, bg, &label, c)
+                }
+                Control::Head => round_button(
+                    &mut list,
+                    shaper,
+                    rect,
+                    &label,
+                    theme::ACCENT_TINT,
+                    theme::ACCENT_TINT,
+                    theme::ACCENT_INK,
+                    LABEL_PX,
+                ),
                 // The MIRC button (a multiperson glyph) glows blue while
                 // broadcasting and wears the driven-count badge ("N profiles") on
                 // its corner. Clicking it opens the panel that orchestrates the set.
                 Control::Sync => {
-                    let (fill, fg) = if self.broadcasting {
-                        (Color::rgb(0x1E, 0x66, 0xE0), Color::WHITE)
+                    let (fill, border, fg) = if self.broadcasting {
+                        (theme::ACCENT, theme::ACCENT, theme::ON_ACCENT)
                     } else {
-                        (bg, text)
+                        (theme::SUNKEN, theme::BORDER, text)
                     };
-                    draw_icon_button(&mut list, shaper, rect, IC_USERS, ICON_PX, fill, fg);
+                    round_icon_button(&mut list, shaper, rect, IC_USERS, ICON_PX, fill, border, fg);
                     push_count_badge(&mut list, shaper, rect, self.sync_count);
                 }
                 other => {
@@ -265,7 +282,16 @@ impl Toolbar {
                         Control::Settings => IC_GEAR,
                         Control::UrlBox | Control::Head | Control::Sync => unreachable!(),
                     };
-                    draw_icon_button(&mut list, shaper, rect, icon, ICON_PX, bg, text);
+                    round_icon_button(
+                        &mut list,
+                        shaper,
+                        rect,
+                        icon,
+                        ICON_PX,
+                        bg,
+                        theme::BORDER,
+                        text,
+                    );
                 }
             }
         }
@@ -283,10 +309,14 @@ impl Toolbar {
         label: &str,
         color: Color,
     ) {
-        list.push(DisplayItem::Rect { rect, color: bg });
-        stroke_rect(list, rect, darken(bg)); // input-field border
+        let border = if self.url_focused {
+            theme::ACCENT
+        } else {
+            theme::BORDER
+        };
+        bordered_round(list, rect, bg, border, theme::RADIUS_SM);
         let y = rect.y + (rect.h as i32 - LABEL_PX as i32) / 2;
-        let tx = rect.x + 6;
+        let tx = rect.x + 10;
         // Width of the actually-typed text (not the placeholder), for the caret
         // and the selection highlight.
         let text_w: i32 = shaper
@@ -296,15 +326,17 @@ impl Toolbar {
             .sum();
         // Select-all highlight behind the text, shown right after focusing.
         if self.url_focused && self.url_selected && !self.url_text.is_empty() {
-            list.push(DisplayItem::Rect {
-                rect: Rect::new(
-                    tx,
+            fill_round(
+                list,
+                Rect::new(
+                    tx - 2,
                     rect.y + 4,
-                    text_w.max(0) as u32,
+                    (text_w + 4).max(0) as u32,
                     rect.h.saturating_sub(8),
                 ),
-                color: Color::rgb(0xB5, 0xD0, 0xF5),
-            });
+                theme::ACCENT_TINT,
+                theme::RADIUS_SM,
+            );
         }
         list.push(DisplayItem::Glyphs {
             origin: Point::new(tx, y),
@@ -317,19 +349,19 @@ impl Toolbar {
         // is empty); while all is selected the highlight stands in for it.
         if self.url_focused && (!self.url_selected || self.url_text.is_empty()) {
             list.push(DisplayItem::Rect {
-                rect: Rect::new(tx + text_w, y, 1, LABEL_PX),
-                color: Color::rgb(0x20, 0x20, 0x20),
+                rect: Rect::new(tx + text_w, y, 2, LABEL_PX),
+                color: theme::ACCENT,
             });
         }
     }
 
     /// Background color, label, and enabled-state for a control.
     fn style(&self, control: Control) -> (Color, String, bool) {
-        let btn_bg = Color::rgb(0xDC, 0xDC, 0xDC);
+        let btn_bg = theme::SUNKEN;
         let box_bg = if self.url_focused {
-            Color::rgb(0xFF, 0xFF, 0xFF)
+            theme::RAISED
         } else {
-            Color::rgb(0xF6, 0xF6, 0xF6)
+            theme::SUNKEN
         };
         match control {
             Control::Back => (btn_bg, "<".into(), self.can_back),
@@ -340,7 +372,7 @@ impl Toolbar {
             // SYNC: label unused (painted as an icon); the broadcasting highlight
             // is applied in `paint`.
             Control::Sync => (btn_bg, String::new(), true),
-            Control::Head => (Color::rgb(0xD0, 0xDC, 0xF0), self.head_label.clone(), true),
+            Control::Head => (theme::ACCENT_TINT, self.head_label.clone(), true),
             Control::Settings => (btn_bg, "S".into(), true),
         }
     }
@@ -407,16 +439,22 @@ impl DrivenBadge {
     pub fn paint(window: Size, count: usize, site: &str, shaper: &dyn TextShaper) -> DisplayList {
         let mut list = DisplayList::new();
         let rect = Self::rect(window, count, site, shaper);
-        list.push(DisplayItem::Rect {
-            rect,
-            color: Color::rgb(0x1E, 0x40, 0x80),
+        // A rounded dark pill (the developer-tooling INK surface) with a live
+        // green dot — the same visual family as the HUD and console overlays.
+        list.push(DisplayItem::Shadow {
+            rect: Rect::new(rect.x, rect.y + 2, rect.w, rect.h),
+            blur: 12,
+            color: Color::rgba(0x10, 0x14, 0x1C, 0x4D),
         });
+        fill_round(&mut list, rect, theme::INK, (BADGE_H / 2) as u16);
         // A status dot at the left edge.
         let dot_y = rect.y + (BADGE_H as i32 - BADGE_DOT as i32) / 2;
-        list.push(DisplayItem::Rect {
-            rect: Rect::new(rect.x + BADGE_PAD, dot_y, BADGE_DOT, BADGE_DOT),
-            color: Color::rgb(0x6C, 0xE0, 0x8A),
-        });
+        fill_round(
+            &mut list,
+            Rect::new(rect.x + BADGE_PAD, dot_y, BADGE_DOT, BADGE_DOT),
+            theme::ON_INK_POS,
+            (BADGE_DOT / 2) as u16,
+        );
         let glyphs = shaper.shape(&Self::label(count, site), BADGE_PX);
         list.push(DisplayItem::Glyphs {
             origin: Point::new(
@@ -425,7 +463,7 @@ impl DrivenBadge {
             ),
             frac_x: 0.0,
             glyphs,
-            color: Color::WHITE,
+            color: theme::ON_INK,
             style: FontStyle::REGULAR,
         });
         list
@@ -493,19 +531,19 @@ mod tests {
             300
         ));
 
-        // Paint emits the pill, the dot, and the label glyphs.
+        // Paint emits the rounded pill, the dot, and the label glyphs.
         let list = DrivenBadge::paint(w, 23, "github.com", &MonoShaper);
-        let rects = list
+        let round = list
             .items
             .iter()
-            .filter(|i| matches!(i, DisplayItem::Rect { .. }))
+            .filter(|i| matches!(i, DisplayItem::RoundRect { .. }))
             .count();
         let glyphs = list
             .items
             .iter()
             .filter(|i| matches!(i, DisplayItem::Glyphs { .. }))
             .count();
-        assert_eq!(rects, 2, "pill + status dot");
+        assert_eq!(round, 2, "pill + status dot");
         assert_eq!(glyphs, 1, "the label");
     }
 
@@ -576,12 +614,14 @@ mod tests {
     fn paint_produces_toolbar_and_controls() {
         let t = Toolbar::new("work");
         let list = t.paint(window(), &MonoShaper);
-        let rects = list
+        // The bar + separator are plain rects; every control is a rounded button
+        // (each a border + fill round-rect pair), so assert on those.
+        let round = list
             .items
             .iter()
-            .filter(|i| matches!(i, DisplayItem::Rect { .. }))
+            .filter(|i| matches!(i, DisplayItem::RoundRect { .. }))
             .count();
-        assert!(rects >= 9, "got {rects} rects");
+        assert!(round >= 9, "got {round} round-rects");
     }
 
     #[test]
@@ -722,17 +762,17 @@ impl ConsentBanner {
         BannerAction::None
     }
 
-    /// Paint the strip: message text left, Allow / Deny / × right.
+    /// Paint the strip: message text left, Allow / Deny / dismiss right.
     pub fn paint(&self, window: Size, shaper: &dyn TextShaper) -> DisplayList {
         let mut list = DisplayList::new();
         let strip = Self::rect(window);
         list.push(DisplayItem::Rect {
             rect: strip,
-            color: Color::rgb(0xFF, 0xF4, 0xD6), // soft warning yellow
+            color: theme::WARNING_TINT,
         });
         list.push(DisplayItem::Rect {
             rect: Rect::new(0, strip.y + BANNER_HEIGHT as i32 - 1, window.w, 1),
-            color: Color::rgb(0xC8, 0xB8, 0x80),
+            color: theme::WARNING,
         });
 
         let more = if self.queued > 0 {
@@ -742,21 +782,47 @@ impl ConsentBanner {
         };
         let msg = format!("{} wants third-party access{more}", self.request_site);
         list.push(DisplayItem::Glyphs {
-            origin: Point::new(PAD + 4, strip.y + 19),
+            origin: Point::new(PAD + 6, strip.y + 19),
             frac_x: 0.0,
-            glyphs: shaper.shape(&msg, 13),
-            color: Color::rgb(0x40, 0x38, 0x10),
+            glyphs: shaper.shape(&msg, theme::TYPE_CAPTION),
+            color: theme::WARNING_INK,
             style: FontStyle::REGULAR,
         });
 
         for (action, rect) in Self::buttons(window) {
-            let (fill, label) = match action {
-                BannerAction::Allow => (Color::rgb(0xD9, 0xEF, 0xD9), "Allow"),
-                BannerAction::Deny => (Color::rgb(0xF3, 0xD9, 0xD9), "Deny"),
-                BannerAction::Dismiss => (Color::rgb(0xE8, 0xE8, 0xE8), "×"),
+            match action {
+                BannerAction::Allow => round_button(
+                    &mut list,
+                    shaper,
+                    rect,
+                    "Allow",
+                    theme::SUCCESS_TINT,
+                    darken(theme::SUCCESS_TINT),
+                    theme::SUCCESS_INK,
+                    theme::TYPE_CAPTION,
+                ),
+                BannerAction::Deny => round_button(
+                    &mut list,
+                    shaper,
+                    rect,
+                    "Deny",
+                    theme::DANGER_TINT,
+                    darken(theme::DANGER_TINT),
+                    theme::DANGER_INK,
+                    theme::TYPE_CAPTION,
+                ),
+                BannerAction::Dismiss => round_icon_button(
+                    &mut list,
+                    shaper,
+                    rect,
+                    IC_CLOSE,
+                    11,
+                    theme::RAISED,
+                    theme::BORDER,
+                    theme::WARNING_INK,
+                ),
                 BannerAction::None => continue,
-            };
-            draw_button(&mut list, shaper, rect, label, fill, Color::BLACK, 12);
+            }
         }
         list
     }
@@ -797,18 +863,26 @@ mod banner_tests {
     fn banner_paints_strip_buttons_and_message() {
         let b = ConsentBanner::new("https://ads.tracker.net", 2);
         let list = b.paint(Size::new(800, 600), &MonoShaper);
+        // Strip + divider are plain rects; the 3 buttons are rounded (a
+        // border+fill round-rect pair each).
         let rects = list
             .items
             .iter()
             .filter(|i| matches!(i, DisplayItem::Rect { .. }))
+            .count();
+        let round = list
+            .items
+            .iter()
+            .filter(|i| matches!(i, DisplayItem::RoundRect { .. }))
             .count();
         let glyphs = list
             .items
             .iter()
             .filter(|i| matches!(i, DisplayItem::Glyphs { .. }))
             .count();
-        assert!(rects >= 5, "strip + divider + 3 buttons");
-        assert!(glyphs >= 4, "message + 3 labels");
+        assert!(rects >= 2, "strip + divider");
+        assert!(round >= 6, "3 buttons × (border + fill)");
+        assert!(glyphs >= 4, "message + Allow + Deny + dismiss icon");
     }
 }
 
@@ -881,28 +955,6 @@ fn push_centered(
     });
 }
 
-/// Standard button chrome: a filled rect with its label centred on both axes.
-/// This is the single place button alignment is defined, so every button across
-/// the UI (toolbar, consent banner, cookie manager) stays consistent instead of
-/// each call site hand-placing a label that drifts out of its box.
-fn draw_button(
-    list: &mut DisplayList,
-    shaper: &dyn TextShaper,
-    rect: Rect,
-    label: &str,
-    fill: Color,
-    text: Color,
-    px: u32,
-) {
-    list.push(DisplayItem::Rect { rect, color: fill });
-    // A 1px border, a shade darker than the fill, gives a standard button edge
-    // (affordance) and keeps a light chip visible on a light background.
-    stroke_rect(list, rect, darken(fill));
-    if !label.is_empty() {
-        push_centered(list, shaper, rect, label, px, text);
-    }
-}
-
 /// A shade darker than `c` (~80%), for button/field borders.
 fn darken(c: Color) -> Color {
     let s = |v: u8| (v as u32 * 80 / 100) as u8;
@@ -933,15 +985,15 @@ fn stroke_rect(list: &mut DisplayList, rect: Rect, color: Color) {
     });
 }
 
-/// Background colour for a cookie-disposition chip, by its token, so the state
+/// Fill + text colour for a cookie-disposition chip, by its token, so the state
 /// reads at a glance: green = allow, amber = session, red = block. Anything else
-/// (legacy timed/allow-once) is neutral grey.
-fn chip_fill(token: &str) -> Color {
+/// (legacy timed/allow-once) is neutral grey. Drawn as a [`pill`].
+fn chip_style(token: &str) -> (Color, Color) {
     match token {
-        "allow" => Color::rgb(0xD9, 0xEF, 0xD9),
-        "session" => Color::rgb(0xFD, 0xEF, 0xC8),
-        "block" => Color::rgb(0xF6, 0xCF, 0xCF),
-        _ => Color::rgb(0xE4, 0xE4, 0xE4),
+        "allow" => (theme::SUCCESS_TINT, theme::SUCCESS_INK),
+        "session" => (theme::WARNING_TINT, theme::WARNING_INK),
+        "block" => (theme::DANGER_TINT, theme::DANGER_INK),
+        _ => (theme::NEUTRAL_TINT, theme::TEXT_MUTED),
     }
 }
 
@@ -1146,63 +1198,76 @@ impl CookieManager {
     ) -> DisplayList {
         let mut list = DisplayList::new();
         let p = Self::panel_rect(window);
-        // Backdrop + panel.
+        // Dim the window, drop a soft shadow, then float the card.
         list.push(DisplayItem::Rect {
-            rect: Rect::new(p.x - 1, p.y - 1, p.w + 2, p.h + 2),
-            color: Color::rgb(0x30, 0x30, 0x30),
+            rect: Rect::new(0, 0, window.w, window.h),
+            color: theme::SCRIM,
         });
-        list.push(DisplayItem::Rect {
-            rect: p,
-            color: Color::rgb(0xFA, 0xFA, 0xFA),
+        list.push(DisplayItem::Shadow {
+            rect: Rect::new(p.x, p.y + 3, p.w, p.h),
+            blur: 26,
+            color: Color::rgba(0x10, 0x14, 0x1C, 0x59),
         });
+        bordered_round(
+            &mut list,
+            p,
+            theme::SURFACE,
+            theme::BORDER,
+            theme::RADIUS_LG,
+        );
         // Title + count.
-        list.push(DisplayItem::Glyphs {
-            origin: Point::new(p.x + 12, p.y + 26),
-            frac_x: 0.0,
-            glyphs: shaper.shape(&format!("Cookies ({})", rows.len()), 20),
-            color: Color::BLACK,
-            style: FontStyle::REGULAR,
-        });
+        push_text(
+            &mut list,
+            shaper,
+            p.x + 20,
+            p.y + 18,
+            &format!("Cookies ({})", rows.len()),
+            theme::TYPE_TITLE,
+            theme::TEXT,
+        );
         // Close button.
         let close = Self::close_rect(window);
-        draw_icon_button(
+        round_icon_button(
             &mut list,
             shaper,
             close,
             IC_CLOSE,
-            13,
-            Color::rgb(0xE0, 0xE0, 0xE0),
-            Color::BLACK,
+            12,
+            theme::SUNKEN,
+            theme::BORDER,
+            theme::TEXT_MUTED,
         );
         // Global default chip.
-        list.push(DisplayItem::Glyphs {
-            origin: Point::new(p.x + 12, p.y + 63),
-            frac_x: 0.0,
-            glyphs: shaper.shape("global default:", 13),
-            color: Color::rgb(0x50, 0x50, 0x50),
-            style: FontStyle::REGULAR,
-        });
+        push_text(
+            &mut list,
+            shaper,
+            p.x + 20,
+            p.y + 52,
+            "global default:",
+            theme::TYPE_BODY,
+            theme::TEXT_MUTED,
+        );
         let gchip = Self::global_chip_rect(window);
-        draw_button(
+        let (gfill, gink) = chip_style(global_chip);
+        pill(
             &mut list,
             shaper,
             gchip,
             global_chip,
-            chip_fill(global_chip),
-            Color::BLACK,
-            12,
+            gfill,
+            gink,
+            theme::TYPE_CAPTION,
         );
         // Legend: explains the per-cookie chip so it isn't a mystery cycle.
-        list.push(DisplayItem::Glyphs {
-            origin: Point::new(p.x + 12, p.y + 88),
-            frac_x: 0.0,
-            glyphs: shaper.shape(
-                "allow = keep   ·   session = forget on close   ·   block = never store",
-                12,
-            ),
-            color: Color::rgb(0x60, 0x60, 0x60),
-            style: FontStyle::REGULAR,
-        });
+        push_text(
+            &mut list,
+            shaper,
+            p.x + 20,
+            p.y + 80,
+            "allow = keep   ·   session = forget on close   ·   block = never store",
+            theme::TYPE_CAPTION,
+            theme::TEXT_FAINT,
+        );
         // Rows.
         let visible = Self::visible_rows(window);
         for vis_i in 0..visible {
@@ -1210,52 +1275,61 @@ impl CookieManager {
             let Some(row) = rows.get(abs) else { break };
             let (chip, reveal, delete, y) = Self::row_controls(window, vis_i);
             if vis_i % 2 == 1 {
-                list.push(DisplayItem::Rect {
-                    rect: Rect::new(p.x + 4, y, p.w - 8, COOKIE_ROW_H),
-                    color: Color::rgb(0xF0, 0xF0, 0xF0),
-                });
+                fill_round(
+                    &mut list,
+                    Rect::new(p.x + 8, y, p.w - 16, COOKIE_ROW_H),
+                    theme::SUNKEN,
+                    theme::RADIUS_SM,
+                );
             }
-            list.push(DisplayItem::Glyphs {
-                origin: Point::new(p.x + 12, y + 17),
-                frac_x: 0.0,
-                glyphs: shaper.shape(&row.primary, 13),
-                color: Color::BLACK,
-                style: FontStyle::REGULAR,
-            });
-            list.push(DisplayItem::Glyphs {
-                origin: Point::new(p.x + 12 + 260, y + 17),
-                frac_x: 0.0,
-                glyphs: shaper.shape(&row.detail, 11),
-                color: Color::rgb(0x80, 0x80, 0x80),
-                style: FontStyle::REGULAR,
-            });
-            // reveal (eye), chip, delete (x)
-            draw_icon_button(
+            push_text(
+                &mut list,
+                shaper,
+                p.x + 16,
+                y + 8,
+                &row.primary,
+                theme::TYPE_BODY,
+                theme::TEXT,
+            );
+            push_text(
+                &mut list,
+                shaper,
+                p.x + 16 + 260,
+                y + 9,
+                &row.detail,
+                theme::TYPE_CAPTION,
+                theme::TEXT_MUTED,
+            );
+            // reveal (eye), chip, delete (trash)
+            round_icon_button(
                 &mut list,
                 shaper,
                 reveal,
                 IC_EYE,
                 12,
-                Color::rgb(0xE8, 0xE8, 0xE8),
-                Color::BLACK,
+                theme::SUNKEN,
+                theme::BORDER,
+                theme::TEXT_MUTED,
             );
-            draw_button(
+            let (cfill, cink) = chip_style(&row.chip);
+            pill(
                 &mut list,
                 shaper,
                 chip,
                 &row.chip,
-                chip_fill(&row.chip),
-                Color::BLACK,
-                12,
+                cfill,
+                cink,
+                theme::TYPE_CAPTION,
             );
-            draw_icon_button(
+            round_icon_button(
                 &mut list,
                 shaper,
                 delete,
                 IC_TRASH,
                 12,
-                Color::rgb(0xF3, 0xD9, 0xD9),
-                Color::BLACK,
+                theme::DANGER_TINT,
+                darken(theme::DANGER_TINT),
+                theme::DANGER_INK,
             );
         }
         // Scroll affordances.
@@ -1263,14 +1337,15 @@ impl CookieManager {
         // ^ / v are plain ASCII the bundled font definitely has; geometric
         // triangles (U+25B2/BC) are not in Roboto and would render as tofu.
         for (r, glyph) in [(up, "^"), (down, "v")] {
-            draw_button(
+            round_button(
                 &mut list,
                 shaper,
                 r,
                 glyph,
-                Color::rgb(0xE0, 0xE0, 0xE0),
-                Color::BLACK,
-                12,
+                theme::SUNKEN,
+                theme::BORDER,
+                theme::TEXT_MUTED,
+                theme::TYPE_CAPTION,
             );
         }
         list
@@ -1403,21 +1478,21 @@ const MIRC_LOGIN_W: u32 = 96;
 const MIRC_STATE_W: u32 = 80;
 const MIRC_ACCOUNT_X: i32 = 196; // panel-local x of the account column
 
-/// Background fill for a state chip, so the status reads at a glance.
-fn mirc_state_fill(s: MircState) -> Color {
+/// Fill + text colour for a state chip, so the status reads at a glance.
+fn mirc_state_chip(s: MircState) -> (Color, Color) {
     match s {
-        MircState::Live => Color::rgb(0xD9, 0xEF, 0xD9),
-        MircState::Dormant => Color::rgb(0xE6, 0xE6, 0xE6),
-        MircState::Diverged => Color::rgb(0xFD, 0xE2, 0xC8),
+        MircState::Live => (theme::SUCCESS_TINT, theme::SUCCESS_INK),
+        MircState::Dormant => (theme::NEUTRAL_TINT, theme::TEXT_MUTED),
+        MircState::Diverged => (theme::WARNING_TINT, theme::WARNING_INK),
     }
 }
 
 /// The status-dot color for a state (a stronger shade of the chip fill).
 fn mirc_state_dot(s: MircState) -> Color {
     match s {
-        MircState::Live => Color::rgb(0x35, 0xA8, 0x5C),
-        MircState::Dormant => Color::rgb(0xA8, 0xA8, 0xA8),
-        MircState::Diverged => Color::rgb(0xE0, 0x8A, 0x1E),
+        MircState::Live => theme::SUCCESS,
+        MircState::Dormant => theme::TEXT_FAINT,
+        MircState::Diverged => theme::WARNING,
     }
 }
 
@@ -1541,23 +1616,33 @@ impl MircPanel {
     ) -> DisplayList {
         let mut list = DisplayList::new();
         let p = Self::panel_rect(window);
-        // Backdrop + panel.
+        // Dim the window, drop a soft shadow, then float the card.
         list.push(DisplayItem::Rect {
-            rect: Rect::new(p.x - 1, p.y - 1, p.w + 2, p.h + 2),
-            color: Color::rgb(0x30, 0x30, 0x30),
+            rect: Rect::new(0, 0, window.w, window.h),
+            color: theme::SCRIM,
         });
-        list.push(DisplayItem::Rect {
-            rect: p,
-            color: Color::rgb(0xFA, 0xFA, 0xFA),
+        list.push(DisplayItem::Shadow {
+            rect: Rect::new(p.x, p.y + 3, p.w, p.h),
+            blur: 26,
+            color: Color::rgba(0x10, 0x14, 0x1C, 0x59),
         });
+        bordered_round(
+            &mut list,
+            p,
+            theme::SURFACE,
+            theme::BORDER,
+            theme::RADIUS_LG,
+        );
         // Title + subtitle.
-        list.push(DisplayItem::Glyphs {
-            origin: Point::new(p.x + 16, p.y + 30),
-            frac_x: 0.0,
-            glyphs: shaper.shape("MIRC — Multi-Identity Remote Control", 19),
-            color: Color::BLACK,
-            style: FontStyle::REGULAR,
-        });
+        push_text(
+            &mut list,
+            shaper,
+            p.x + 20,
+            p.y + 20,
+            "MIRC — Multi-Identity Remote Control",
+            theme::TYPE_TITLE,
+            theme::TEXT,
+        );
         let noun = if rows.len() == 1 {
             "session"
         } else {
@@ -1568,73 +1653,84 @@ impl MircPanel {
         } else {
             format!("{} {noun} being driven · {site}", rows.len())
         };
-        list.push(DisplayItem::Glyphs {
-            origin: Point::new(p.x + 16, p.y + 54),
-            frac_x: 0.0,
-            glyphs: shaper.shape(&subtitle, 13),
-            color: Color::rgb(0x60, 0x60, 0x60),
-            style: FontStyle::REGULAR,
-        });
+        push_text(
+            &mut list,
+            shaper,
+            p.x + 20,
+            p.y + 46,
+            &subtitle,
+            theme::TYPE_CAPTION,
+            theme::TEXT_MUTED,
+        );
         // Close button.
-        draw_icon_button(
+        round_icon_button(
             &mut list,
             shaper,
             Self::close_rect(window),
             IC_CLOSE,
-            13,
-            Color::rgb(0xE0, 0xE0, 0xE0),
-            Color::BLACK,
+            12,
+            theme::SUNKEN,
+            theme::BORDER,
+            theme::TEXT_MUTED,
         );
         // Control bar: broadcast toggle, then the bulk verbs.
         let bc = Self::broadcast_rect(window);
-        let (bfill, bfg, blabel) = if broadcasting {
-            (Color::rgb(0x1E, 0x66, 0xE0), Color::WHITE, "broadcast: on")
+        if broadcasting {
+            round_button(
+                &mut list,
+                shaper,
+                bc,
+                "broadcast: on",
+                theme::ACCENT,
+                theme::ACCENT,
+                theme::ON_ACCENT,
+                theme::TYPE_BODY,
+            );
         } else {
-            (
-                Color::rgb(0xDF, 0xDF, 0xDF),
-                Color::rgb(0x30, 0x30, 0x30),
+            round_button(
+                &mut list,
+                shaper,
+                bc,
                 "broadcast: off",
-            )
-        };
-        draw_button(&mut list, shaper, bc, blabel, bfill, bfg, 13);
-        let bulk = Color::rgb(0xE6, 0xEE, 0xF6);
-        let bulk_fg = Color::rgb(0x20, 0x40, 0x70);
-        draw_button(
-            &mut list,
-            shaper,
-            Self::navigate_rect(window),
-            "navigate all",
-            bulk,
-            bulk_fg,
-            13,
-        );
-        draw_button(
-            &mut list,
-            shaper,
-            Self::login_rect(window),
-            "login all",
-            bulk,
-            bulk_fg,
-            13,
-        );
+                theme::SUNKEN,
+                theme::BORDER,
+                theme::TEXT,
+                theme::TYPE_BODY,
+            );
+        }
+        for (rect, label) in [
+            (Self::navigate_rect(window), "navigate all"),
+            (Self::login_rect(window), "login all"),
+        ] {
+            round_button(
+                &mut list,
+                shaper,
+                rect,
+                label,
+                theme::ACCENT_TINT,
+                darken(theme::ACCENT_TINT),
+                theme::ACCENT_INK,
+                theme::TYPE_BODY,
+            );
+        }
         // Column headers + a hairline divider above the list.
-        list.push(DisplayItem::Glyphs {
-            origin: Point::new(p.x + 34, p.y + MIRC_LIST_TOP - 10),
-            frac_x: 0.0,
-            glyphs: shaper.shape("identity", 11),
-            color: Color::rgb(0x90, 0x90, 0x90),
-            style: FontStyle::REGULAR,
-        });
-        list.push(DisplayItem::Glyphs {
-            origin: Point::new(p.x + MIRC_ACCOUNT_X, p.y + MIRC_LIST_TOP - 10),
-            frac_x: 0.0,
-            glyphs: shaper.shape("account", 11),
-            color: Color::rgb(0x90, 0x90, 0x90),
-            style: FontStyle::REGULAR,
-        });
+        section_header(
+            &mut list,
+            shaper,
+            p.x + 38,
+            p.y + MIRC_LIST_TOP - 12,
+            "IDENTITY",
+        );
+        section_header(
+            &mut list,
+            shaper,
+            p.x + MIRC_ACCOUNT_X,
+            p.y + MIRC_LIST_TOP - 12,
+            "ACCOUNT",
+        );
         list.push(DisplayItem::Rect {
-            rect: Rect::new(p.x + 12, p.y + MIRC_LIST_TOP - 4, p.w - 24, 1),
-            color: Color::rgb(0xD8, 0xD8, 0xD8),
+            rect: Rect::new(p.x + 16, p.y + MIRC_LIST_TOP - 4, p.w - 32, 1),
+            color: theme::DIVIDER,
         });
         // Rows.
         let visible = Self::visible_rows(window);
@@ -1643,90 +1739,93 @@ impl MircPanel {
             let Some(row) = rows.get(abs) else { break };
             let (state, login, open, y) = Self::row_controls(window, vis_i);
             if vis_i % 2 == 1 {
-                list.push(DisplayItem::Rect {
-                    rect: Rect::new(p.x + 4, y, p.w - 8 - MIRC_SCROLL_GUTTER as u32, MIRC_ROW_H),
-                    color: Color::rgb(0xF0, 0xF0, 0xF0),
-                });
+                fill_round(
+                    &mut list,
+                    Rect::new(p.x + 8, y, p.w - 16 - MIRC_SCROLL_GUTTER as u32, MIRC_ROW_H),
+                    theme::SUNKEN,
+                    theme::RADIUS_SM,
+                );
             }
             // Status dot.
-            list.push(DisplayItem::Rect {
-                rect: Rect::new(p.x + 14, y + (MIRC_ROW_H as i32 - 10) / 2, 10, 10),
-                color: mirc_state_dot(row.state),
-            });
+            let dot = 10u32;
+            fill_round(
+                &mut list,
+                Rect::new(p.x + 16, y + (MIRC_ROW_H as i32 - dot as i32) / 2, dot, dot),
+                mirc_state_dot(row.state),
+                (dot / 2) as u16,
+            );
             // Identity label + dimmed account, vertically centered in the row so
             // they line up with the chips/pills (which center in their boxes).
-            list.push(DisplayItem::Glyphs {
-                origin: Point::new(p.x + 34, y + (MIRC_ROW_H as i32 - 14) / 2),
-                frac_x: 0.0,
-                glyphs: shaper.shape(&row.label, 14),
-                color: Color::rgb(0x18, 0x18, 0x18),
-                style: FontStyle::REGULAR,
-            });
-            list.push(DisplayItem::Glyphs {
-                origin: Point::new(p.x + MIRC_ACCOUNT_X, y + (MIRC_ROW_H as i32 - 12) / 2),
-                frac_x: 0.0,
-                glyphs: shaper.shape(&row.account, 12),
-                color: Color::rgb(0x78, 0x78, 0x78),
-                style: FontStyle::REGULAR,
-            });
+            push_text(
+                &mut list,
+                shaper,
+                p.x + 38,
+                y + (MIRC_ROW_H as i32 - theme::TYPE_BODY as i32) / 2,
+                &row.label,
+                theme::TYPE_BODY,
+                theme::TEXT,
+            );
+            push_text(
+                &mut list,
+                shaper,
+                p.x + MIRC_ACCOUNT_X,
+                y + (MIRC_ROW_H as i32 - theme::TYPE_CAPTION as i32) / 2,
+                &row.account,
+                theme::TYPE_CAPTION,
+                theme::TEXT_MUTED,
+            );
             // State chip.
-            draw_button(
+            let (sfill, sink) = mirc_state_chip(row.state);
+            pill(
                 &mut list,
                 shaper,
                 state,
                 mirc_state_label(row.state),
-                mirc_state_fill(row.state),
-                Color::rgb(0x30, 0x30, 0x30),
-                12,
+                sfill,
+                sink,
+                theme::TYPE_CAPTION,
             );
             // Login pill.
             let (lf, lt, ll) = if row.logged_in {
-                (
-                    Color::rgb(0xD9, 0xEF, 0xD9),
-                    Color::rgb(0x1E, 0x50, 0x20),
-                    "logged in",
-                )
+                (theme::SUCCESS_TINT, theme::SUCCESS_INK, "logged in")
             } else {
-                (
-                    Color::rgb(0xEC, 0xEC, 0xEC),
-                    Color::rgb(0x80, 0x80, 0x80),
-                    "logged out",
-                )
+                (theme::NEUTRAL_TINT, theme::TEXT_MUTED, "logged out")
             };
-            draw_button(&mut list, shaper, login, ll, lf, lt, 12);
+            pill(&mut list, shaper, login, ll, lf, lt, theme::TYPE_CAPTION);
             // Open (select → render) button.
-            draw_button(
+            round_button(
                 &mut list,
                 shaper,
                 open,
                 "open",
-                Color::rgb(0xE6, 0xEE, 0xF6),
-                Color::rgb(0x20, 0x40, 0x70),
-                12,
+                theme::ACCENT_TINT,
+                darken(theme::ACCENT_TINT),
+                theme::ACCENT_INK,
+                theme::TYPE_CAPTION,
             );
         }
         // Legend.
-        list.push(DisplayItem::Glyphs {
-            origin: Point::new(p.x + 16, p.y + p.h as i32 - 16),
-            frac_x: 0.0,
-            glyphs: shaper.shape(
-                "live = on screen   ·   dormant = sealed & paused   ·   diverged = needs attention",
-                12,
-            ),
-            color: Color::rgb(0x70, 0x70, 0x70),
-            style: FontStyle::REGULAR,
-        });
+        push_text(
+            &mut list,
+            shaper,
+            p.x + 20,
+            p.y + p.h as i32 - 22,
+            "live = on screen   ·   dormant = sealed & paused   ·   diverged = needs attention",
+            theme::TYPE_CAPTION,
+            theme::TEXT_FAINT,
+        );
         // Scroll affordances (same plain ASCII glyphs the cookie list uses).
         let (up, down) = Self::scroll_rects(window);
         for (r, glyph) in [(up, "^"), (down, "v")] {
-            draw_button(
+            round_button(
                 &mut list,
                 shaper,
                 r,
                 glyph,
-                Color::rgb(0xE0, 0xE0, 0xE0),
-                Color::BLACK,
-                12,
+                theme::SUNKEN,
+                theme::BORDER,
+                theme::TEXT_MUTED,
+                theme::TYPE_CAPTION,
             );
         }
         list
@@ -1850,38 +1949,44 @@ impl PerfHud {
         if rows.is_empty() {
             return list;
         }
-        let h = HUD_PAD * 2 + rows.len() as i32 * HUD_ROW_H + HUD_ROW_H;
+        // Header row + one row each, plus a little extra bottom clearance so the
+        // rounded corners don't clip the last row's descenders.
+        let h = HUD_PAD * 2 + (rows.len() as i32 + 1) * HUD_ROW_H + 4;
         let x = (window.w as i32 - HUD_W as i32 - 8).max(0);
         let y = TOOLBAR_HEIGHT as i32 + 8;
-        // Semi-opaque dark panel (the rasterizer composites the solid fill).
-        list.push(DisplayItem::Rect {
-            rect: Rect::new(x, y, HUD_W, h as u32),
-            color: Color::rgb(0x10, 0x12, 0x16),
-        });
+        // Rounded dark panel (shares the developer-tooling INK surface).
+        bordered_round(
+            &mut list,
+            Rect::new(x, y, HUD_W, h as u32),
+            theme::INK,
+            theme::INK_BORDER,
+            theme::RADIUS_MD,
+        );
+        let px = theme::TYPE_CAPTION;
         list.push(DisplayItem::Glyphs {
-            origin: Point::new(x + HUD_PAD, y + HUD_PAD + 12),
+            origin: Point::new(x + HUD_PAD + 2, y + HUD_PAD + 12),
             frac_x: 0.0,
-            glyphs: shaper.shape("performance", 12),
-            color: Color::rgb(0x9A, 0xD0, 0xFF),
+            glyphs: shaper.shape("performance", px),
+            color: theme::ACCENT_ON_INK,
             style: FontStyle::REGULAR,
         });
         for (i, (label, value)) in rows.iter().enumerate() {
             let ry = y + HUD_PAD + HUD_ROW_H * (i as i32 + 1) + 12;
             list.push(DisplayItem::Glyphs {
-                origin: Point::new(x + HUD_PAD, ry),
+                origin: Point::new(x + HUD_PAD + 2, ry),
                 frac_x: 0.0,
-                glyphs: shaper.shape(label, 12),
-                color: Color::rgb(0xD8, 0xD8, 0xD8),
+                glyphs: shaper.shape(label, px),
+                color: theme::ON_INK,
                 style: FontStyle::REGULAR,
             });
             // Value column, right-aligned within the panel.
-            let vw: u32 = shaper.shape(value, 12).iter().map(|g| g.advance).sum();
-            let vx = x + HUD_W as i32 - HUD_PAD - vw as i32;
+            let vw: u32 = shaper.shape(value, px).iter().map(|g| g.advance).sum();
+            let vx = x + HUD_W as i32 - HUD_PAD - 2 - vw as i32;
             list.push(DisplayItem::Glyphs {
                 origin: Point::new(vx, ry),
                 frac_x: 0.0,
-                glyphs: shaper.shape(value, 12),
-                color: Color::rgb(0x86, 0xE3, 0x9A),
+                glyphs: shaper.shape(value, px),
+                color: theme::ON_INK_POS,
                 style: FontStyle::REGULAR,
             });
         }
@@ -1908,12 +2013,12 @@ mod perf_hud_tests {
         ];
         let w = Size::new(800, 600);
         let list = PerfHud::paint(w, &MonoShaper, &rows);
-        // The panel rect is in the right half, below the toolbar.
+        // The panel is a rounded dark card in the right half, below the toolbar.
         let panel = list
             .items
             .iter()
             .find_map(|i| match i {
-                DisplayItem::Rect { rect, .. } => Some(*rect),
+                DisplayItem::RoundRect { rect, .. } => Some(*rect),
                 _ => None,
             })
             .unwrap();
@@ -1979,10 +2084,28 @@ pub mod theme {
     // — Semantic —
     /// Positive state (vault unlocked dot).
     pub const SUCCESS: Color = Color::rgb(0x1E, 0xA5, 0x5B);
-    /// Error text.
+    /// Attention state (needs review; consent prompt, diverged session).
+    pub const WARNING: Color = Color::rgb(0xC7, 0x7D, 0x11);
+    /// Error text / negative state.
     pub const DANGER: Color = Color::rgb(0xC2, 0x38, 0x38);
     /// A toggle's neutral off-state track.
     pub const TRACK_OFF: Color = Color::rgb(0xC6, 0xCC, 0xD4);
+
+    // — Semantic chip tints (soft fill + a deep ink that reads on it) —
+    /// Positive chip fill / deep positive ink.
+    pub const SUCCESS_TINT: Color = Color::rgb(0xDC, 0xF1, 0xE4);
+    pub const SUCCESS_INK: Color = Color::rgb(0x14, 0x6C, 0x3A);
+    /// Attention chip fill / deep attention ink.
+    pub const WARNING_TINT: Color = Color::rgb(0xFB, 0xEC, 0xCF);
+    pub const WARNING_INK: Color = Color::rgb(0x8A, 0x5A, 0x0F);
+    /// Negative chip fill / deep negative ink.
+    pub const DANGER_TINT: Color = Color::rgb(0xF7, 0xDA, 0xDA);
+    pub const DANGER_INK: Color = Color::rgb(0x9A, 0x2A, 0x2A);
+    /// Neutral chip fill (a shade off the panel surface).
+    pub const NEUTRAL_TINT: Color = Color::rgb(0xEB, 0xEE, 0xF2);
+    /// Accent chip fill / deep accent ink (secondary "verb" buttons).
+    pub const ACCENT_TINT: Color = Color::rgb(0xE1, 0xEB, 0xFB);
+    pub const ACCENT_INK: Color = Color::rgb(0x1A, 0x4C, 0xA8);
 
     // — Dark surfaces (developer tooling — the console reads as a tool, not a
     //   page, but shares the accent, spacing, radii, and type scale) —
@@ -2002,6 +2125,8 @@ pub mod theme {
     pub const CONSOLE_ERROR: Color = Color::rgb(0xFF, 0x74, 0x74);
     /// Console warning line (amber that reads on `INK`).
     pub const CONSOLE_WARN: Color = Color::rgb(0xE7, 0xB4, 0x53);
+    /// Positive value on a dark surface (HUD timing figures).
+    pub const ON_INK_POS: Color = Color::rgb(0x7E, 0xE0, 0x9A);
 
     // — Spacing scale (device px) —
     pub const SP_1: i32 = 4;
@@ -2107,6 +2232,60 @@ fn chevron_right(list: &mut DisplayList, cx: i32, cy: i32, size: i32, color: Col
         width: 2,
         color,
     });
+}
+
+/// A rounded, bordered button with a centred text label — the design-system
+/// replacement for the square `draw_button`. Radius `RADIUS_SM` reads as a
+/// button; pass a taller radius via [`pill`] for status chips.
+#[allow(clippy::too_many_arguments)] // paint helper: fill/border/text are distinct visual params
+fn round_button(
+    list: &mut DisplayList,
+    shaper: &dyn TextShaper,
+    rect: Rect,
+    label: &str,
+    fill: Color,
+    border: Color,
+    text: Color,
+    px: u32,
+) {
+    bordered_round(list, rect, fill, border, theme::RADIUS_SM);
+    if !label.is_empty() {
+        push_centered(list, shaper, rect, label, px, text);
+    }
+}
+
+/// A rounded, bordered button whose label is a centred icon glyph.
+#[allow(clippy::too_many_arguments)] // paint helper: fill/border/color are distinct visual params
+fn round_icon_button(
+    list: &mut DisplayList,
+    shaper: &dyn TextShaper,
+    rect: Rect,
+    icon: char,
+    px: u32,
+    fill: Color,
+    border: Color,
+    color: Color,
+) {
+    bordered_round(list, rect, fill, border, theme::RADIUS_SM);
+    push_icon(list, shaper, rect, icon, px, color);
+}
+
+/// A fully-rounded status "pill" (radius = half-height): soft `fill`, a border a
+/// touch darker, and a centred label. Used for the disposition/state chips so
+/// every status across the UI shares one shape.
+fn pill(
+    list: &mut DisplayList,
+    shaper: &dyn TextShaper,
+    rect: Rect,
+    label: &str,
+    fill: Color,
+    text: Color,
+    px: u32,
+) {
+    bordered_round(list, rect, fill, darken(fill), (rect.h / 2) as u16);
+    if !label.is_empty() {
+        push_centered(list, shaper, rect, label, px, text);
+    }
 }
 
 /// An iOS-style pill toggle inside `rect`: an accent track when `on` (neutral
