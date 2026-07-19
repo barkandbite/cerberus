@@ -3619,6 +3619,26 @@ mod tests {
     }
 
     #[test]
+    fn media_query_overrides_root_custom_property() {
+        // mozilla.org drives its whole type/spacing scale through `:root` custom
+        // properties that a wider `@media` redefines (`--text-title-2xl` goes
+        // 48px → 80px → 128px). At a width where the query matches, the override
+        // must win so a `var()`-driven font-size scales up. Regression for the
+        // hero `<h1>` rendering at the base 48px instead of Chrome's 80px.
+        let html = "<html><head><style>\
+            :root{--t:48px}\
+            @media(min-width:768px){:root{--t:80px}}\
+            h1{font-size:var(--t)}\
+            </style></head><body><h1>x</h1></body></html>";
+        // Narrow viewport: the base value wins.
+        let narrow = CssEngine::with_media(500, 800).style(&parse_html(html));
+        assert_eq!(first(&narrow.root, "h1").unwrap().style.font_size, 48);
+        // Wide viewport: the `@media` override wins.
+        let wide = CssEngine::with_media(1200, 800).style(&parse_html(html));
+        assert_eq!(first(&wide.root, "h1").unwrap().style.font_size, 80);
+    }
+
+    #[test]
     fn margin_right_from_longhand_and_shorthand() {
         // The `margin-right` longhand is honored (previously only its `auto` flag
         // was), and each shorthand arity fills the right side correctly.
