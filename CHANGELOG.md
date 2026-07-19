@@ -5,6 +5,18 @@ browser is pre-1.0; this is the first tagged preview.
 
 ## [Unreleased]
 
+### Added
+- **Web fonts: substitute, don't download.** A page's own `@font-face` families
+  are now reported as loaded by `document.fonts.check()` — matching a real
+  browser that fetched them — while Cerberus never downloads the bytes and keeps
+  rendering with a metric-compatible bundled face (ADR-0005). This closes a
+  fingerprinting tell (a site could otherwise flag "this browser didn't load my
+  own web font") without adding a font-fetch/cache/timing signal. The page's
+  `@font-face` names are parsed from inline and external CSS and injected as
+  `__CERBERUS_PAGE_FONTS__` ahead of page scripts (and refreshed when external
+  sheets arrive). Local system-font enumeration stays defended by the existing
+  per-head farbling.
+
 ## [0.0.13] - 2026-07-19
 
 ### Added

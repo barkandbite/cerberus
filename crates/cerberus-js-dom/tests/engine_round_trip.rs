@@ -2328,3 +2328,37 @@ fn document_fonts_check_consults_the_persona_font_list() {
         "unlisted family does not resolve"
     );
 }
+
+#[test]
+fn document_fonts_check_reports_page_font_face_families() {
+    // A page's OWN @font-face families are reported "loaded" — matching a real
+    // browser that loaded them — so a sensor can't flag us for not loading our
+    // own web font. The host injects __CERBERUS_PAGE_FONTS__ from the parsed CSS;
+    // the bytes are never fetched (ADR-0005), and this is additive to the persona
+    // enumeration list (an undeclared, unlisted name still resolves false).
+    let (mut engine, realm) = engine_and_realm();
+    engine
+        .eval(
+            realm,
+            "globalThis.__CERBERUS_PROFILE__ = { fonts: ['Georgia'] };\
+             globalThis.__CERBERUS_PAGE_FONTS__ = ['mozilla text'];",
+        )
+        .expect("set globals");
+    let doc = doc_with_div_x();
+    let scripts = vec!["var x = document.getElementById('x'); \
+         x.setAttribute('c-page', String(document.fonts.check(\"12px 'Mozilla Text'\"))); \
+         x.setAttribute('c-absent', String(document.fonts.check(\"12px 'Zilla Slab 9000'\")));"
+        .to_string()];
+    let out = run_page_scripts(engine.as_mut(), realm, &doc, &scripts, &env()).expect("run");
+    let x = find_id(out.root(), "x").expect("#x present");
+    assert_eq!(
+        x.attr("c-page"),
+        Some("true"),
+        "page @font-face family reports loaded"
+    );
+    assert_eq!(
+        x.attr("c-absent"),
+        Some("false"),
+        "a font neither declared nor in the persona list does not resolve"
+    );
+}

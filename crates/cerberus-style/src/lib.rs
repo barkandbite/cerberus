@@ -788,6 +788,12 @@ impl StyledNode {
 #[derive(Clone, Debug)]
 pub struct StyledDom {
     pub root: StyledNode,
+    /// The `font-family` names declared by the page's `@font-face` rules
+    /// (lowercased). We never fetch the bytes (ADR-0005), but a page's own web
+    /// font is reported as available by `document.fonts.check()` once "loaded";
+    /// the app injects these so the DOM prelude answers the same, while layout
+    /// substitutes a metric-compatible bundled face.
+    pub font_face_families: Vec<String>,
 }
 
 /// Externally-fetched stylesheets (`<link rel="stylesheet">` bodies), keyed by

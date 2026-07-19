@@ -2524,6 +2524,12 @@ pub const DOM_MODEL_PRELUDE: &str = r##"
           "system-ui":1,"ui-serif":1,"ui-sans-serif":1,"ui-monospace":1,"ui-rounded":1,
           "math":1,"emoji":1,"-apple-system":1,"blinkmacsystemfont":1 };
         if (GEN[fam]) return true;
+        // The page's OWN @font-face families are reported "loaded": a real
+        // browser that loaded them answers true, so we do too — we render them
+        // with a metric-compatible bundled face and never fetch the bytes
+        // (ADR-0005). The host injects this list from the page's parsed CSS.
+        var pf = g.__CERBERUS_PAGE_FONTS__;
+        if (pf) { for (var j = 0; j < pf.length; j++) { if (String(pf[j]).toLowerCase() === fam) return true; } }
         var p = g.__CERBERUS_PROFILE__, list = (p && p.fonts) || null;
         if (!list) return true; // no persona wired: don't leak "nothing installed"
         for (var i = 0; i < list.length; i++) { if (String(list[i]).toLowerCase() === fam) return true; }

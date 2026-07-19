@@ -1150,6 +1150,9 @@ pub fn render(config: &RenderConfig) -> Result<RenderOutcome, AppError> {
                 first_party: first_party.clone(),
             },
         };
+        // Report the page's inline @font-face families as loaded (external sheets
+        // are fetched after scripts on this one-shot path). See inject_page_fonts.
+        inject_page_fonts(engine, base_realm, &document, &ExternalSheets::new());
         document = match &client {
             Some(c) => {
                 let mut fc = SyncFetchClient {
@@ -3015,6 +3018,28 @@ impl BrowserApp {
         // External sheets often carry the svg `fill` rules; re-inject any
         // whose computed fill the new cascade changed.
         self.refresh_svg_fills();
+        // They also carry @font-face (mozilla's whole type scale is external);
+        // refresh the page-fonts list so document.fonts.check() reports them for
+        // any post-load probe (the realm is live only if the page ran scripts).
+        self.refresh_page_fonts();
+    }
+
+    /// Re-inject `__CERBERUS_PAGE_FONTS__` from the current document + fetched
+    /// sheets, so `document.fonts.check()` covers `@font-face` families that
+    /// arrived in external stylesheets after the initial script run. No realm
+    /// (script-less page) or no `@font-face` → nothing to do.
+    fn refresh_page_fonts(&mut self) {
+        if self.node_to_js.is_empty() {
+            return;
+        }
+        let fonts = cerberus_css::page_font_families(&self.document, &self.sheets);
+        if fonts.is_empty() {
+            return;
+        }
+        let realm = RealmId(self.heads.active().id.0);
+        if let Ok(engine) = self.heads.engine() {
+            set_page_fonts(engine, realm, &fonts);
+        }
     }
 
     /// Run the document's inline scripts against the active head's engine and
@@ -3068,6 +3093,12 @@ impl BrowserApp {
         if install_page(engine, realm, &doc, &env).is_err() {
             return doc;
         }
+        // Report the page's OWN @font-face families as loaded via
+        // document.fonts.check() — a real browser that loaded them answers true,
+        // so a sensor can't flag us for "didn't load your own font". We render
+        // them with a metric-compatible bundled face and never fetch the bytes
+        // (ADR-0005). Injected before page scripts so early probes see them.
+        inject_page_fonts(engine, realm, &doc, &self.sheets);
         if cerberus_js_dom::run_scripts(engine, realm, doc.scripts()).is_err() {
             return doc;
         }
@@ -5355,6 +5386,42 @@ fn first_party_of(url: &cerberus_url::Url) -> Option<Origin> {
 }
 
 /// The cookies this instance's sealed jar would expose to `document.cookie` for
+/// Inject the page's own `@font-face` families as `globalThis.__CERBERUS_PAGE_FONTS__`
+/// so the DOM prelude's `document.fonts.check()` reports them loaded — matching a
+/// real browser that loaded them, so a sensor can't flag "didn't load your own
+/// font". We never fetch the bytes; layout substitutes a metric-compatible
+/// bundled face (ADR-0005). No-op when the page declares no `@font-face`.
+fn inject_page_fonts(
+    engine: &mut dyn cerberus_js::JsEngine,
+    realm: RealmId,
+    doc: &Document,
+    sheets: &ExternalSheets,
+) {
+    set_page_fonts(
+        engine,
+        realm,
+        &cerberus_css::page_font_families(doc, sheets),
+    );
+}
+
+/// Set `globalThis.__CERBERUS_PAGE_FONTS__` to `fonts` (already lowercased). A
+/// no-op for an empty list (leaves any earlier list in place). The strings are
+/// JSON-escaped so a font name can't break out of the array literal.
+fn set_page_fonts(engine: &mut dyn cerberus_js::JsEngine, realm: RealmId, fonts: &[String]) {
+    if fonts.is_empty() {
+        return;
+    }
+    let arr = fonts
+        .iter()
+        .map(|f| format!("\"{}\"", f.replace('\\', "\\\\").replace('"', "\\\"")))
+        .collect::<Vec<_>>()
+        .join(",");
+    let _ = engine.eval(
+        realm,
+        &format!("globalThis.__CERBERUS_PAGE_FONTS__=[{arr}];"),
+    );
+}
+
 /// `origin` under `first_party`, formatted as `"name=value; name=value"`.
 /// Read-only in two senses: unlike the attach path it does **not** consume
 /// `Allow-once` cookies (those are spent on a real request, not a script read),

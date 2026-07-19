@@ -473,6 +473,13 @@ impl Rule {
 #[derive(Clone, Debug, Default)]
 pub struct Stylesheet {
     pub rules: Vec<Rule>,
+    /// The `font-family` names declared by this sheet's `@font-face` rules,
+    /// lowercased. We never fetch the font bytes (ADR-0005: a fixed bundled set,
+    /// no external font loads) — but a page's own web font, once "loaded", is
+    /// reported by `document.fonts.check()` in a real browser, so we surface
+    /// these names to present the same answer (rendering substitutes a
+    /// metric-compatible bundled face). See the DOM prelude's `document.fonts`.
+    pub font_face_families: Vec<String>,
 }
 
 /// Parse a full stylesheet.
@@ -480,7 +487,49 @@ pub fn parse_stylesheet(css: &str) -> Stylesheet {
     let css = strip_comments(css);
     let mut rules = Vec::new();
     parse_rules_into(&css, None, &mut rules);
-    Stylesheet { rules }
+    let font_face_families = extract_font_face_families(&css);
+    Stylesheet {
+        rules,
+        font_face_families,
+    }
+}
+
+/// Scan a (comment-stripped) stylesheet for every `@font-face` block's declared
+/// `font-family`, returning the names lowercased and de-quoted. A flat scan (not
+/// the recursive rule parser) so it also catches `@font-face` nested in `@media`.
+fn extract_font_face_families(css: &str) -> Vec<String> {
+    let lower = css.to_ascii_lowercase();
+    let mut out: Vec<String> = Vec::new();
+    let mut search = 0;
+    while let Some(rel) = lower[search..].find("@font-face") {
+        let at = search + rel;
+        // The block body between the next `{` and its matching `}`.
+        let Some(open) = css[at..].find('{').map(|i| at + i + 1) else {
+            break;
+        };
+        let Some(len) = matching_brace(&css[open..]) else {
+            break;
+        };
+        let body = &css[open..open + len];
+        // Pull `font-family: <name>` (the first; @font-face has exactly one).
+        for decl in body.split(';') {
+            if let Some((prop, val)) = decl.split_once(':') {
+                if prop.trim().eq_ignore_ascii_case("font-family") {
+                    let name = val
+                        .trim()
+                        .trim_matches(['"', '\''])
+                        .trim()
+                        .to_ascii_lowercase();
+                    if !name.is_empty() && !out.contains(&name) {
+                        out.push(name);
+                    }
+                    break;
+                }
+            }
+        }
+        search = open + len + 1;
+    }
+    out
 }
 
 /// Whether an `@supports` block's rules should apply.

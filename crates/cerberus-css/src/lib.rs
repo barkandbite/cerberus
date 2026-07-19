@@ -490,7 +490,10 @@ impl StyleEngine for CssEngine {
             &author,
             INITIAL_ROOT_FONT_PX,
         );
-        StyledDom { root: styled }
+        StyledDom {
+            root: styled,
+            font_face_families: author.font_face_families,
+        }
     }
 }
 
@@ -544,6 +547,18 @@ fn collect_author_css(node: NodeRef<'_>, sheets: &ExternalSheets, out: &mut Stri
             collect_author_css(child, sheets, out);
         }
     }
+}
+
+/// The `font-family` names declared by the page's `@font-face` rules (inline
+/// `<style>` + fetched external sheets), lowercased. The app injects these into
+/// the JS realm so `document.fonts.check()` reports a page's own web fonts as
+/// available — matching a real browser that loaded them — without ever fetching
+/// the bytes (ADR-0005). Available before the full cascade, so it can be injected
+/// ahead of page scripts.
+pub fn page_font_families(doc: &Document, sheets: &ExternalSheets) -> Vec<String> {
+    let mut css = String::new();
+    collect_author_css(doc.root(), sheets, &mut css);
+    parse_stylesheet(&css).font_face_families
 }
 
 /// Whether a `<link>` carries `rel="stylesheet"` (rel is a space-separated,
@@ -4179,6 +4194,28 @@ mod tests {
             first(&dom.root, "p").unwrap().style.color,
             Color::rgb(0xff, 0, 0),
             "@supports rule applied; @font-face caused no breakage"
+        );
+    }
+
+    #[test]
+    fn font_face_families_are_collected_for_document_fonts() {
+        // The page's own @font-face families are surfaced (lowercased, de-quoted)
+        // so document.fonts.check() can report them loaded — without ever fetching
+        // the bytes (ADR-0005). Also catches @font-face nested in @media.
+        let html = "<html><head><style>\
+            @font-face { font-family: 'Mozilla Text'; src: url(a.woff2); font-weight: 400 }\
+            @font-face { font-family: \"Mozilla Headline\"; src: url(b.woff2) }\
+            @media (min-width: 100px) { @font-face { font-family: Zilla; src: url(c.woff2) } }\
+            p { color: #000 }\
+            </style></head><body><p>hi</p></body></html>";
+        let dom = CssEngine::new().style(&parse_html(html));
+        assert_eq!(
+            dom.font_face_families,
+            vec![
+                "mozilla text".to_string(),
+                "mozilla headline".to_string(),
+                "zilla".to_string()
+            ]
         );
     }
 
