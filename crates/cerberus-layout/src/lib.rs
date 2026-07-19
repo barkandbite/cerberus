@@ -1838,10 +1838,20 @@ impl<'a> Ctx<'a> {
         // only `max_x` matters there, and it must stay integer-stable.
         if self.measuring {
             self.x += w as i32;
+            // Size `max_x` to `ceil(x + x_frac)`: include the sub-pixel remainder
+            // that fractional inter-word gaps carry in `x_frac`, so a box sized to
+            // this max-content is never a fraction too narrow for the real,
+            // fractional-advance layout. Without it a just-fitting multi-word run
+            // wraps once the box is that measured width (measured: mozilla.org's
+            // "About us" nav item wrapped to two lines, inflating the header and
+            // shifting the whole page down). Bounded to +1px, so it cannot
+            // reintroduce the multi-px column drift the integer word advance above
+            // exists to prevent.
+            self.max_x = self.max_x.max(self.x + self.x_frac.ceil() as i32);
         } else {
             self.advance_x_f(w_f);
+            self.max_x = self.max_x.max(self.x);
         }
-        self.max_x = self.max_x.max(self.x);
         // Resolve `line-height` against this piece's own font size, so a unitless
         // factor inherited from an ancestor scales to this element (not the
         // ancestor's font size). `Normal` uses the face's real vertical metrics
