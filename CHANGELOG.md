@@ -14,6 +14,13 @@ browser is pre-1.0; this is the first tagged preview.
   hero tagline, and other flex layouts). No parity regressions.
 
 ### Added
+- **`clip-path: polygon(...)` decorative dividers.** A solid (or colored) box
+  background with a `polygon()` clip now paints as that shape — angled and
+  stepped "hero" dividers common on marketing pages (e.g. mozilla.org) — instead
+  of a full rectangle. Vertices accept `%` (of the box's width/height) and `px`
+  (origin-relative) coordinates; the fill is a real even-odd scanline rasterizer
+  (`DisplayItem::Polygon`). Works in both the flow walker and the taffy engine,
+  and for absolutely-positioned `::before`/`::after` overlays.
 - **Web fonts: substitute, don't download.** A page's own `@font-face` families
   are now reported as loaded by `document.fonts.check()` — matching a real
   browser that fetched them — while Cerberus never downloads the bytes and keeps

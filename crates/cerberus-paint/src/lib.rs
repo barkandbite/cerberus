@@ -78,6 +78,14 @@ pub enum DisplayItem {
         rect: Rect,
     },
     ClipPop,
+    /// A solid-filled polygon (even-odd scanline fill). The device-pixel vertices
+    /// are the polygon in order; the shape closes back to the first. Used for a
+    /// `clip-path: polygon(...)` background — e.g. an angled/stepped section
+    /// divider (mozilla.org's hero transition).
+    Polygon {
+        points: Vec<Point>,
+        color: Color,
+    },
 }
 
 /// Offset every primitive in `items` by `(dx, dy)` in place. Used to reuse a
@@ -109,6 +117,12 @@ pub fn translate_items(items: &mut [DisplayItem], dx: i32, dy: i32) {
                 b.x += dx;
                 b.y += dy;
             }
+            DisplayItem::Polygon { points, .. } => {
+                for p in points {
+                    p.x += dx;
+                    p.y += dy;
+                }
+            }
             DisplayItem::ClipPop => {}
         }
     }
@@ -132,6 +146,7 @@ pub fn content_height(items: &[DisplayItem]) -> i32 {
                 origin.y + glyphs.iter().map(|g| g.h as i32).max().unwrap_or(0)
             }
             DisplayItem::Line { a, b, .. } => a.y.max(b.y),
+            DisplayItem::Polygon { points, .. } => points.iter().map(|p| p.y).max().unwrap_or(0),
             DisplayItem::ClipPop => 0,
         })
         .max()
@@ -220,6 +235,13 @@ impl DisplayList {
                     a: Point::new(si(a.x), si(a.y)),
                     b: Point::new(si(b.x), si(b.y)),
                     width: su(*width),
+                    color: *color,
+                },
+                DisplayItem::Polygon { points, color } => DisplayItem::Polygon {
+                    points: points
+                        .iter()
+                        .map(|p| Point::new(si(p.x), si(p.y)))
+                        .collect(),
                     color: *color,
                 },
                 DisplayItem::Glyphs {
@@ -658,7 +680,21 @@ impl Rasterizer for BoxRasterizer {
                 // shadows/clips/lines.
                 DisplayItem::RoundRect { rect, color, .. } => target.fill_rect(*rect, *color),
                 DisplayItem::Gradient { rect, start, .. } => target.fill_rect(*rect, *start),
-                DisplayItem::Shadow { .. }
+                // The placeholder approximates a polygon by its bounding box.
+                DisplayItem::Polygon { points, color } if points.len() >= 3 => {
+                    let x0 = points.iter().map(|p| p.x).min().unwrap_or(0);
+                    let y0 = points.iter().map(|p| p.y).min().unwrap_or(0);
+                    let x1 = points.iter().map(|p| p.x).max().unwrap_or(0);
+                    let y1 = points.iter().map(|p| p.y).max().unwrap_or(0);
+                    target.fill_rect(
+                        Rect::new(x0, y0, (x1 - x0).max(0) as u32, (y1 - y0).max(0) as u32),
+                        *color,
+                    );
+                }
+                // The placeholder approximates fills as solid and ignores
+                // shadows/clips/lines/degenerate polygons.
+                DisplayItem::Polygon { .. }
+                | DisplayItem::Shadow { .. }
                 | DisplayItem::Line { .. }
                 | DisplayItem::ClipPush { .. }
                 | DisplayItem::ClipPop => {}

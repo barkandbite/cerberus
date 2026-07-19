@@ -361,6 +361,11 @@ pub struct ComputedStyle {
     /// `background-image: url(...)` — the (unresolved) URL, painted behind the
     /// element's content via the image pipeline (ADR-0038). Not inherited.
     pub background_image: Option<String>,
+    /// `clip-path: polygon(...)` vertices, as `(x, y)` lengths against the border
+    /// box (percentages of width/height, or px). When set, the element's solid
+    /// background paints as that polygon instead of its box — an angled/stepped
+    /// section divider. Not inherited. `None` for the overwhelmingly common case.
+    pub clip_polygon: Option<Vec<(Len, Len)>>,
     pub font_size: u32,
     pub font: FontStyle,
     /// Whether `font-size` is still the initial `medium` keyword (no explicit
@@ -550,6 +555,7 @@ impl ComputedStyle {
             color: Color::BLACK,
             background: None,
             background_image: None,
+            clip_polygon: None,
             font_size: 16,
             font: FontStyle::REGULAR,
             font_size_medium: true,
@@ -665,6 +671,7 @@ impl ComputedStyle {
             display: Display::Inline,
             background: None,
             background_image: None,
+            clip_polygon: None,
             opacity: 1.0,
             margin_top: Len::Px(0),
             margin_bottom: Len::Px(0),

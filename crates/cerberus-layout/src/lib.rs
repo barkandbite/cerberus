@@ -151,6 +151,28 @@ pub fn flow_inline(
 /// before flowing that box's content on top, so both engines decorate boxes
 /// identically (`RENDERING_ARCHITECTURE_PLAN.md`, Stage 3). Content the caller
 /// appends afterward therefore paints over the background, as in normal flow.
+/// Resolve a `clip-path: polygon(...)` vertex list against `rect` (the border
+/// box): each `%` is of the box's width/height, each `px` is an offset from its
+/// origin. Shared by the flow walker (`fill_box`) and the taffy engine
+/// (`box_decorations`) so both paint the same divider shape.
+fn polygon_points(poly: &[(cerberus_style::Len, cerberus_style::Len)], rect: Rect) -> Vec<Point> {
+    let resolve = |len: &cerberus_style::Len, extent: i32| -> i32 {
+        match len {
+            cerberus_style::Len::Pct(p) => (p / 100.0 * extent as f32).round() as i32,
+            cerberus_style::Len::Px(v) => *v,
+            _ => 0,
+        }
+    };
+    poly.iter()
+        .map(|(lx, ly)| {
+            Point::new(
+                rect.x + resolve(lx, rect.w as i32),
+                rect.y + resolve(ly, rect.h as i32),
+            )
+        })
+        .collect()
+}
+
 pub fn box_decorations(
     style: &ComputedStyle,
     rect: Rect,
@@ -183,15 +205,38 @@ pub fn box_decorations(
                 radius,
             });
         } else if let Some(color) = style.background {
-            out.push(if radius > 0 {
-                DisplayItem::RoundRect {
-                    rect,
-                    color,
-                    radius,
-                }
+            if let Some(poly) = &style.clip_polygon {
+                // `clip-path: polygon(...)`: the solid background paints as that
+                // shape against the border box (an angled/stepped divider). `%`
+                // is of the box's width/height; `px` is an offset from its origin.
+                let resolve = |len: &cerberus_style::Len, extent: i32| -> i32 {
+                    match len {
+                        cerberus_style::Len::Pct(p) => (p / 100.0 * extent as f32).round() as i32,
+                        cerberus_style::Len::Px(v) => *v,
+                        _ => 0,
+                    }
+                };
+                let points = poly
+                    .iter()
+                    .map(|(lx, ly)| {
+                        Point::new(
+                            rect.x + resolve(lx, rect.w as i32),
+                            rect.y + resolve(ly, rect.h as i32),
+                        )
+                    })
+                    .collect();
+                out.push(DisplayItem::Polygon { points, color });
             } else {
-                DisplayItem::Rect { rect, color }
-            });
+                out.push(if radius > 0 {
+                    DisplayItem::RoundRect {
+                        rect,
+                        color,
+                        radius,
+                    }
+                } else {
+                    DisplayItem::Rect { rect, color }
+                });
+            }
         }
         if let Some(url) = &style.background_image {
             if let Some(img) = images.get(url) {
@@ -2600,7 +2645,15 @@ impl<'a> Ctx<'a> {
             );
             idx += 1;
         } else if let Some(color) = style.background {
-            let item = if radius > 0 {
+            let item = if let Some(poly) = &style.clip_polygon {
+                // `clip-path: polygon(...)`: the solid background paints as that
+                // shape against the border box (an angled/stepped divider). `%`
+                // is of the box's width/height; `px` is an offset from its origin.
+                DisplayItem::Polygon {
+                    points: polygon_points(poly, rect),
+                    color,
+                }
+            } else if radius > 0 {
                 DisplayItem::RoundRect {
                     rect,
                     color,
@@ -3801,6 +3854,11 @@ fn translate_item(item: &mut DisplayItem, dx: i32, dy: i32) {
         DisplayItem::Line { a, b, .. } => {
             *a = offset_point(*a, dx, dy);
             *b = offset_point(*b, dx, dy);
+        }
+        DisplayItem::Polygon { points, .. } => {
+            for p in points {
+                *p = offset_point(*p, dx, dy);
+            }
         }
         DisplayItem::ClipPop => {}
     }
@@ -5011,6 +5069,38 @@ mod tests {
             "width:70% flex item is width-driven (~490px here), not its ~11px \
              content width; got {w}"
         );
+    }
+
+    #[test]
+    fn clip_path_polygon_emits_resolved_divider_shape() {
+        // A `clip-path: polygon(...)` background paints as that shape (a stepped
+        // hero divider), not a full rect. The `%` vertices resolve against the
+        // box's width/height and `px` are origin-relative offsets.
+        let out = lay(
+            "<div style='width:400px;height:120px;background:#5b21b6;\
+               clip-path:polygon(0 0,100% 0,100% 70%,0 100%)'></div>",
+            800,
+        );
+        let points = out
+            .display
+            .items
+            .iter()
+            .find_map(|i| match i {
+                DisplayItem::Polygon { points, color }
+                    if *color == Color::rgb(0x5b, 0x21, 0xb6) =>
+                {
+                    Some(points.clone())
+                }
+                _ => None,
+            })
+            .expect("the divider paints as a Polygon, not a Rect");
+        // Top edge spans the full 400px width at the box top; the bottom-right
+        // vertex sits at 70% of the 120px height, the bottom-left at full height.
+        let xs: Vec<i32> = points.iter().map(|p| p.x).collect();
+        let ys: Vec<i32> = points.iter().map(|p| p.y).collect();
+        let (x0, y0) = (xs[0], ys[0]);
+        assert_eq!(xs.iter().map(|x| x - x0).collect::<Vec<_>>(), vec![0, 400, 400, 0]);
+        assert_eq!(ys.iter().map(|y| y - y0).collect::<Vec<_>>(), vec![0, 0, 84, 120]);
     }
 
     #[test]

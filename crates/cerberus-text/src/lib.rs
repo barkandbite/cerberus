@@ -759,6 +759,48 @@ fn lerp_color(a: Color, b: Color, t: f32) -> Color {
 
 /// Fill a uniformly rounded rect (ADR-0041): the interior is opaque `fill_rect`
 /// (fast), only the four `r×r` corners are anti-aliased per-pixel.
+/// Fill a solid polygon by even-odd scanlines (`clip-path: polygon(...)`
+/// backgrounds). Each scanline's edge crossings are sorted and the spans between
+/// consecutive pairs are filled, honouring the framebuffer clip and alpha via
+/// `fill_rect`. Hard-edged — exact for the axis-aligned step polygons real pages
+/// use as section dividers; a slanted edge staircases by a pixel (acceptable, and
+/// improvable with coverage later).
+fn draw_polygon(points: &[Point], color: Color, target: &mut Framebuffer) {
+    if points.len() < 3 || color.a == 0 {
+        return;
+    }
+    let min_y = points.iter().map(|p| p.y).min().unwrap_or(0);
+    let max_y = points.iter().map(|p| p.y).max().unwrap_or(0);
+    let n = points.len();
+    let mut xs: Vec<f32> = Vec::with_capacity(n);
+    for y in min_y..max_y {
+        // Sample at the pixel centre so a vertex exactly on a scanline doesn't
+        // double-count (standard top-left fill rule).
+        let yc = y as f32 + 0.5;
+        xs.clear();
+        for i in 0..n {
+            let a = points[i];
+            let b = points[(i + 1) % n];
+            let (ay, by) = (a.y as f32, b.y as f32);
+            // Edge crosses this scanline (half-open, so shared vertices count once).
+            if (ay <= yc && by > yc) || (by <= yc && ay > yc) {
+                let t = (yc - ay) / (by - ay);
+                xs.push(a.x as f32 + t * (b.x as f32 - a.x as f32));
+            }
+        }
+        xs.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+        let mut i = 0;
+        while i + 1 < xs.len() {
+            let x0 = xs[i].round() as i32;
+            let x1 = xs[i + 1].round() as i32;
+            if x1 > x0 {
+                target.fill_rect(Rect::new(x0, y, (x1 - x0) as u32, 1), color);
+            }
+            i += 2;
+        }
+    }
+}
+
 fn draw_round_rect(rect: Rect, color: Color, radius: i32, target: &mut Framebuffer) {
     let r = radius.min(rect.w as i32 / 2).min(rect.h as i32 / 2).max(0);
     if r == 0 {
@@ -950,6 +992,7 @@ impl Rasterizer for TextEngine {
                 DisplayItem::Line { a, b, width, color } => {
                     self.draw_line(*a, *b, *width, *color, target)
                 }
+                DisplayItem::Polygon { points, color } => draw_polygon(points, *color, target),
                 DisplayItem::ClipPush { rect } => {
                     let r = clips
                         .last()
