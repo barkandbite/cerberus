@@ -12,6 +12,26 @@ implement each without re-deriving the investigation.
 
 ---
 
+## ✅ DONE — `flex-basis: auto` must honor the item's `width`
+
+**Landed.** A casual live-browse run surfaced narrow content columns across sites
+(rust-lang.org's hero tagline `A language empowering everyone…` wrapped **one word
+per line**; recurred on Wikipedia/rust-blog intros). Root cause: `flex_base_main`
+resolved `FlexBasis::Auto` to `measure_intrinsic_width` (content), **ignoring the
+item's `width`** — so a `width:70%` flex item (Tachyons `w-70-l`) collapsed toward
+min-content when the row was tight. Per spec `flex-basis:auto` resolves to the used
+`width` when set, else content. Fix: `Auto => resolve_block_width(...).unwrap_or(
+measure_intrinsic_width)`. rust-lang's columns render at width; corpus unchanged
+(mozilla 0.28948→0.28856, bbc/hn/wikipedia/static all identical).
+
+**Known follow-up (deliberately not shipped):** a flex item's `width:%` still
+resolves *twice* — once as the flex basis, once when the item lays its own box in
+the flex-assigned sub — so `width:70%` comes out ~70%-of-70%. Fixing it by setting
+`sub.as_block_once` on flex items (mirroring inline-block/float, so the item fills
+its assigned width) works and is more correct, **but regressed bbc** (0.16180→
+0.16654) — some flex item there legitimately relied on the re-resolve. Needs a
+narrower condition before shipping; the basis fix alone is already a large win.
+
 ## ✅ DONE — max-content undercount wrapped content-sized flex/table boxes
 
 **Landed.** mozilla.org was the corpus outlier (RMSE 0.302 vs ~0.13 elsewhere).

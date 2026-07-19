@@ -2951,9 +2951,16 @@ impl<'a> Ctx<'a> {
             cerberus_style::FlexBasis::Pct(f) => {
                 ((f / 100.0) * avail as f32).round().max(0.0) as i32
             }
-            cerberus_style::FlexBasis::Content | cerberus_style::FlexBasis::Auto => {
-                self.measure_intrinsic_width(item)
+            // `flex-basis: auto` resolves to the item's used `width` (its main
+            // size) when it sets one, and only falls back to content otherwise.
+            // Ignoring the width collapsed an explicit-width flex item — e.g.
+            // Tachyons `w-70-l` (width:70%) — to its min-content, so rust-lang.org's
+            // hero tagline wrapped one word per line. `content` always measures.
+            cerberus_style::FlexBasis::Auto => {
+                resolve_block_width(&item.style, avail, self.vw, self.vh)
+                    .unwrap_or_else(|| self.measure_intrinsic_width(item))
             }
+            cerberus_style::FlexBasis::Content => self.measure_intrinsic_width(item),
         }
     }
 
@@ -4968,6 +4975,42 @@ mod tests {
             children: Vec::new(),
             node_id: 0,
         }
+    }
+
+    #[test]
+    fn flex_item_auto_basis_honors_explicit_width() {
+        // flex-basis:auto resolves to the item's `width` when it sets one (not
+        // content). A width:70% flex item must take ~70% of the row regardless of
+        // its content width — else a short-content item collapses and a
+        // long-content one wraps to min-content (rust-lang.org's hero tagline,
+        // Tachyons `w-70-l`, wrapped one word per line).
+        let out = lay(
+            "<div style='display:flex;width:1000px'>\
+               <div style='width:70%;background:#ff0000'>hi</div>\
+               <div style='width:30%'>x</div>\
+             </div>",
+            1000,
+        );
+        // The 70% item's background fills ~700px, not its ~content width.
+        let w = out
+            .display
+            .items
+            .iter()
+            .find_map(|i| match i {
+                DisplayItem::Rect { rect, color } if *color == Color::rgb(0xff, 0, 0) => {
+                    Some(rect.w)
+                }
+                _ => None,
+            })
+            .expect("the 70% item's background rect");
+        // ~490 (70% resolves against the flex-assigned space once more when the
+        // item lays its own box — a separate, pre-existing double-resolve); the
+        // point here is it's the width, not the ~11px content width.
+        assert!(
+            w > 300,
+            "width:70% flex item is width-driven (~490px here), not its ~11px \
+             content width; got {w}"
+        );
     }
 
     #[test]

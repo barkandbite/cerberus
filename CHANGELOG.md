@@ -5,6 +5,14 @@ browser is pre-1.0; this is the first tagged preview.
 
 ## [Unreleased]
 
+### Fixed
+- **Flex columns no longer collapse to one word per line.** `flex-basis: auto`
+  now resolves to a flex item's explicit `width` (per spec) instead of ignoring
+  it and measuring content — so a `width:70%` flex column (e.g. Tachyons
+  `w-70-l`) takes its share of the row rather than shrinking toward min-content.
+  This fixed narrow, one-word-per-line text seen across real sites (rust-lang.org's
+  hero tagline, and other flex layouts). No parity regressions.
+
 ### Added
 - **Web fonts: substitute, don't download.** A page's own `@font-face` families
   are now reported as loaded by `document.fonts.check()` — matching a real
