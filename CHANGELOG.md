@@ -5,6 +5,38 @@ browser is pre-1.0; this is the first tagged preview.
 
 ## [Unreleased]
 
+## [0.0.15] - 2026-07-21
+
+Speed & stability release, from real-world Windows testing that surfaced a hard
+freeze and general sluggishness — the two things the project is supposed to get
+right.
+
+### Fixed
+- **A page can no longer freeze the window ("Not Responding").** All page
+  JavaScript runs synchronously on the UI thread, and the only limit was a
+  per-eval 5s watchdog re-armed for every script — so approving a site's
+  third-party access (e.g. cnn.com) let its many external scripts, each with a
+  full event-loop drain, run back-to-back and starve the OS message pump. The JS
+  event loop now takes a wall-clock budget (`EventLoopBudget::interactive()`,
+  the batch default plus a 50 ms cap) so a single drain can't hog the thread, and
+  `poll()` processes completed jobs under a ~48 ms slice and re-wakes to continue
+  — the work drains across serviced frames instead of one frozen burst. A page
+  that drains quickly is unaffected; the one-time first-paint drain keeps the
+  full budget.
+- **Scrolling and interaction are much faster.** Every redraw used to re-run a
+  full styled-tree layout — re-shaping every text run through rustybuzz — and
+  scroll, click, and keypress each trigger a redraw, so one scroll notch paid for
+  a complete relayout of the page. Layout is now cached and reused for any redraw
+  that doesn't change it (the big one: scrolling only shifts the cached display
+  list); it's recomputed only when the page, a form, an image/stylesheet, the
+  viewport size, or an edit actually changes it.
+- **Rendering.** A childless `<button>` (an icon button whose glyph comes from
+  CSS/JS we don't run) no longer stamps the literal word "Button" on the page
+  (seen top-left on React sites); it renders empty, as a real browser does. Form
+  controls now honor `border-radius`, so a pill-shaped input (eBay's search
+  field) draws rounded instead of a square rect with corners protruding past the
+  outline.
+
 ## [0.0.14] - 2026-07-21
 
 ### Fixed
