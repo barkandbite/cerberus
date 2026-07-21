@@ -518,7 +518,10 @@ mod tests {
 
     fn run(root: StyledNode, w: u32, h: u32) -> LaidOut {
         TaffyLayout.layout(
-            &StyledDom { root },
+            &StyledDom {
+                root,
+                font_face_families: Vec::new(),
+            },
             Size { w, h },
             &MonoShaper,
             &NoImages,
