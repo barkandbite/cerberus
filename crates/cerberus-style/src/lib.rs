@@ -361,6 +361,11 @@ pub struct ComputedStyle {
     /// `background-image: url(...)` — the (unresolved) URL, painted behind the
     /// element's content via the image pipeline (ADR-0038). Not inherited.
     pub background_image: Option<String>,
+    /// `clip-path: polygon(...)` vertices, as `(x, y)` lengths against the border
+    /// box (percentages of width/height, or px). When set, the element's solid
+    /// background paints as that polygon instead of its box — an angled/stepped
+    /// section divider. Not inherited. `None` for the overwhelmingly common case.
+    pub clip_polygon: Option<Vec<(Len, Len)>>,
     pub font_size: u32,
     pub font: FontStyle,
     /// Whether `font-size` is still the initial `medium` keyword (no explicit
@@ -550,6 +555,7 @@ impl ComputedStyle {
             color: Color::BLACK,
             background: None,
             background_image: None,
+            clip_polygon: None,
             font_size: 16,
             font: FontStyle::REGULAR,
             font_size_medium: true,
@@ -665,6 +671,7 @@ impl ComputedStyle {
             display: Display::Inline,
             background: None,
             background_image: None,
+            clip_polygon: None,
             opacity: 1.0,
             margin_top: Len::Px(0),
             margin_bottom: Len::Px(0),
@@ -788,6 +795,12 @@ impl StyledNode {
 #[derive(Clone, Debug)]
 pub struct StyledDom {
     pub root: StyledNode,
+    /// The `font-family` names declared by the page's `@font-face` rules
+    /// (lowercased). We never fetch the bytes (ADR-0005), but a page's own web
+    /// font is reported as available by `document.fonts.check()` once "loaded";
+    /// the app injects these so the DOM prelude answers the same, while layout
+    /// substitutes a metric-compatible bundled face.
+    pub font_face_families: Vec<String>,
 }
 
 /// Externally-fetched stylesheets (`<link rel="stylesheet">` bodies), keyed by

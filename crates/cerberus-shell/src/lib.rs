@@ -106,6 +106,36 @@ pub trait FrameApp {
 
     /// Backspace.
     fn backspace(&mut self) -> bool;
+
+    /// Scroll the page content vertically by `dy` logical pixels (positive =
+    /// down / toward the end of the document). Wheel notches and arrow keys map
+    /// here. Returns true if the offset changed and a redraw is needed. Default:
+    /// no scrolling.
+    fn scroll_by(&mut self, dy: i32) -> bool {
+        let _ = dy;
+        false
+    }
+
+    /// Scroll by whole viewport pages (`down` = toward the end), the Page
+    /// Down/Up and Space keys. Returns true if a redraw is needed. Default:
+    /// no scrolling.
+    fn scroll_page(&mut self, down: bool) -> bool {
+        let _ = down;
+        false
+    }
+
+    /// Jump to the top (`end == false`) or bottom (`end == true`) of the page —
+    /// the Home/End keys. Returns true if a redraw is needed. Default: no-op.
+    fn scroll_to_end(&mut self, end: bool) -> bool {
+        let _ = end;
+        false
+    }
+
+    /// Toggle the developer console overlay (the F12 key). Returns true if a
+    /// redraw is needed. Default: no console.
+    fn dev_console_toggle(&mut self) -> bool {
+        false
+    }
 }
 
 /// An application that drives **multiple** surfaces (windows) at once — the

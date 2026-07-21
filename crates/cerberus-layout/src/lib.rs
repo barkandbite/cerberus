@@ -151,6 +151,28 @@ pub fn flow_inline(
 /// before flowing that box's content on top, so both engines decorate boxes
 /// identically (`RENDERING_ARCHITECTURE_PLAN.md`, Stage 3). Content the caller
 /// appends afterward therefore paints over the background, as in normal flow.
+/// Resolve a `clip-path: polygon(...)` vertex list against `rect` (the border
+/// box): each `%` is of the box's width/height, each `px` is an offset from its
+/// origin. Shared by the flow walker (`fill_box`) and the taffy engine
+/// (`box_decorations`) so both paint the same divider shape.
+fn polygon_points(poly: &[(cerberus_style::Len, cerberus_style::Len)], rect: Rect) -> Vec<Point> {
+    let resolve = |len: &cerberus_style::Len, extent: i32| -> i32 {
+        match len {
+            cerberus_style::Len::Pct(p) => (p / 100.0 * extent as f32).round() as i32,
+            cerberus_style::Len::Px(v) => *v,
+            _ => 0,
+        }
+    };
+    poly.iter()
+        .map(|(lx, ly)| {
+            Point::new(
+                rect.x + resolve(lx, rect.w as i32),
+                rect.y + resolve(ly, rect.h as i32),
+            )
+        })
+        .collect()
+}
+
 pub fn box_decorations(
     style: &ComputedStyle,
     rect: Rect,
@@ -183,15 +205,38 @@ pub fn box_decorations(
                 radius,
             });
         } else if let Some(color) = style.background {
-            out.push(if radius > 0 {
-                DisplayItem::RoundRect {
-                    rect,
-                    color,
-                    radius,
-                }
+            if let Some(poly) = &style.clip_polygon {
+                // `clip-path: polygon(...)`: the solid background paints as that
+                // shape against the border box (an angled/stepped divider). `%`
+                // is of the box's width/height; `px` is an offset from its origin.
+                let resolve = |len: &cerberus_style::Len, extent: i32| -> i32 {
+                    match len {
+                        cerberus_style::Len::Pct(p) => (p / 100.0 * extent as f32).round() as i32,
+                        cerberus_style::Len::Px(v) => *v,
+                        _ => 0,
+                    }
+                };
+                let points = poly
+                    .iter()
+                    .map(|(lx, ly)| {
+                        Point::new(
+                            rect.x + resolve(lx, rect.w as i32),
+                            rect.y + resolve(ly, rect.h as i32),
+                        )
+                    })
+                    .collect();
+                out.push(DisplayItem::Polygon { points, color });
             } else {
-                DisplayItem::Rect { rect, color }
-            });
+                out.push(if radius > 0 {
+                    DisplayItem::RoundRect {
+                        rect,
+                        color,
+                        radius,
+                    }
+                } else {
+                    DisplayItem::Rect { rect, color }
+                });
+            }
         }
         if let Some(url) = &style.background_image {
             if let Some(img) = images.get(url) {
@@ -1838,10 +1883,20 @@ impl<'a> Ctx<'a> {
         // only `max_x` matters there, and it must stay integer-stable.
         if self.measuring {
             self.x += w as i32;
+            // Size `max_x` to `ceil(x + x_frac)`: include the sub-pixel remainder
+            // that fractional inter-word gaps carry in `x_frac`, so a box sized to
+            // this max-content is never a fraction too narrow for the real,
+            // fractional-advance layout. Without it a just-fitting multi-word run
+            // wraps once the box is that measured width (measured: mozilla.org's
+            // "About us" nav item wrapped to two lines, inflating the header and
+            // shifting the whole page down). Bounded to +1px, so it cannot
+            // reintroduce the multi-px column drift the integer word advance above
+            // exists to prevent.
+            self.max_x = self.max_x.max(self.x + self.x_frac.ceil() as i32);
         } else {
             self.advance_x_f(w_f);
+            self.max_x = self.max_x.max(self.x);
         }
-        self.max_x = self.max_x.max(self.x);
         // Resolve `line-height` against this piece's own font size, so a unitless
         // factor inherited from an ancestor scales to this element (not the
         // ancestor's font size). `Normal` uses the face's real vertical metrics
@@ -2590,7 +2645,15 @@ impl<'a> Ctx<'a> {
             );
             idx += 1;
         } else if let Some(color) = style.background {
-            let item = if radius > 0 {
+            let item = if let Some(poly) = &style.clip_polygon {
+                // `clip-path: polygon(...)`: the solid background paints as that
+                // shape against the border box (an angled/stepped divider). `%`
+                // is of the box's width/height; `px` is an offset from its origin.
+                DisplayItem::Polygon {
+                    points: polygon_points(poly, rect),
+                    color,
+                }
+            } else if radius > 0 {
                 DisplayItem::RoundRect {
                     rect,
                     color,
@@ -2941,9 +3004,16 @@ impl<'a> Ctx<'a> {
             cerberus_style::FlexBasis::Pct(f) => {
                 ((f / 100.0) * avail as f32).round().max(0.0) as i32
             }
-            cerberus_style::FlexBasis::Content | cerberus_style::FlexBasis::Auto => {
-                self.measure_intrinsic_width(item)
+            // `flex-basis: auto` resolves to the item's used `width` (its main
+            // size) when it sets one, and only falls back to content otherwise.
+            // Ignoring the width collapsed an explicit-width flex item — e.g.
+            // Tachyons `w-70-l` (width:70%) — to its min-content, so rust-lang.org's
+            // hero tagline wrapped one word per line. `content` always measures.
+            cerberus_style::FlexBasis::Auto => {
+                resolve_block_width(&item.style, avail, self.vw, self.vh)
+                    .unwrap_or_else(|| self.measure_intrinsic_width(item))
             }
+            cerberus_style::FlexBasis::Content => self.measure_intrinsic_width(item),
         }
     }
 
@@ -3784,6 +3854,11 @@ fn translate_item(item: &mut DisplayItem, dx: i32, dy: i32) {
         DisplayItem::Line { a, b, .. } => {
             *a = offset_point(*a, dx, dy);
             *b = offset_point(*b, dx, dy);
+        }
+        DisplayItem::Polygon { points, .. } => {
+            for p in points {
+                *p = offset_point(*p, dx, dy);
+            }
         }
         DisplayItem::ClipPop => {}
     }
@@ -4958,6 +5033,80 @@ mod tests {
             children: Vec::new(),
             node_id: 0,
         }
+    }
+
+    #[test]
+    fn flex_item_auto_basis_honors_explicit_width() {
+        // flex-basis:auto resolves to the item's `width` when it sets one (not
+        // content). A width:70% flex item must take ~70% of the row regardless of
+        // its content width — else a short-content item collapses and a
+        // long-content one wraps to min-content (rust-lang.org's hero tagline,
+        // Tachyons `w-70-l`, wrapped one word per line).
+        let out = lay(
+            "<div style='display:flex;width:1000px'>\
+               <div style='width:70%;background:#ff0000'>hi</div>\
+               <div style='width:30%'>x</div>\
+             </div>",
+            1000,
+        );
+        // The 70% item's background fills ~700px, not its ~content width.
+        let w = out
+            .display
+            .items
+            .iter()
+            .find_map(|i| match i {
+                DisplayItem::Rect { rect, color } if *color == Color::rgb(0xff, 0, 0) => {
+                    Some(rect.w)
+                }
+                _ => None,
+            })
+            .expect("the 70% item's background rect");
+        // ~490 (70% resolves against the flex-assigned space once more when the
+        // item lays its own box — a separate, pre-existing double-resolve); the
+        // point here is it's the width, not the ~11px content width.
+        assert!(
+            w > 300,
+            "width:70% flex item is width-driven (~490px here), not its ~11px \
+             content width; got {w}"
+        );
+    }
+
+    #[test]
+    fn clip_path_polygon_emits_resolved_divider_shape() {
+        // A `clip-path: polygon(...)` background paints as that shape (a stepped
+        // hero divider), not a full rect. The `%` vertices resolve against the
+        // box's width/height and `px` are origin-relative offsets.
+        let out = lay(
+            "<div style='width:400px;height:120px;background:#5b21b6;\
+               clip-path:polygon(0 0,100% 0,100% 70%,0 100%)'></div>",
+            800,
+        );
+        let points = out
+            .display
+            .items
+            .iter()
+            .find_map(|i| match i {
+                DisplayItem::Polygon { points, color }
+                    if *color == Color::rgb(0x5b, 0x21, 0xb6) =>
+                {
+                    Some(points.clone())
+                }
+                _ => None,
+            })
+            .expect("the divider paints as a Polygon, not a Rect");
+        // Top edge spans the full 400px width at the box top; the bottom-right
+        // vertex sits at 70% of the 120px height, the bottom-left at full height.
+        let xs: Vec<i32> = points.iter().map(|p| p.x).collect();
+        let ys: Vec<i32> = points.iter().map(|p| p.y).collect();
+        let (x0, y0) = (xs[0], ys[0]);
+        assert_eq!(
+            xs.iter().map(|x| x - x0).collect::<Vec<_>>(),
+            vec![0, 400, 400, 0]
+        );
+        assert_eq!(
+            ys.iter().map(|y| y - y0).collect::<Vec<_>>(),
+            vec![0, 0, 84, 120]
+        );
     }
 
     #[test]

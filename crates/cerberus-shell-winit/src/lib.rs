@@ -25,10 +25,26 @@ use cerberus_paint::Framebuffer;
 use cerberus_shell::{FrameApp, MultiSurfaceApp, Waker};
 use cerberus_types::Size;
 use winit::application::ApplicationHandler;
-use winit::event::{ElementState, KeyEvent, MouseButton, WindowEvent};
+use winit::event::{ElementState, KeyEvent, MouseButton, MouseScrollDelta, WindowEvent};
 use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop, EventLoopProxy};
 use winit::keyboard::{Key, NamedKey};
 use winit::window::{Fullscreen, Window, WindowId};
+
+/// Logical pixels scrolled per wheel notch / arrow-key press.
+const WHEEL_LINE_PX: f32 = 48.0;
+const ARROW_STEP_PX: i32 = 48;
+
+/// Convert a winit wheel `delta` into a logical-pixel vertical offset, positive
+/// = scroll toward the end of the document. Line deltas (mouse wheels) are
+/// notches; pixel deltas (trackpads) are physical pixels divided back to
+/// logical. winit reports positive `y` for scrolling *up*, so we negate.
+fn wheel_dy(delta: MouseScrollDelta, scale: f64) -> i32 {
+    let logical = match delta {
+        MouseScrollDelta::LineDelta(_, y) => -y * WHEEL_LINE_PX,
+        MouseScrollDelta::PixelDelta(pos) => -(pos.y as f32) / (scale.max(1.0) as f32),
+    };
+    logical.round() as i32
+}
 
 /// Wraps a winit proxy so a worker thread can wake the event loop.
 struct ProxyWaker(EventLoopProxy<()>);
@@ -155,6 +171,13 @@ impl<A: FrameApp> State<A> {
                 self.set_fullscreen(false);
                 true
             }
+            Key::Named(NamedKey::F12) => self.app.dev_console_toggle(),
+            Key::Named(NamedKey::ArrowDown) => self.app.scroll_by(ARROW_STEP_PX),
+            Key::Named(NamedKey::ArrowUp) => self.app.scroll_by(-ARROW_STEP_PX),
+            Key::Named(NamedKey::PageDown) => self.app.scroll_page(true),
+            Key::Named(NamedKey::PageUp) => self.app.scroll_page(false),
+            Key::Named(NamedKey::Home) => self.app.scroll_to_end(false),
+            Key::Named(NamedKey::End) => self.app.scroll_to_end(true),
             _ => match event.text {
                 Some(text) => text
                     .chars()
@@ -227,6 +250,16 @@ impl<A: FrameApp> ApplicationHandler for State<A> {
                     if self.app.pointer_down(x, y) {
                         self.request_redraw();
                     }
+                }
+            }
+            WindowEvent::MouseWheel { delta, .. } => {
+                let scale = self
+                    .window
+                    .as_ref()
+                    .map(|w| w.scale_factor())
+                    .unwrap_or(1.0);
+                if self.app.scroll_by(wheel_dy(delta, scale)) {
+                    self.request_redraw();
                 }
             }
             WindowEvent::KeyboardInput { event, .. } => self.handle_key(event),

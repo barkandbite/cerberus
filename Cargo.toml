@@ -14,7 +14,7 @@ resolver = "2"
 members = ["crates/*"]
 
 [workspace.package]
-version = "0.0.12"
+version = "0.0.14"
 edition = "2021"
 rust-version = "1.94"
 # Provisional: recommended in ADR-0002 (V8 → permissive path). Ratify on engine

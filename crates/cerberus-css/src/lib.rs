@@ -490,7 +490,10 @@ impl StyleEngine for CssEngine {
             &author,
             INITIAL_ROOT_FONT_PX,
         );
-        StyledDom { root: styled }
+        StyledDom {
+            root: styled,
+            font_face_families: author.font_face_families,
+        }
     }
 }
 
@@ -544,6 +547,18 @@ fn collect_author_css(node: NodeRef<'_>, sheets: &ExternalSheets, out: &mut Stri
             collect_author_css(child, sheets, out);
         }
     }
+}
+
+/// The `font-family` names declared by the page's `@font-face` rules (inline
+/// `<style>` + fetched external sheets), lowercased. The app injects these into
+/// the JS realm so `document.fonts.check()` reports a page's own web fonts as
+/// available — matching a real browser that loaded them — without ever fetching
+/// the bytes (ADR-0005). Available before the full cascade, so it can be injected
+/// ahead of page scripts.
+pub fn page_font_families(doc: &Document, sheets: &ExternalSheets) -> Vec<String> {
+    let mut css = String::new();
+    collect_author_css(doc.root(), sheets, &mut css);
+    parse_stylesheet(&css).font_face_families
 }
 
 /// Whether a `<link>` carries `rel="stylesheet"` (rel is a space-separated,
@@ -1659,7 +1674,12 @@ fn apply_declarations(
             // attempt real clipping. The last declaration wins, so a visible
             // `auto`/`none`/partial value overrides an earlier hiding one.
             "clip" => pending.clip = clip_rect_hides(v, style.font_size as f32),
-            "clip-path" => pending.clip_path = clip_path_inset_hides(v),
+            "clip-path" => {
+                pending.clip_path = clip_path_inset_hides(v);
+                // A `polygon(...)` clip paints the background as that shape (an
+                // angled/stepped divider); any other value clears it.
+                style.clip_polygon = parse_clip_polygon(v, style.font_size as f32);
+            }
             "opacity" => {
                 if let Some(o) = parse_opacity(v) {
                     style.opacity = o;
@@ -2679,6 +2699,26 @@ fn parse_inset(v: &str, em_base: f32) -> Option<Len> {
     })
 }
 
+/// Parse `clip-path: polygon(x y, x y, …)` into its vertices as `(x, y)` lengths
+/// against the border box. `None` for any other value (`none`/`inset()`/`circle()`
+/// /`url()`…), which also clears an earlier polygon. Needs ≥3 points to be a fill.
+fn parse_clip_polygon(v: &str, em_base: f32) -> Option<Vec<(Len, Len)>> {
+    let t = v.trim().to_ascii_lowercase();
+    // Allow an optional `<geometry-box>` prefix before the shape (e.g.
+    // `border-box polygon(...)`); we ignore the box and take the polygon.
+    let inner = t
+        .split_once("polygon(")
+        .and_then(|(_, rest)| rest.strip_suffix(')'))?;
+    let mut pts = Vec::new();
+    for pair in inner.split(',') {
+        let mut it = pair.split_whitespace();
+        let x = parse_inset(it.next()?, em_base)?;
+        let y = parse_inset(it.next()?, em_base)?;
+        pts.push((x, y));
+    }
+    (pts.len() >= 3).then_some(pts)
+}
+
 /// Parse a `flex-basis` value: `auto`, `content` (and friends), a px length, or
 /// a percentage of the container's main size (kept symbolic for layout).
 fn parse_flex_basis(v: &str, em: f32) -> FlexBasis {
@@ -3010,6 +3050,35 @@ mod tests {
             "<a href='/x' style='text-decoration:none'>x</a>",
         ));
         assert!(!first(&cleared.root, "a").unwrap().style.underline);
+    }
+
+    #[test]
+    fn clip_path_polygon_parses_to_vertices() {
+        use crate::Len;
+        // A four-point divider polygon: `%` → Pct, `px` → Px, both resolved
+        // against the border box at paint time.
+        let dom = CssEngine::new().style(&parse_html(
+            "<div style='clip-path:polygon(0 0, 100% 0, 100% 70%, 0 100%)'>x</div>",
+        ));
+        let d = first(&dom.root, "div").unwrap();
+        let poly = d.style.clip_polygon.as_ref().expect("polygon parsed");
+        assert_eq!(
+            poly,
+            &vec![
+                (Len::Px(0), Len::Px(0)),
+                (Len::Pct(100.0), Len::Px(0)),
+                (Len::Pct(100.0), Len::Pct(70.0)),
+                (Len::Px(0), Len::Pct(100.0)),
+            ]
+        );
+        // A non-polygon clip form leaves no fill shape.
+        let inset =
+            CssEngine::new().style(&parse_html("<div style='clip-path:inset(0 0 0 0)'>x</div>"));
+        assert!(first(&inset.root, "div")
+            .unwrap()
+            .style
+            .clip_polygon
+            .is_none());
     }
 
     #[test]
@@ -3619,6 +3688,26 @@ mod tests {
     }
 
     #[test]
+    fn media_query_overrides_root_custom_property() {
+        // mozilla.org drives its whole type/spacing scale through `:root` custom
+        // properties that a wider `@media` redefines (`--text-title-2xl` goes
+        // 48px → 80px → 128px). At a width where the query matches, the override
+        // must win so a `var()`-driven font-size scales up. Regression for the
+        // hero `<h1>` rendering at the base 48px instead of Chrome's 80px.
+        let html = "<html><head><style>\
+            :root{--t:48px}\
+            @media(min-width:768px){:root{--t:80px}}\
+            h1{font-size:var(--t)}\
+            </style></head><body><h1>x</h1></body></html>";
+        // Narrow viewport: the base value wins.
+        let narrow = CssEngine::with_media(500, 800).style(&parse_html(html));
+        assert_eq!(first(&narrow.root, "h1").unwrap().style.font_size, 48);
+        // Wide viewport: the `@media` override wins.
+        let wide = CssEngine::with_media(1200, 800).style(&parse_html(html));
+        assert_eq!(first(&wide.root, "h1").unwrap().style.font_size, 80);
+    }
+
+    #[test]
     fn margin_right_from_longhand_and_shorthand() {
         // The `margin-right` longhand is honored (previously only its `auto` flag
         // was), and each shorthand arity fills the right side correctly.
@@ -4159,6 +4248,28 @@ mod tests {
             first(&dom.root, "p").unwrap().style.color,
             Color::rgb(0xff, 0, 0),
             "@supports rule applied; @font-face caused no breakage"
+        );
+    }
+
+    #[test]
+    fn font_face_families_are_collected_for_document_fonts() {
+        // The page's own @font-face families are surfaced (lowercased, de-quoted)
+        // so document.fonts.check() can report them loaded — without ever fetching
+        // the bytes (ADR-0005). Also catches @font-face nested in @media.
+        let html = "<html><head><style>\
+            @font-face { font-family: 'Mozilla Text'; src: url(a.woff2); font-weight: 400 }\
+            @font-face { font-family: \"Mozilla Headline\"; src: url(b.woff2) }\
+            @media (min-width: 100px) { @font-face { font-family: Zilla; src: url(c.woff2) } }\
+            p { color: #000 }\
+            </style></head><body><p>hi</p></body></html>";
+        let dom = CssEngine::new().style(&parse_html(html));
+        assert_eq!(
+            dom.font_face_families,
+            vec![
+                "mozilla text".to_string(),
+                "mozilla headline".to_string(),
+                "zilla".to_string()
+            ]
         );
     }
 

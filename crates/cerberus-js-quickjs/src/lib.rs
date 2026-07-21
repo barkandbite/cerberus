@@ -209,10 +209,17 @@ const SPEED_FIRST_PRELUDE: &str = r#"
 /// [`JsError::Eval`] instead of a process OOM kill.
 const MAX_JS_HEAP_BYTES: usize = 192 * 1024 * 1024;
 
-/// Max QuickJS interpreter stack size. This matches rquickjs's own built-in
-/// default (see `Runtime::set_max_stack_size` doc comment); we set it
-/// explicitly rather than relying on the implicit default so the cap is
-/// visible and auditable here rather than only inside the vendored crate.
+/// Default max QuickJS interpreter stack size — the ceiling QuickJS enforces on
+/// its own C-stack usage before raising a catchable stack-overflow, well below
+/// the OS thread stack. This matches rquickjs's own built-in default; we set it
+/// explicitly so the cap is auditable here rather than only inside the vendored
+/// crate. It must stay a safe fraction of the smallest thread this engine runs
+/// on (the default worker-thread stack is 2 MiB), so a runaway script surfaces
+/// as a catchable [`JsError::Eval`] rather than overflowing the native stack and
+/// crashing the process. Sized against release builds, where interpreter frames
+/// are compact — a *debug* build's frames are several times larger, so tests
+/// that need deep recursion build an engine with an explicit larger cap on an
+/// explicitly large-stacked thread (see the recursion tests).
 const MAX_JS_STACK_BYTES: usize = 256 * 1024;
 
 /// Default wall-clock budget for a single top-level [`QuickJsEngine::eval`]
@@ -281,9 +288,25 @@ impl QuickJsEngine {
     /// Returns [`JsError::Instantiate`] if the runtime cannot be created (only
     /// happens on allocation failure).
     pub fn with_eval_timeout(timeout: Duration) -> Result<Self, JsError> {
+        Self::with_limits(timeout, MAX_JS_STACK_BYTES)
+    }
+
+    /// Build an engine with an explicit interpreter stack cap. Production uses
+    /// the [`MAX_JS_STACK_BYTES`] default via [`Self::with_eval_timeout`]; the
+    /// recursion tests use this to raise the cap (on an explicitly large-stacked
+    /// thread) so a *debug* build's oversized interpreter frames don't clip
+    /// legitimate recursion the shipped release build handles comfortably.
+    ///
+    /// `stack_bytes` must stay a safe fraction of the running thread's stack, or
+    /// a runaway script overflows the native stack instead of raising a
+    /// catchable error — the caller owns that invariant.
+    ///
+    /// Returns [`JsError::Instantiate`] if the runtime cannot be created (only
+    /// happens on allocation failure).
+    fn with_limits(timeout: Duration, stack_bytes: usize) -> Result<Self, JsError> {
         let runtime = Runtime::new().map_err(|e| JsError::Instantiate(e.to_string()))?;
         runtime.set_memory_limit(MAX_JS_HEAP_BYTES);
-        runtime.set_max_stack_size(MAX_JS_STACK_BYTES);
+        runtime.set_max_stack_size(stack_bytes);
         let deadline: DeadlineCell = Arc::new(Mutex::new(None));
         install_deadline_watchdog(&runtime, Arc::clone(&deadline));
         Ok(Self {
@@ -904,19 +927,29 @@ mod tests {
 
     #[test]
     fn deep_but_bounded_recursion_still_works() {
-        // Sanity check on the explicit stack-size cap: legitimate, bounded
-        // recursion (well short of overflowing 256 KiB of interpreter stack)
-        // must still evaluate normally.
-        let r = realm(1);
-        let mut e = engine_with_realm(r);
-        assert_eq!(
-            e.eval(
-                r,
-                "function sum(n) { return n <= 0 ? 0 : n + sum(n - 1); } sum(100)"
-            )
-            .unwrap(),
-            JsValue::Number(5_050.0)
-        );
+        // Legitimate, bounded recursion must evaluate normally when the engine
+        // has stack room. Run on a thread with an explicit, generous stack and
+        // an engine cap to match: a *debug* build's interpreter frames are
+        // several times larger than the shipped release build's, so depth 100
+        // can need ~1 MiB of native stack here even though release handles far
+        // deeper within the production default. The large-stacked thread keeps
+        // this deterministic across platforms (a default worker thread is only
+        // 2 MiB, and Windows debug frames are the heaviest).
+        let handle = std::thread::Builder::new()
+            .stack_size(32 * 1024 * 1024)
+            .spawn(|| {
+                let r = realm(1);
+                let mut e = QuickJsEngine::with_limits(DEFAULT_EVAL_TIMEOUT, 16 * 1024 * 1024)
+                    .expect("runtime");
+                e.create_realm(r).expect("create realm");
+                e.eval(
+                    r,
+                    "function sum(n) { return n <= 0 ? 0 : n + sum(n - 1); } sum(100)",
+                )
+                .unwrap()
+            })
+            .expect("spawn recursion test thread");
+        assert_eq!(handle.join().unwrap(), JsValue::Number(5_050.0));
     }
 
     #[test]

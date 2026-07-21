@@ -3,6 +3,98 @@
 All notable changes to Cerberus are recorded here. Versions are small while the
 browser is pre-1.0; this is the first tagged preview.
 
+## [Unreleased]
+
+## [0.0.14] - 2026-07-21
+
+### Fixed
+- **Flex columns no longer collapse to one word per line.** `flex-basis: auto`
+  now resolves to a flex item's explicit `width` (per spec) instead of ignoring
+  it and measuring content — so a `width:70%` flex column (e.g. Tachyons
+  `w-70-l`) takes its share of the row rather than shrinking toward min-content.
+  This fixed narrow, one-word-per-line text seen across real sites (rust-lang.org's
+  hero tagline, and other flex layouts). No parity regressions.
+
+### Added
+- **`clip-path: polygon(...)` decorative dividers.** A solid (or colored) box
+  background with a `polygon()` clip now paints as that shape — angled and
+  stepped "hero" dividers common on marketing pages (e.g. mozilla.org) — instead
+  of a full rectangle. Vertices accept `%` (of the box's width/height) and `px`
+  (origin-relative) coordinates; the fill is a real even-odd scanline rasterizer
+  (`DisplayItem::Polygon`). Works in both the flow walker and the taffy engine,
+  and for absolutely-positioned `::before`/`::after` overlays.
+- **Web fonts: substitute, don't download.** A page's own `@font-face` families
+  are now reported as loaded by `document.fonts.check()` — matching a real
+  browser that fetched them — while Cerberus never downloads the bytes and keeps
+  rendering with a metric-compatible bundled face (ADR-0005). This closes a
+  fingerprinting tell (a site could otherwise flag "this browser didn't load my
+  own web font") without adding a font-fetch/cache/timing signal. The page's
+  `@font-face` names are parsed from inline and external CSS and injected as
+  `__CERBERUS_PAGE_FONTS__` ahead of page scripts (and refreshed when external
+  sheets arrive). Local system-font enumeration stays defended by the existing
+  per-head farbling.
+
+## [0.0.13] - 2026-07-19
+
+### Added
+- **Whole UI on the design system.** Every remaining chrome surface now draws
+  from `cerberus_ui::theme` and its rounded widgets, so the browser reads as one
+  product instead of a set of hand-placed rectangles: the toolbar (rounded
+  buttons, an accent URL field with an accent caret, an accent-tint head chip),
+  the consent banner (an attention-amber strip with green "Allow" / red "Deny"
+  pills), the cookie inspector and the MIRC roster (scrim + rounded card + soft
+  shadow, uppercase section headers, zebra rows, and semantic disposition/state
+  **pills** — green allow/live, amber session/diverged, red block), the
+  performance HUD and the mirror "driven" badge (the rounded dark developer-
+  tooling `INK` surface with an accent header and green figures). New shared
+  tokens (semantic chip tints + inks, an attention/warning colour, a positive
+  on-dark value) and helpers (`round_button`, `round_icon_button`, `pill`) keep
+  every button and chip one shape. A `chrome_preview` example renders the
+  toolbar, banner, HUD, and cookie inspector to PNGs for review.
+- **UI design system + redesigned settings panel.** A small shared visual
+  language (`cerberus_ui::theme`) — one surface palette, the toolbar's blue as
+  the single accent, one spacing rhythm, type scale, and corner radius — plus
+  reusable widgets (rounded cards, iOS-style toggles, section headers, chevron
+  rows, a masked field) built on it. The settings menu is rebuilt on top: a
+  centred modal card that dims the page, with grouped sections (Privacy & data,
+  Performance, Identity vault) of real toggle/nav rows and a proper passphrase
+  field — replacing the old flat "clickable text" rows. `SettingsPanel`
+  (`layout`/`paint`/`hit_test`) is a pure view like the rest of the crate. The
+  developer console is rebuilt on the same tokens (see below).
+- **Web Workers + more Web platform APIs.** Page script can now spawn `Worker`s
+  (from `Blob` object URLs, with `postMessage`/`importScripts`), validated
+  against Google's Comlink SDK and the real Web Platform Tests `testharness.js`
+  running end-to-end in a worker. Also new/upgraded: `Blob`, `URL` +
+  `URLSearchParams` (relative resolution, dot-segment normalization,
+  special-scheme origins), `Image`/`WebSocket`, `DOMException` +
+  `QuotaExceededError`, `Event`/`CustomEvent`/`EventTarget` (with `performance`
+  as an EventTarget), `TextDecoder` utf-16, spec-correct `crypto.getRandomValues`
+  validation, and `atob`/`btoa` `InvalidCharacterError`. Real `<img>`/beacon and
+  `navigator.sendBeacon` requests now go out through the sealed network path.
+- **Developer console (F12), rebuilt on the design system.** A dark bottom
+  drawer that reads as a developer tool while sharing the design system's
+  accent, spacing, radii, and type scale: a titled tab strip (Console active;
+  Elements/Network/Storage signposted for later), a row of live stat chips
+  (DOM nodes · links · fields · cookies), the page URL, and the page's captured
+  `console.*` output (most recent last, tail-clipped) **colour-coded by level**
+  (`console.error` red, `console.warn` amber). Toggle with F12; the
+  drawer swallows clicks so content behind it isn't activated. `DevConsole`
+  (`drawer_rect`/`paint`) is a pure view. Next: an interactive command line and
+  populated Elements/Network/Storage panels.
+- **Settings: working "images" toggle.** The settings panel now has a real
+  images control (graphical ↔ text-only) alongside the existing cookie-manager
+  and performance-HUD rows, replacing greyed-out placeholder text with a live
+  button. Text-only skips image fetches entirely (privacy + speed); toggling
+  reloads the current page so the new policy takes full effect.
+- **Page scrolling.** The main content area now scrolls: mouse wheel and
+  trackpad, `↑`/`↓` (48 px), `Page Up`/`Page Down` (90% of the viewport), and
+  `Home`/`End` (jump to top/bottom). The offset is clamped to the document
+  height (computed from the display list via `cerberus_paint::content_height`)
+  and reset to the top on every navigation. Link, form-control, and element hit
+  boxes — and scripted-page `getBoundingClientRect` — follow the scroll offset,
+  so clicks land on what's visible. Previously the viewport was fixed to the top
+  of the page with no way to reach content below the fold.
+
 ## [0.0.12] — 2026-07-13
 
 Tooling release: trustworthy parity references. No engine behavior changes.

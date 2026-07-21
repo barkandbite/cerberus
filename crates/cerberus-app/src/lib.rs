@@ -104,8 +104,9 @@ use cerberus_text::TextEngine;
 use cerberus_tls_rustls::RustlsProvider;
 use cerberus_types::{Color, FontStyle, HeadId, InstanceId, Origin, Point, RealmId, Rect, Size};
 use cerberus_ui::{
-    BannerAction, ConsentBanner, CookieAction, CookieManager, CookieRow, MircAction, MircPanel,
-    MircRow, MircState, PerfHud, Toolbar, ToolbarAction, BANNER_HEIGHT,
+    BannerAction, ConsentBanner, ConsoleLevel, ConsoleLine, CookieAction, CookieManager, CookieRow,
+    DevConsole, DevConsoleModel, MircAction, MircPanel, MircRow, MircState, PerfHud,
+    SettingsAction, SettingsModel, SettingsPanel, Toolbar, ToolbarAction, BANNER_HEIGHT,
 };
 use cerberus_url::{join as join_url, parse as parse_url, Url};
 use std::collections::HashMap;
@@ -1149,6 +1150,9 @@ pub fn render(config: &RenderConfig) -> Result<RenderOutcome, AppError> {
                 first_party: first_party.clone(),
             },
         };
+        // Report the page's inline @font-face families as loaded (external sheets
+        // are fetched after scripts on this one-shot path). See inject_page_fonts.
+        inject_page_fonts(engine, base_realm, &document, &ExternalSheets::new());
         document = match &client {
             Some(c) => {
                 let mut fc = SyncFetchClient {
@@ -2557,6 +2561,13 @@ pub struct BrowserApp {
     settings_open: bool,
     background: Color,
     last_size: Size,
+    /// Vertical scroll offset of the main page content, in logical pixels
+    /// (0 = top). Clamped to `[0, max_scroll]` at paint; navigation resets it.
+    scroll_y: i32,
+    /// Largest valid `scroll_y` for the last painted page (content height minus
+    /// viewport height, floored at 0). Lets wheel/key handlers clamp without
+    /// re-running layout.
+    max_scroll: i32,
     /// HiDPI scale factor (physical ÷ logical px). 1.0 unless the shell sets it.
     scale: f32,
     /// Consent policy shared with the worker-side cookie jar.
@@ -2592,6 +2603,9 @@ pub struct BrowserApp {
     /// A transient status line shown under the MIRC control bar (e.g. the result
     /// of a bulk action), cleared on the next panel interaction.
     mirc_status: Option<String>,
+    /// Whether the developer console overlay is open (the F12 key). Shows page
+    /// stats and the page's captured `console.*` output.
+    console_open: bool,
     /// Remaining script-initiated navigations before further ones are ignored.
     /// A user gesture refills it to [`SCRIPT_NAV_CAP`]; each `location.*`/
     /// `location.href =` reload spends one. Caps a page that reloads on every
@@ -2761,6 +2775,8 @@ impl BrowserApp {
             settings_open: false,
             background: Color::WHITE,
             last_size: Size::new(800, 600),
+            scroll_y: 0,
+            max_scroll: 0,
             scale: 1.0,
             consent: Arc::new(Mutex::new(DefaultDenyPolicy::new(true))),
             cookie_policy: Arc::new(Mutex::new(CookiePolicy::new())),
@@ -2778,6 +2794,7 @@ impl BrowserApp {
             mirc_open: false,
             mirc_scroll: 0,
             mirc_status: None,
+            console_open: false,
             script_nav_budget: SCRIPT_NAV_CAP,
         };
         // The SYNC button shows how many identities/sessions it can drive.
@@ -2883,6 +2900,9 @@ impl BrowserApp {
         self.forms.clear();
         self.focused_field = None;
         self.form_fields.clear();
+        // A new document starts scrolled to the top.
+        self.scroll_y = 0;
+        self.max_scroll = 0;
 
         if url.starts_with("cerberus:") {
             self.load_builtin(url); // built-in pages are GET-only; ignore any body
@@ -2998,6 +3018,28 @@ impl BrowserApp {
         // External sheets often carry the svg `fill` rules; re-inject any
         // whose computed fill the new cascade changed.
         self.refresh_svg_fills();
+        // They also carry @font-face (mozilla's whole type scale is external);
+        // refresh the page-fonts list so document.fonts.check() reports them for
+        // any post-load probe (the realm is live only if the page ran scripts).
+        self.refresh_page_fonts();
+    }
+
+    /// Re-inject `__CERBERUS_PAGE_FONTS__` from the current document + fetched
+    /// sheets, so `document.fonts.check()` covers `@font-face` families that
+    /// arrived in external stylesheets after the initial script run. No realm
+    /// (script-less page) or no `@font-face` → nothing to do.
+    fn refresh_page_fonts(&mut self) {
+        if self.node_to_js.is_empty() {
+            return;
+        }
+        let fonts = cerberus_css::page_font_families(&self.document, &self.sheets);
+        if fonts.is_empty() {
+            return;
+        }
+        let realm = RealmId(self.heads.active().id.0);
+        if let Ok(engine) = self.heads.engine() {
+            set_page_fonts(engine, realm, &fonts);
+        }
     }
 
     /// Run the document's inline scripts against the active head's engine and
@@ -3051,6 +3093,12 @@ impl BrowserApp {
         if install_page(engine, realm, &doc, &env).is_err() {
             return doc;
         }
+        // Report the page's OWN @font-face families as loaded via
+        // document.fonts.check() — a real browser that loaded them answers true,
+        // so a sensor can't flag us for "didn't load your own font". We render
+        // them with a metric-compatible bundled face and never fetch the bytes
+        // (ADR-0005). Injected before page scripts so early probes see them.
+        inject_page_fonts(engine, realm, &doc, &self.sheets);
         if cerberus_js_dom::run_scripts(engine, realm, doc.scripts()).is_err() {
             return doc;
         }
@@ -3355,6 +3403,27 @@ impl BrowserApp {
                 let _ = run_event_loop(engine, realm, EventLoopBudget::default());
             }
             self.reconcile_realm();
+        }
+    }
+
+    /// Read the page's captured `console.*` output for the developer console.
+    /// Page script writes each console record into `globalThis.__cerberusConsole`
+    /// (see the DOM prelude) as `"level\u0002text"`; we join records with `\u0001`
+    /// (neither can appear in a line) and split them back into typed entries.
+    /// Empty for script-less pages (no realm/console).
+    fn read_console_entries(&mut self) -> Vec<ConsoleLine> {
+        if self.node_to_js.is_empty() {
+            return Vec::new();
+        }
+        let realm = RealmId(self.heads.active().id.0);
+        let Ok(engine) = self.heads.engine() else {
+            return Vec::new();
+        };
+        match engine.eval(realm, "(globalThis.__cerberusConsole||[]).join('\\u0001')") {
+            Ok(cerberus_js::JsValue::Str(s)) if !s.is_empty() => {
+                s.split('\u{1}').map(parse_console_record).collect()
+            }
+            _ => Vec::new(),
         }
     }
 
@@ -4282,6 +4351,17 @@ impl BrowserApp {
     /// line of that, which is exact for the single-line editing we support today
     /// (newlines can't be typed — Enter submits). The caret is always clamped
     /// inside the box.
+    /// Height of the page content viewport in logical pixels — the toolbar
+    /// content area minus any consent banner. Used to size a Page Up/Down step.
+    fn page_viewport_h(&self) -> i32 {
+        let banner_h = if self.consent_prompts.is_empty() {
+            0
+        } else {
+            BANNER_HEIGHT
+        };
+        (self.toolbar.content_size(self.last_size).h as i32 - banner_h as i32).max(1)
+    }
+
     fn paint_caret(&self, page: &mut Framebuffer, origin: Point, scale: f32) {
         let Some(id) = self.focused_field else {
             return;
@@ -4321,6 +4401,26 @@ impl BrowserApp {
             color: Color::rgb(0x22, 0x22, 0x22),
         });
         self.text.rasterize(&list.scaled(scale), page);
+    }
+
+    /// Snapshot the state the settings panel renders and hit-tests against.
+    fn settings_model(&self) -> SettingsModel<'_> {
+        SettingsModel {
+            vault_locked: self.storage.locked().vault_locked(),
+            passphrase_len: self.vault_input.chars().count(),
+            vault_msg: self.vault_msg.as_deref(),
+            hud_on: self.hud_on,
+            images_on: self.image_policy.default != ImageDisplayMode::TextOnly,
+        }
+    }
+
+    /// Dismiss the settings overlay, clearing its transient state. The typed
+    /// passphrase is scrubbed (`zeroize`, not just dropped — issue #30) so it
+    /// never lingers in the backing buffer.
+    fn close_settings(&mut self) {
+        self.settings_open = false;
+        self.vault_msg = None;
+        self.vault_input.zeroize();
     }
 
     /// Attempt a vault unlock with the passphrase typed into the settings
@@ -4590,11 +4690,10 @@ impl BrowserApp {
                 true
             }
             ToolbarAction::OpenSettings => {
-                self.settings_open = !self.settings_open;
-                if !self.settings_open {
-                    // Closing the overlay must wipe any typed-but-unsubmitted
-                    // passphrase, not just drop the reference to it (issue #30).
-                    self.vault_input.zeroize();
+                if self.settings_open {
+                    self.close_settings();
+                } else {
+                    self.settings_open = true;
                 }
                 true
             }
@@ -4793,18 +4892,29 @@ impl FrameApp for BrowserApp {
         // Time layout+paint (M11). The image provider's borrow of `self` is
         // scoped to this block so the timing record (a `&mut self` op) is free.
         let t = Instant::now();
-        let (laid, mut page) = {
+        let (laid, mut page, scroll_y) = {
             let provider = StoreImages {
                 base: self.current_url.as_ref(),
                 images: &self.images,
                 policy: &self.image_policy,
             };
             let mut layout = BlockLayout::default();
-            let laid = layout.layout(&self.styled, content, &self.text, &provider, &self.forms);
+            let mut laid = layout.layout(&self.styled, content, &self.text, &provider, &self.forms);
+
+            // Clamp the requested scroll to the document height, then shift the
+            // page content up by that offset so the viewport shows a lower slice.
+            // Hit boxes below are placed with the same offset (window coords).
+            let doc_h = cerberus_paint::content_height(&laid.display.items);
+            let max_scroll = (doc_h - content.h as i32).max(0);
+            let scroll_y = self.scroll_y.clamp(0, max_scroll);
+            self.max_scroll = max_scroll;
+            self.scroll_y = scroll_y;
+            cerberus_paint::translate_items(&mut laid.display.items, 0, -scroll_y);
+
             let mut page = Framebuffer::new(Size::new(su(content.w), su(content.h)));
             page.clear(canvas_bg);
             self.text.rasterize(&laid.display.scaled(scale), &mut page);
-            (laid, page)
+            (laid, page, scroll_y)
         };
         self.timings.record("layout+paint", t.elapsed());
 
@@ -4817,16 +4927,23 @@ impl FrameApp for BrowserApp {
             laid.elements
                 .iter()
                 .filter_map(|e| self.node_to_js.get(&e.node).map(|&js| (js, e.rect)))
+                .map(|(js, mut rect)| {
+                    // getBoundingClientRect is viewport-relative, so it follows
+                    // the scroll offset (top goes negative once scrolled past).
+                    rect.y -= scroll_y;
+                    (js, rect)
+                })
                 .collect()
         };
 
-        // Record link hit-boxes in window coordinates for click handling.
+        // Record link hit-boxes in window coordinates for click handling. The
+        // scroll offset moves them with the painted content so clicks land.
         self.links = laid
             .links
             .into_iter()
             .map(|mut l| {
                 l.rect.x += origin.x;
-                l.rect.y += origin.y;
+                l.rect.y += origin.y - scroll_y;
                 l
             })
             .collect();
@@ -4837,7 +4954,7 @@ impl FrameApp for BrowserApp {
             .into_iter()
             .map(|mut f| {
                 f.rect.x += origin.x;
-                f.rect.y += origin.y;
+                f.rect.y += origin.y - scroll_y;
                 f
             })
             .collect();
@@ -4848,7 +4965,7 @@ impl FrameApp for BrowserApp {
             .into_iter()
             .map(|mut e| {
                 e.rect.x += origin.x;
-                e.rect.y += origin.y;
+                e.rect.y += origin.y - scroll_y;
                 e
             })
             .collect();
@@ -4884,17 +5001,10 @@ impl FrameApp for BrowserApp {
             self.insecure_button = Some(paint_insecure_button(&mut fb, &self.text, scale));
         }
         if self.settings_open {
-            let vault_locked = self.storage.locked().vault_locked();
-            paint_settings_overlay(
+            let model = self.settings_model();
+            self.text.rasterize(
+                &SettingsPanel::paint(logical, &self.text, &model).scaled(scale),
                 &mut fb,
-                logical,
-                &self.text,
-                &self.text,
-                vault_locked,
-                self.vault_input.chars().count(),
-                self.vault_msg.as_deref(),
-                self.hud_on,
-                scale,
             );
         }
         if self.cookie_manager_open {
@@ -4949,6 +5059,34 @@ impl FrameApp for BrowserApp {
                 self.text.rasterize(&list.scaled(scale), &mut fb);
             }
         }
+        // Developer console drawer (F12), under the HUD. Gather stats + the
+        // captured console output before borrowing the text engine to paint.
+        if self.console_open {
+            let url = self
+                .current_url
+                .as_ref()
+                .map(|u| u.to_string())
+                .unwrap_or_else(|| self.toolbar.url_text.clone());
+            let (dom_nodes, links, fields, cookies) = (
+                self.elements.len(),
+                self.links.len(),
+                self.form_fields.len(),
+                self.cookie_rows().len(),
+            );
+            let lines = self.read_console_entries();
+            let model = DevConsoleModel {
+                url: &url,
+                dom_nodes,
+                links,
+                fields,
+                cookies,
+                lines: &lines,
+            };
+            self.text.rasterize(
+                &DevConsole::paint(logical, &self.text, &model).scaled(scale),
+                &mut fb,
+            );
+        }
         // Performance HUD on top of everything, when enabled (M11).
         if self.hud_on {
             let rows = self.timings.display_rows();
@@ -4968,6 +5106,12 @@ impl FrameApp for BrowserApp {
                     return true;
                 }
             }
+        }
+        // The developer console drawer swallows clicks that land on it, so page
+        // content painted behind it isn't activated by a click meant for the
+        // console.
+        if self.console_open && point_in_rect(DevConsole::drawer_rect(self.last_size), x, y) {
+            return true;
         }
         if self.mirc_open {
             // The MIRC panel owns all clicks while open; a click outside it (but
@@ -4997,28 +5141,32 @@ impl FrameApp for BrowserApp {
             return true;
         }
         if self.settings_open {
-            // A click on the "manage cookies" row opens the inspector.
-            if point_in_rect(settings_cookies_rect(self.last_size), x, y) {
-                self.settings_open = false;
-                self.vault_msg = None;
-                // Leaving the overlay wipes any typed-but-unsubmitted passphrase
-                // (issue #30) — `zeroize()`, not `clear()`, actually scrubs it.
-                self.vault_input.zeroize();
-                self.cookie_manager_open = true;
-                self.cookie_scroll = 0;
-                return true;
-            }
-            // Toggle the performance HUD.
-            if point_in_rect(settings_timers_rect(self.last_size), x, y) {
-                self.hud_on = !self.hud_on;
-                return true;
-            }
-            // Clicks inside the panel stay in the panel (passphrase entry);
-            // clicking outside dismisses it.
-            if !point_in_rect(settings_panel_rect(self.last_size), x, y) {
-                self.settings_open = false;
-                self.vault_msg = None;
-                self.vault_input.zeroize();
+            // Resolve the click first so the borrow of `self` (via the model)
+            // ends before the arms mutate `self`.
+            let action = SettingsPanel::hit_test(self.last_size, &self.settings_model(), x, y);
+            match action {
+                SettingsAction::OpenCookies => {
+                    self.close_settings();
+                    self.cookie_manager_open = true;
+                    self.cookie_scroll = 0;
+                }
+                SettingsAction::ToggleHud => self.hud_on = !self.hud_on,
+                // Flip image loading (graphical <-> text-only) and reload the
+                // current page so the new policy takes full effect — text-only
+                // skips the fetch entirely, graphical needs the bytes it skipped.
+                SettingsAction::ToggleImages => {
+                    self.image_policy.default = match self.image_policy.default {
+                        ImageDisplayMode::Graphical => ImageDisplayMode::TextOnly,
+                        ImageDisplayMode::TextOnly => ImageDisplayMode::Graphical,
+                    };
+                    if let Some(url) = self.current_url.clone() {
+                        self.begin_load(&url.to_string(), None, true);
+                    }
+                }
+                SettingsAction::Close => self.close_settings(),
+                // A click inside the panel that hit no control (e.g. the
+                // passphrase field) stays in the panel.
+                SettingsAction::None => {}
             }
             return true;
         }
@@ -5169,6 +5317,45 @@ impl FrameApp for BrowserApp {
         }
         false
     }
+
+    fn scroll_by(&mut self, dy: i32) -> bool {
+        // Overlays own the wheel while open (they scroll their own lists via
+        // clicks); don't move the page underneath them.
+        if self.mirc_open || self.cookie_manager_open || self.settings_open {
+            return false;
+        }
+        let new = (self.scroll_y + dy).clamp(0, self.max_scroll);
+        if new != self.scroll_y {
+            self.scroll_y = new;
+            true
+        } else {
+            false
+        }
+    }
+
+    fn scroll_page(&mut self, down: bool) -> bool {
+        // A page step leaves a sliver of overlap (Chrome keeps ~10%).
+        let step = (self.page_viewport_h() * 9 / 10).max(1);
+        self.scroll_by(if down { step } else { -step })
+    }
+
+    fn scroll_to_end(&mut self, end: bool) -> bool {
+        if self.mirc_open || self.cookie_manager_open || self.settings_open {
+            return false;
+        }
+        let target = if end { self.max_scroll } else { 0 };
+        if target != self.scroll_y {
+            self.scroll_y = target;
+            true
+        } else {
+            false
+        }
+    }
+
+    fn dev_console_toggle(&mut self) -> bool {
+        self.console_open = !self.console_open;
+        true
+    }
 }
 
 fn empty_document() -> Document {
@@ -5199,6 +5386,42 @@ fn first_party_of(url: &cerberus_url::Url) -> Option<Origin> {
 }
 
 /// The cookies this instance's sealed jar would expose to `document.cookie` for
+/// Inject the page's own `@font-face` families as `globalThis.__CERBERUS_PAGE_FONTS__`
+/// so the DOM prelude's `document.fonts.check()` reports them loaded — matching a
+/// real browser that loaded them, so a sensor can't flag "didn't load your own
+/// font". We never fetch the bytes; layout substitutes a metric-compatible
+/// bundled face (ADR-0005). No-op when the page declares no `@font-face`.
+fn inject_page_fonts(
+    engine: &mut dyn cerberus_js::JsEngine,
+    realm: RealmId,
+    doc: &Document,
+    sheets: &ExternalSheets,
+) {
+    set_page_fonts(
+        engine,
+        realm,
+        &cerberus_css::page_font_families(doc, sheets),
+    );
+}
+
+/// Set `globalThis.__CERBERUS_PAGE_FONTS__` to `fonts` (already lowercased). A
+/// no-op for an empty list (leaves any earlier list in place). The strings are
+/// JSON-escaped so a font name can't break out of the array literal.
+fn set_page_fonts(engine: &mut dyn cerberus_js::JsEngine, realm: RealmId, fonts: &[String]) {
+    if fonts.is_empty() {
+        return;
+    }
+    let arr = fonts
+        .iter()
+        .map(|f| format!("\"{}\"", f.replace('\\', "\\\\").replace('"', "\\\"")))
+        .collect::<Vec<_>>()
+        .join(",");
+    let _ = engine.eval(
+        realm,
+        &format!("globalThis.__CERBERUS_PAGE_FONTS__=[{arr}];"),
+    );
+}
+
 /// `origin` under `first_party`, formatted as `"name=value; name=value"`.
 /// Read-only in two senses: unlike the attach path it does **not** consume
 /// `Allow-once` cookies (those are spent on a real request, not a script read),
@@ -5384,6 +5607,28 @@ fn simple_document(heading: &str, line: &str, note: Option<&str>) -> Document {
 
 fn point_in_rect(r: Rect, x: i32, y: i32) -> bool {
     x >= r.x && y >= r.y && x < r.x + r.w as i32 && y < r.y + r.h as i32
+}
+
+/// Parse one `"leveltext"` console record (see the DOM prelude) into a
+/// typed [`ConsoleLine`]. An untagged record (legacy or hand-written) is treated
+/// as a plain `log`.
+fn parse_console_record(record: &str) -> ConsoleLine {
+    match record.split_once('\u{2}') {
+        Some((level, text)) => ConsoleLine {
+            level: match level {
+                "warn" => ConsoleLevel::Warn,
+                "error" => ConsoleLevel::Error,
+                "info" => ConsoleLevel::Info,
+                "debug" => ConsoleLevel::Debug,
+                _ => ConsoleLevel::Log,
+            },
+            text: text.to_string(),
+        },
+        None => ConsoleLine {
+            level: ConsoleLevel::Log,
+            text: record.to_string(),
+        },
+    }
 }
 
 // --- Form controls: the id convention + GET submission. ---
@@ -5794,146 +6039,6 @@ fn paint_insecure_button(fb: &mut Framebuffer, text: &TextEngine, scale: f32) ->
     });
     text.rasterize(&list.scaled(scale), fb);
     rect
-}
-
-/// The settings panel's window rect (shared by paint and hit-testing).
-fn settings_panel_rect(size: Size) -> Rect {
-    let pw = size.w * 3 / 5;
-    let ph = size.h * 3 / 5;
-    let px = (size.w.saturating_sub(pw) / 2) as i32;
-    let py = (size.h.saturating_sub(ph) / 2) as i32;
-    Rect::new(px, py, pw, ph)
-}
-
-/// The clickable "manage cookies" row inside the settings overlay.
-fn settings_cookies_rect(size: Size) -> Rect {
-    let p = settings_panel_rect(size);
-    Rect::new(p.x + 12, p.y + 176, 220, 22)
-}
-
-/// The clickable "performance HUD" toggle row inside the settings overlay.
-fn settings_timers_rect(size: Size) -> Rect {
-    let p = settings_panel_rect(size);
-    Rect::new(p.x + 12, p.y + 204, 220, 22)
-}
-
-/// Paint the centered settings panel: vault state + passphrase entry.
-#[allow(clippy::too_many_arguments)]
-fn paint_settings_overlay(
-    fb: &mut Framebuffer,
-    size: Size,
-    shaper: &dyn TextShaper,
-    raster: &dyn Rasterizer,
-    vault_locked: bool,
-    input_chars: usize,
-    vault_msg: Option<&str>,
-    hud_on: bool,
-    scale: f32,
-) {
-    let panel = settings_panel_rect(size);
-    let (px, py, pw, ph) = (panel.x, panel.y, panel.w, panel.h);
-
-    let mut list = DisplayList::new();
-    list.push(DisplayItem::Rect {
-        rect: Rect::new(px - 1, py - 1, pw + 2, ph + 2),
-        color: Color::rgb(0x40, 0x40, 0x40),
-    });
-    list.push(DisplayItem::Rect {
-        rect: Rect::new(px, py, pw, ph),
-        color: Color::rgb(0xFA, 0xFA, 0xFA),
-    });
-    list.push(DisplayItem::Glyphs {
-        origin: Point::new(px + 12, py + 20),
-        frac_x: 0.0,
-        glyphs: shaper.shape("Settings", 22),
-        color: Color::BLACK,
-        style: FontStyle::REGULAR,
-    });
-    list.push(DisplayItem::Glyphs {
-        origin: Point::new(px + 12, py + 52),
-        frac_x: 0.0,
-        glyphs: shaper.shape("identities | vault | consent | farbling (coming soon)", 14),
-        color: Color::rgb(0x50, 0x50, 0x50),
-        style: FontStyle::REGULAR,
-    });
-    let vault_line = if vault_locked {
-        "vault: locked (quarantined cookies are dropped)"
-    } else {
-        "vault: unlocked"
-    };
-    list.push(DisplayItem::Glyphs {
-        origin: Point::new(px + 12, py + 78),
-        frac_x: 0.0,
-        glyphs: shaper.shape(vault_line, 14),
-        color: Color::rgb(0x50, 0x50, 0x50),
-        style: FontStyle::REGULAR,
-    });
-    if vault_locked {
-        // Masked passphrase entry: type + Enter while the panel is open.
-        let mask = "\u{2022}".repeat(input_chars);
-        list.push(DisplayItem::Glyphs {
-            origin: Point::new(px + 12, py + 104),
-            frac_x: 0.0,
-            glyphs: shaper.shape(&format!("passphrase: {mask}_"), 14),
-            color: Color::BLACK,
-            style: FontStyle::REGULAR,
-        });
-        list.push(DisplayItem::Glyphs {
-            origin: Point::new(px + 12, py + 126),
-            frac_x: 0.0,
-            glyphs: shaper.shape("(type, then Enter to unlock)", 12),
-            color: Color::rgb(0x80, 0x80, 0x80),
-            style: FontStyle::REGULAR,
-        });
-    }
-    if let Some(msg) = vault_msg {
-        list.push(DisplayItem::Glyphs {
-            origin: Point::new(px + 12, py + 150),
-            frac_x: 0.0,
-            glyphs: shaper.shape(msg, 14),
-            color: Color::rgb(0x90, 0x30, 0x30),
-            style: FontStyle::REGULAR,
-        });
-    }
-    // A glyph's origin.y is the TOP of the text box, so a label is vertically
-    // centered in an `h`-tall row at `y + (h - px) / 2` — the same formula the
-    // toolbar buttons use. (The old `+ 16` was a baseline-style offset that left
-    // the 14px label hanging below the 22px row.)
-    let row_label_dy = (settings_cookies_rect(size).h as i32 - 14) / 2;
-    // Entry point to the cookie inspector.
-    let cr = settings_cookies_rect(size);
-    list.push(DisplayItem::Rect {
-        rect: cr,
-        color: Color::rgb(0xE6, 0xEE, 0xF6),
-    });
-    list.push(DisplayItem::Glyphs {
-        origin: Point::new(cr.x + 8, cr.y + row_label_dy),
-        frac_x: 0.0,
-        glyphs: shaper.shape("manage cookies  >", 14),
-        color: Color::rgb(0x20, 0x40, 0x70),
-        style: FontStyle::REGULAR,
-    });
-    // Performance HUD toggle.
-    let tr = settings_timers_rect(size);
-    list.push(DisplayItem::Rect {
-        rect: tr,
-        color: Color::rgb(0xE6, 0xEE, 0xF6),
-    });
-    list.push(DisplayItem::Glyphs {
-        origin: Point::new(tr.x + 8, tr.y + row_label_dy),
-        frac_x: 0.0,
-        glyphs: shaper.shape(
-            if hud_on {
-                "performance HUD: on"
-            } else {
-                "performance HUD: off"
-            },
-            14,
-        ),
-        color: Color::rgb(0x20, 0x40, 0x70),
-        style: FontStyle::REGULAR,
-    });
-    raster.rasterize(&list.scaled(scale), fb);
 }
 
 /// One pipeline-stage benchmark result.
@@ -6371,24 +6476,32 @@ mod tests {
     }
 
     #[test]
-    fn settings_row_labels_stay_inside_their_highlight_boxes() {
-        // Regression: a glyph's origin.y is the TOP of the text, so a 14px label
-        // in an `h`-tall clickable row must sit at `(h - 14)/2`, not the old `+16`
-        // baseline-style offset that pushed it below the box. Paint the overlay
-        // and assert the strip just below each row's highlight box is blank — no
-        // label ink spilled out the bottom.
+    fn settings_row_labels_stay_inside_their_rows() {
+        // Each row's two-line label (title + muted subtitle) must sit inside its
+        // rounded box. Paint the real panel with the real rasterizer and assert
+        // the strip just below each control row carries no dark label ink — only
+        // the panel's light surface (and its faint border).
         let size = Size::new(800, 650);
         let mut fb = Framebuffer::new(size);
         fb.clear(Color::WHITE);
         let text = TextEngine::new();
-        paint_settings_overlay(&mut fb, size, &text, &text, true, 3, None, false, 1.0);
-        for row in [settings_cookies_rect(size), settings_timers_rect(size)] {
-            let below = (row.y + row.h as i32) as u32;
-            for y in below..below + 5 {
-                for x in (row.x as u32)..(row.x as u32 + row.w) {
+        let model = SettingsModel {
+            vault_locked: true,
+            passphrase_len: 3,
+            vault_msg: None,
+            hud_on: false,
+            images_on: false,
+        };
+        text.rasterize(&SettingsPanel::paint(size, &text, &model), &mut fb);
+        let lay = SettingsPanel::layout(size, &model);
+        for row in [lay.cookies_row, lay.images_row, lay.hud_row] {
+            // Start two pixels below the row (clearing its 1px border ring).
+            let below = (row.y + row.h as i32) as u32 + 2;
+            for y in below..below + 4 {
+                for x in (row.x as u32 + 4)..(row.x as u32 + row.w - 4) {
                     if let Some(c) = fb.pixel(x, y) {
                         assert!(
-                            c.r > 0xC8 && c.g > 0xC8 && c.b > 0xC8,
+                            c.r > 0xB0 && c.g > 0xB0 && c.b > 0xB0,
                             "label ink spilled below the row box at ({x},{y}): #{:02x}{:02x}{:02x}",
                             c.r,
                             c.g,
@@ -6398,6 +6511,75 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn dev_console_toggles_and_captures_page_console_output() {
+        // F12 opens a read-only drawer that surfaces the page's console.* output
+        // — the "see what the page is doing" inspector the browser was missing.
+        let mut b = loaded(
+            vec![(
+                "https://site.test/",
+                Ok(page(
+                    "https://site.test/",
+                    200,
+                    None,
+                    "<div id='x'>hi</div><script>console.log('hello', 42);</script>",
+                )),
+            )],
+            "https://site.test/",
+        );
+        assert!(!b.console_open, "starts closed");
+        assert!(b.dev_console_toggle(), "F12 opens and asks for a redraw");
+        assert!(b.console_open);
+
+        let lines = b.read_console_entries();
+        assert!(
+            lines.iter().any(|l| l.text.contains("hello 42")),
+            "captured page console output, got {lines:?}"
+        );
+
+        // Painting with the console open produces a full frame without panicking.
+        let fb = b.render_frame(Size::new(800, 600));
+        assert_eq!(fb.size, Size::new(800, 600));
+
+        assert!(b.dev_console_toggle(), "F12 again closes it");
+        assert!(!b.console_open);
+    }
+
+    #[test]
+    fn settings_images_row_toggles_the_policy() {
+        // Clicking the settings "images" row flips the global image policy
+        // between graphical and text-only (and reloads); a real control, not a
+        // greyed-out label.
+        let mut b = loaded(
+            vec![(
+                "https://site.test/",
+                Ok(page("https://site.test/", 200, None, "<p>hi</p>")),
+            )],
+            "https://site.test/",
+        );
+        let _ = b.render_frame(Size::new(800, 650)); // sets last_size
+        assert_eq!(b.image_policy.default, ImageDisplayMode::Graphical);
+
+        b.settings_open = true;
+        let (cx, cy) = {
+            let r = SettingsPanel::layout(b.last_size, &b.settings_model()).images_row;
+            (r.x + r.w as i32 / 2, r.y + r.h as i32 / 2)
+        };
+        assert!(b.pointer_down(cx, cy), "clicking the images row is handled");
+        assert_eq!(
+            b.image_policy.default,
+            ImageDisplayMode::TextOnly,
+            "first click switches to text-only"
+        );
+
+        assert!(b.pointer_down(cx, cy), "row stays live after the toggle");
+        assert_eq!(
+            b.image_policy.default,
+            ImageDisplayMode::Graphical,
+            "second click switches back to graphical"
+        );
     }
 
     #[test]
@@ -7740,7 +7922,8 @@ mod tests {
         let mut b = fake_app(vec![]);
         let fb = b.render_frame(Size::new(400, 300));
         assert_eq!(fb.size, Size::new(400, 300));
-        assert_eq!(fb.pixel(200, 1), Some(Color::rgb(0xEC, 0xEC, 0xEC)));
+        // The toolbar bar is the design-system surface colour; the page below is white.
+        assert_eq!(fb.pixel(200, 1), Some(Color::rgb(0xFB, 0xFC, 0xFD)));
         assert_eq!(fb.pixel(380, 200), Some(Color::WHITE));
     }
 
@@ -8083,6 +8266,79 @@ mod tests {
         b.navigate(url);
         assert!(b.poll(), "page load + fetch cascade drained");
         b
+    }
+
+    #[test]
+    fn wheel_and_keys_scroll_the_page_and_clamp_to_content() {
+        // A page far taller than the viewport becomes scrollable; the offset
+        // clamps to the document bottom and to the top, and a fresh navigation
+        // resets it. Drives the FrameApp scroll seam the winit shell calls.
+        let tall: String = (0..200).map(|i| format!("<p>line {i}</p>")).collect();
+        let mut b = loaded(
+            vec![(
+                "https://site.test/",
+                Ok(page("https://site.test/", 200, None, &tall)),
+            )],
+            "https://site.test/",
+        );
+        // Render at a short viewport so the content overflows it.
+        let _ = b.render_frame(Size::new(400, 300));
+        assert!(b.max_scroll > 0, "tall page overflows the viewport");
+        assert_eq!(b.scroll_y, 0, "starts at the top");
+
+        // Wheel/arrow scroll moves the offset down.
+        assert!(b.scroll_by(48), "scrolling down changes the offset");
+        assert_eq!(b.scroll_y, 48);
+
+        // Can't scroll above the top; a no-op scroll reports no redraw.
+        assert!(b.scroll_by(-1000));
+        assert_eq!(b.scroll_y, 0);
+        assert!(!b.scroll_by(-1000), "already at the top: no redraw");
+
+        // End jumps to the bottom; further downward scroll is clamped there.
+        assert!(b.scroll_to_end(true));
+        assert_eq!(b.scroll_y, b.max_scroll);
+        assert!(!b.scroll_by(1000), "already at the bottom: no redraw");
+
+        // A new navigation resets scroll to the top.
+        b.navigate("https://site.test/");
+        assert!(b.poll(), "reload drained");
+        assert_eq!(b.scroll_y, 0, "navigation resets scroll");
+    }
+
+    #[test]
+    fn scrolled_link_hit_boxes_follow_the_content() {
+        // A link below the fold is clickable after scrolling it into view: its
+        // recorded hit box moves up with the painted content by the scroll offset.
+        let mut body = String::from("<div style='height:1000px'>tall</div>");
+        body.push_str("<a href='https://site.test/target'>go</a>");
+        let mut b = loaded(
+            vec![
+                (
+                    "https://site.test/",
+                    Ok(page("https://site.test/", 200, None, &body)),
+                ),
+                (
+                    "https://site.test/target",
+                    Ok(page("https://site.test/target", 200, None, "arrived")),
+                ),
+            ],
+            "https://site.test/",
+        );
+        let _ = b.render_frame(Size::new(400, 300));
+        let before: Vec<i32> = b.links.iter().map(|l| l.rect.y).collect();
+        assert!(!before.is_empty(), "the page has a link");
+
+        // Scroll down and re-render: the link's window-space y drops by 200.
+        assert!(b.scroll_by(200));
+        let _ = b.render_frame(Size::new(400, 300));
+        let after: Vec<i32> = b.links.iter().map(|l| l.rect.y).collect();
+        assert_eq!(after.len(), before.len());
+        assert_eq!(
+            after[0],
+            before[0] - 200,
+            "hit box tracks the scroll offset"
+        );
     }
 
     #[test]

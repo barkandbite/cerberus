@@ -12,6 +12,57 @@ implement each without re-deriving the investigation.
 
 ---
 
+## ✅ DONE — `flex-basis: auto` must honor the item's `width`
+
+**Landed.** A casual live-browse run surfaced narrow content columns across sites
+(rust-lang.org's hero tagline `A language empowering everyone…` wrapped **one word
+per line**; recurred on Wikipedia/rust-blog intros). Root cause: `flex_base_main`
+resolved `FlexBasis::Auto` to `measure_intrinsic_width` (content), **ignoring the
+item's `width`** — so a `width:70%` flex item (Tachyons `w-70-l`) collapsed toward
+min-content when the row was tight. Per spec `flex-basis:auto` resolves to the used
+`width` when set, else content. Fix: `Auto => resolve_block_width(...).unwrap_or(
+measure_intrinsic_width)`. rust-lang's columns render at width; corpus unchanged
+(mozilla 0.28948→0.28856, bbc/hn/wikipedia/static all identical).
+
+**Known follow-up (deliberately not shipped):** a flex item's `width:%` still
+resolves *twice* — once as the flex basis, once when the item lays its own box in
+the flex-assigned sub — so `width:70%` comes out ~70%-of-70%. Fixing it by setting
+`sub.as_block_once` on flex items (mirroring inline-block/float, so the item fills
+its assigned width) works and is more correct, **but regressed bbc** (0.16180→
+0.16654) — some flex item there legitimately relied on the re-resolve. Needs a
+narrower condition before shipping; the basis fix alone is already a large win.
+
+## ✅ DONE — max-content undercount wrapped content-sized flex/table boxes
+
+**Landed.** mozilla.org was the corpus outlier (RMSE 0.302 vs ~0.13 elsewhere).
+The dominant error was a ~30px **vertical offset** of the whole hero (top/bottom
+edge bands y40–80 and y600–680 dominated a per-row error profile): the nav's
+"About us" link **wrapped to two lines**, inflating the header and shoving the
+page down. Confirmed by injecting `white-space:nowrap` on `.m24-c-menu-title`
+(hero top y122→y99).
+
+Root cause was **not** the `%`/`calc` width first suspected (that resolves fine).
+In `push_piece`, the MEASURE path advances the cursor by **integer** word widths
+(`self.x += w as i32`) — deliberately, to keep `max_x` integer-stable and avoid
+multi-px table-column drift. But real layout advances **fractionally**, so a
+multi-word run's measured max-content was a sub-pixel *short*: the fractional
+inter-word gap remainder carried in `x_frac` was dropped from `max_x`. A
+content-sized flex item (or table cell / float) sized to that max-content is then
+a fraction too narrow, and a just-fitting two-word run wraps.
+
+**Fix (1 line):** in the measure branch, `max_x = max(max_x, x + ceil(x_frac))`.
+Bounded to +1px, so it can't reintroduce the drift the integer advance prevents.
+Isolated on identical cached mirrors: mozilla **0.30188 → 0.28948**, hn unchanged
+(0.12632 → 0.12632 — the feared column drift did not occur), all static pages
+byte-identical. Not unit-tested: the sub-pixel wrap needs real-font run mechanics
+that `cerberus-layout`'s `MonoShaper` (integer advances) can't produce, and the
+crate has no real-font dev-dep; `scripts/parity.sh mozilla` is the guard.
+
+mozilla's remaining deltas are web-font metrics (workstream D) and the decorative
+stepped hero background — both larger, separate efforts.
+
+---
+
 ## Wikipedia portal — remaining deltas
 
 The masthead, centered globe, two-column language grid, CJK, the centered search

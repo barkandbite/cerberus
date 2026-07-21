@@ -1391,16 +1391,22 @@ pub const DOM_MODEL_PRELUDE: &str = r##"
 
     // ---- console (capture, never throw) --------------------------------
     if (!Array.isArray(g.__cerberusConsole)) g.__cerberusConsole = [];
-    function consoleSink() {
-      var parts = [];
-      for (var i = 0; i < arguments.length; i++) {
-        try { parts.push(String(arguments[i])); } catch (e) { parts.push(""); }
-      }
-      try { g.__cerberusConsole.push(parts.join(" ")); } catch (e) {}
+    // Each record is "level\u0002text"; the host splits records on \u0001 and
+    // the level tag on \u0002, so the developer console can colour by severity.
+    // The message still contains the formatted text, so callers that only look
+    // for a substring keep working.
+    function makeSink(level) {
+      return function () {
+        var parts = [];
+        for (var i = 0; i < arguments.length; i++) {
+          try { parts.push(String(arguments[i])); } catch (e) { parts.push(""); }
+        }
+        try { g.__cerberusConsole.push(level + "\u0002" + parts.join(" ")); } catch (e) {}
+      };
     }
     g.console = {
-      log: consoleSink, warn: consoleSink, error: consoleSink,
-      info: consoleSink, debug: consoleSink,
+      log: makeSink("log"), warn: makeSink("warn"), error: makeSink("error"),
+      info: makeSink("info"), debug: makeSink("debug"),
     };
 
     // ---- node model ----------------------------------------------------
@@ -2518,6 +2524,12 @@ pub const DOM_MODEL_PRELUDE: &str = r##"
           "system-ui":1,"ui-serif":1,"ui-sans-serif":1,"ui-monospace":1,"ui-rounded":1,
           "math":1,"emoji":1,"-apple-system":1,"blinkmacsystemfont":1 };
         if (GEN[fam]) return true;
+        // The page's OWN @font-face families are reported "loaded": a real
+        // browser that loaded them answers true, so we do too — we render them
+        // with a metric-compatible bundled face and never fetch the bytes
+        // (ADR-0005). The host injects this list from the page's parsed CSS.
+        var pf = g.__CERBERUS_PAGE_FONTS__;
+        if (pf) { for (var j = 0; j < pf.length; j++) { if (String(pf[j]).toLowerCase() === fam) return true; } }
         var p = g.__CERBERUS_PROFILE__, list = (p && p.fonts) || null;
         if (!list) return true; // no persona wired: don't leak "nothing installed"
         for (var i = 0; i < list.length; i++) { if (String(list[i]).toLowerCase() === fam) return true; }
@@ -2956,7 +2968,13 @@ pub const DOM_MODEL_PRELUDE: &str = r##"
         dispatchEvent: function () { return false; },
       });
     };
-    g.navigator.sendBeacon = function () { return true; };
+    g.navigator.sendBeacon = function (url, data) {
+      // A real beacon is a keep-alive POST; route it through the shared fetch
+      // queue (defined later in the prelude) so telemetry actually goes out and
+      // is observable, instead of silently dropping it.
+      try { if (typeof g.__cerberusBeacon === "function") g.__cerberusBeacon(url, "POST", data != null ? data : ""); } catch (e) {}
+      return true;
+    };
     g.navigator.storage = {
       estimate: function () { return Promise.resolve({ quota: 299977129984, usage: 0 }); },
       persisted: function () { return Promise.resolve(false); },
@@ -3073,6 +3091,266 @@ pub const DOM_MODEL_PRELUDE: &str = r##"
     // it; now() reports elapsed time since the anchor, forced strictly
     // increasing. If Date were ever neutralized we fall back to a fixed
     // plausible epoch and the old counter, still never emitting a zero clock.
+    // ---- Web IDL basics: DOMException, Event/CustomEvent, EventTarget ---
+    // QuickJS ships none of these. They are load-bearing for conformance:
+    // crypto.getRandomValues throws DOMExceptions, real code constructs Events,
+    // and objects like `performance` are EventTargets. Guarded so any native
+    // impl wins.
+    if (typeof g.DOMException !== "function") {
+      var DOM_CODES = {
+        IndexSizeError: 1, HierarchyRequestError: 3, WrongDocumentError: 4,
+        InvalidCharacterError: 5, NoModificationAllowedError: 7, NotFoundError: 8,
+        NotSupportedError: 9, InUseAttributeError: 10, InvalidStateError: 11,
+        SyntaxError: 12, InvalidModificationError: 13, NamespaceError: 14,
+        InvalidAccessError: 15, TypeMismatchError: 17, SecurityError: 18,
+        NetworkError: 19, AbortError: 20, URLMismatchError: 21,
+        QuotaExceededError: 22, TimeoutError: 23, InvalidNodeTypeError: 24,
+        DataCloneError: 25
+      };
+      var DOMExceptionCtor = function DOMException(message, name) {
+        var e = this instanceof DOMExceptionCtor ? this : Object.create(DOMExceptionCtor.prototype);
+        var nm = name === undefined ? "Error" : String(name);
+        var msg = message === undefined ? "" : String(message);
+        Object.defineProperty(e, "message", { value: msg, configurable: true, writable: true });
+        Object.defineProperty(e, "name", { value: nm, configurable: true, writable: true });
+        Object.defineProperty(e, "code", { value: DOM_CODES[nm] || 0, configurable: true, writable: true });
+        var st = ""; try { st = new Error(msg).stack || ""; } catch (x) {}
+        Object.defineProperty(e, "stack", { value: nm + ": " + msg + "\n" + st, configurable: true, writable: true });
+        return e;
+      };
+      DOMExceptionCtor.prototype = Object.create(Error.prototype);
+      DOMExceptionCtor.prototype.constructor = DOMExceptionCtor;
+      DOMExceptionCtor.prototype.name = "Error";
+      DOMExceptionCtor.prototype.message = "";
+      DOMExceptionCtor.prototype.toString = function () { return this.name + ": " + this.message; };
+      g.DOMException = DOMExceptionCtor;
+    }
+    if (typeof g.QuotaExceededError !== "function") {
+      // Modern interface (a DOMException subclass) that
+      // assert_throws_quotaexceedederror and storage/crypto APIs check against.
+      var QEE = function QuotaExceededError(message, options) {
+        var e = this instanceof QEE ? this : Object.create(QEE.prototype);
+        g.DOMException.call(e, message, "QuotaExceededError");
+        var q = (options && options.quota != null) ? Number(options.quota) : null;
+        var r = (options && options.requested != null) ? Number(options.requested) : null;
+        Object.defineProperty(e, "quota", { value: q, configurable: true });
+        Object.defineProperty(e, "requested", { value: r, configurable: true });
+        return e;
+      };
+      QEE.prototype = Object.create(g.DOMException.prototype);
+      QEE.prototype.constructor = QEE;
+      g.QuotaExceededError = QEE;
+    }
+    if (typeof g.Event !== "function") {
+      g.Event = function Event(type, init) {
+        init = init || {};
+        this.type = String(type);
+        this.bubbles = !!init.bubbles; this.cancelable = !!init.cancelable; this.composed = !!init.composed;
+        this.defaultPrevented = false; this.target = null; this.currentTarget = null;
+        this.eventPhase = 0; this.timeStamp = 0; this.isTrusted = false;
+      };
+      g.Event.prototype.preventDefault = function () { if (this.cancelable) this.defaultPrevented = true; };
+      g.Event.prototype.stopPropagation = function () {};
+      g.Event.prototype.stopImmediatePropagation = function () {};
+      g.Event.NONE = 0; g.Event.CAPTURING_PHASE = 1; g.Event.AT_TARGET = 2; g.Event.BUBBLING_PHASE = 3;
+    }
+    if (typeof g.CustomEvent !== "function") {
+      g.CustomEvent = function CustomEvent(type, init) {
+        g.Event.call(this, type, init);
+        this.detail = (init && "detail" in init) ? init.detail : null;
+      };
+      g.CustomEvent.prototype = Object.create(g.Event.prototype);
+      g.CustomEvent.prototype.constructor = g.CustomEvent;
+    }
+    if (typeof g.URLSearchParams !== "function") {
+      var USP = function URLSearchParams(init) {
+        this.__p = [];
+        var self = this;
+        if (typeof init === "string") {
+          var q = init.charAt(0) === "?" ? init.slice(1) : init;
+          if (q) q.split("&").forEach(function (pair) {
+            if (!pair) return;
+            var i = pair.indexOf("=");
+            var k = i < 0 ? pair : pair.slice(0, i);
+            var v = i < 0 ? "" : pair.slice(i + 1);
+            try { self.__p.push([decodeURIComponent(k.replace(/\+/g, " ")), decodeURIComponent(v.replace(/\+/g, " "))]); }
+            catch (e) { self.__p.push([k, v]); }
+          });
+        } else if (init && typeof init.forEach === "function" && !Array.isArray(init)) {
+          init.forEach(function (v, k) { self.__p.push([String(k), String(v)]); });
+        } else if (Array.isArray(init)) {
+          init.forEach(function (e) { self.__p.push([String(e[0]), String(e[1])]); });
+        } else if (init && typeof init === "object") {
+          for (var kk in init) if (Object.prototype.hasOwnProperty.call(init, kk)) self.__p.push([String(kk), String(init[kk])]);
+        }
+      };
+      USP.prototype.append = function (k, v) { this.__p.push([String(k), String(v)]); };
+      USP.prototype.set = function (k, v) {
+        k = String(k); v = String(v); var seen = false;
+        this.__p = this.__p.filter(function (e) { if (e[0] !== k) return true; if (!seen) { e[1] = v; seen = true; return true; } return false; });
+        if (!seen) this.__p.push([k, v]);
+      };
+      USP.prototype.get = function (k) { k = String(k); for (var i = 0; i < this.__p.length; i++) if (this.__p[i][0] === k) return this.__p[i][1]; return null; };
+      USP.prototype.getAll = function (k) { k = String(k); return this.__p.filter(function (e) { return e[0] === k; }).map(function (e) { return e[1]; }); };
+      USP.prototype.has = function (k) { return this.get(String(k)) !== null; };
+      USP.prototype["delete"] = function (k) { k = String(k); this.__p = this.__p.filter(function (e) { return e[0] !== k; }); };
+      USP.prototype.forEach = function (fn, thisArg) { var self = this; this.__p.slice().forEach(function (e) { fn.call(thisArg, e[1], e[0], self); }); };
+      USP.prototype.toString = function () { return this.__p.map(function (e) { return encodeURIComponent(e[0]) + "=" + encodeURIComponent(e[1]); }).join("&"); };
+      g.URLSearchParams = USP;
+    }
+    if (typeof g.URL !== "function") {
+      // A pragmatic URL parser (absolute + relative resolution + special-scheme
+      // origins). Not full-WHATWG (that torture-tests thousands of edge cases),
+      // but correct for the URLs real pages use. `createObjectURL`/`revokeObjectURL`
+      // statics are attached later in the Blob section.
+      var SPECIAL = { "http:": "80", "https:": "443", "ws:": "80", "wss:": "443", "ftp:": "21" };
+      // RFC 3986 remove_dot_segments: resolve "." and ".." in a path.
+      var normPath = function (input) {
+        var output = [];
+        while (input.length) {
+          if (input.slice(0, 3) === "../") input = input.slice(3);
+          else if (input.slice(0, 2) === "./") input = input.slice(2);
+          else if (input.slice(0, 3) === "/./") input = "/" + input.slice(3);
+          else if (input === "/.") input = "/";
+          else if (input.slice(0, 4) === "/../") { input = "/" + input.slice(4); output.pop(); }
+          else if (input === "/..") { input = "/"; output.pop(); }
+          else if (input === "." || input === "..") input = "";
+          else {
+            var seg, rest = input.charAt(0) === "/" ? input.indexOf("/", 1) : input.indexOf("/");
+            seg = rest < 0 ? input : input.slice(0, rest);
+            output.push(seg); input = input.slice(seg.length);
+          }
+        }
+        return output.join("");
+      };
+      // Percent-encode the ASCII path/query encode sets (space, C0, and the
+      // unsafe punctuation browsers escape). Non-ASCII is left as-is (pragmatic).
+      var pctEnc = function (s, unsafe) {
+        return s.replace(/[\x00-\x20\x7f"<>`{}#?]/g, function (ch) {
+          if (unsafe.indexOf(ch) < 0) return ch;
+          var cc = ch.charCodeAt(0);
+          return "%" + (cc < 16 ? "0" : "") + cc.toString(16).toUpperCase();
+        });
+      };
+      var encPath = function (s) { return pctEnc(s, "\x00\x01\x02\x03\x04\x05\x06\x07\x08\x09\x0a\x0b\x0c\x0d\x0e\x0f\x10\x11\x12\x13\x14\x15\x16\x17\x18\x19\x1a\x1b\x1c\x1d\x1e\x1f \x7f\"<>`{}"); };
+      var encQuery = function (s) { return pctEnc(s, "\x00\x01\x02\x03\x04\x05\x06\x07\x08\x09\x0a\x0b\x0c\x0d\x0e\x0f\x10\x11\x12\x13\x14\x15\x16\x17\x18\x19\x1a\x1b\x1c\x1d\x1e\x1f \x7f\"<>#`"); };
+      var __oldURL = (typeof g.URL === "object") ? g.URL : null;
+      var URLCtor = function URL(url, base) {
+        var input = String(url == null ? "" : url).replace(/^[\x00-\x20]+|[\x00-\x20]+$/g, "");
+        var b = null;
+        if (base != null) b = (base && base.__isURL) ? base : new URLCtor(base);
+        var schemeM = /^([a-zA-Z][a-zA-Z0-9+.\-]*):/.exec(input);
+        var scheme = schemeM ? (schemeM[1].toLowerCase() + ":") : null;
+        // A URL is "special" (http/https/ws/wss/ftp) by its own scheme, or by the
+        // base's when the input is scheme-relative. Special URLs treat \ as /.
+        var special = scheme ? !!SPECIAL[scheme] : (b ? !!SPECIAL[b.protocol] : false);
+        if (special) input = input.replace(/\\/g, "/");
+
+        var abs;
+        if (scheme) {
+          // Special same-scheme relative ("http:foo" against an http base):
+          // resolve against the base rather than treating it as opaque.
+          if (special && b && scheme === b.protocol && input.charAt(scheme.length) !== "/") {
+            input = input.slice(scheme.length);
+          } else {
+            abs = input;
+          }
+        }
+        if (abs == null) {
+          if (b == null) throw new TypeError("Failed to construct 'URL': Invalid URL");
+          if (input.slice(0, 2) === "//") abs = b.protocol + input;
+          else if (b.__opaque) {
+            // Opaque base (mailto:/data:/blob:…): don't fabricate an authority.
+            if (input === "") abs = b.protocol + b.pathname + b.search;
+            else if (input.charAt(0) === "#") abs = b.protocol + b.pathname + b.search + input;
+            else if (input.charAt(0) === "?") abs = b.protocol + b.pathname + input;
+            else abs = b.protocol + input;
+          } else if (input === "") abs = b.protocol + "//" + b.__auth + b.pathname + b.search;
+          else if (input.charAt(0) === "/") abs = b.protocol + "//" + b.__auth + input;
+          else if (input.charAt(0) === "?") abs = b.protocol + "//" + b.__auth + b.pathname + input;
+          else if (input.charAt(0) === "#") abs = b.protocol + "//" + b.__auth + b.pathname + b.search + input;
+          else {
+            var dir = b.pathname.slice(0, b.pathname.lastIndexOf("/") + 1);
+            abs = b.protocol + "//" + b.__auth + (dir || "/") + input;
+          }
+        }
+        var pm = /^([a-zA-Z][a-zA-Z0-9+.\-]*:)(\/\/([^\/?#]*))?([^?#]*)(\?[^#]*)?(#.*)?$/.exec(abs);
+        if (!pm) throw new TypeError("Failed to construct 'URL': Invalid URL");
+        this.__isURL = true;
+        this.protocol = pm[1].toLowerCase();
+        var hasAuthority = pm[2] != null;
+        this.__opaque = !hasAuthority;
+        var authority = pm[3] || "";
+        var at = authority.lastIndexOf("@");
+        var userinfo = at >= 0 ? authority.slice(0, at) : "";
+        var hostport = at >= 0 ? authority.slice(at + 1) : authority;
+        var ci = userinfo.indexOf(":");
+        this.username = userinfo ? (ci >= 0 ? userinfo.slice(0, ci) : userinfo) : "";
+        this.password = (userinfo && ci >= 0) ? userinfo.slice(ci + 1) : "";
+        if (hostport.charAt(0) === "[") { var rb = hostport.indexOf("]"); this.hostname = hostport.slice(0, rb + 1).toLowerCase(); this.port = hostport.slice(rb + 2) || ""; }
+        else { var c = hostport.lastIndexOf(":"); if (c >= 0) { this.hostname = hostport.slice(0, c).toLowerCase(); this.port = hostport.slice(c + 1); } else { this.hostname = hostport.toLowerCase(); this.port = ""; } }
+        // Numeric-normalize the port (drop leading zeros) then drop it if it is
+        // the scheme's default.
+        if (this.port !== "") { var pn = parseInt(this.port, 10); this.port = isNaN(pn) ? "" : String(pn); }
+        if (this.port && SPECIAL[this.protocol] === this.port) this.port = "";
+        this.host = this.hostname + (this.port ? ":" + this.port : "");
+        this.__auth = (userinfo ? userinfo + "@" : "") + this.host;
+        this.pathname = hasAuthority ? encPath(normPath(pm[4] || "/")) : (pm[4] || "");
+        this.search = encQuery(pm[5] || "");
+        this.hash = pm[6] || "";
+        this.searchParams = new g.URLSearchParams(this.search);
+        if (this.protocol === "blob:") {
+          try { this.origin = new URLCtor(this.pathname).origin; } catch (e) { this.origin = "null"; }
+        } else {
+          this.origin = (SPECIAL[this.protocol] && this.host) ? (this.protocol + "//" + this.host) : "null";
+        }
+        this.href = hasAuthority
+          ? this.protocol + "//" + this.__auth + this.pathname + this.search + this.hash
+          : this.protocol + this.pathname + this.search + this.hash;
+      };
+      URLCtor.prototype.toString = function () { return this.href; };
+      URLCtor.prototype.toJSON = function () { return this.href; };
+      if (__oldURL) { for (var __uk in __oldURL) { try { URLCtor[__uk] = __oldURL[__uk]; } catch (e) {} } }
+      g.URL = URLCtor;
+    }
+    if (typeof g.EventTarget !== "function") {
+      g.EventTarget = function EventTarget() { this.__ls = Object.create(null); };
+      g.EventTarget.prototype.addEventListener = function (type, fn, opts) {
+        if (typeof fn !== "function" && !(fn && typeof fn.handleEvent === "function")) return;
+        type = String(type); if (!this.__ls) this.__ls = Object.create(null);
+        var cap = !!(opts && (opts === true || opts.capture));
+        var list = (this.__ls[type] = this.__ls[type] || []);
+        // DOM "add an event listener" step 4: identical (callback, capture) is a
+        // no-op — don't register duplicates.
+        for (var i = 0; i < list.length; i++) if (list[i].fn === fn && list[i].capture === cap) return;
+        list.push({ fn: fn, once: !!(opts && opts.once), capture: cap });
+      };
+      g.EventTarget.prototype.removeEventListener = function (type, fn, opts) {
+        type = String(type); var a = this.__ls && this.__ls[type]; if (!a) return;
+        var cap = !!(opts && (opts === true || opts.capture));
+        for (var i = a.length - 1; i >= 0; i--) if (a[i].fn === fn && a[i].capture === cap) a.splice(i, 1);
+      };
+      g.EventTarget.prototype.dispatchEvent = function (ev) {
+        var a = this.__ls && this.__ls[ev && ev.type];
+        if (ev) { ev.target = this; ev.currentTarget = this; ev.eventPhase = 2; }
+        if (a) {
+          var copy = a.slice();
+          for (var i = 0; i < copy.length; i++) {
+            var l = copy[i];
+            // Skip a listener removed by an earlier one during this dispatch.
+            if (a.indexOf(l) < 0) continue;
+            var isHE = l.fn && typeof l.fn.handleEvent === "function";
+            var h = isHE ? l.fn.handleEvent : l.fn;
+            try { h.call(isHE ? l.fn : this, ev); } catch (x) {}
+            if (l.once) { var j = a.indexOf(l); if (j >= 0) a.splice(j, 1); }
+          }
+        }
+        // DOM "dispatch" final steps: clear currentTarget / eventPhase.
+        if (ev) { ev.currentTarget = null; ev.eventPhase = 0; }
+        return !(ev && ev.defaultPrevented);
+      };
+    }
+
     (function () {
       var __rawNow = (typeof Date === "function" && Date.now) ? Date.now() : 0;
       var __hasClock = __rawNow > 1000000000000;
@@ -3112,6 +3390,11 @@ pub const DOM_MODEL_PRELUDE: &str = r##"
         setResourceTimingBufferSize: function () {},
         toJSON: function () { return {}; },
       };
+      // Performance is an EventTarget (WPT hr-time checks event dispatch works).
+      window.performance.__ls = Object.create(null);
+      window.performance.addEventListener = g.EventTarget.prototype.addEventListener;
+      window.performance.removeEventListener = g.EventTarget.prototype.removeEventListener;
+      window.performance.dispatchEvent = g.EventTarget.prototype.dispatchEvent;
     })();
     // TextEncoder / TextDecoder — real UTF-8 (QuickJS may ship none). Anti-bot
     // payloads are encoded/decoded with these; a throwing or absent impl breaks
@@ -3156,15 +3439,46 @@ pub const DOM_MODEL_PRELUDE: &str = r##"
       };
     }
     if (typeof g.TextDecoder !== "function") {
-      g.TextDecoder = function (label) {
+      g.TextDecoder = function (label, options) {
         this.encoding = label ? String(label).toLowerCase() : "utf-8";
-        this.fatal = false; this.ignoreBOM = false;
+        this.fatal = !!(options && options.fatal);
+        this.ignoreBOM = !!(options && options.ignoreBOM);
       };
       g.TextDecoder.prototype.decode = function (buf) {
         if (buf == null) return "";
+        // Accept a Uint8Array, any ArrayBufferView (honouring its offset/length),
+        // or a bare ArrayBuffer.
         var bytes = (buf instanceof Uint8Array) ? buf
-          : (buf && buf.buffer) ? new Uint8Array(buf.buffer) : new Uint8Array(buf);
-        var out = "", i = 0, n = bytes.length;
+          : (buf && buf.buffer && typeof buf.byteOffset === "number")
+            ? new Uint8Array(buf.buffer, buf.byteOffset, buf.byteLength)
+            : new Uint8Array(buf);
+        var enc = this.encoding;
+        if (enc === "utf-16le" || enc === "utf-16" || enc === "utf-16be") {
+          var le = (enc !== "utf-16be");
+          var s = "", k = 0, m = bytes.length;
+          var first = true, lead = 0;
+          while (k + 1 < m) {
+            var unit = le ? (bytes[k] | (bytes[k + 1] << 8)) : ((bytes[k] << 8) | bytes[k + 1]);
+            k += 2;
+            // Strip a leading BOM (U+FEFF) unless ignoreBOM is set.
+            if (first) { first = false; if (!this.ignoreBOM && unit === 0xFEFF) continue; }
+            if (lead) {
+              if (unit >= 0xDC00 && unit <= 0xDFFF) { s += String.fromCharCode(lead, unit); lead = 0; continue; }
+              // Pending lead with no trail → U+FFFD, then reprocess this unit.
+              s += "�"; lead = 0;
+            }
+            if (unit >= 0xD800 && unit <= 0xDBFF) { lead = unit; }
+            else if (unit >= 0xDC00 && unit <= 0xDFFF) { s += "�"; } // lone trail surrogate
+            else { s += String.fromCharCode(unit); }
+          }
+          if (lead) s += "�";          // unpaired lead at end
+          if (k < m) s += "�";         // dangling odd byte
+          return s;
+        }
+        // utf-8: strip a leading BOM (EF BB BF) unless ignoreBOM is set.
+        var start = 0;
+        if (!this.ignoreBOM && bytes.length >= 3 && bytes[0] === 0xEF && bytes[1] === 0xBB && bytes[2] === 0xBF) start = 3;
+        var out = "", i = start, n = bytes.length;
         while (i < n) {
           var b0 = bytes[i++];
           if (b0 < 0x80) {
@@ -3657,7 +3971,7 @@ pub const DOM_MODEL_PRELUDE: &str = r##"
         var b2 = i < s.length ? s.charCodeAt(i++) : NaN;
         var b3 = i < s.length ? s.charCodeAt(i++) : NaN;
         if (b1 > 255 || (b2 === b2 && b2 > 255) || (b3 === b3 && b3 > 255)) {
-          throw new Error("btoa: string contains characters outside of the Latin1 range");
+          throw new g.DOMException("The string to be encoded contains characters outside of the Latin1 range.", "InvalidCharacterError");
         }
         var e1 = b1 >> 2;
         var e2 = ((b1 & 3) << 4) | (b2 === b2 ? b2 >> 4 : 0);
@@ -3670,13 +3984,18 @@ pub const DOM_MODEL_PRELUDE: &str = r##"
       return out;
     };
     g.atob = function (input) {
+      // WHATWG forgiving-base64: strip ASCII whitespace, then remove AT MOST two
+      // trailing '=' and ONLY when the length is a multiple of 4; a length ≡ 1
+      // (mod 4) fails, and any surviving '=' (or non-alphabet char) fails via the
+      // -1 lookup below. Stripping all padding unconditionally would wrongly
+      // decode "ab=", "====", etc.
       var s = String(input).replace(/[ \t\n\f\r]/g, "");
-      if (s.length % 4 === 1) throw new Error("atob: invalid base64 length");
-      s = s.replace(/=+$/, "");
+      if (s.length % 4 === 0) s = s.replace(/={1,2}$/, "");
+      if (s.length % 4 === 1) throw new g.DOMException("The string to be decoded is not correctly encoded.", "InvalidCharacterError");
       var out = "", bits = 0, buffer = 0;
       for (var i = 0; i < s.length; i++) {
         var idx = B64.indexOf(s.charAt(i));
-        if (idx === -1) throw new Error("atob: invalid base64 character");
+        if (idx === -1) throw new g.DOMException("The string to be decoded is not correctly encoded.", "InvalidCharacterError");
         buffer = (buffer << 6) | idx;
         bits += 6;
         if (bits >= 8) { bits -= 8; out += String.fromCharCode((buffer >> bits) & 0xff); }
@@ -3699,11 +4018,37 @@ pub const DOM_MODEL_PRELUDE: &str = r##"
       var __seedLo = (typeof g.__FARBLE_LO === "number") ? (g.__FARBLE_LO >>> 0) : 0x9e3779b9;
       var __cs = ((__seedHi ^ __seedLo ^ 0x9e3779b9) >>> 0) || 0x2545F491;
       var __crypto = g.crypto || {};
+      var __INT_VIEWS = {
+        Int8Array: 1, Uint8Array: 1, Uint8ClampedArray: 1, Int16Array: 1,
+        Uint16Array: 1, Int32Array: 1, Uint32Array: 1, BigInt64Array: 1, BigUint64Array: 1
+      };
       __crypto.getRandomValues = function (a) {
+        // WHATWG: only integer typed arrays are allowed; Float*/DataView reject
+        // with TypeMismatchError, and > 65536 bytes with QuotaExceededError.
+        // Use the [[TypedArrayName]] tag (not constructor.name) so subclasses
+        // of an integer view — whose constructor name differs — are accepted.
+        var tag = Object.prototype.toString.call(a);
+        var kind = (tag.slice(0, 8) === "[object " && tag.charAt(tag.length - 1) === "]")
+          ? tag.slice(8, -1) : "";
+        if (!a || !(kind in __INT_VIEWS)) {
+          throw new g.DOMException("The provided ArrayBufferView is not an integer-typed view", "TypeMismatchError");
+        }
+        if (a.byteLength > 65536) {
+          // Per spec this QuotaExceededError leaves quota/requested null (they
+          // are meaningful for storage quotas, not the entropy cap).
+          throw new g.QuotaExceededError(
+            "The ArrayBufferView's byte length (" + a.byteLength + ") exceeds the number of bytes of entropy available (65536)");
+        }
+        var big = (kind === "BigInt64Array" || kind === "BigUint64Array");
         for (var i = 0; i < a.length; i++) {
           __cs ^= __cs << 13; __cs ^= __cs >>> 17; __cs ^= __cs << 5; __cs >>>= 0;
-          a[i] = (a.BYTES_PER_ELEMENT === 1) ? (__cs & 0xff)
-               : (a.BYTES_PER_ELEMENT === 2) ? (__cs & 0xffff) : (__cs >>> 0);
+          if (big) {
+            __cs ^= __cs << 13; __cs ^= __cs >>> 17; __cs ^= __cs << 5; __cs >>>= 0;
+            a[i] = BigInt(__cs >>> 0);
+          } else {
+            a[i] = (a.BYTES_PER_ELEMENT === 1) ? (__cs & 0xff)
+                 : (a.BYTES_PER_ELEMENT === 2) ? (__cs & 0xffff) : (__cs >>> 0);
+          }
         }
         return a;
       };
@@ -4083,6 +4428,199 @@ pub const DOM_MODEL_PRELUDE: &str = r##"
       this.status = 0;
     };
     g.XMLHttpRequest = XMLHttpRequest;
+
+    // ---- Blob + object URLs + Worker + Image + WebSocket ----------------
+    // Speed-first, single-thread shims. Modern sites (and anti-bot sensors)
+    // routinely offload work to a Blob-backed Worker, or beacon telemetry via
+    // `new Image().src` / `navigator.sendBeacon`. A real Worker runs off-thread;
+    // we run its code synchronously in-realm and route `postMessage` both ways
+    // through the existing timer queue. Network from a Worker or a beacon reuses
+    // the page's fetch queue + sealed jar, so it stays first-party and consented.
+    (function () {
+      // Fire-and-forget request onto the shared fetch queue (beacons: no caller
+      // awaits the response). Reuses the same drain + sealed jar as fetch/XHR.
+      function beacon(url, method, body) {
+        try {
+          var id = g.__cerberusFetchId++;
+          g.__cerberusFetchQueue.push({
+            id: id, url: String(url), method: method || "GET",
+            headers: [], body: body != null ? String(body) : ""
+          });
+          g.__cerberusFetchPending[id] = { resolve: function () {}, reject: function () {} };
+          return id;
+        } catch (e) { return -1; }
+      }
+      g.__cerberusBeacon = beacon;
+
+      if (typeof g.Blob !== "function") {
+        g.Blob = function (parts, opts) {
+          this.__parts = [];
+          if (parts && parts.length) for (var i = 0; i < parts.length; i++) this.__parts.push(String(parts[i]));
+          this.type = (opts && opts.type) ? String(opts.type) : "";
+          var n = 0; for (var j = 0; j < this.__parts.length; j++) n += this.__parts[j].length;
+          this.size = n;
+        };
+        g.Blob.prototype.slice = function () { return new g.Blob(this.__parts, { type: this.type }); };
+        g.Blob.prototype.text = function () { return Promise.resolve(this.__parts.join("")); };
+        g.Blob.prototype.arrayBuffer = function () {
+          var s = this.__parts.join(""), buf = new ArrayBuffer(s.length), v = new Uint8Array(buf);
+          for (var i = 0; i < s.length; i++) v[i] = s.charCodeAt(i) & 0xff;
+          return Promise.resolve(buf);
+        };
+      }
+
+      // object URLs: map blob: URLs back to their Blob so Worker() reads source.
+      var __blobs = Object.create(null), __blobSeq = 1;
+      if (!g.URL) g.URL = {};
+      if (typeof g.URL.createObjectURL !== "function") {
+        g.URL.createObjectURL = function (blob) {
+          var origin = (g.location && g.location.origin) || "null";
+          var id = "blob:" + origin + "/cerberus-" + (__blobSeq++);
+          __blobs[id] = blob;
+          return id;
+        };
+        g.URL.revokeObjectURL = function (id) { delete __blobs[String(id)]; };
+      }
+      function blobSource(u) {
+        var b = __blobs[String(u)];
+        return b && b.__parts ? b.__parts.join("") : null;
+      }
+
+      if (typeof g.Worker !== "function") {
+        g.Worker = function (scriptUrl) {
+          var outer = this;
+          outer.onmessage = null; outer.onerror = null; outer.onmessageerror = null;
+          outer.__ls = { message: [], error: [] };
+          outer.addEventListener = function (t, fn) { if (outer.__ls[t]) outer.__ls[t].push(fn); };
+          outer.removeEventListener = function (t, fn) { var a = outer.__ls[t]; if (a) { var i = a.indexOf(fn); if (i >= 0) a.splice(i, 1); } };
+          outer.terminate = function () { outer.__dead = true; };
+
+          var scope = { onmessage: null, name: "", __ls: { message: [], error: [] } };
+          scope.self = scope;
+          // Give the scope a WorkerGlobalScope/DedicatedWorkerGlobalScope identity
+          // so code that branches on `self instanceof DedicatedWorkerGlobalScope`
+          // (e.g. the WPT testharness, and real libraries feature-detecting the
+          // worker context) takes the worker path.
+          scope.WorkerGlobalScope = function WorkerGlobalScope() {};
+          scope.DedicatedWorkerGlobalScope = function DedicatedWorkerGlobalScope() {};
+          scope.DedicatedWorkerGlobalScope.prototype = Object.create(scope.WorkerGlobalScope.prototype);
+          try { Object.setPrototypeOf(scope, scope.DedicatedWorkerGlobalScope.prototype); } catch (e) {}
+          scope.location = g.location; scope.navigator = g.navigator;
+          scope.setTimeout = g.setTimeout; scope.clearTimeout = g.clearTimeout;
+          scope.setInterval = g.setInterval; scope.clearInterval = g.clearInterval;
+          scope.queueMicrotask = g.queueMicrotask;
+          scope.fetch = g.fetch; scope.XMLHttpRequest = g.XMLHttpRequest;
+          scope.crypto = g.crypto; scope.atob = g.atob; scope.btoa = g.btoa;
+          scope.TextEncoder = g.TextEncoder; scope.TextDecoder = g.TextDecoder;
+          scope.performance = g.performance; scope.Blob = g.Blob; scope.URL = g.URL;
+          // Web IDL constructors a worker exposes on `self` — code (and the WPT
+          // testharness) reaches them via `self.X`, and they must be the SAME
+          // objects the real global throws/constructs so `instanceof` holds.
+          scope.DOMException = g.DOMException; scope.QuotaExceededError = g.QuotaExceededError;
+          scope.Event = g.Event; scope.CustomEvent = g.CustomEvent; scope.EventTarget = g.EventTarget;
+          scope.addEventListener = function (t, fn) { if (scope.__ls[t]) scope.__ls[t].push(fn); };
+          scope.removeEventListener = function (t, fn) { var a = scope.__ls[t]; if (a) { var i = a.indexOf(fn); if (i >= 0) a.splice(i, 1); } };
+          scope.close = function () { scope.__dead = true; };
+          // Run `source` in the worker scope: bare globals resolve to `self`
+          // (via `with (this)`), which is the invariant real worker code and
+          // test harnesses rely on (they assign their API onto `self`).
+          function runInScope(source) {
+            var f = new Function(
+              "self", "postMessage", "importScripts", "addEventListener", "removeEventListener",
+              "close", "location", "navigator", "setTimeout", "clearTimeout", "setInterval",
+              "clearInterval", "queueMicrotask", "fetch", "XMLHttpRequest", "crypto", "atob",
+              "btoa", "TextEncoder", "TextDecoder", "performance", "Blob", "URL",
+              "with (this) {\n" + source + "\n}");
+            return f.call(scope, scope, scope.postMessage, scope.importScripts, scope.addEventListener,
+              scope.removeEventListener, scope.close, scope.location, scope.navigator, scope.setTimeout,
+              scope.clearTimeout, scope.setInterval, scope.clearInterval, scope.queueMicrotask, scope.fetch,
+              scope.XMLHttpRequest, scope.crypto, scope.atob, scope.btoa, scope.TextEncoder, scope.TextDecoder,
+              scope.performance, scope.Blob, scope.URL);
+          }
+          // importScripts: synchronous script loading. Real workers hit the
+          // network here; our arch avoids sync network, so resolve from a
+          // prefetched cache (host- or test-populated `__cerberusScriptCache`).
+          // Unknown scripts are recorded for diagnostics and skipped.
+          scope.importScripts = function () {
+            for (var i = 0; i < arguments.length; i++) {
+              var u = String(arguments[i]);
+              (g.__cerberusWorkerImports = g.__cerberusWorkerImports || []).push(u);
+              var cache = g.__cerberusScriptCache;
+              var s = cache ? (cache[u] || cache[u.replace(/^.*\/\/[^/]+/, "")]) : null;
+              if (s != null) runInScope(s);
+            }
+          };
+          function deliver(target, ls, data) {
+            if (target && target.__dead) return;
+            g.setTimeout(function () {
+              var ev = { data: data, type: "message" };
+              var h = target.onmessage; if (typeof h === "function") { try { h.call(target, ev); } catch (e) {} }
+              ls.message.forEach(function (fn) { try { fn.call(target, ev); } catch (e) {} });
+            }, 0);
+          }
+          scope.postMessage = function (data) { deliver(outer, outer.__ls, data); };  // worker -> main
+          outer.postMessage = function (data) { deliver(scope, scope.__ls, data); };   // main -> worker
+
+          var src = blobSource(scriptUrl);
+          if (src == null) {
+            // Not a blob URL — try the prefetched script cache (real workers are
+            // often `new Worker('/path.js')`), else record and give up.
+            var c = g.__cerberusScriptCache;
+            src = c ? (c[String(scriptUrl)] || c[String(scriptUrl).replace(/^.*\/\/[^/]+/, "")]) : null;
+            if (src == null) { (g.__cerberusWorkerScripts = g.__cerberusWorkerScripts || []).push(String(scriptUrl)); return; }
+          }
+          try {
+            runInScope(src);
+          } catch (e) {
+            g.setTimeout(function () {
+              var ev = { type: "error", message: String(e), error: e };
+              if (typeof outer.onerror === "function") { try { outer.onerror(ev); } catch (_) {} }
+              outer.__ls.error.forEach(function (fn) { try { fn(ev); } catch (_) {} });
+            }, 0);
+          }
+        };
+      }
+
+      if (typeof g.Image !== "function") {
+        g.Image = function (w, h) {
+          var self = this;
+          self.width = w || 0; self.height = h || 0;
+          self.naturalWidth = 0; self.naturalHeight = 0;
+          self.complete = false; self.onload = null; self.onerror = null;
+          var _src = "";
+          Object.defineProperty(self, "src", {
+            configurable: true, enumerable: true,
+            get: function () { return _src; },
+            set: function (v) {
+              _src = String(v);
+              // An <img> load is a GET; route non-data beacons like the network
+              // does so sensor pixel beacons actually go out and are observable.
+              if (_src && _src.indexOf("data:") !== 0) g.__cerberusBeacon(_src, "GET", null);
+              self.complete = true;
+              g.setTimeout(function () { if (typeof self.onload === "function") { try { self.onload({ type: "load" }); } catch (e) {} } }, 0);
+            }
+          });
+        };
+      }
+
+      if (typeof g.WebSocket !== "function") {
+        g.WebSocket = function (url, protocols) {
+          var self = this;
+          self.url = String(url); self.readyState = 0; // CONNECTING
+          self.onopen = null; self.onmessage = null; self.onerror = null; self.onclose = null;
+          self.protocol = protocols ? String([].concat(protocols)[0]) : "";
+          self.bufferedAmount = 0; self.extensions = "";
+          self.send = function () {};
+          self.addEventListener = function () {};
+          self.removeEventListener = function () {};
+          self.close = function () { self.readyState = 3; if (typeof self.onclose === "function") { try { self.onclose({ type: "close", code: 1000, wasClean: true }); } catch (e) {} } };
+          // Report open so feature-detection passes; no messages arrive (a live
+          // socket to the sensor is out of scope for this speed-first shim).
+          g.setTimeout(function () { self.readyState = 1; if (typeof self.onopen === "function") { try { self.onopen({ type: "open" }); } catch (e) {} } }, 0);
+        };
+        g.WebSocket.CONNECTING = 0; g.WebSocket.OPEN = 1; g.WebSocket.CLOSING = 2; g.WebSocket.CLOSED = 3;
+      }
+    })();
 
     // ---- serialize: JS tree -> wire JSON -------------------------------
     g.__cerberusSerializeDOM = function () {
