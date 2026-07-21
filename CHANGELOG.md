@@ -5,6 +5,8 @@ browser is pre-1.0; this is the first tagged preview.
 
 ## [Unreleased]
 
+## [0.0.14] - 2026-07-21
+
 ### Fixed
 - **Flex columns no longer collapse to one word per line.** `flex-basis: auto`
   now resolves to a flex item's explicit `width` (per spec) instead of ignoring
