@@ -2207,6 +2207,7 @@ fn event_loop_caps_runaway_settimeout_recursion() {
     let budget = EventLoopBudget {
         max_tasks: 50,
         max_virtual_ms: 60_000,
+        max_wall_ms: 0,
     };
     let stats = run_event_loop(engine.as_mut(), realm, budget).expect("loop");
     assert_eq!(stats.tasks_run, 50, "ran exactly the cap");
@@ -2234,6 +2235,7 @@ fn event_loop_caps_setinterval_by_virtual_clock() {
     let budget = EventLoopBudget {
         max_tasks: 10_000,
         max_virtual_ms: 5_000,
+        max_wall_ms: 0,
     };
     let stats = run_event_loop(engine.as_mut(), realm, budget).expect("loop");
     assert_eq!(

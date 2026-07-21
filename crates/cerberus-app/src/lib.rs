@@ -1610,6 +1610,11 @@ trait PageLoader {
     fn try_recv(&mut self) -> Option<Done>;
     /// Receive a waker to notify the UI when a result is ready.
     fn set_waker(&mut self, waker: Arc<dyn Waker>);
+    /// Re-post a wake so the app is polled again soon, even without a new job
+    /// completing. `poll()` uses this to yield to the OS message pump mid-drain
+    /// (so a burst of results can't freeze the UI) and resume on the next tick.
+    /// Default no-op for test loaders that drain synchronously.
+    fn wake(&self) {}
 }
 
 /// The production loader: a worker thread owning the network client.
@@ -1714,6 +1719,11 @@ impl PageLoader for NetLoader {
     }
     fn set_waker(&mut self, waker: Arc<dyn Waker>) {
         *self.waker.locked() = Some(waker);
+    }
+    fn wake(&self) {
+        if let Some(w) = self.waker.locked().clone() {
+            w.wake();
+        }
     }
 }
 
@@ -2619,6 +2629,13 @@ pub struct BrowserApp {
 /// Beyond this we stop following script reloads to avoid a spin loop.
 const SCRIPT_NAV_CAP: u32 = 4;
 
+/// How long a single `poll()` may spend processing completed jobs (each of which
+/// can run page JS synchronously) before yielding to the OS message pump and
+/// re-waking to continue. Well under the ~5 s at which desktop platforms flag a
+/// window "Not Responding", so even a page that unblocks dozens of trackers stays
+/// interactive while its work drains across successive frames.
+const POLL_SLICE: std::time::Duration = std::time::Duration::from_millis(48);
+
 impl BrowserApp {
     /// Create a browser on the default heads, showing `cerberus:home`.
     pub fn new() -> Self {
@@ -3400,7 +3417,7 @@ impl BrowserApp {
         if rejected_sync {
             let realm = RealmId(self.heads.active().id.0);
             if let Ok(engine) = self.heads.engine() {
-                let _ = run_event_loop(engine, realm, EventLoopBudget::default());
+                let _ = run_event_loop(engine, realm, EventLoopBudget::interactive());
             }
             self.reconcile_realm();
         }
@@ -3453,7 +3470,7 @@ impl BrowserApp {
                     let _ = reject_fetch(engine, realm, id, message);
                 }
             }
-            let _ = run_event_loop(engine, realm, EventLoopBudget::default());
+            let _ = run_event_loop(engine, realm, EventLoopBudget::interactive());
         }
         self.reconcile_realm();
         self.pump_fetches();
@@ -3770,7 +3787,7 @@ impl BrowserApp {
                 Err(e) if trace => eprintln!("[trace]   script ERROR: {url}: {e:?}"),
                 _ => {}
             }
-            let _ = run_event_loop(engine, realm, EventLoopBudget::default());
+            let _ = run_event_loop(engine, realm, EventLoopBudget::interactive());
         }
         // The script may have set document.cookie, mutated the DOM, or queued a
         // fetch/navigation — persist, re-read, and pump, exactly like a settled
@@ -4843,7 +4860,25 @@ impl FrameApp for BrowserApp {
             self.queue_consent_prompt(event);
             redraw = true;
         }
-        while let Some(done) = self.loader.try_recv() {
+        // Process completed jobs under a wall-clock budget instead of draining the
+        // whole queue in one pass. Each job may run page JS synchronously (a
+        // settled fetch or an external `<script>`), so a flood of them — e.g. the
+        // trackers unblocked by approving a site's third-party access — would
+        // otherwise run back-to-back on the UI thread and starve the OS message
+        // pump long enough to show "Not Responding". We take a ~48 ms slice, then
+        // yield; if the queue still has work, re-wake so the loop resumes on the
+        // next tick with a serviced pump in between (the per-drain wall cap in
+        // `EventLoopBudget::interactive()` bounds any single job the same way).
+        let deadline = Instant::now() + POLL_SLICE;
+        let mut yielded_early = false;
+        loop {
+            if Instant::now() >= deadline {
+                yielded_early = true;
+                break;
+            }
+            let Some(done) = self.loader.try_recv() else {
+                break;
+            };
             redraw |= match done {
                 Done::Page {
                     id,
@@ -4857,6 +4892,13 @@ impl FrameApp for BrowserApp {
                 } => self.handle_subresource(url, bytes, elapsed),
                 Done::Fetch { id, result } => self.handle_fetch(id, result),
             };
+        }
+        // Broke on the time budget with (possibly) more queued: come back soon so
+        // the remaining jobs drain across several serviced frames rather than one
+        // frozen burst. A spurious re-wake (queue actually empty) just costs one
+        // no-op poll, so this always terminates.
+        if yielded_early {
+            self.loader.wake();
         }
         redraw
     }
