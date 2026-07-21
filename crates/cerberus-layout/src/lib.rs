@@ -5099,8 +5099,14 @@ mod tests {
         let xs: Vec<i32> = points.iter().map(|p| p.x).collect();
         let ys: Vec<i32> = points.iter().map(|p| p.y).collect();
         let (x0, y0) = (xs[0], ys[0]);
-        assert_eq!(xs.iter().map(|x| x - x0).collect::<Vec<_>>(), vec![0, 400, 400, 0]);
-        assert_eq!(ys.iter().map(|y| y - y0).collect::<Vec<_>>(), vec![0, 0, 84, 120]);
+        assert_eq!(
+            xs.iter().map(|x| x - x0).collect::<Vec<_>>(),
+            vec![0, 400, 400, 0]
+        );
+        assert_eq!(
+            ys.iter().map(|y| y - y0).collect::<Vec<_>>(),
+            vec![0, 0, 84, 120]
+        );
     }
 
     #[test]

@@ -3072,10 +3072,13 @@ mod tests {
             ]
         );
         // A non-polygon clip form leaves no fill shape.
-        let inset = CssEngine::new().style(&parse_html(
-            "<div style='clip-path:inset(0 0 0 0)'>x</div>",
-        ));
-        assert!(first(&inset.root, "div").unwrap().style.clip_polygon.is_none());
+        let inset =
+            CssEngine::new().style(&parse_html("<div style='clip-path:inset(0 0 0 0)'>x</div>"));
+        assert!(first(&inset.root, "div")
+            .unwrap()
+            .style
+            .clip_polygon
+            .is_none());
     }
 
     #[test]
