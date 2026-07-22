@@ -38,8 +38,8 @@ use cerberus_paint::Framebuffer;
 use cerberus_types::{Color, FontStyle};
 use skrifa::instance::{LocationRef, Size};
 use skrifa::outline::{
-    DrawSettings, Engine, HintingInstance, HintingOptions, OutlineGlyphCollection, OutlinePen,
-    SmoothMode, Target,
+    DrawSettings, Engine, HintingInstance, HintingOptions, OutlineGlyph, OutlineGlyphCollection,
+    OutlinePen, SmoothMode, Target,
 };
 use skrifa::GlyphId;
 
@@ -47,18 +47,71 @@ use skrifa::GlyphId;
 /// outline; matches the framebuffer scale of anything we draw).
 const MAX_GLYPH_RASTER: usize = 4096;
 
+/// Sub-pixel x positions cached per pixel. The outline is grid-fit vertically
+/// (integer baseline) but positioned at a fractional pen x, so its coverage
+/// depends on that fraction. Quantizing to 1/64 px keeps the render visually
+/// identical to exact positioning (≤1/128 px shift, far below perception or the
+/// AA measurement floor) while making the key discrete — and crucially, a page
+/// re-rasterized on scroll hits every glyph at the *same* fraction, so the cache
+/// is a full hit frame-to-frame.
+const SUBPX: u32 = 64;
+
+/// Upper bound on the rendered-glyph cache before it's dropped wholesale. Glyph
+/// bitmaps are tiny (a 16 px glyph is ~200 B), so this holds many thousands of
+/// (face, glyph, size, sub-pixel) variants — well past any page's working set —
+/// while staying a small fraction of the 64 MB memory budget.
+const GLYPH_CACHE_CAP_BYTES: usize = 4 * 1024 * 1024;
+
+/// One rasterized glyph's coverage, positioned relative to its pen. `cov` is a
+/// `w`×`h` row-major alpha map (0–255); `rel_x`/`rel_y` place its top-left
+/// relative to `(floor(pen_x), baseline)`. Style (bold smear / italic shear) and
+/// colour are applied at blit time, so this is the plain, reusable glyph.
+struct CachedGlyph {
+    w: u16,
+    h: u16,
+    rel_x: i32,
+    rel_y: i32,
+    cov: Vec<u8>,
+}
+
+/// Rendered-glyph cache with a byte budget. On overflow it clears wholesale
+/// (simpler than eviction and cheap — the working set repopulates in one frame).
+struct GlyphCache {
+    map: HashMap<(usize, u16, u32, u16), CachedGlyph>,
+    bytes: usize,
+}
+
+impl GlyphCache {
+    fn insert(&mut self, key: (usize, u16, u32, u16), val: CachedGlyph) {
+        let sz = val.cov.len() + 48;
+        if self.bytes + sz > GLYPH_CACHE_CAP_BYTES {
+            self.map.clear();
+            self.bytes = 0;
+        }
+        self.bytes += sz;
+        self.map.insert(key, val);
+    }
+}
+
 /// A cache of per-(face, px) skrifa [`HintingInstance`]s. Building one runs the
 /// font's `fpgm`/`prep` programs, so it is done once per face+size, not per
 /// glyph. `None` records a face+size whose hinting failed to initialize (the
-/// caller falls back to the unhinted `ab_glyph` path).
+/// caller falls back to the unhinted `ab_glyph` path). Also holds the
+/// rendered-glyph cache so a repaint (the common case: scrolling) blits cached
+/// coverage instead of re-outlining and re-rasterizing every glyph.
 pub(crate) struct HintCache {
     cache: Mutex<HashMap<(usize, u32), Option<HintingInstance>>>,
+    glyphs: Mutex<GlyphCache>,
 }
 
 impl HintCache {
     pub(crate) fn new() -> Self {
         Self {
             cache: Mutex::new(HashMap::new()),
+            glyphs: Mutex::new(GlyphCache {
+                map: HashMap::new(),
+                bytes: 0,
+            }),
         }
     }
 
@@ -81,62 +134,121 @@ impl HintCache {
         residual: FontStyle,
         target: &mut Framebuffer,
     ) -> bool {
+        // Quantize the sub-pixel pen x so the glyph's coverage has a discrete
+        // key; a fraction that rounds up to a whole pixel carries into the
+        // integer part.
+        let mut floor_x = pen_x.floor();
+        let mut bucket = ((pen_x - floor_x) * SUBPX as f32).round() as u32;
+        if bucket >= SUBPX {
+            bucket -= SUBPX;
+            floor_x += 1.0;
+        }
+        let floor_xi = floor_x as i32;
+        let base_i = baseline.round() as i32;
+        let key = (face_key, id, px, bucket as u16);
+
+        // Fast path: this glyph, at this size and sub-pixel phase, is already
+        // rasterized — blit its cached coverage. On a repaint (the common case:
+        // scrolling re-rasterizes the same glyphs at the same fractions) this is
+        // the whole win: a blit instead of re-outlining and re-filling.
+        {
+            let glyphs = self.glyphs.lock().unwrap_or_else(|e| e.into_inner());
+            if let Some(cached) = glyphs.map.get(&key) {
+                Self::blit(cached, target, floor_xi, base_i, baseline, color, residual);
+                return true;
+            }
+        }
+
+        // Miss: build (or reuse) the face+size hinter and rasterize the glyph at
+        // this bucket's canonical sub-pixel position, then cache it.
         let Some(glyph) = outlines.get(GlyphId::new(id as u32)) else {
             return false;
         };
-        let mut cache = self.cache.lock().unwrap_or_else(|e| e.into_inner());
-        let hinter = cache.entry((face_key, px)).or_insert_with(|| {
-            HintingInstance::new(
-                outlines,
-                Size::new(px.max(1) as f32),
-                LocationRef::default(),
-                HintingOptions {
-                    // Auto-hinter in light mode — the measured best match for
-                    // the reference Chrome (see module docs); light means
-                    // vertical-only grid-fitting, horizontal spacing
-                    // untouched (FT_LOAD_TARGET_LIGHT).
-                    engine: Engine::Auto(None),
-                    target: Target::Smooth {
-                        mode: SmoothMode::Light,
-                        // FreeType always renders as if this is set.
-                        symmetric_rendering: true,
-                        // FreeType behaves as if disabled; advances stay
-                        // rustybuzz's regardless (only outlines change).
-                        preserve_linear_metrics: false,
+        let canon_pen_x = floor_x + bucket as f32 / SUBPX as f32;
+        let cached = {
+            let mut cache = self.cache.lock().unwrap_or_else(|e| e.into_inner());
+            let hinter = cache.entry((face_key, px)).or_insert_with(|| {
+                HintingInstance::new(
+                    outlines,
+                    Size::new(px.max(1) as f32),
+                    LocationRef::default(),
+                    HintingOptions {
+                        // Auto-hinter in light mode — the measured best match for
+                        // the reference Chrome (see module docs); light means
+                        // vertical-only grid-fitting, horizontal spacing
+                        // untouched (FT_LOAD_TARGET_LIGHT).
+                        engine: Engine::Auto(None),
+                        target: Target::Smooth {
+                            mode: SmoothMode::Light,
+                            // FreeType always renders as if this is set.
+                            symmetric_rendering: true,
+                            // FreeType behaves as if disabled; advances stay
+                            // rustybuzz's regardless (only outlines change).
+                            preserve_linear_metrics: false,
+                        },
                     },
-                },
-            )
-            .ok()
-        });
-        let Some(hinter) = hinter.as_ref() else {
-            return false;
+                )
+                .ok()
+            });
+            let Some(hinter) = hinter.as_ref() else {
+                return false;
+            };
+            match Self::compute_coverage(&glyph, hinter, canon_pen_x, baseline) {
+                Some(c) => c,
+                None => return false,
+            }
         };
 
+        Self::blit(&cached, target, floor_xi, base_i, baseline, color, residual);
+        self.glyphs
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(key, cached);
+        true
+    }
+
+    /// Rasterize one glyph's hinted outline into a reusable coverage map
+    /// positioned at `canon_pen_x` / `baseline`. Colour and residual style are
+    /// deliberately NOT applied here — they're per-draw and would break sharing.
+    /// `None` means the outline couldn't be drawn (caller falls back to the
+    /// unhinted path); an empty glyph (a space) is `Some` with a zero-size map.
+    fn compute_coverage(
+        glyph: &OutlineGlyph<'_>,
+        hinter: &HintingInstance,
+        canon_pen_x: f32,
+        baseline: f32,
+    ) -> Option<CachedGlyph> {
         // Collect the hinted outline in device space: skrifa draws y-up around
         // the glyph origin; the framebuffer is y-down with the origin at
-        // (pen_x, baseline).
-        let mut pen = DevicePen::new(pen_x, baseline);
+        // (canon_pen_x, baseline).
+        let mut pen = DevicePen::new(canon_pen_x, baseline);
         if glyph
             .draw(DrawSettings::hinted(hinter, false), &mut pen)
             .is_err()
         {
-            return false;
+            return None;
         }
+        let empty = CachedGlyph {
+            w: 0,
+            h: 0,
+            rel_x: 0,
+            rel_y: 0,
+            cov: Vec::new(),
+        };
         if pen.cmds.is_empty() {
-            return true; // empty glyph (space): nothing to ink, but handled
+            return Some(empty); // empty glyph (space): nothing to ink
         }
 
-        // Pixel grid the outline touches (conservative: includes control
-        // points). Coverage is computed on this local grid then blended.
+        // Pixel grid the outline touches (conservative: includes control points).
         let x0 = pen.min_x.floor();
         let y0 = pen.min_y.floor();
         let w = (pen.max_x.ceil() - x0) as usize;
         let h = (pen.max_y.ceil() - y0) as usize;
         if w == 0 || h == 0 {
-            return true;
+            return Some(empty);
         }
         if w > MAX_GLYPH_RASTER || h > MAX_GLYPH_RASTER {
-            return false;
+            return None;
         }
         let mut ras = CoverageRaster::new(w, h);
         let t = |p: (f32, f32)| rpoint(p.0 - x0, p.1 - y0);
@@ -177,29 +289,59 @@ impl HintCache {
             ras.draw_line(t(cur), t(start));
         }
 
-        // Blend, synthesizing any residual style exactly as the unhinted path
-        // does: faux-bold smears one pixel right, faux-italic shears scanlines
-        // above the baseline (~12°).
-        let slant = if residual.italic { 0.21f32 } else { 0.0 };
-        let (ox, oy) = (x0 as i32, y0 as i32);
+        // Bake coverage into a compact u8 alpha map (the ≤1/255 quantization is
+        // imperceptible and standard for glyph caches).
+        let mut cov = vec![0u8; w * h];
         ras.for_each_pixel_2d(|gx, gy, coverage| {
-            if coverage <= 0.0 {
-                return;
+            if coverage > 0.0 {
+                cov[gy as usize * w + gx as usize] = (coverage.min(1.0) * 255.0).round() as u8;
             }
-            let y = oy + gy as i32;
+        });
+        Some(CachedGlyph {
+            w: w as u16,
+            h: h as u16,
+            rel_x: x0 as i32 - canon_pen_x.floor() as i32,
+            rel_y: y0 as i32 - baseline.round() as i32,
+            cov,
+        })
+    }
+
+    /// Composite a cached coverage map into `target` with `(floor_xi, base_i)` as
+    /// the pen origin, synthesizing residual style exactly as the raster path
+    /// does: faux-bold smears one pixel right, faux-italic shears scanlines above
+    /// the baseline (~12°).
+    fn blit(
+        cached: &CachedGlyph,
+        target: &mut Framebuffer,
+        floor_xi: i32,
+        base_i: i32,
+        baseline: f32,
+        color: Color,
+        residual: FontStyle,
+    ) {
+        let (w, h) = (cached.w as i32, cached.h as i32);
+        let slant = if residual.italic { 0.21f32 } else { 0.0 };
+        for gy in 0..h {
+            let y = base_i + cached.rel_y + gy;
             let shear = if slant != 0.0 {
                 (slant * (baseline - y as f32)) as i32
             } else {
                 0
             };
-            let x = ox + gx as i32 + shear;
-            let cov = coverage.min(1.0);
-            target.blend_pixel(x, y, color, cov);
-            if residual.bold {
-                target.blend_pixel(x + 1, y, color, cov);
+            let row = (gy * w) as usize;
+            for gx in 0..w {
+                let c = cached.cov[row + gx as usize];
+                if c == 0 {
+                    continue;
+                }
+                let x = floor_xi + cached.rel_x + gx + shear;
+                let cov = c as f32 / 255.0;
+                target.blend_pixel(x, y, color, cov);
+                if residual.bold {
+                    target.blend_pixel(x + 1, y, color, cov);
+                }
             }
-        });
-        true
+        }
     }
 }
 
