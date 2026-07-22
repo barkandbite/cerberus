@@ -5,6 +5,24 @@ browser is pre-1.0; this is the first tagged preview.
 
 ## [Unreleased]
 
+## [0.0.16] - 2026-07-22
+
+Continues the speed pass from 0.0.15.
+
+### Fixed
+- **Repainting (scrolling) is much cheaper: glyphs are cached, not re-outlined.**
+  0.0.15 stopped re-laying-out the page on every redraw; this stops re-drawing
+  every glyph from scratch. Each glyph's rasterized coverage is cached by (face,
+  glyph, size, sub-pixel-x) and blitted on subsequent paints, so scrolling a
+  text page no longer re-tessellates and re-fills every visible character each
+  frame — it composites cached bitmaps. Output is pixel-identical to before (a
+  direct A/B on a bold/italic/multi-size text page measured 0 pixels changed over
+  tolerance, RMSE 0.0008): sub-pixel x is quantized to 1/64 px (≤1/128 px shift,
+  below the anti-aliasing measurement floor) and — because a page re-rasterized on
+  scroll hits every glyph at the same fraction — the cache is a full hit
+  frame-to-frame. The cache is bounded (4 MB, keyed over the bundled fonts so
+  switching identities adds nothing) and well within the memory budget.
+
 ## [0.0.15] - 2026-07-21
 
 Speed & stability release, from real-world Windows testing that surfaced a hard

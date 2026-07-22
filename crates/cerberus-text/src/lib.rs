@@ -1311,6 +1311,48 @@ mod tests {
     }
 
     #[test]
+    fn glyph_cache_renders_identically_warm_and_cold() {
+        // The rendered-glyph cache must be byte-identical whether a glyph is
+        // rasterized fresh or blitted from cache — otherwise scrolling (which
+        // re-renders the same glyphs from a warm cache) would shimmer against a
+        // first paint. Uses a fractional origin so the sub-pixel path is exercised.
+        let engine = TextEngine::new();
+        let glyphs = engine.shape("Reading gy 123", 16);
+        let render = |e: &TextEngine| {
+            let mut list = DisplayList::new();
+            list.push(DisplayItem::Glyphs {
+                origin: Point::new(3, 30),
+                frac_x: 0.37,
+                glyphs: glyphs.clone(),
+                color: Color::BLACK,
+                style: FontStyle::REGULAR,
+            });
+            let mut fb = Framebuffer::new(Size::new(200, 48));
+            fb.clear(Color::WHITE);
+            e.rasterize(&list, &mut fb);
+            fb
+        };
+        let warm_first = render(&engine); // cold miss → populates the cache
+        let warm_second = render(&engine); // fully warm → all blits
+        assert_eq!(
+            warm_first.rgba, warm_second.rgba,
+            "a warm re-render (the scroll case) must match the first paint"
+        );
+        let cold = render(&TextEngine::new());
+        assert_eq!(
+            cold.rgba, warm_first.rgba,
+            "cold-cache render must equal warm — a blit reproduces a fresh raster"
+        );
+        assert!(
+            warm_first
+                .rgba
+                .chunks_exact(4)
+                .any(|p| p[..3] != [255, 255, 255]),
+            "expected glyph ink"
+        );
+    }
+
+    #[test]
     fn icon_font_has_the_toolbar_glyphs() {
         let e = TextEngine::new();
         // users (MIRC), reload, gear, back, forward, close, eye, trash — all
