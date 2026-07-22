@@ -1610,6 +1610,11 @@ trait PageLoader {
     fn try_recv(&mut self) -> Option<Done>;
     /// Receive a waker to notify the UI when a result is ready.
     fn set_waker(&mut self, waker: Arc<dyn Waker>);
+    /// Re-post a wake so the app is polled again soon, even without a new job
+    /// completing. `poll()` uses this to yield to the OS message pump mid-drain
+    /// (so a burst of results can't freeze the UI) and resume on the next tick.
+    /// Default no-op for test loaders that drain synchronously.
+    fn wake(&self) {}
 }
 
 /// The production loader: a worker thread owning the network client.
@@ -1714,6 +1719,11 @@ impl PageLoader for NetLoader {
     }
     fn set_waker(&mut self, waker: Arc<dyn Waker>) {
         *self.waker.locked() = Some(waker);
+    }
+    fn wake(&self) {
+        if let Some(w) = self.waker.locked().clone() {
+            w.wake();
+        }
     }
 }
 
@@ -2519,6 +2529,19 @@ pub struct BrowserApp {
     /// `Done::Sub` response can be routed to the JS engine and executed against
     /// the page realm rather than decoded as an image.
     pending_scripts: std::collections::HashSet<String>,
+    /// Cached layout for the current page, keyed by the content-area size it was
+    /// laid out at. Layout is a full styled-tree walk that re-shapes every text
+    /// run (rustybuzz) — by far the dominant per-frame cost — so we reuse this
+    /// result for any redraw that doesn't change layout (the big one: scrolling,
+    /// which only shifts the display list). Invalidated via `layout_dirty` on any
+    /// state change, and by the size key on resize; scale and scroll are applied
+    /// after layout so they never invalidate it.
+    layout_cache: Option<(Size, cerberus_layout::LaidOut)>,
+    /// Set whenever something that affects layout changed (page load, DOM/script
+    /// mutation, image/stylesheet arrival, typing, a click). Cleared when
+    /// `render_frame` recomputes. Scrolling deliberately leaves it unset so a
+    /// scroll reuses the cache instead of re-laying-out the whole page.
+    layout_dirty: bool,
     history: Vec<String>,
     index: usize,
     document: Document,
@@ -2618,6 +2641,13 @@ pub struct BrowserApp {
 /// gestures. A cookie-gated reload needs one; a couple covers redirect chains.
 /// Beyond this we stop following script reloads to avoid a spin loop.
 const SCRIPT_NAV_CAP: u32 = 4;
+
+/// How long a single `poll()` may spend processing completed jobs (each of which
+/// can run page JS synchronously) before yielding to the OS message pump and
+/// re-waking to continue. Well under the ~5 s at which desktop platforms flag a
+/// window "Not Responding", so even a page that unblocks dozens of trackers stays
+/// interactive while its work drains across successive frames.
+const POLL_SLICE: std::time::Duration = std::time::Duration::from_millis(48);
 
 impl BrowserApp {
     /// Create a browser on the default heads, showing `cerberus:home`.
@@ -2753,6 +2783,8 @@ impl BrowserApp {
             sheets: ExternalSheets::new(),
             pending_sheets: HashMap::new(),
             pending_scripts: std::collections::HashSet::new(),
+            layout_cache: None,
+            layout_dirty: true,
             history: Vec::new(),
             index: 0,
             document: empty_document(),
@@ -3400,7 +3432,7 @@ impl BrowserApp {
         if rejected_sync {
             let realm = RealmId(self.heads.active().id.0);
             if let Ok(engine) = self.heads.engine() {
-                let _ = run_event_loop(engine, realm, EventLoopBudget::default());
+                let _ = run_event_loop(engine, realm, EventLoopBudget::interactive());
             }
             self.reconcile_realm();
         }
@@ -3453,7 +3485,7 @@ impl BrowserApp {
                     let _ = reject_fetch(engine, realm, id, message);
                 }
             }
-            let _ = run_event_loop(engine, realm, EventLoopBudget::default());
+            let _ = run_event_loop(engine, realm, EventLoopBudget::interactive());
         }
         self.reconcile_realm();
         self.pump_fetches();
@@ -3770,7 +3802,7 @@ impl BrowserApp {
                 Err(e) if trace => eprintln!("[trace]   script ERROR: {url}: {e:?}"),
                 _ => {}
             }
-            let _ = run_event_loop(engine, realm, EventLoopBudget::default());
+            let _ = run_event_loop(engine, realm, EventLoopBudget::interactive());
         }
         // The script may have set document.cookie, mutated the DOM, or queued a
         // fetch/navigation — persist, re-read, and pump, exactly like a settled
@@ -4837,13 +4869,36 @@ impl FrameApp for BrowserApp {
 
     fn poll(&mut self) -> bool {
         let mut redraw = false;
+        // Anything a poll delivers — a loaded page, a mutated DOM, an arrived
+        // image or stylesheet, a script's effect — can change layout, so the
+        // cached layout can't be trusted after one. (Scrolling is the only redraw
+        // that keeps it.)
+        self.layout_dirty = true;
         // Worker-side consent events (cookie capture) surface in the banner.
         let drained: Vec<ConsentEvent> = std::mem::take(self.pending_consent.locked().as_mut());
         for event in drained {
             self.queue_consent_prompt(event);
             redraw = true;
         }
-        while let Some(done) = self.loader.try_recv() {
+        // Process completed jobs under a wall-clock budget instead of draining the
+        // whole queue in one pass. Each job may run page JS synchronously (a
+        // settled fetch or an external `<script>`), so a flood of them — e.g. the
+        // trackers unblocked by approving a site's third-party access — would
+        // otherwise run back-to-back on the UI thread and starve the OS message
+        // pump long enough to show "Not Responding". We take a ~48 ms slice, then
+        // yield; if the queue still has work, re-wake so the loop resumes on the
+        // next tick with a serviced pump in between (the per-drain wall cap in
+        // `EventLoopBudget::interactive()` bounds any single job the same way).
+        let deadline = Instant::now() + POLL_SLICE;
+        let mut yielded_early = false;
+        loop {
+            if Instant::now() >= deadline {
+                yielded_early = true;
+                break;
+            }
+            let Some(done) = self.loader.try_recv() else {
+                break;
+            };
             redraw |= match done {
                 Done::Page {
                     id,
@@ -4857,6 +4912,13 @@ impl FrameApp for BrowserApp {
                 } => self.handle_subresource(url, bytes, elapsed),
                 Done::Fetch { id, result } => self.handle_fetch(id, result),
             };
+        }
+        // Broke on the time budget with (possibly) more queued: come back soon so
+        // the remaining jobs drain across several serviced frames rather than one
+        // frozen burst. A spurious re-wake (queue actually empty) just costs one
+        // no-op poll, so this always terminates.
+        if yielded_early {
+            self.loader.wake();
         }
         redraw
     }
@@ -4892,30 +4954,52 @@ impl FrameApp for BrowserApp {
         // Time layout+paint (M11). The image provider's borrow of `self` is
         // scoped to this block so the timing record (a `&mut self` op) is free.
         let t = Instant::now();
-        let (laid, mut page, scroll_y) = {
-            let provider = StoreImages {
-                base: self.current_url.as_ref(),
-                images: &self.images,
-                policy: &self.image_policy,
+        // (Re)lay out only when something that affects layout actually changed, or
+        // the content area was resized; otherwise reuse the cached tree. Layout is
+        // a full styled-tree walk that re-shapes every text run through rustybuzz —
+        // the dominant per-frame cost — so paying it on every scroll and repaint is
+        // what made the browser feel sluggish. Scale and scroll are applied *after*
+        // layout, so neither invalidates the cache.
+        if self.layout_dirty || self.layout_cache.as_ref().map(|(sz, _)| *sz) != Some(content) {
+            let laid = {
+                let provider = StoreImages {
+                    base: self.current_url.as_ref(),
+                    images: &self.images,
+                    policy: &self.image_policy,
+                };
+                let mut layout = BlockLayout::default();
+                layout.layout(&self.styled, content, &self.text, &provider, &self.forms)
             };
-            let mut layout = BlockLayout::default();
-            let mut laid = layout.layout(&self.styled, content, &self.text, &provider, &self.forms);
-
-            // Clamp the requested scroll to the document height, then shift the
-            // page content up by that offset so the viewport shows a lower slice.
-            // Hit boxes below are placed with the same offset (window coords).
-            let doc_h = cerberus_paint::content_height(&laid.display.items);
-            let max_scroll = (doc_h - content.h as i32).max(0);
-            let scroll_y = self.scroll_y.clamp(0, max_scroll);
-            self.max_scroll = max_scroll;
-            self.scroll_y = scroll_y;
-            cerberus_paint::translate_items(&mut laid.display.items, 0, -scroll_y);
-
-            let mut page = Framebuffer::new(Size::new(su(content.w), su(content.h)));
-            page.clear(canvas_bg);
-            self.text.rasterize(&laid.display.scaled(scale), &mut page);
-            (laid, page, scroll_y)
+            self.layout_cache = Some((content, laid));
+            self.layout_dirty = false;
+        }
+        // Clone the pieces this frame mutates — the display list (shifted by the
+        // scroll offset) and the hit boxes (offset into window space). This clone
+        // is O(items), far cheaper than the layout + text-shaping it replaces when
+        // only the scroll position changed.
+        let (mut display, links_src, fields_src, elements_src) = {
+            let cached = &self.layout_cache.as_ref().unwrap().1;
+            (
+                cached.display.clone(),
+                cached.links.clone(),
+                cached.fields.clone(),
+                cached.elements.clone(),
+            )
         };
+
+        // Clamp the requested scroll to the document height, then shift the page
+        // content up by that offset so the viewport shows a lower slice. Hit boxes
+        // below are placed with the same offset (window coords).
+        let doc_h = cerberus_paint::content_height(&display.items);
+        let max_scroll = (doc_h - content.h as i32).max(0);
+        let scroll_y = self.scroll_y.clamp(0, max_scroll);
+        self.max_scroll = max_scroll;
+        self.scroll_y = scroll_y;
+        cerberus_paint::translate_items(&mut display.items, 0, -scroll_y);
+
+        let mut page = Framebuffer::new(Size::new(su(content.w), su(content.h)));
+        page.clear(canvas_bg);
+        self.text.rasterize(&display.scaled(scale), &mut page);
         self.timings.record("layout+paint", t.elapsed());
 
         // Capture element geometry in content (viewport) coordinates for
@@ -4924,7 +5008,7 @@ impl FrameApp for BrowserApp {
         let geometry: Vec<(u64, Rect)> = if self.node_to_js.is_empty() {
             Vec::new()
         } else {
-            laid.elements
+            elements_src
                 .iter()
                 .filter_map(|e| self.node_to_js.get(&e.node).map(|&js| (js, e.rect)))
                 .map(|(js, mut rect)| {
@@ -4938,8 +5022,7 @@ impl FrameApp for BrowserApp {
 
         // Record link hit-boxes in window coordinates for click handling. The
         // scroll offset moves them with the painted content so clicks land.
-        self.links = laid
-            .links
+        self.links = links_src
             .into_iter()
             .map(|mut l| {
                 l.rect.x += origin.x;
@@ -4949,8 +5032,7 @@ impl FrameApp for BrowserApp {
             .collect();
 
         // Record form-control hit-boxes in window coordinates too.
-        self.form_fields = laid
-            .fields
+        self.form_fields = fields_src
             .into_iter()
             .map(|mut f| {
                 f.rect.x += origin.x;
@@ -4960,8 +5042,7 @@ impl FrameApp for BrowserApp {
             .collect();
 
         // Generic element hit map in window coordinates (M12b dispatch targets).
-        self.elements = laid
-            .elements
+        self.elements = elements_src
             .into_iter()
             .map(|mut e| {
                 e.rect.x += origin.x;
@@ -5099,6 +5180,10 @@ impl FrameApp for BrowserApp {
     }
 
     fn pointer_down(&mut self, x: i32, y: i32) -> bool {
+        // Any click may change layout (focus/submit a form, toggle a panel, run a
+        // script), so invalidate the cached layout — only scrolling keeps it. A
+        // redundant relayout on a no-op click is cheap; a stale frame is not.
+        self.layout_dirty = true;
         if self.insecure_prompt.is_some() {
             if let Some(button) = self.insecure_button {
                 if point_in_rect(button, x, y) {
@@ -5229,6 +5314,10 @@ impl FrameApp for BrowserApp {
     }
 
     fn text_input(&mut self, c: char) -> bool {
+        // Typing into a page field changes what layout renders for it, so the
+        // cached layout no longer holds (the URL box repaints separately, so a
+        // relayout there is just harmless).
+        self.layout_dirty = true;
         // The MIRC panel is read-only (no text entry yet); it swallows typing so
         // keystrokes don't leak to the URL box or page behind it.
         if self.mirc_open {
@@ -5267,6 +5356,7 @@ impl FrameApp for BrowserApp {
     }
 
     fn submit(&mut self) -> bool {
+        self.layout_dirty = true;
         if self.mirc_open {
             return true;
         }
@@ -5291,6 +5381,7 @@ impl FrameApp for BrowserApp {
     }
 
     fn backspace(&mut self) -> bool {
+        self.layout_dirty = true;
         if self.mirc_open {
             return true;
         }
@@ -8304,6 +8395,62 @@ mod tests {
         b.navigate("https://site.test/");
         assert!(b.poll(), "reload drained");
         assert_eq!(b.scroll_y, 0, "navigation resets scroll");
+    }
+
+    #[test]
+    fn scrolling_reuses_the_cached_layout_while_other_input_invalidates_it() {
+        // The perf contract behind "scrolling shouldn't re-run layout": a scroll
+        // keeps the cached layout, but anything that can change layout drops it.
+        let tall: String = (0..200).map(|i| format!("<p>line {i}</p>")).collect();
+        let mut b = loaded(
+            vec![(
+                "https://site.test/",
+                Ok(page("https://site.test/", 200, None, &tall)),
+            )],
+            "https://site.test/",
+        );
+
+        // First paint populates the cache and clears the dirty flag.
+        let _ = b.render_frame(Size::new(400, 300));
+        assert!(!b.layout_dirty, "a render leaves the layout cached");
+        assert!(b.layout_cache.is_some());
+
+        // Scrolling must NOT invalidate the cache — that is the whole point: a
+        // scroll shifts the display list instead of re-shaping every text run.
+        assert!(b.scroll_by(48));
+        assert!(!b.layout_dirty, "scrolling reuses the cached layout");
+
+        // Reuse is correct, not just cheap: a scroll-only frame is pixel-identical
+        // to a forced full relayout at the same offset.
+        let cached = b.render_frame(Size::new(400, 300));
+        b.layout_dirty = true;
+        let fresh = b.render_frame(Size::new(400, 300));
+        for y in 0..300 {
+            for x in 0..400 {
+                assert_eq!(
+                    cached.pixel(x, y),
+                    fresh.pixel(x, y),
+                    "cached scroll frame differs from a full relayout at ({x},{y})"
+                );
+            }
+        }
+
+        // Every non-scroll interaction drops the cache so the next frame relays out.
+        let _ = b.render_frame(Size::new(400, 300));
+        assert!(!b.layout_dirty);
+        b.text_input('x');
+        assert!(b.layout_dirty, "typing invalidates the cached layout");
+
+        let _ = b.render_frame(Size::new(400, 300));
+        b.pointer_down(200, 200);
+        assert!(b.layout_dirty, "a click invalidates the cached layout");
+
+        let _ = b.render_frame(Size::new(400, 300));
+        b.poll();
+        assert!(
+            b.layout_dirty,
+            "an async result invalidates the cached layout"
+        );
     }
 
     #[test]

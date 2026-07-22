@@ -620,6 +620,14 @@ pub struct EventLoopBudget {
     pub max_tasks: u32,
     /// Maximum virtual time, in ms, a task may be due at and still run.
     pub max_virtual_ms: u64,
+    /// Maximum **wall-clock** time, in ms, the drain may run before it yields
+    /// (0 = unbounded). The task/virtual caps guarantee termination but say
+    /// nothing about *real* time: a page whose timers each do heavy synchronous
+    /// work can hold the thread for many seconds inside one drain, which on a
+    /// windowed build starves the OS message pump and shows "Not Responding".
+    /// An interactive caller sets this so a single drain can't freeze the UI;
+    /// a batch/headless caller leaves it 0 to drain fully (ADR-0013).
+    pub max_wall_ms: u64,
 }
 
 impl Default for EventLoopBudget {
@@ -627,6 +635,26 @@ impl Default for EventLoopBudget {
         Self {
             max_tasks: 10_000,
             max_virtual_ms: 60_000,
+            max_wall_ms: 0,
+        }
+    }
+}
+
+impl EventLoopBudget {
+    /// The budget the **windowed** app drains under: bounded in wall-clock so a
+    /// runaway (or merely heavy) page can't hold the UI thread long enough to
+    /// trip the OS "Not Responding" watchdog. The caller re-pumps on the next
+    /// tick, so pending timers still run — just interleaved with a live message
+    /// pump instead of in one multi-second synchronous burst. The task/virtual
+    /// caps are also tightened from the batch defaults since interactivity, not
+    /// completeness, is the goal here.
+    pub fn interactive() -> Self {
+        Self {
+            // Deviate from the batch default by *only* the wall cap, so any page
+            // that drains within 50 ms behaves identically to before — the yield
+            // affects only a drain that would otherwise hog the UI thread.
+            max_wall_ms: 50,
+            ..Self::default()
         }
     }
 }
@@ -640,6 +668,11 @@ pub struct EventLoopStats {
     /// emptying the queue — a page we deliberately stopped (it may still have
     /// pending timers).
     pub hit_task_cap: bool,
+    /// `true` if the drain yielded on [`EventLoopBudget::max_wall_ms`] with tasks
+    /// still pending — the interactive caller should re-pump on a later tick so
+    /// the message loop breathes in between. Distinct from `hit_task_cap` so the
+    /// caller can tell "keep going soon" from "gave up on a runaway page".
+    pub hit_wall_cap: bool,
 }
 
 /// Drain the realm's macrotask queue (timers / rAF / idle) under `budget`,
@@ -657,7 +690,24 @@ pub fn run_event_loop(
 ) -> Result<EventLoopStats, BridgeError> {
     let step = format!("__cerberusStepTimer({})", budget.max_virtual_ms);
     let mut tasks_run = 0u32;
+    // Only consult the wall clock when a real cap is set (0 = unbounded), so the
+    // batch/headless path pays no `Instant::now()` per task and stays fully
+    // deterministic.
+    let deadline = (budget.max_wall_ms > 0)
+        .then(|| std::time::Instant::now() + std::time::Duration::from_millis(budget.max_wall_ms));
     while tasks_run < budget.max_tasks {
+        // Yield the moment we cross the wall-clock budget, before running another
+        // (potentially heavy) task — the caller re-pumps so pending timers still
+        // run, just off the critical path of the UI thread.
+        if let Some(deadline) = deadline {
+            if std::time::Instant::now() >= deadline {
+                return Ok(EventLoopStats {
+                    tasks_run,
+                    hit_task_cap: false,
+                    hit_wall_cap: true,
+                });
+            }
+        }
         match engine.eval(realm, &step) {
             Ok(JsValue::Number(n)) if n >= 1.0 => tasks_run += 1,
             // Empty queue (0) / unexpected value / a stepper throw: stop cleanly.
@@ -665,6 +715,7 @@ pub fn run_event_loop(
                 return Ok(EventLoopStats {
                     tasks_run,
                     hit_task_cap: false,
+                    hit_wall_cap: false,
                 })
             }
             Err(other) => return Err(BridgeError::Js(other)),
@@ -673,6 +724,7 @@ pub fn run_event_loop(
     Ok(EventLoopStats {
         tasks_run,
         hit_task_cap: true,
+        hit_wall_cap: false,
     })
 }
 

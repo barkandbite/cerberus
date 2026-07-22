@@ -2119,10 +2119,16 @@ impl<'a> Ctx<'a> {
             return;
         }
         let text = node.text();
-        let label = if text.trim().is_empty() {
-            node.attr("value").unwrap_or("Button")
+        let trimmed = text.trim();
+        // An empty `<button>` / `<input type=button>` renders as an empty box in a
+        // real browser — icon buttons get their glyph from CSS or client-side JS we
+        // don't run, so their markup arrives childless. Prefer an explicit `value`,
+        // otherwise render it empty rather than stamping the literal word "Button"
+        // (which floated at the top-left of every React site, e.g. target.com).
+        let label = if trimmed.is_empty() {
+            node.attr("value").unwrap_or("")
         } else {
-            text.trim()
+            trimmed
         };
         self.push_button(&node.style, id, label);
     }
@@ -2314,15 +2320,41 @@ impl<'a> Ctx<'a> {
             CONTROL_BORDER
         };
         self.place_box(w, h);
-        self.display.push(DisplayItem::Rect {
-            rect: Rect::new(self.x, self.y, w, h),
-            color: border,
-        });
-        if w > 2 && h > 2 {
-            self.display.push(DisplayItem::Rect {
-                rect: Rect::new(self.x + 1, self.y + 1, w - 2, h - 2),
-                color: fill,
+        // Honor `border-radius` like block boxes do, so a pill-shaped control
+        // (e.g. eBay's rounded search field) draws as a rounded box instead of a
+        // hard-edged rect whose square corners protrude past the intended outline.
+        let radius = style.border_radius;
+        let outer = Rect::new(self.x, self.y, w, h);
+        let inner = Rect::new(
+            self.x + 1,
+            self.y + 1,
+            w.saturating_sub(2),
+            h.saturating_sub(2),
+        );
+        if radius > 0 {
+            self.display.push(DisplayItem::RoundRect {
+                rect: outer,
+                color: border,
+                radius,
             });
+            if w > 2 && h > 2 {
+                self.display.push(DisplayItem::RoundRect {
+                    rect: inner,
+                    color: fill,
+                    radius: radius.saturating_sub(1),
+                });
+            }
+        } else {
+            self.display.push(DisplayItem::Rect {
+                rect: outer,
+                color: border,
+            });
+            if w > 2 && h > 2 {
+                self.display.push(DisplayItem::Rect {
+                    rect: inner,
+                    color: fill,
+                });
+            }
         }
     }
 
