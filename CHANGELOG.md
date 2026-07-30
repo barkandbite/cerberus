@@ -5,7 +5,21 @@ browser is pre-1.0; this is the first tagged preview.
 
 ## [Unreleased]
 
-## [0.0.16] - 2026-07-22
+## [0.0.17] - 2026-07-22
+
+Small correctness + cleanup pass (tool-driven; verified with the parity harness).
+
+### Fixed
+- **`z-index: -1` layers paint behind content, not over it.** Out-of-flow
+  positioned layers were all painted on top of the in-flow content regardless of
+  `z-index`, so a decorative negative-`z-index` layer (a common hero-background
+  pattern) covered the text in front of it. Paint order now follows CSS: negative
+  `z-index` positioned layers render behind the in-flow, non-positioned content;
+  `auto`/`0`/positive stay on top. No corpus parity regression.
+
+### Changed
+- **Dropped an unused dependency** (`cerberus-dom` from `cerberus-taffy`), found
+  with `cargo-machete` — smaller build graph, no behavior change.
 
 Continues the speed pass from 0.0.15.
 
