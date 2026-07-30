@@ -1481,15 +1481,42 @@ impl<'a> Ctx<'a> {
         self.x = self.left;
     }
 
-    /// Sort the out-of-flow layers by `z-index` (then document order) and append
-    /// them after the in-flow content, so they paint on top (ADR-0034).
+    /// Sort the out-of-flow layers by `z-index` (then document order) and splice
+    /// them into the paint order (ADR-0034). Per CSS 2.1 §9.9 / "Elaborate
+    /// description of Stacking Contexts", a positioned layer with a **negative**
+    /// `z-index` paints *behind* the in-flow, non-positioned content, while
+    /// `z-index: auto/0` and positive layers paint *on top*. Splitting at zero
+    /// gets the common case right — a decorative `z-index: -1` layer (e.g. a hero
+    /// background) sitting behind the text instead of covering it — without a full
+    /// per-stacking-context rewrite. In-flow content is painted after the canvas
+    /// background (a page-level clear, not a display item), so prepending the
+    /// negative layers puts them behind that content but still above the page
+    /// background, exactly where `z-index: -1` belongs.
     fn finish_positioned(&mut self) {
         if self.positioned.is_empty() {
             return;
         }
         let mut layers = std::mem::take(&mut self.positioned);
         layers.sort_by(|a, b| a.z.cmp(&b.z).then(a.order.cmp(&b.order)));
-        for layer in layers {
+        let on_top = layers.split_off(layers.partition_point(|l| l.z < 0));
+
+        // Negative-z layers go behind the already-emitted in-flow content.
+        if !layers.is_empty() {
+            let mut behind = Vec::new();
+            for layer in layers {
+                behind.extend(layer.items);
+                // Hit boxes are visual-order-insensitive for the decorative,
+                // non-interactive elements this targets; keep them registered.
+                self.links.extend(layer.links);
+                self.fields.extend(layer.fields);
+                self.elements.extend(layer.elements);
+            }
+            behind.append(&mut self.display.items);
+            self.display.items = behind;
+        }
+
+        // Zero/positive-z layers paint over the in-flow content, in z/doc order.
+        for layer in on_top {
             self.display.items.extend(layer.items);
             self.links.extend(layer.links);
             self.fields.extend(layer.fields);
@@ -5138,6 +5165,58 @@ mod tests {
         assert_eq!(
             ys.iter().map(|y| y - y0).collect::<Vec<_>>(),
             vec![0, 0, 84, 120]
+        );
+    }
+
+    #[test]
+    fn negative_z_index_paints_behind_inflow_content() {
+        // A `z-index: -1` positioned layer (a decorative hero background) must
+        // paint BEHIND the in-flow text, not cover it — its box must be emitted
+        // before the text in the display list (earlier = painted first = behind).
+        let behind = lay(
+            "<div style='position:relative'>\
+               <div style='position:absolute;top:0;left:0;width:200px;height:40px;\
+                    background:#ff0000;z-index:-1'></div>\
+               <span>hello world</span>\
+             </div>",
+            400,
+        );
+        let red = behind.display.items.iter().position(
+            |i| matches!(i, DisplayItem::Rect { color, .. } if *color == Color::rgb(0xff, 0, 0)),
+        );
+        let glyph = behind
+            .display
+            .items
+            .iter()
+            .position(|i| matches!(i, DisplayItem::Glyphs { .. }));
+        let (red, glyph) = (red.expect("red background box"), glyph.expect("text run"));
+        assert!(
+            red < glyph,
+            "z-index:-1 background must paint before (behind) the text; red@{red} text@{glyph}"
+        );
+
+        // Control (same structure — box first, then text): a positive z-index
+        // still paints ON TOP of (after) the text, so the split didn't invert the
+        // normal case.
+        let front = lay(
+            "<div style='position:relative'>\
+               <div style='position:absolute;top:0;left:0;width:200px;height:40px;\
+                    background:#0000ff;z-index:5'></div>\
+               <span>hello world</span>\
+             </div>",
+            400,
+        );
+        let blue = front.display.items.iter().position(
+            |i| matches!(i, DisplayItem::Rect { color, .. } if *color == Color::rgb(0, 0, 0xff)),
+        );
+        let g = front
+            .display
+            .items
+            .iter()
+            .position(|i| matches!(i, DisplayItem::Glyphs { .. }));
+        assert!(
+            blue.expect("blue box") > g.expect("text run"),
+            "a positive z-index still paints on top of the text"
         );
     }
 

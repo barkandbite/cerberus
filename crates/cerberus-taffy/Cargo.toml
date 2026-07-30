@@ -20,7 +20,6 @@ cerberus-style = { path = "../cerberus-style" }
 cerberus-layout = { path = "../cerberus-layout" }
 cerberus-paint = { path = "../cerberus-paint" }
 cerberus-types = { path = "../cerberus-types" }
-cerberus-dom = { path = "../cerberus-dom" }
 # Modular adoption behind the LayoutEngine seam (RENDERING_ARCHITECTURE_PLAN.md,
 # Stage 3): taffy owns block/flex/grid box geometry; we keep inline/text/replaced
 # leaves in cerberus-layout via a measure closure. Its only transitive dep is
