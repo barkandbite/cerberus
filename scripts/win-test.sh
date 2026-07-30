@@ -13,15 +13,22 @@
 #   rustup target add x86_64-pc-windows-gnu
 #   apt-get install gcc-mingw-w64-x86-64 wine64
 #
-# Usage: scripts/win-test.sh [--release]
+# Usage: scripts/win-test.sh [--release] [--gui]
+#   --release  build/verify the release profile (GUI subsystem) instead of debug
+#   --gui      also screenshot the actual GUI under Wine+Xvfb (implies --release;
+#              needs xvfb + imagemagick + x11-utils; see scripts/win-gui-shot.sh)
 set -euo pipefail
 
 PROFILE_DIR=debug
 CARGO_PROFILE=()
-if [[ "${1:-}" == "--release" ]]; then
-  PROFILE_DIR=release
-  CARGO_PROFILE=(--release)
-fi
+GUI=0
+for arg in "$@"; do
+  case "$arg" in
+    --release) PROFILE_DIR=release; CARGO_PROFILE=(--release) ;;
+    --gui)     GUI=1; PROFILE_DIR=release; CARGO_PROFILE=(--release) ;;
+    *) echo "unknown arg: $arg" >&2; exit 2 ;;
+  esac
+done
 
 TARGET=x86_64-pc-windows-gnu
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
@@ -54,5 +61,10 @@ if command -v wine64 >/dev/null 2>&1 || [[ -x /usr/lib/wine/wine64 ]]; then
   rm -rf "$TMP"
 else
   echo "(wine not installed; skipped execution test)"
+fi
+
+if [[ "$GUI" == "1" ]]; then
+  echo "== screenshotting the GUI under Wine+Xvfb =="
+  "$ROOT/scripts/win-gui-shot.sh" "$ROOT/target/win-gui.png"
 fi
 echo "== win-test passed =="

@@ -5,6 +5,14 @@ browser is pre-1.0; this is the first tagged preview.
 
 ## [Unreleased]
 
+### Tooling
+- **Screenshot the actual Windows GUI from Linux.** `scripts/win-gui-shot.sh`
+  (also `scripts/win-test.sh --gui`) cross-builds the release `.exe`, launches
+  the real browser window under Wine on a headless Xvfb display, and saves a
+  cropped PNG of the window — closing much of the "can't see Windows" gap for
+  coarse visual checks. Wine's software raster is not byte-identical to real
+  Windows, so it is for layout / gross-regression checks, not pixel parity.
+
 ## [0.0.19] - 2026-07-30
 
 Windows experience pass — scroll performance and a stray console window.
