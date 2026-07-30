@@ -8340,10 +8340,28 @@ mod tests {
     // ---- Form interactivity ----
 
     /// Load `url` into a fresh app, draining the background fetch.
+    /// Pump `poll()` until quiescent. `poll()` processes completed jobs under a
+    /// wall-clock slice and re-wakes to continue if it yields early (so a burst
+    /// can't freeze the UI, v0.0.15); a real event loop services that re-wake,
+    /// but a test must drain it itself — otherwise on a slow/loaded machine a
+    /// single `poll()` can yield mid-drain and strand work (a Windows CI flake).
+    /// Returns whether any pump did work. Bounded so a genuine hang still fails.
+    fn drain(b: &mut BrowserApp) -> bool {
+        let mut did = false;
+        for _ in 0..10_000 {
+            if b.poll() {
+                did = true;
+            } else {
+                break;
+            }
+        }
+        did
+    }
+
     fn loaded(responses: Vec<(&str, Result<FetchedPage, String>)>, url: &str) -> BrowserApp {
         let mut b = fake_app(responses);
         b.navigate(url);
-        assert!(b.poll(), "page load drained");
+        assert!(drain(&mut b), "page load drained");
         b
     }
 
@@ -8355,7 +8373,7 @@ mod tests {
         let loader = FakeLoader::new(responses).with_fetches(fetches);
         let mut b = BrowserApp::with_loader(Box::new(loader));
         b.navigate(url);
-        assert!(b.poll(), "page load + fetch cascade drained");
+        assert!(drain(&mut b), "page load + fetch cascade drained");
         b
     }
 
