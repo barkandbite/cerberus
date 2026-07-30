@@ -628,6 +628,12 @@ struct Ctx<'a> {
     /// center/justify offsets place content at ~width/2, both wildly inflating the
     /// measured width and corrupting nested sizing (ADR-0038).
     measuring: bool,
+    /// How many `<table>`s deep this flow is (propagated into cell sub-contexts).
+    /// Auto table layout re-measures cell content per level, so nested tables
+    /// compound ~exponentially; beyond a generous cap a table degrades to its
+    /// flowed text so hostile/malformed markup can't hang layout (browsers impose
+    /// a similar nesting limit). Real pages nest tables only a few deep.
+    table_depth: usize,
     /// One-shot: treat the next walked element as a block (the inline-block atom
     /// laid into its own sub gets the full block box model) — ADR-0042.
     as_block_once: bool,
@@ -703,6 +709,7 @@ impl<'a> Ctx<'a> {
             pending_indent: 0,
             cur_picture: None,
             pending_vmargin: 0,
+            table_depth: 0,
         }
     }
 
@@ -773,6 +780,7 @@ impl<'a> Ctx<'a> {
             pending_indent: 0,
             cur_picture: None,
             pending_vmargin: 0,
+            table_depth: 0,
         }
     }
 
@@ -3525,6 +3533,10 @@ impl<'a> Ctx<'a> {
             self.vh,
         );
         sub.measuring = true;
+        // Carry table nesting into the cell so a nested table's own measurement
+        // sees the accumulated depth and the cap can engage (bounds the
+        // otherwise ~exponential re-measure of nested tables).
+        sub.table_depth = self.table_depth;
         let mut fb = FloatBand::new(sub.left, sub.right, sub.y);
         for child in &cell.children {
             match child {
@@ -3543,6 +3555,22 @@ impl<'a> Ctx<'a> {
     fn table(&mut self, node: &StyledNode) {
         self.flush_line();
         self.flush_vmargin();
+        // Bound pathological table nesting (see `table_depth`): beyond the cap,
+        // render this table's text in normal flow instead of the per-level auto
+        // sizing that compounds exponentially and would hang layout.
+        if self.table_depth >= MAX_TABLE_NESTING {
+            let text = node.text();
+            let text = text.trim();
+            if !text.is_empty() {
+                self.x = self.left;
+                self.add_run(text, &node.style, None);
+                self.flush_line();
+            }
+            self.y += TABLE_MARGIN;
+            self.x = self.left;
+            return;
+        }
+        self.table_depth += 1;
         let left = self.left;
         let right = self.right.max(left + 1);
         self.line_align = node.style.text_align;
@@ -3569,6 +3597,7 @@ impl<'a> Ctx<'a> {
         if num_cols == 0 || right - left < num_cols as i32 {
             self.y += TABLE_MARGIN;
             self.x = self.left;
+            self.table_depth -= 1;
             return;
         }
 
@@ -3742,6 +3771,7 @@ impl<'a> Ctx<'a> {
         }
         self.y = row_y + TABLE_MARGIN;
         self.x = self.left;
+        self.table_depth -= 1;
     }
 
     /// Flow one table cell's children into its own rectangle and read back the
@@ -3777,6 +3807,9 @@ impl<'a> Ctx<'a> {
         );
         // Legacy `<center>` block-centering stops here (see `in_cell`).
         sub.in_cell = true;
+        // Carry table nesting into the cell so a nested table increments from
+        // here and the depth cap engages before layout blows up.
+        sub.table_depth = self.table_depth;
 
         let is_header = cell.tag == "th";
         // Headers centre their text; cells take their own alignment — except
@@ -4977,6 +5010,12 @@ const BUTTON_BG: Color = Color::rgb(0xE9, 0xE9, 0xED);
 const CELL_PAD: i32 = 4;
 /// Space left below a table before the next block.
 const TABLE_MARGIN: i32 = 8;
+/// Maximum `<table>` nesting before a table degrades to its flowed text. Auto
+/// table layout re-measures cell content per level (~1.8×/level here), so ~25
+/// nested tables hang layout for tens of seconds — a DoS on hostile or badly
+/// malformed markup. Real pages nest tables only a few deep, so a cap of 12 is
+/// far above anything legitimate while keeping the worst case well under 0.1 s.
+const MAX_TABLE_NESTING: usize = 12;
 /// Table cell border colour.
 const TABLE_BORDER: Color = Color::rgb(0xCC, 0xCC, 0xCC);
 /// Default `<th>` header-cell fill (light grey) when none is set by the cascade.
@@ -5217,6 +5256,31 @@ mod tests {
         assert!(
             blue.expect("blue box") > g.expect("text run"),
             "a positive z-index still paints on top of the text"
+        );
+    }
+
+    #[test]
+    fn deeply_nested_tables_do_not_hang() {
+        // 25 nested tables would compound auto-sizing's per-level cell re-measure
+        // exponentially and hang layout (a DoS on malformed/hostile markup). The
+        // nesting cap degrades tables past the limit to flowed text, so this
+        // returns promptly and still shows the innermost content. (On the
+        // pre-cap engine this test times out.)
+        let mut html = String::new();
+        for _ in 0..25 {
+            html.push_str("<table><tr><td>");
+        }
+        html.push_str("DEEP");
+        for _ in 0..25 {
+            html.push_str("</td></tr></table>");
+        }
+        let out = lay(&html, 400);
+        assert!(
+            out.display
+                .items
+                .iter()
+                .any(|i| matches!(i, DisplayItem::Glyphs { .. })),
+            "a deeply nested table still renders its innermost text"
         );
     }
 
