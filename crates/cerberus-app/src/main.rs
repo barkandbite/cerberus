@@ -12,6 +12,16 @@
 //!   version   Print the version.
 //!   help      Print usage.
 
+// On Windows a console-subsystem binary pops a cmd window whenever the GUI is
+// launched from Explorer (double-click). Cerberus is primarily a windowed
+// browser, so a *release* build uses the GUI subsystem — no stray console. A
+// GUI-subsystem process still inherits redirected stdio, so the headless
+// subcommands (render/diff/bench/mem-gate) keep working under a pipe (CI, shell
+// redirection); only an *interactive* console loses their printed text, and
+// their exit codes — what the CI gates assert on — are unaffected. Debug builds
+// stay on the console subsystem so `cargo run` prints normally during dev.
+#![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
+
 use cerberus_app::{head_switch_rss, render, resident_set_kb, RenderConfig};
 use cerberus_types::{Color, Size};
 use std::process::ExitCode;

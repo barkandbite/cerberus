@@ -7,7 +7,17 @@ browser is pre-1.0; this is the first tagged preview.
 
 ## [0.0.19] - 2026-07-30
 
-Performance pass — scroll cost on long pages.
+Windows experience pass — scroll performance and a stray console window.
+
+### Fixed
+- **No more console window behind the browser on Windows.** The binary was built
+  with the console subsystem, so double-clicking the `.exe` popped a `cmd`
+  window alongside the browser. A *release* build now uses the Windows GUI
+  subsystem (verified on the actual PE header:
+  `IMAGE_SUBSYSTEM_WINDOWS_GUI`); the headless subcommands still work under a
+  pipe (CI, shell redirection) because a GUI process inherits redirected stdio,
+  and their exit codes — what the CI gates assert on — are unchanged. Debug
+  builds stay on the console subsystem so `cargo run` prints normally in dev.
 
 ### Changed
 - **Scrolling a long page no longer re-dispatches the whole document.** The
@@ -20,6 +30,13 @@ Performance pass — scroll cost on long pages.
   cost scales with the viewport. Output is byte-identical (a new test renders a
   tall list with and without the off-screen runs and asserts the visible pixels
   match); clip push/pop are never culled, so the clip stack stays correct.
+
+### Tooling
+- **Windows can now be smoke-tested from Linux** without a Windows machine.
+  `.cargo/config.toml` wires the mingw-w64 linker for the
+  `x86_64-pc-windows-gnu` target, and `scripts/win-test.sh` cross-builds the
+  `.exe`, asserts its PE subsystem, and drives the headless `render` path under
+  Wine. This is how the console-subsystem fix above was verified end to end.
 
 ## [0.0.18] - 2026-07-30
 

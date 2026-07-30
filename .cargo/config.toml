@@ -1,0 +1,16 @@
+# Cross-compilation to Windows from a Linux dev box / sandbox.
+#
+# Cerberus ships a native Windows binary (CI builds the MSVC target on a
+# windows-latest runner). To exercise Windows behaviour *without* Windows —
+# check the PE subsystem, or run the headless subcommands under Wine — build the
+# GNU target here with the mingw-w64 linker:
+#
+#     rustup target add x86_64-pc-windows-gnu
+#     sudo apt-get install gcc-mingw-w64-x86-64          # provides the linker
+#     cargo build --release --target x86_64-pc-windows-gnu -p cerberus-app --bin cerberus-app
+#
+# then verify / run it with scripts/win-test.sh. This section is target-scoped,
+# so it is completely inert for the native Linux build and for CI's MSVC target.
+[target.x86_64-pc-windows-gnu]
+linker = "x86_64-w64-mingw32-gcc-posix"
+ar = "x86_64-w64-mingw32-gcc-ar-posix"
