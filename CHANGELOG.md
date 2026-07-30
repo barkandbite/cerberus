@@ -5,7 +5,25 @@ browser is pre-1.0; this is the first tagged preview.
 
 ## [Unreleased]
 
-## [0.0.17] - 2026-07-22
+## [0.0.18] - 2026-07-30
+
+Robustness pass — found by fuzzing the parsers/layout with pathological input.
+
+### Fixed
+- **Deeply nested tables can no longer hang the browser.** Auto table layout
+  re-measures each cell's content to size columns, so a table nested inside a
+  table inside a table… re-measures ~1.8× more per level — about 25 levels deep
+  (well-formed *or* from unclosed `<table><tr><td>` tag soup) pinned layout for
+  tens of seconds, a denial-of-service on hostile or badly-malformed markup.
+  Table nesting is now capped (12 deep — far beyond any real page); past the cap
+  a table degrades to its flowed text so layout stays bounded (worst case
+  <0.1 s). Real, shallow tables are completely unaffected (every existing table
+  test passes unchanged). Browsers impose a similar nesting limit.
+
+### Known
+- A stylesheet with a pathologically long descendant selector (thousands of
+  combinators, e.g. `div div div …`) can still stall selector matching. Purely
+  synthetic — no real page does this — and tracked as a follow-up.
 
 Small correctness + cleanup pass (tool-driven; verified with the parity harness).
 
