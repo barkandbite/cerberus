@@ -953,11 +953,68 @@ fn draw_shadow(rect: Rect, blur: i32, color: Color, target: &mut Framebuffer) {
     }
 }
 
+/// The vertical `[top, bottom]` device-pixel span an item can ink, or `None`
+/// for the clip primitives (which paint nothing but manage the clip stack, so
+/// they must never be culled). A small margin absorbs anti-aliasing, hinting,
+/// and italic-shear spill so the viewport cull below can never drop a pixel a
+/// draw op would have painted.
+fn paint_vspan(item: &DisplayItem) -> Option<(i32, i32)> {
+    const M: i32 = 2;
+    let (top, bottom) = match item {
+        DisplayItem::Rect { rect, .. }
+        | DisplayItem::RoundRect { rect, .. }
+        | DisplayItem::Gradient { rect, .. }
+        | DisplayItem::Image { rect, .. } => (rect.y, rect.y + rect.h as i32),
+        // A blurred shadow spreads `blur` px beyond its box on every side.
+        DisplayItem::Shadow { rect, blur, .. } => {
+            let b = *blur as i32;
+            (rect.y - b, rect.y + rect.h as i32 + b)
+        }
+        // `origin.y` is the top of the run's boxes; ink stays within the box
+        // height (see `content_height`).
+        DisplayItem::Glyphs { origin, glyphs, .. } => {
+            let h = glyphs.iter().map(|g| g.h as i32).max().unwrap_or(0);
+            (origin.y, origin.y + h)
+        }
+        DisplayItem::Line { a, b, width, .. } => {
+            let w = *width as i32;
+            (a.y.min(b.y) - w, a.y.max(b.y) + w)
+        }
+        DisplayItem::Polygon { points, .. } => {
+            let mut lo = i32::MAX;
+            let mut hi = i32::MIN;
+            for p in points {
+                lo = lo.min(p.y);
+                hi = hi.max(p.y);
+            }
+            if lo > hi {
+                return None; // empty polygon: nothing to paint, nothing to cull
+            }
+            (lo, hi)
+        }
+        DisplayItem::ClipPush { .. } | DisplayItem::ClipPop => return None,
+    };
+    Some((top - M, bottom + M))
+}
+
 impl Rasterizer for TextEngine {
     fn rasterize(&self, list: &DisplayList, target: &mut Framebuffer) {
         // Clip stack: each push intersects with the current clip (ADR-0043).
         let mut clips: Vec<Rect> = Vec::new();
+        // Viewport cull: a painting primitive whose vertical span lies entirely
+        // above the surface or below it produces no pixels — draw ops already
+        // clip to the framebuffer — so skip the dispatch. Clip push/pop carry no
+        // ink but manage the clip stack, so they are never culled (`paint_vspan`
+        // returns `None`). This makes per-frame paint cost scale with the visible
+        // slice, not the whole document: scrolling a long page (e.g. cnn.com) no
+        // longer re-dispatches tens of thousands of off-screen glyph runs.
+        let surface_h = target.size.h as i32;
         for item in &list.items {
+            if let Some((top, bottom)) = paint_vspan(item) {
+                if bottom < 0 || top >= surface_h {
+                    continue;
+                }
+            }
             match item {
                 DisplayItem::Rect { rect, color } => target.fill_rect(*rect, *color),
                 DisplayItem::RoundRect {
@@ -1308,6 +1365,96 @@ mod tests {
             .filter(|px| px[..3] != [255, 255, 255])
             .count();
         assert!(inked > 0, "expected anti-aliased glyph ink");
+    }
+
+    #[test]
+    fn viewport_cull_is_output_identical_to_the_full_list() {
+        // Culling off-screen primitives must produce byte-identical pixels to
+        // rasterizing the whole list — it only skips dispatch for items that
+        // would paint nothing. Build a tall document and render just the top
+        // slice; the visible pixels must match whether or not the off-screen
+        // runs above and below are present.
+        let engine = TextEngine::new();
+        let glyphs = engine.shape("The quick brown fox", 16);
+        let visible = || DisplayItem::Glyphs {
+            origin: Point::new(3, 20),
+            frac_x: 0.0,
+            glyphs: glyphs.clone(),
+            color: Color::BLACK,
+            style: FontStyle::REGULAR,
+        };
+        // A list with only the on-screen run.
+        let lean = DisplayList {
+            items: vec![visible()],
+        };
+        // The same on-screen run surrounded by many off-screen runs (far above
+        // the surface and far below it) plus off-screen rects.
+        let mut items = Vec::new();
+        for i in 1..=500 {
+            items.push(DisplayItem::Glyphs {
+                origin: Point::new(3, -20 * i), // above the surface
+                frac_x: 0.0,
+                glyphs: glyphs.clone(),
+                color: Color::rgb(255, 0, 0),
+                style: FontStyle::REGULAR,
+            });
+            items.push(DisplayItem::Rect {
+                rect: Rect::new(0, 5000 + 20 * i, 100, 10), // below the surface
+                color: Color::rgb(0, 255, 0),
+            });
+        }
+        items.push(visible());
+        let fat = DisplayList { items };
+
+        let render = |list: &DisplayList| {
+            let mut fb = Framebuffer::new(Size::new(200, 48));
+            fb.clear(Color::WHITE);
+            engine.rasterize(list, &mut fb);
+            fb
+        };
+        assert_eq!(
+            render(&lean).rgba,
+            render(&fat).rgba,
+            "off-screen items must not change the visible pixels"
+        );
+    }
+
+    #[test]
+    fn viewport_cull_preserves_the_clip_stack() {
+        // An off-screen paint item is culled, but the clip push/pop that bracket
+        // it must still be honoured for the on-screen item that follows inside
+        // the same clip. Otherwise culling would leak or drop a clip level.
+        let mut fb = Framebuffer::new(Size::new(40, 40));
+        fb.fill_rect(Rect::new(0, 0, 40, 40), Color::WHITE);
+        let list = DisplayList {
+            items: vec![
+                DisplayItem::ClipPush {
+                    rect: Rect::new(0, 0, 20, 40),
+                },
+                // Off-screen (far below): culled, but must not disturb the clip.
+                DisplayItem::Rect {
+                    rect: Rect::new(0, 9000, 40, 10),
+                    color: Color::rgb(0, 0, 255),
+                },
+                // On-screen: painted, and must still be clipped to x<20.
+                DisplayItem::Rect {
+                    rect: Rect::new(0, 0, 40, 40),
+                    color: Color::rgb(255, 0, 0),
+                },
+                DisplayItem::ClipPop,
+            ],
+        };
+        TextEngine::new().rasterize(&list, &mut fb);
+        assert_eq!(
+            fb.pixel(5, 5).unwrap(),
+            Color::rgb(255, 0, 0),
+            "inside the clip still paints after a culled item"
+        );
+        assert_eq!(
+            fb.pixel(30, 5).unwrap(),
+            Color::WHITE,
+            "clip still bounds the on-screen item (push/pop survived the cull)"
+        );
     }
 
     #[test]
