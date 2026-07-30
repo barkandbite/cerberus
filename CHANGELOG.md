@@ -5,6 +5,22 @@ browser is pre-1.0; this is the first tagged preview.
 
 ## [Unreleased]
 
+## [0.0.19] - 2026-07-30
+
+Performance pass — scroll cost on long pages.
+
+### Changed
+- **Scrolling a long page no longer re-dispatches the whole document.** The
+  rasterizer walked every paint primitive each frame, so per-frame cost scaled
+  with total document size rather than the visible slice — on a tall page (e.g.
+  cnn.com) that meant re-dispatching tens of thousands of off-screen glyph runs
+  on every scroll tick, the main source of the reported sluggishness. Primitives
+  whose vertical span lies entirely outside the surface are now skipped (they
+  paint nothing anyway — draw ops already clip to the framebuffer), so paint
+  cost scales with the viewport. Output is byte-identical (a new test renders a
+  tall list with and without the off-screen runs and asserts the visible pixels
+  match); clip push/pop are never culled, so the clip stack stays correct.
+
 ## [0.0.18] - 2026-07-30
 
 Robustness pass — found by fuzzing the parsers/layout with pathological input.
