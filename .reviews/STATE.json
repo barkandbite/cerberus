@@ -3,7 +3,14 @@
   "repo": "barkandbite/cerberus",
   "reviewer": "fleet-worker",
   "focus_band": "Full codebase pass: stale-issue reconciliation + under-audited-crate sweep + targeted fixes",
-  "categories_swept": ["P0 Security", "P1 Performance", "P2 Structure & maintainability", "P3 Architecture", "P4 UX", "stale PR/issue reconciliation"],
+  "categories_swept": [
+    "P0 Security",
+    "P1 Performance",
+    "P2 Structure & maintainability",
+    "P3 Architecture",
+    "P4 UX",
+    "stale PR/issue reconciliation"
+  ],
   "corpus": {
     "open_issues_seen": 56,
     "closed_issues_seen": 8,
@@ -15,18 +22,22 @@
       "disposition": "NEW",
       "severity": "critical",
       "category": "Security",
-      "title": "QuickJS runtime has no memory limit, interrupt handler, or stack cap — a single script can hang or OOM the entire browser",
+      "title": "QuickJS runtime has no memory limit, interrupt handler, or stack cap \u2014 a single script can hang or OOM the entire browser",
       "primary_file": "crates/cerberus-js-quickjs/src/lib.rs",
-      "fingerprint": "cerberus|crates/cerberus-js-quickjs/src/lib.rs|quickjs-no-runtime-limits"
+      "fingerprint": "cerberus|crates/cerberus-js-quickjs/src/lib.rs|quickjs-no-runtime-limits",
+      "status": "obsolete",
+      "status_note": "2026-08-02 fix run: issue #68 is closed on GitHub (absent from the open-issue set as of this run) \u2014 resolved since the 2026-07-01 review; nothing to implement."
     },
     {
       "issue": 69,
       "disposition": "NEW",
       "severity": "high",
       "category": "Architecture",
-      "title": "Mirror-group windows never get the farbling prologue — identities are trivially correlatable in mirror mode",
+      "title": "Mirror-group windows never get the farbling prologue \u2014 identities are trivially correlatable in mirror mode",
       "primary_file": "crates/cerberus-mirror/src/group.rs",
-      "fingerprint": "cerberus|crates/cerberus-mirror/src/group.rs|mirror-no-farbling-injection"
+      "fingerprint": "cerberus|crates/cerberus-mirror/src/group.rs|mirror-no-farbling-injection",
+      "status": "obsolete",
+      "status_note": "2026-08-02 fix run: issue #69 is closed on GitHub (absent from the open-issue set as of this run) \u2014 resolved since the 2026-07-01 review; nothing to implement."
     },
     {
       "issue": 70,
@@ -35,41 +46,84 @@
       "category": "maintainability",
       "title": "is_public_suffix returns true for every single-label host (operator-precedence bug), breaking cookies on localhost/intranet names",
       "primary_file": "crates/cerberus-consent/src/psl.rs",
-      "fingerprint": "cerberus|crates/cerberus-consent/src/psl.rs|is_public_suffix-precedence-bug"
+      "fingerprint": "cerberus|crates/cerberus-consent/src/psl.rs|is_public_suffix-precedence-bug",
+      "status": "obsolete",
+      "status_note": "2026-08-02 fix run: issue #70 is closed on GitHub (absent from the open-issue set as of this run) \u2014 resolved since the 2026-07-01 review; nothing to implement."
     },
     {
       "issue": 71,
       "disposition": "NEW",
       "severity": "low",
       "category": "maintainability",
-      "title": "Consent rule serialization has no escaping — a whitespace-containing site/host corrupts the persisted rule format",
+      "title": "Consent rule serialization has no escaping \u2014 a whitespace-containing site/host corrupts the persisted rule format",
       "primary_file": "crates/cerberus-consent/src/lib.rs",
-      "fingerprint": "cerberus|crates/cerberus-consent/src/lib.rs|consent-rule-serialize-no-escaping"
+      "fingerprint": "cerberus|crates/cerberus-consent/src/lib.rs|consent-rule-serialize-no-escaping",
+      "status": "obsolete",
+      "status_note": "2026-08-02 fix run: issue #71 is closed on GitHub (absent from the open-issue set as of this run) \u2014 resolved since the 2026-07-01 review; nothing to implement."
     }
   ],
   "fixed_this_run": [
-    { "issue": 62, "summary": "combine_pos same-axis keyword pairs now return None instead of misparsing to a bogus 2-D point" },
-    { "issue": 35, "summary": "select_srcset now tokenizes per the WHATWG srcset grammar; commas inside candidate URLs no longer shear candidates" },
-    { "issue": 37, "summary": "background shorthand now resets background-position/background-size to their initial values before applying parsed geometry" },
-    { "issue": 17, "summary": "ProfileFillProvider's decrypted profile map is now clearable, and MirrorShell::lock_vault() clears it together with locking the underlying vault, so no live structure holds decrypted secrets past a lock" },
-    { "issue": 30, "summary": "vault_input and the CLI passphrase String are now actually zeroize()d (not just .clear()ed) on every reset path" }
+    {
+      "issue": 62,
+      "summary": "combine_pos same-axis keyword pairs now return None instead of misparsing to a bogus 2-D point"
+    },
+    {
+      "issue": 35,
+      "summary": "select_srcset now tokenizes per the WHATWG srcset grammar; commas inside candidate URLs no longer shear candidates"
+    },
+    {
+      "issue": 37,
+      "summary": "background shorthand now resets background-position/background-size to their initial values before applying parsed geometry"
+    },
+    {
+      "issue": 17,
+      "summary": "ProfileFillProvider's decrypted profile map is now clearable, and MirrorShell::lock_vault() clears it together with locking the underlying vault, so no live structure holds decrypted secrets past a lock"
+    },
+    {
+      "issue": 30,
+      "summary": "vault_input and the CLI passphrase String are now actually zeroize()d (not just .clear()ed) on every reset path"
+    }
   ],
   "closed_stale": [
-    { "issue": 9, "reason": "CSPRNG fail-closed fix (abc9360) already on main; fallback removed" },
-    { "issue": 12, "reason": "origin-bound autofill fix (abc9360) already on main" },
-    { "issue": 13, "reason": "HTTP response size cap (22e5465) already on main" },
-    { "issue": 15, "reason": "atomic_write unique-tmp-name fix (abc9360) already on main" }
+    {
+      "issue": 9,
+      "reason": "CSPRNG fail-closed fix (abc9360) already on main; fallback removed"
+    },
+    {
+      "issue": 12,
+      "reason": "origin-bound autofill fix (abc9360) already on main"
+    },
+    {
+      "issue": 13,
+      "reason": "HTTP response size cap (22e5465) already on main"
+    },
+    {
+      "issue": 15,
+      "reason": "atomic_write unique-tmp-name fix (abc9360) already on main"
+    }
   ],
   "stale_prs_reconciled": [
-    { "pr": 33, "action": "closed", "reason": "head commit is an ancestor of PR #53's branch; fully superseded, no changes lost" },
-    { "pr": 63, "action": "merged", "reason": "bookkeeping-only (.reviews/STATE.json), zero code changes, no CI gate on this repo" },
-    { "pr": 53, "action": "left open", "reason": "large in-progress draft (17.7k+ additions, 129 files); out of scope for this pass, needs dedicated review" }
+    {
+      "pr": 33,
+      "action": "closed",
+      "reason": "head commit is an ancestor of PR #53's branch; fully superseded, no changes lost"
+    },
+    {
+      "pr": 63,
+      "action": "merged",
+      "reason": "bookkeeping-only (.reviews/STATE.json), zero code changes, no CI gate on this repo"
+    },
+    {
+      "pr": 53,
+      "action": "left open",
+      "reason": "large in-progress draft (17.7k+ additions, 129 files); out of scope for this pass, needs dedicated review"
+    }
   ],
   "duplicates_skipped": [
     "web-platform epic phases #40-#48 (roadmap, not bugs)",
     "#49 eTLD+1 OnceLock fail-open (distinct from #70's is_public_suffix precedence bug)",
     "#50 deeply nested HTML stack-overflow (distinct from #68's QuickJS runtime limits)",
-    "#29 vault passphrase env var (distinct egress-channel issue from #30's in-memory zeroize gap, left open — not in this session's fix scope)"
+    "#29 vault passphrase env var (distinct egress-channel issue from #30's in-memory zeroize gap, left open \u2014 not in this session's fix scope)"
   ],
   "no_findings_areas": [
     "cerberus-crypto / cerberus-crypto-rustcrypto: correct AEAD/KDF usage, proper zeroize + redacted Debug",
@@ -77,5 +131,10 @@
     "cerberus-js-dom JSON/storage/cookie shims: careful parsing, run-scoped, isolation holds for the single-window path",
     "cerberus-shell / cerberus-shell-winit / cerberus-headless / cerberus-sysmem: plumbing is sound, single Windows unsafe FFI is bounded and documented"
   ],
-  "overall_health": "Good and improving. This run reconciled 4 stale-but-fixed issues and 2 stale/superseded PRs, fixed 5 open low/medium correctness and secret-hygiene issues with tests, and surfaced one critical (JS sandboxing) and one high (mirror farbling gap) finding that should be prioritized next — both concrete, verified bugs rather than roadmap items."
+  "overall_health": "Good and improving. This run reconciled 4 stale-but-fixed issues and 2 stale/superseded PRs, fixed 5 open low/medium correctness and secret-hygiene issues with tests, and surfaced one critical (JS sandboxing) and one high (mirror farbling gap) finding that should be prioritized next \u2014 both concrete, verified bugs rather than roadmap items.",
+  "last_fix_run": {
+    "date": "2026-08-02",
+    "agent": "daily-code-fix",
+    "note": "All four 2026-07-01 findings (#68 critical, #69 high, #70 medium, #71 low) verified closed on GitHub; queue empty for this repo, no code changes made."
+  }
 }
