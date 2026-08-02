@@ -1,81 +1,114 @@
 {
-  "review_date": "2026-07-01",
+  "review_date": "2026-08-02",
   "repo": "barkandbite/cerberus",
   "reviewer": "fleet-worker",
-  "focus_band": "Full codebase pass: stale-issue reconciliation + under-audited-crate sweep + targeted fixes",
-  "categories_swept": ["P0 Security", "P1 Performance", "P2 Structure & maintainability", "P3 Architecture", "P4 UX", "stale PR/issue reconciliation"],
+  "focus_band": "P1 Performance & efficiency (deep dive) + normal-depth sweep of P0 security, P2 structure/tests, P3 architecture, P4 UX/observability",
+  "categories_swept": ["P0 Security", "P1 Performance (deep)", "P2 Structure", "P3 Architecture", "P4 UX/observability"],
+  "churn_window": {
+    "since": "2026-07-01",
+    "commits": 87,
+    "releases": "v0.0.11 through v0.0.19",
+    "hotspots": [
+      "crates/cerberus-css/src/lib.rs (light-dark(), var() IACVT)",
+      "crates/cerberus-layout/src/lib.rs (negative z-index split, table-depth cap)",
+      "crates/cerberus-app/src/lib.rs (poll slice, layout cache, dev console)",
+      "crates/cerberus-text/src/lib.rs + hinted.rs (glyph cache v0.0.16, viewport cull v0.0.19, hinted raster)",
+      "crates/cerberus-js-dom (console shim, event-loop budget)"
+    ]
+  },
   "corpus": {
-    "open_issues_seen": 56,
-    "closed_issues_seen": 8,
-    "notes": "Verified 4 previously-open issues (#9 CSPRNG, #12 autofill origin binding, #13 HTTP body cap, #15 atomic_write race) were already fixed on main by commits abc9360/22e5465 but never closed; closed all four with evidence. Reconciled stale PRs: PR #33 was fully subsumed by PR #53 (confirmed via merge-base ancestor check) and closed; PR #63 (bookkeeping-only, this repo's prior review-state commit) was merged. New-issue sweep targeted crates the prior runs (#9-#62) covered less: cerberus-js-quickjs, cerberus-mirror, cerberus-consent, cerberus-identity, cerberus-crypto(-rustcrypto), cerberus-tls-rustls, cerberus-js-dom, cerberus-shell(-winit), cerberus-sysmem, cerberus-farbling, cerberus-dom, cerberus-types."
+    "open_issues_seen": 55,
+    "closed_issues_seen_last_30d": 33,
+    "notes": "A separate review wave (#151-#196, filed 2026-07-03..07-18) post-dates the previous STATE.json and densely covers P1; deduped against it. Prior headliners #68 (QuickJS limits) and #69 (mirror farbling) verified FIXED on main (with_limits/set_memory_limit/interrupt handler + tests referencing #68) and already closed 2026-07-01 — no action needed."
   },
   "findings": [
     {
-      "issue": 68,
-      "disposition": "NEW",
-      "severity": "critical",
-      "category": "Security",
-      "title": "QuickJS runtime has no memory limit, interrupt handler, or stack cap — a single script can hang or OOM the entire browser",
-      "primary_file": "crates/cerberus-js-quickjs/src/lib.rs",
-      "fingerprint": "cerberus|crates/cerberus-js-quickjs/src/lib.rs|quickjs-no-runtime-limits"
-    },
-    {
-      "issue": 69,
-      "disposition": "NEW",
-      "severity": "high",
-      "category": "Architecture",
-      "title": "Mirror-group windows never get the farbling prologue — identities are trivially correlatable in mirror mode",
-      "primary_file": "crates/cerberus-mirror/src/group.rs",
-      "fingerprint": "cerberus|crates/cerberus-mirror/src/group.rs|mirror-no-farbling-injection"
-    },
-    {
-      "issue": 70,
+      "id": "CERBERUS-20260802-001",
+      "issue": 204,
       "disposition": "NEW",
       "severity": "medium",
-      "category": "maintainability",
-      "title": "is_public_suffix returns true for every single-label host (operator-precedence bug), breaking cookies on localhost/intranet names",
-      "primary_file": "crates/cerberus-consent/src/psl.rs",
-      "fingerprint": "cerberus|crates/cerberus-consent/src/psl.rs|is_public_suffix-precedence-bug"
+      "category": "Structure",
+      "title": "Viewport cull and content_height read GlyphBox.h, which the real TextEngine always leaves 0 — top-edge text loses visible ink while scrolling",
+      "primary_file": "crates/cerberus-text/src/lib.rs",
+      "fingerprint": "cerberus|crates/cerberus-text/src/lib.rs|glyphbox-h-zero-cull-span"
     },
     {
-      "issue": 71,
+      "id": "CERBERUS-20260802-002",
+      "issue": 205,
+      "disposition": "NEW",
+      "severity": "medium",
+      "category": "Performance",
+      "title": "Per-(face, px) HintingInstance cache is unbounded and keyed by unclamped author-controlled font-size",
+      "primary_file": "crates/cerberus-text/src/hinted.rs",
+      "fingerprint": "cerberus|crates/cerberus-text/src/hinted.rs|unbounded-hinting-instance-map"
+    },
+    {
+      "id": "CERBERUS-20260802-003",
+      "issue": 206,
+      "disposition": "NEW",
+      "severity": "medium",
+      "category": "Performance",
+      "title": "__cerberusConsole grows without bound and the dev console re-serializes the entire history out of JS every open frame",
+      "primary_file": "crates/cerberus-js-dom/src/lib.rs",
+      "fingerprint": "cerberus|crates/cerberus-js-dom/src/lib.rs|console-capture-unbounded"
+    },
+    {
+      "id": "CERBERUS-20260802-004",
+      "issue": 207,
+      "disposition": "NEW",
+      "severity": "medium",
+      "category": "Performance",
+      "title": "Scroll/repaint still O(document) per frame: double display-list deep clone, full-list translate/rescan, per-frame surface allocations",
+      "primary_file": "crates/cerberus-app/src/lib.rs",
+      "fingerprint": "cerberus|crates/cerberus-app/src/lib.rs|render-frame-display-list-double-clone"
+    },
+    {
+      "id": "CERBERUS-20260802-005",
+      "issue": 208,
       "disposition": "NEW",
       "severity": "low",
-      "category": "maintainability",
-      "title": "Consent rule serialization has no escaping — a whitespace-containing site/host corrupts the persisted rule format",
-      "primary_file": "crates/cerberus-consent/src/lib.rs",
-      "fingerprint": "cerberus|crates/cerberus-consent/src/lib.rs|consent-rule-serialize-no-escaping"
+      "category": "UX",
+      "title": "Windows release builds print nothing for CLI subcommands run from an interactive console (GUI subsystem)",
+      "primary_file": "crates/cerberus-app/src/main.rs",
+      "fingerprint": "cerberus|crates/cerberus-app/src/main.rs|windows-gui-subsystem-cli-output"
     }
   ],
-  "fixed_this_run": [
-    { "issue": 62, "summary": "combine_pos same-axis keyword pairs now return None instead of misparsing to a bogus 2-D point" },
-    { "issue": 35, "summary": "select_srcset now tokenizes per the WHATWG srcset grammar; commas inside candidate URLs no longer shear candidates" },
-    { "issue": 37, "summary": "background shorthand now resets background-position/background-size to their initial values before applying parsed geometry" },
-    { "issue": 17, "summary": "ProfileFillProvider's decrypted profile map is now clearable, and MirrorShell::lock_vault() clears it together with locking the underlying vault, so no live structure holds decrypted secrets past a lock" },
-    { "issue": 30, "summary": "vault_input and the CLI passphrase String are now actually zeroize()d (not just .clear()ed) on every reset path" }
-  ],
-  "closed_stale": [
-    { "issue": 9, "reason": "CSPRNG fail-closed fix (abc9360) already on main; fallback removed" },
-    { "issue": 12, "reason": "origin-bound autofill fix (abc9360) already on main" },
-    { "issue": 13, "reason": "HTTP response size cap (22e5465) already on main" },
-    { "issue": 15, "reason": "atomic_write unique-tmp-name fix (abc9360) already on main" }
-  ],
-  "stale_prs_reconciled": [
-    { "pr": 33, "action": "closed", "reason": "head commit is an ancestor of PR #53's branch; fully superseded, no changes lost" },
-    { "pr": 63, "action": "merged", "reason": "bookkeeping-only (.reviews/STATE.json), zero code changes, no CI gate on this repo" },
-    { "pr": 53, "action": "left open", "reason": "large in-progress draft (17.7k+ additions, 129 files); out of scope for this pass, needs dedicated review" }
+  "enrichments": [
+    {
+      "issue": 22,
+      "note": "v0.0.15 layout cache fixed half; collect_computed/set_computed_styles/set_geometry still unconditional per frame; poll() dirties the cache even on empty drains; paint-side churn split to #207",
+      "fingerprint": "cerberus|crates/cerberus-app/src/lib.rs|collect_computed-per-frame-ungated"
+    },
+    {
+      "issue": 38,
+      "note": "v0.0.16 implemented the proposed glyph coverage cache (sub-pixel buckets, blit-time residual styling, 4 MiB cap); residuals: uncached ab_glyph fallback, hinter-map growth split to #205; recommend verify + close",
+      "fingerprint": "cerberus|crates/cerberus-text/src/hinted.rs|glyph-cache-implemented-v0016"
+    },
+    {
+      "issue": 196,
+      "note": "v0.0.19 vertical dispatch cull partially mitigates (fully-offscreen-vertical only); loop-bound intersection for viewport-intersecting huge rects and horizontal cull still open; cross-ref #204 for the cull's own GlyphBox.h bug",
+      "fingerprint": "cerberus|crates/cerberus-text/src/lib.rs|vertical-cull-partial-mitigation-v0019"
+    }
   ],
   "duplicates_skipped": [
-    "web-platform epic phases #40-#48 (roadmap, not bugs)",
-    "#49 eTLD+1 OnceLock fail-open (distinct from #70's is_public_suffix precedence bug)",
-    "#50 deeply nested HTML stack-overflow (distinct from #68's QuickJS runtime limits)",
-    "#29 vault passphrase env var (distinct egress-channel issue from #30's in-memory zeroize gap, left open — not in this session's fix scope)"
+    "draw_image/draw_gradient/draw_shadow full-rect per-pixel iteration -> #196 (enriched instead)",
+    "pathological descendant-selector hang (v0.0.18 changelog follow-up) -> #179",
+    "nested flex/grid exponential measurement -> #170",
+    "inline-SVG payload stores never cleared on navigation -> #194 (no material change since filing)",
+    "per-event full DOM serialize + rebuild -> #195",
+    "TZ env pin vs Intl hardcode coherence -> #168",
+    "per-frame itemize/shape allocation churn in cascade/layout -> #26/#178/#187 family"
   ],
   "no_findings_areas": [
-    "cerberus-crypto / cerberus-crypto-rustcrypto: correct AEAD/KDF usage, proper zeroize + redacted Debug",
-    "cerberus-tls-rustls: correct rustls + bundled roots, no type leaks",
-    "cerberus-js-dom JSON/storage/cookie shims: careful parsing, run-scoped, isolation holds for the single-window path",
-    "cerberus-shell / cerberus-shell-winit / cerberus-headless / cerberus-sysmem: plumbing is sound, single Windows unsafe FFI is bounded and documented"
+    "cerberus-css light-dark()/var() IACVT sentinel work (20585c9): paren/quote-aware, depth-capped, tested — no new defects found",
+    "cerberus-layout v0.0.18 table-depth cap and v0.0.17 negative-z split: correct at both call sites (root + inline-block sub); prepend is once-per-context, not quadratic",
+    "inline-SVG computed-fill injection (ab53e5d): fill formatted from parsed Color — no injection surface",
+    "cerberus-js-quickjs limits (#68 fix): memory limit, interrupt deadline, stack cap + with_limits test pattern all present",
+    "v0.0.18 poll drain()/table cap test hardening: sound"
   ],
-  "overall_health": "Good and improving. This run reconciled 4 stale-but-fixed issues and 2 stale/superseded PRs, fixed 5 open low/medium correctness and secret-hygiene issues with tests, and surfaced one critical (JS sandboxing) and one high (mirror farbling gap) finding that should be prioritized next — both concrete, verified bugs rather than roadmap items."
+  "prior_headliner_check": {
+    "issue_68": "fixed on main (set_memory_limit, interrupt handler, MAX_JS_STACK_BYTES, tests titled 'issue #68'); closed 2026-07-01 — no enrichment needed",
+    "issue_69": "closed 2026-07-01 alongside the mirror farbling work; no contrary evidence in churn — no enrichment needed"
+  },
+  "overall_health": "Good and actively improving: v0.0.14-v0.0.19 delivered real, tested perf/stability work (JS budgets, layout cache, glyph cache, viewport cull, table-depth DoS cap) and closed both prior headliners. This run's findings are second-order: one correctness bug inside the new cull (#204), three bounded-resource/allocation gaps in the new hot paths (#205-#207), and one Windows CLI papercut (#208). The dense open P1 backlog (#170-#196) remains the main debt."
 }
