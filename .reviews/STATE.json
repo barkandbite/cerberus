@@ -1,81 +1,64 @@
 {
-  "review_date": "2026-07-01",
+  "review_date": "2026-08-03",
   "repo": "barkandbite/cerberus",
   "reviewer": "fleet-worker",
-  "focus_band": "Full codebase pass: stale-issue reconciliation + under-audited-crate sweep + targeted fixes",
-  "categories_swept": ["P0 Security", "P1 Performance", "P2 Structure & maintainability", "P3 Architecture", "P4 UX", "stale PR/issue reconciliation"],
+  "focus_band": "P1 Performance & efficiency (+P2 Structure & maintainability)",
+  "categories_swept": ["P0 Security", "P1 Performance", "P2 Structure & maintainability", "P3 Architecture", "P4 UX"],
   "corpus": {
-    "open_issues_seen": 56,
-    "closed_issues_seen": 8,
-    "notes": "Verified 4 previously-open issues (#9 CSPRNG, #12 autofill origin binding, #13 HTTP body cap, #15 atomic_write race) were already fixed on main by commits abc9360/22e5465 but never closed; closed all four with evidence. Reconciled stale PRs: PR #33 was fully subsumed by PR #53 (confirmed via merge-base ancestor check) and closed; PR #63 (bookkeeping-only, this repo's prior review-state commit) was merged. New-issue sweep targeted crates the prior runs (#9-#62) covered less: cerberus-js-quickjs, cerberus-mirror, cerberus-consent, cerberus-identity, cerberus-crypto(-rustcrypto), cerberus-tls-rustls, cerberus-js-dom, cerberus-shell(-winit), cerberus-sysmem, cerberus-farbling, cerberus-dom, cerberus-types."
+    "open_issues_seen": 72,
+    "closed_issues_recent_seen": 0,
+    "notes": "Read all 72 open issues (titles+labels) and fetched bodies/comments for plausible matches (#26, #38). Corpus is exceptionally well-covered for perf: nearly every hot-path allocation/cache/blocking-IO issue already filed (#170-#227 span layout, cascade, net, storage, paint, text). Roadmap epic #40-#48 left alone. Weighted attention to churn since 2026-07-01 (v0.0.14-v0.0.19): rendering parity, hinted glyph raster + glyph cache, CSS light-dark()/var() IACVT, :is/:where/:has, grid explicit numeric line placement, min/max/clamp, table-nesting cap, negative z-index, Windows scroll perf. Both plausible enrichment targets (#26 SiblingRef :has children clone; #38 glyph cache in v0.0.16) already carried thorough, up-to-date follow-up comments from prior runs — left quiet to honor the no-duplicate-noise gate."
   },
   "findings": [
     {
-      "issue": 68,
-      "disposition": "NEW",
-      "severity": "critical",
-      "category": "Security",
-      "title": "QuickJS runtime has no memory limit, interrupt handler, or stack cap — a single script can hang or OOM the entire browser",
-      "primary_file": "crates/cerberus-js-quickjs/src/lib.rs",
-      "fingerprint": "cerberus|crates/cerberus-js-quickjs/src/lib.rs|quickjs-no-runtime-limits"
-    },
-    {
-      "issue": 69,
+      "issue": 226,
       "disposition": "NEW",
       "severity": "high",
-      "category": "Architecture",
-      "title": "Mirror-group windows never get the farbling prologue — identities are trivially correlatable in mirror mode",
-      "primary_file": "crates/cerberus-mirror/src/group.rs",
-      "fingerprint": "cerberus|crates/cerberus-mirror/src/group.rs|mirror-no-farbling-injection"
+      "category": "performance",
+      "title": "Grid explicit numeric line placement allocates an unbounded occupancy grid — grid-row: 2000000000 in page CSS exhausts memory and aborts the browser",
+      "primary_file": "crates/cerberus-layout/src/lib.rs",
+      "fingerprint": "cerberus|crates/cerberus-layout/src/lib.rs|grid-row-line-unbounded-occ-allocation"
     },
     {
-      "issue": 70,
+      "issue": 227,
       "disposition": "NEW",
       "severity": "medium",
-      "category": "maintainability",
-      "title": "is_public_suffix returns true for every single-label host (operator-precedence bug), breaking cookies on localhost/intranet names",
-      "primary_file": "crates/cerberus-consent/src/psl.rs",
-      "fingerprint": "cerberus|crates/cerberus-consent/src/psl.rs|is_public_suffix-precedence-bug"
-    },
-    {
-      "issue": 71,
-      "disposition": "NEW",
-      "severity": "low",
-      "category": "maintainability",
-      "title": "Consent rule serialization has no escaping — a whitespace-containing site/host corrupts the persisted rule format",
-      "primary_file": "crates/cerberus-consent/src/lib.rs",
-      "fingerprint": "cerberus|crates/cerberus-consent/src/lib.rs|consent-rule-serialize-no-escaping"
+      "category": "performance",
+      "title": "Nested repeat() in grid-template track parsing multiplies the per-level 1000 cap — repeat(1000, repeat(1000, 1px)) expands to 1M+ tracks at parse time",
+      "primary_file": "crates/cerberus-css/src/lib.rs",
+      "fingerprint": "cerberus|crates/cerberus-css/src/lib.rs|nested-repeat-track-expansion-multiplies-cap"
     }
   ],
-  "fixed_this_run": [
-    { "issue": 62, "summary": "combine_pos same-axis keyword pairs now return None instead of misparsing to a bogus 2-D point" },
-    { "issue": 35, "summary": "select_srcset now tokenizes per the WHATWG srcset grammar; commas inside candidate URLs no longer shear candidates" },
-    { "issue": 37, "summary": "background shorthand now resets background-position/background-size to their initial values before applying parsed geometry" },
-    { "issue": 17, "summary": "ProfileFillProvider's decrypted profile map is now clearable, and MirrorShell::lock_vault() clears it together with locking the underlying vault, so no live structure holds decrypted secrets past a lock" },
-    { "issue": 30, "summary": "vault_input and the CLI passphrase String are now actually zeroize()d (not just .clear()ed) on every reset path" }
+  "enrichments_considered_but_skipped": [
+    {"issue": 26, "reason": "The :has() SiblingRef child-clone broadening is already captured verbatim in the 2026-07-18 follow-up comment (fp-update sibling-ref-has-children-clone) — no new detail to add."},
+    {"issue": 38, "reason": "The v0.0.16 glyph-cache implementation (incl. the remaining unhinted-fallback re-outline and the unbounded HintingInstance cache spun off as #205) is already documented in the 2026-08-02 follow-up comment (fp-update glyph-cache-implemented-v0016)."}
   ],
-  "closed_stale": [
-    { "issue": 9, "reason": "CSPRNG fail-closed fix (abc9360) already on main; fallback removed" },
-    { "issue": 12, "reason": "origin-bound autofill fix (abc9360) already on main" },
-    { "issue": 13, "reason": "HTTP response size cap (22e5465) already on main" },
-    { "issue": 15, "reason": "atomic_write unique-tmp-name fix (abc9360) already on main" }
-  ],
-  "stale_prs_reconciled": [
-    { "pr": 33, "action": "closed", "reason": "head commit is an ancestor of PR #53's branch; fully superseded, no changes lost" },
-    { "pr": 63, "action": "merged", "reason": "bookkeeping-only (.reviews/STATE.json), zero code changes, no CI gate on this repo" },
-    { "pr": 53, "action": "left open", "reason": "large in-progress draft (17.7k+ additions, 129 files); out of scope for this pass, needs dedicated review" }
-  ],
+  "fixed_this_run": [],
+  "closed_stale": [],
   "duplicates_skipped": [
     "web-platform epic phases #40-#48 (roadmap, not bugs)",
-    "#49 eTLD+1 OnceLock fail-open (distinct from #70's is_public_suffix precedence bug)",
-    "#50 deeply nested HTML stack-overflow (distinct from #68's QuickJS runtime limits)",
-    "#29 vault passphrase env var (distinct egress-channel issue from #30's in-memory zeroize gap, left open — not in this session's fix scope)"
+    "grid-row DoS vs #170 nested-flex/grid-exponential (distinct: #170 is 2^depth re-measurement of subtrees; #226 is a single item's huge line number sizing the occupancy grid)",
+    "grid-row/repeat DoS vs #201/#220 table-nesting and #177 calc-recursion (same DoS class, different subsystem/root cause)",
+    "JSON recursive-descent parser depth (json.rs) — wire format is flat (nodes[] with flat children id lists), so parse depth is bounded ~4; not attacker-deep; DOM tree walkers already bounded by MAX_OPEN_DEPTH=512 per #224"
+  ],
+  "fingerprints_authored": [
+    "cerberus|crates/cerberus-layout/src/lib.rs|grid-row-line-unbounded-occ-allocation",
+    "cerberus|crates/cerberus-css/src/lib.rs|nested-repeat-track-expansion-multiplies-cap"
+  ],
+  "prior_fingerprints": [
+    "cerberus|crates/cerberus-js-quickjs/src/lib.rs|quickjs-no-runtime-limits",
+    "cerberus|crates/cerberus-mirror/src/group.rs|mirror-no-farbling-injection",
+    "cerberus|crates/cerberus-consent/src/psl.rs|is_public_suffix-precedence-bug",
+    "cerberus|crates/cerberus-consent/src/lib.rs|consent-rule-serialize-no-escaping",
+    "cerberus|crates/cerberus-text/src/hinted.rs|glyph-cache-implemented-v0016",
+    "cerberus|crates/cerberus-text/src/hinted.rs|per-glyph-mutex-and-subpixel-cache-key",
+    "cerberus|crates/cerberus-css/src/lib.rs|sibling-ref-has-children-clone"
   ],
   "no_findings_areas": [
-    "cerberus-crypto / cerberus-crypto-rustcrypto: correct AEAD/KDF usage, proper zeroize + redacted Debug",
-    "cerberus-tls-rustls: correct rustls + bundled roots, no type leaks",
-    "cerberus-js-dom JSON/storage/cookie shims: careful parsing, run-scoped, isolation holds for the single-window path",
-    "cerberus-shell / cerberus-shell-winit / cerberus-headless / cerberus-sysmem: plumbing is sound, single Windows unsafe FFI is bounded and documented"
+    "cerberus-net decompress.rs: MAX_DECOMPRESSED=64MB bomb guard enforced during inflation — sound",
+    "grid column sizing: auto-fill capped at 64, repeat() capped 1000/level (only the ROW placement and NESTED repeat escape the caps — filed as #226/#227)",
+    "cerberus-js-dom wire format: flat node map, bounded JSON parse depth; U+2028/2029 eval-splice escaping in place",
+    "cerberus-crypto/tls/dns bombs and net header/body caps: already covered by prior filings (#186/#180/#210/#221)"
   ],
-  "overall_health": "Good and improving. This run reconciled 4 stale-but-fixed issues and 2 stale/superseded PRs, fixed 5 open low/medium correctness and secret-hygiene issues with tests, and surfaced one critical (JS sandboxing) and one high (mirror farbling gap) finding that should be prioritized next — both concrete, verified bugs rather than roadmap items."
+  "overall_health": "Very good and well-audited. The perf/efficiency surface is thoroughly covered by ~50 prior open issues; this rotated deep-dive found the codebase in strong shape and surfaced two genuinely new untrusted-input allocation DoS bugs, both introduced by the post-2026-07-01 CSS grid work: an unbounded grid-row occupancy allocation (high) and a nested-repeat() track-expansion amplification (medium). No new stale-but-fixed issues; the two obvious enrichment targets already carry current follow-up comments, so nothing was re-commented."
 }
