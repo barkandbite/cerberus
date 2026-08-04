@@ -99,7 +99,12 @@ fn cmd_run(args: &[String]) -> ExitCode {
             }
         };
     }
-    let app = cerberus_app::BrowserApp::with_config(opts);
+    let mut app = cerberus_app::BrowserApp::with_config(opts);
+    // Optional initial page: `run <url>` or `run --url <url>`. Without one the
+    // browser opens to its built-in home page.
+    if let Some(url) = run_target_url(args) {
+        app.open(&url);
+    }
     match cerberus_shell_winit::run(app, fullscreen) {
         Ok(()) => ExitCode::SUCCESS,
         Err(e) => {
@@ -108,6 +113,33 @@ fn cmd_run(args: &[String]) -> ExitCode {
             ExitCode::FAILURE
         }
     }
+}
+
+/// The initial page for `run`: an explicit `--url <URL>`, else the first bare
+/// positional argument (skipping the value-taking flags), else `None` (open the
+/// built-in home page). Lets `cerberus-app run example.com` open straight to a
+/// site, as a normal browser launched with a URL would.
+#[cfg(feature = "windowing")]
+fn run_target_url(args: &[String]) -> Option<String> {
+    if let Some(u) = flag(args, "--url") {
+        return Some(u);
+    }
+    // Flags that consume the following argument as their value; the scanner must
+    // not mistake that value for the positional URL.
+    let value_flags = ["--url", "--data-dir", "--proxy"];
+    let mut skip_next = false;
+    for a in args {
+        if skip_next {
+            skip_next = false;
+            continue;
+        }
+        if a.starts_with('-') {
+            skip_next = value_flags.contains(&a.as_str());
+            continue;
+        }
+        return Some(a.clone());
+    }
+    None
 }
 
 #[cfg(not(feature = "windowing"))]
@@ -776,4 +808,42 @@ fn flags(args: &[String], key: &str) -> Vec<String> {
         .filter(|(_, a)| a.as_str() == key)
         .filter_map(|(i, _)| args.get(i + 1).cloned())
         .collect()
+}
+
+#[cfg(all(test, feature = "windowing"))]
+mod tests {
+    use super::run_target_url;
+
+    fn v(args: &[&str]) -> Vec<String> {
+        args.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn run_url_parsing() {
+        // No positional / flag → home page (None).
+        assert_eq!(run_target_url(&v(&[])), None);
+        assert_eq!(run_target_url(&v(&["--fullscreen"])), None);
+        // Bare positional is the URL.
+        assert_eq!(
+            run_target_url(&v(&["example.com"])).as_deref(),
+            Some("example.com")
+        );
+        // Explicit --url wins and is unambiguous.
+        assert_eq!(
+            run_target_url(&v(&["--url", "https://cnn.com"])).as_deref(),
+            Some("https://cnn.com")
+        );
+        // A value-taking flag's value must NOT be mistaken for the URL...
+        assert_eq!(run_target_url(&v(&["--data-dir", "/tmp/p"])), None);
+        // ...but a real positional after it is still found.
+        assert_eq!(
+            run_target_url(&v(&["--data-dir", "/tmp/p", "example.org"])).as_deref(),
+            Some("example.org")
+        );
+        // Boolean flags don't consume the next arg.
+        assert_eq!(
+            run_target_url(&v(&["--fullscreen", "example.net"])).as_deref(),
+            Some("example.net")
+        );
+    }
 }

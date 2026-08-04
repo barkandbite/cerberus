@@ -5,13 +5,28 @@ browser is pre-1.0; this is the first tagged preview.
 
 ## [Unreleased]
 
+### Added
+- **Open a page from the command line: `cerberus-app run <url>`** (or
+  `run --url <url>`). Without one, `run` opens the built-in home page as before.
+  Lets the browser be launched straight onto a site, like any other browser.
+
+### Fixed
+- **`http://localhost` (and `127.0.0.0/8`, `::1`) is no longer force-upgraded to
+  https.** Loopback is a potentially-trustworthy origin — Chrome doesn't upgrade
+  it — and it can never present a valid certificate, so the upgrade only added a
+  doomed round-trip and broke loading a local dev server. Non-loopback http is
+  still upgraded exactly as before.
+
 ### Tooling
 - **Screenshot the actual Windows GUI from Linux.** `scripts/win-gui-shot.sh`
   (also `scripts/win-test.sh --gui`) cross-builds the release `.exe`, launches
   the real browser window under Wine on a headless Xvfb display, and saves a
   cropped PNG of the window — closing much of the "can't see Windows" gap for
-  coarse visual checks. Wine's software raster is not byte-identical to real
-  Windows, so it is for layout / gross-regression checks, not pixel parity.
+  coarse visual checks. Takes an optional URL (`win-gui-shot.sh OUT URL`) and
+  settles adaptively (polls until the page finishes loading) so a heavy page
+  like cnn.com is captured loaded, not mid-spinner. Wine's software raster is
+  not byte-identical to real Windows, so it is for layout / gross-regression
+  checks, not pixel parity.
 
 ## [0.0.19] - 2026-07-30
 

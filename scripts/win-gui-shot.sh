@@ -99,10 +99,26 @@ fi
 WH=${GEO%%+*}; REST=${GEO#*+}; X=${REST%%+*}; Y=${REST#*+}
 [ "$X" -lt 0 ] && X=0; [ "$Y" -lt 0 ] && Y=0
 echo "== window mapped: $GEO -> crop ${WH}+${X}+${Y} =="
-sleep 3 # let the first paint settle
 
-import -window root "$WORK/root.png" 2>/dev/null || { echo "FAIL: import" >&2; exit 1; }
-convert "$WORK/root.png" -crop "${WH}+${X}+${Y}" +repage "$OUT" 2>/dev/null || cp "$WORK/root.png" "$OUT"
+# Adaptive settle: a heavy page (e.g. cnn.com is ~11s to style under Wine) is
+# still on its "Loading…" screen after a fixed short sleep. Poll the window
+# until two consecutive frames are near-identical (load + first paint done),
+# capped at ~40s so a genuinely stuck page still returns. Cheap pages converge
+# in the first couple of iterations.
+shoot() { import -window root "$WORK/root.png" 2>/dev/null &&
+  convert "$WORK/root.png" -crop "${WH}+${X}+${Y}" +repage "$1" 2>/dev/null; }
+sleep 2
+shoot "$WORK/prev.png" || { echo "FAIL: import" >&2; exit 1; }
+for _ in $(seq 1 20); do
+  sleep 2
+  shoot "$OUT" || { echo "FAIL: import" >&2; exit 1; }
+  # Per-pixel mean absolute difference between consecutive frames.
+  D=$(convert "$WORK/prev.png" "$OUT" -compose difference -composite \
+        -colorspace Gray -format "%[fx:mean]" info: 2>/dev/null)
+  # Converged when frames differ by < 0.1% average.
+  awk -v d="$D" 'BEGIN{ exit (d+0 < 0.001) ? 0 : 1 }' && break
+  cp "$OUT" "$WORK/prev.png"
+done
 
 MEAN=$(convert "$OUT" -format "%[fx:mean]" info: 2>/dev/null)
 echo "screenshot: $OUT ($WH, mean=$MEAN)"

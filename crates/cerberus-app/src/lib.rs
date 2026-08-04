@@ -1954,6 +1954,31 @@ fn normalize_url(input: &str) -> String {
     }
 }
 
+/// Whether `url`'s authority is a loopback host (`localhost`, `127.0.0.0/8`,
+/// `::1`). Loopback is a potentially-trustworthy origin, so — like Chrome — we
+/// don't force-upgrade `http://` loopback to https (it can't present a valid
+/// cert, and the upgrade would just add a failed round-trip).
+fn is_loopback_http(url: &str) -> bool {
+    let Some((_, rest)) = url.split_once("://") else {
+        return false;
+    };
+    // Authority is everything before the first path/query/fragment separator.
+    let authority = rest.split(['/', '?', '#']).next().unwrap_or("");
+    // Drop any userinfo, then the port (bracketed IPv6 keeps its colons).
+    let hostport = authority.rsplit_once('@').map_or(authority, |(_, h)| h);
+    let host = if let Some(v6) = hostport.strip_prefix('[') {
+        v6.split(']').next().unwrap_or("")
+    } else {
+        hostport.rsplit_once(':').map_or(hostport, |(h, _)| h)
+    };
+    host.eq_ignore_ascii_case("localhost")
+        || host == "::1"
+        || host.to_ascii_lowercase().ends_with(".localhost")
+        || host.strip_prefix("127.").is_some_and(|_| {
+            host.split('.').count() == 4 && host.split('.').all(|o| o.parse::<u8>().is_ok())
+        })
+}
+
 /// A 1×1 fully transparent bitmap: the stand-in for an inline SVG the decoder
 /// declined (byte-ceiling bomb, malformed markup). The synthetic `<img>`
 /// carries both width/height attributes, so layout stretches this invisible
@@ -2940,7 +2965,11 @@ impl BrowserApp {
             self.load_builtin(url); // built-in pages are GET-only; ignore any body
             return;
         }
-        let (target, http_fallback) = if url.starts_with("http://") {
+        // Try https first for an http URL, keeping the original as a fallback —
+        // except for loopback, which browsers treat as already-trustworthy and
+        // never force-upgrade. `http://localhost` can't present a valid cert, so
+        // upgrading it only adds a doomed round-trip (and breaks local dev).
+        let (target, http_fallback) = if url.starts_with("http://") && !is_loopback_http(url) {
             (
                 url.replacen("http://", "https://", 1),
                 Some(url.to_string()),
@@ -6360,6 +6389,34 @@ pub use cerberus_sysmem::resident_set_kb;
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn loopback_is_exempt_from_https_upgrade() {
+        // Loopback hosts (any form) are not force-upgraded.
+        for u in [
+            "http://localhost/",
+            "http://localhost:8901/index.html",
+            "http://127.0.0.1:8080/",
+            "http://127.9.9.9/",
+            "http://[::1]:3000/app",
+            "http://foo.localhost/",
+            "http://user@127.0.0.1:5000/x",
+        ] {
+            assert!(is_loopback_http(u), "{u} should be loopback");
+        }
+        // Public hosts (and look-alikes) still upgrade.
+        for u in [
+            "http://example.com/",
+            "http://127.0.0.1.evil.com/",
+            "http://notlocalhost/",
+            "http://1270.0.0.1/",
+            "https://localhost/", // not http:// → helper only matters for http
+        ] {
+            assert!(!is_loopback_http(u) || u.starts_with("https"), "{u}");
+        }
+        assert!(!is_loopback_http("http://example.com/"));
+        assert!(!is_loopback_http("http://127.0.0.1.evil.com/"));
+    }
 
     #[test]
     fn image_policy_default_and_per_image_overrides() {
