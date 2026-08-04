@@ -16,6 +16,14 @@ browser is pre-1.0; this is the first tagged preview.
   it — and it can never present a valid certificate, so the upgrade only added a
   doomed round-trip and broke loading a local dev server. Non-loopback http is
   still upgraded exactly as before.
+- **Windows no longer intermittently overflows the main-thread stack.** Windows
+  reserves only 1 MiB for the main thread's stack where Linux/macOS give 8 MiB,
+  and QuickJS engine setup/teardown on the main thread (switching identities,
+  and the mem-gate's head-switch loop) can exceed 1 MiB — an intermittent
+  "thread 'main' has overflowed its stack" abort seen only on Windows. A build
+  script now raises the Windows PE stack reserve to 8 MiB to match the other
+  platforms (the JS engine keeps its own bounded stack cap; this just removes an
+  arbitrary platform inconsistency).
 
 ### Tooling
 - **Screenshot the actual Windows GUI from Linux.** `scripts/win-gui-shot.sh`
