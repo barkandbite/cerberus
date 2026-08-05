@@ -5,6 +5,17 @@ browser is pre-1.0; this is the first tagged preview.
 
 ## [Unreleased]
 
+### Changed
+- **Styling a big page is ~19× faster (the main sluggishness on heavy sites).**
+  The cascade tested every element against *every* rule in the UA and author
+  sheets — O(elements × rules) — and did it a third time for `::before`/`::after`.
+  On cnn.com that was **5.6 s** of style resolution, by far the dominant cost of a
+  page load. Rules are now indexed by their subject selector's key (id / class /
+  tag, else universal), so each element only tests the rules it could actually
+  match; the generated-content cascade is indexed the same way. cnn.com style
+  dropped **5.6 s → 0.29 s** (page load 6.5 s → 1.1 s), and the rendered output is
+  **pixel-identical** — the index only skips rules that provably cannot match.
+
 ### Added
 - **Open a page from the command line: `cerberus-app run <url>`** (or
   `run --url <url>`). Without one, `run` opens the built-in home page as before.

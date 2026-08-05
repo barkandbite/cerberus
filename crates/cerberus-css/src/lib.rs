@@ -20,11 +20,83 @@ use cerberus_style::{
 };
 use cerberus_types::{Color, GenericFamily, ImageFit, ImagePos, Point};
 use parser::{
-    parse_declaration_block, parse_stylesheet, ElemRef, MediaContext, PseudoElement, SiblingRef,
-    Specificity, Stylesheet,
+    parse_declaration_block, parse_stylesheet, BucketKey, ElemRef, MediaContext, PseudoElement,
+    SiblingRef, Specificity, Stylesheet,
 };
 use std::collections::HashMap;
 use std::rc::Rc;
+
+/// Rules indexed by their subject selector's key (id/class/tag/universal), so a
+/// given element only tests the rules it could actually match instead of the
+/// whole sheet. Values are indices into the stylesheet's `rules`, preserving
+/// source order for the cascade tie-break.
+#[derive(Default)]
+struct RuleIndex {
+    id: HashMap<String, Vec<usize>>,
+    class: HashMap<String, Vec<usize>>,
+    tag: HashMap<String, Vec<usize>>,
+    /// Rules whose subject has no id/class/tag (`*`, attribute-only, pseudo-only):
+    /// they could match any element, so every element must consider them.
+    universal: Vec<usize>,
+}
+
+impl RuleIndex {
+    /// Build an index over `sheet` using `keys` to read each rule's bucket keys
+    /// (normal vs pseudo-element selectors are indexed separately).
+    fn build(sheet: &Stylesheet, keys: impl Fn(&parser::Rule) -> Vec<BucketKey>) -> Self {
+        let mut idx = RuleIndex::default();
+        for (i, rule) in sheet.rules.iter().enumerate() {
+            for key in keys(rule) {
+                match key {
+                    BucketKey::Id(s) => idx.id.entry(s).or_default().push(i),
+                    BucketKey::Class(s) => idx.class.entry(s).or_default().push(i),
+                    BucketKey::Tag(s) => idx.tag.entry(s).or_default().push(i),
+                    BucketKey::Universal => idx.universal.push(i),
+                }
+            }
+        }
+        idx
+    }
+
+    /// The rule indices an element with this `tag`/`id`/`classes` could match,
+    /// ascending and de-duplicated (a rule reachable via several of its selectors
+    /// — e.g. `.a, .b` for an element with both classes — appears once so its
+    /// declarations aren't applied twice).
+    fn candidates(&self, tag: &str, id: Option<&str>, classes: &[String]) -> Vec<usize> {
+        let mut out = self.universal.clone();
+        if let Some(v) = self.tag.get(tag) {
+            out.extend_from_slice(v);
+        }
+        if let Some(v) = id.and_then(|i| self.id.get(i)) {
+            out.extend_from_slice(v);
+        }
+        for c in classes {
+            if let Some(v) = self.class.get(c) {
+                out.extend_from_slice(v);
+            }
+        }
+        out.sort_unstable();
+        out.dedup();
+        out
+    }
+}
+
+/// A stylesheet's two cascade indices: the element cascade and the generated
+/// `::before`/`::after` cascade (built from disjoint sets of the sheet's
+/// selectors, since a rule can feed either or both).
+struct SheetIndex {
+    normal: RuleIndex,
+    pseudo: RuleIndex,
+}
+
+impl SheetIndex {
+    fn build(sheet: &Stylesheet) -> Self {
+        Self {
+            normal: RuleIndex::build(sheet, parser::Rule::bucket_keys_normal),
+            pseudo: RuleIndex::build(sheet, parser::Rule::bucket_keys_pseudo),
+        }
+    }
+}
 
 /// The cascaded CSS custom properties (`--name` → raw value) in scope for an
 /// element. Inherited down the tree and shared by `Rc` so elements that declare
@@ -101,6 +173,8 @@ sup { vertical-align: super; font-size: smaller; }
 /// CSS engine built on our parser + cascade.
 pub struct CssEngine {
     ua: Stylesheet,
+    /// Cascade index over the (fixed) UA sheet, built once at construction.
+    ua_index: SheetIndex,
     media: MediaContext,
 }
 
@@ -113,8 +187,11 @@ impl CssEngine {
 
     /// Build an engine that evaluates `@media` queries against `width`×`height`.
     pub fn with_media(width: u32, height: u32) -> Self {
+        let ua = parse_stylesheet(UA_CSS);
+        let ua_index = SheetIndex::build(&ua);
         Self {
-            ua: parse_stylesheet(UA_CSS),
+            ua,
+            ua_index,
             media: MediaContext { width, height },
         }
     }
@@ -132,6 +209,7 @@ impl CssEngine {
         parent_vars: &Vars,
         path: &mut Vec<ElemRef>,
         author: &Stylesheet,
+        author_index: &SheetIndex,
         // Root element's computed font-size in px — the base for `rem`.
         // `html { font-size: 62.5% }` → 1rem = 10px; a hardcoded 16 would size
         // every rem-based box 1.6x too large.
@@ -162,16 +240,22 @@ impl CssEngine {
             apply_presentational_hints(&mut style, node);
 
             // Collect matching declarations: (origin, specificity, source-order),
-            // honoring @media against the engine's viewport.
+            // honoring @media against the engine's viewport. Only rules whose
+            // subject key this element carries are tested (see `RuleIndex`) — the
+            // rest cannot match, so scanning them was pure overhead on big pages.
+            let el = &siblings[index];
+            let el_id = el.id.as_deref();
             let mut matched: Vec<MatchedRule<'_>> = Vec::new();
-            for (order, rule) in self.ua.rules.iter().enumerate() {
+            for order in self.ua_index.normal.candidates(&el.tag, el_id, &el.classes) {
+                let rule = &self.ua.rules[order];
                 if rule.applies(self.media) {
                     if let Some(spec) = rule.matches(path) {
                         matched.push((0, spec, order, &rule.declarations));
                     }
                 }
             }
-            for (order, rule) in author.rules.iter().enumerate() {
+            for order in author_index.normal.candidates(&el.tag, el_id, &el.classes) {
+                let rule = &author.rules[order];
                 if rule.applies(self.media) {
                     if let Some(spec) = rule.matches(path) {
                         matched.push((1, spec, order, &rule.declarations));
@@ -304,6 +388,7 @@ impl CssEngine {
                         &vars,
                         path,
                         author,
+                        author_index,
                         child_root_font_size,
                     );
                     elem_index += 1;
@@ -321,6 +406,7 @@ impl CssEngine {
                 PseudoElement::Before,
                 path,
                 author,
+                author_index,
                 &style,
                 &vars,
                 child_root_font_size,
@@ -332,6 +418,7 @@ impl CssEngine {
                 PseudoElement::After,
                 path,
                 author,
+                author_index,
                 &style,
                 &vars,
                 child_root_font_size,
@@ -362,20 +449,28 @@ impl CssEngine {
         which: PseudoElement,
         path: &[ElemRef],
         author: &Stylesheet,
+        author_index: &SheetIndex,
         elem_style: &ComputedStyle,
         vars: &Vars,
         root_font_size: u32,
         node: NodeRef<'_>,
     ) -> Option<StyledNode> {
+        // The originating element (subject of the ::before/::after selector); the
+        // pseudo index is keyed by its subject compound, same as the element one.
+        let owner = path.last()?;
+        let el = &owner.siblings[owner.index];
+        let el_id = el.id.as_deref();
         let mut matched: Vec<MatchedRule<'_>> = Vec::new();
-        for (order, rule) in self.ua.rules.iter().enumerate() {
+        for order in self.ua_index.pseudo.candidates(&el.tag, el_id, &el.classes) {
+            let rule = &self.ua.rules[order];
             if rule.applies(self.media) {
                 if let Some(spec) = rule.matches_pseudo(path, which) {
                     matched.push((0, spec, order, &rule.declarations));
                 }
             }
         }
-        for (order, rule) in author.rules.iter().enumerate() {
+        for order in author_index.pseudo.candidates(&el.tag, el_id, &el.classes) {
+            let rule = &author.rules[order];
             if rule.applies(self.media) {
                 if let Some(spec) = rule.matches_pseudo(path, which) {
                     matched.push((1, spec, order, &rule.declarations));
@@ -476,6 +571,7 @@ impl StyleEngine for CssEngine {
         let mut css = String::new();
         collect_author_css(doc.root(), sheets, &mut css);
         let author = parse_stylesheet(&css);
+        let author_index = SheetIndex::build(&author);
         let mut path = Vec::new();
         let root = doc.root();
         let root_siblings: Rc<[SiblingRef]> = vec![sibling_ref(root)].into();
@@ -488,6 +584,7 @@ impl StyleEngine for CssEngine {
             &no_vars,
             &mut path,
             &author,
+            &author_index,
             INITIAL_ROOT_FONT_PX,
         );
         StyledDom {
@@ -2967,6 +3064,39 @@ mod tests {
             StyledChild::Element(e) => first(e, tag),
             StyledChild::Text(_) => None,
         })
+    }
+
+    #[test]
+    fn cascade_bucketing_keeps_every_matchable_rule() {
+        // Regression guard for the key-selector index: an element must still see
+        // a rule keyed on *any* of its classes (not just the first), a bare
+        // attribute selector (universal bucket), a tag rule, and a comma rule
+        // reachable via two of its keys (deduped, applied once).
+        let dom = CssEngine::new().style(&parse_html(
+            "<style>\
+               .c { color: #ff0000 }\
+               [data-k] { text-decoration: underline }\
+               p { font-weight: bold }\
+               .a, p { color: #00ff00 }\
+             </style>\
+             <p id='t' class='a b c' data-k='v'>x</p>",
+        ));
+        let p = first(&dom.root, "p").expect("p");
+        // `.c` is the element's THIRD class — the index must bucket by it and the
+        // element must probe all its classes, or this rule would be dropped.
+        // `.a, p` is a lower-specificity earlier rule, so `.c` (0,1,0 vs 0,1,0
+        // but later source order) wins red only over `.a,p`'s green... both are
+        // (0,1,0)/(0,0,1); the class rules tie on specificity so source order
+        // decides: `.c` precedes `.a,p`, so green (from `.a, p`) wins last.
+        assert_eq!(
+            p.style.color,
+            Color::rgb(0, 255, 0),
+            "later equal-specificity class rule (reached via the bucket) wins"
+        );
+        // Universal-bucket attribute rule still applies.
+        assert!(p.style.underline, "[data-k] underline applied");
+        // Tag-bucket rule still applies.
+        assert!(p.style.font.bold, "p{{font-weight:bold}} applied");
     }
 
     #[test]

@@ -469,6 +469,65 @@ impl Rule {
     }
 }
 
+/// The bucket a selector is indexed under for cascade pruning: its rightmost
+/// (subject) compound's most specific of id > class > tag, else universal. An
+/// element only needs to test rules whose key it actually carries, which turns
+/// the per-element cascade from O(all rules) into O(rules that could match) —
+/// the difference between usable and unusable on a big page.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum BucketKey {
+    Id(String),
+    Class(String),
+    Tag(String),
+    Universal,
+}
+
+impl Selector {
+    /// The subject (rightmost) compound's key. Uses raw strings so it stays
+    /// exactly consistent with [`Compound::matches`] (which compares them
+    /// verbatim) — an element probing by the same raw tag/id/class can never
+    /// miss a rule this pruning kept out.
+    fn bucket_key(&self) -> BucketKey {
+        match self.compounds.last() {
+            Some(c) if c.id.is_some() => BucketKey::Id(c.id.clone().unwrap()),
+            Some(c) if !c.classes.is_empty() => BucketKey::Class(c.classes[0].clone()),
+            Some(c) if c.tag.is_some() => BucketKey::Tag(c.tag.clone().unwrap()),
+            _ => BucketKey::Universal,
+        }
+    }
+
+    /// Whether this selector targets a `::before`/`::after` (its subject carries
+    /// a pseudo-element) — i.e. it feeds the generated-content cascade, not the
+    /// element cascade.
+    fn targets_pseudo_element(&self) -> bool {
+        self.compounds
+            .last()
+            .is_some_and(|c| c.pseudo_element.is_some())
+    }
+}
+
+impl Rule {
+    /// Bucket keys for this rule's element-matching selectors (one per selector
+    /// that targets the element itself), for indexing the normal cascade.
+    pub fn bucket_keys_normal(&self) -> Vec<BucketKey> {
+        self.selectors
+            .iter()
+            .filter(|s| !s.targets_pseudo_element())
+            .map(Selector::bucket_key)
+            .collect()
+    }
+
+    /// Bucket keys for this rule's `::before`/`::after` selectors, for indexing
+    /// the generated-content cascade.
+    pub fn bucket_keys_pseudo(&self) -> Vec<BucketKey> {
+        self.selectors
+            .iter()
+            .filter(|s| s.targets_pseudo_element())
+            .map(Selector::bucket_key)
+            .collect()
+    }
+}
+
 /// A parsed stylesheet.
 #[derive(Clone, Debug, Default)]
 pub struct Stylesheet {
