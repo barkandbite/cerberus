@@ -1,81 +1,68 @@
 {
-  "review_date": "2026-07-01",
+  "review_date": "2026-08-03",
   "repo": "barkandbite/cerberus",
   "reviewer": "fleet-worker",
-  "focus_band": "Full codebase pass: stale-issue reconciliation + under-audited-crate sweep + targeted fixes",
-  "categories_swept": ["P0 Security", "P1 Performance", "P2 Structure & maintainability", "P3 Architecture", "P4 UX", "stale PR/issue reconciliation"],
+  "focus_band": "P1 Performance & efficiency (rotated)",
+  "categories_swept": ["P1 Performance (deep: parse/layout/paint/text/scroll hot paths)", "P2 Structure (untested critical paths)", "P0 Security sweep (js-dom new surface: Worker/WebSocket/Blob; image decode caps)", "P3 Architecture sweep", "P4 UX sweep"],
   "corpus": {
-    "open_issues_seen": 56,
-    "closed_issues_seen": 8,
-    "notes": "Verified 4 previously-open issues (#9 CSPRNG, #12 autofill origin binding, #13 HTTP body cap, #15 atomic_write race) were already fixed on main by commits abc9360/22e5465 but never closed; closed all four with evidence. Reconciled stale PRs: PR #33 was fully subsumed by PR #53 (confirmed via merge-base ancestor check) and closed; PR #63 (bookkeeping-only, this repo's prior review-state commit) was merged. New-issue sweep targeted crates the prior runs (#9-#62) covered less: cerberus-js-quickjs, cerberus-mirror, cerberus-consent, cerberus-identity, cerberus-crypto(-rustcrypto), cerberus-tls-rustls, cerberus-js-dom, cerberus-shell(-winit), cerberus-sysmem, cerberus-farbling, cerberus-dom, cerberus-types."
+    "open_issues_seen": 74,
+    "closed_issues_checked": ["#23 (find_ci O(n²), closed — precedent class for new #229)", "#68-#71 status inferred (not in open list)"],
+    "notes": "An intermediate automated run on 2026-08-02 filed #204-#227 and enriched #196 — the tree (through v0.0.19, last commit 81255fa 2026-07-30) was exhaustively covered two days before this run. Dedup bar was very high; deep-dived v0.0.14-v0.0.19 churn (cerberus-text/hinted.rs glyph cache, viewport cull, cerberus-app layout cache/render_frame, cerberus-ui, cerberus-css polygon/font-face additions, cerberus-dom parser, cerberus-paint, js-dom Worker/WebSocket shims, winit scroll path)."
   },
   "findings": [
     {
-      "issue": 68,
-      "disposition": "NEW",
-      "severity": "critical",
-      "category": "Security",
-      "title": "QuickJS runtime has no memory limit, interrupt handler, or stack cap — a single script can hang or OOM the entire browser",
-      "primary_file": "crates/cerberus-js-quickjs/src/lib.rs",
-      "fingerprint": "cerberus|crates/cerberus-js-quickjs/src/lib.rs|quickjs-no-runtime-limits"
-    },
-    {
-      "issue": 69,
-      "disposition": "NEW",
-      "severity": "high",
-      "category": "Architecture",
-      "title": "Mirror-group windows never get the farbling prologue — identities are trivially correlatable in mirror mode",
-      "primary_file": "crates/cerberus-mirror/src/group.rs",
-      "fingerprint": "cerberus|crates/cerberus-mirror/src/group.rs|mirror-no-farbling-injection"
-    },
-    {
-      "issue": 70,
+      "id": "CERBERUS-20260803-001",
       "disposition": "NEW",
       "severity": "medium",
-      "category": "maintainability",
-      "title": "is_public_suffix returns true for every single-label host (operator-precedence bug), breaking cookies on localhost/intranet names",
-      "primary_file": "crates/cerberus-consent/src/psl.rs",
-      "fingerprint": "cerberus|crates/cerberus-consent/src/psl.rs|is_public_suffix-precedence-bug"
+      "category": "Performance",
+      "title": "decode_entities scans to the next ';' anywhere in the remaining text for every '&' — O(n²) HTML parse on ampersand-dense text nodes",
+      "primary_file": "crates/cerberus-dom/src/lib.rs",
+      "issue_number": 229,
+      "fingerprint": "cerberus|crates/cerberus-dom/src/lib.rs|match rest.find(';') {"
     },
     {
-      "issue": 71,
-      "disposition": "NEW",
-      "severity": "low",
-      "category": "maintainability",
-      "title": "Consent rule serialization has no escaping — a whitespace-containing site/host corrupts the persisted rule format",
-      "primary_file": "crates/cerberus-consent/src/lib.rs",
-      "fingerprint": "cerberus|crates/cerberus-consent/src/lib.rs|consent-rule-serialize-no-escaping"
+      "id": "CERBERUS-20260803-002",
+      "disposition": "ENRICHMENT",
+      "severity": "high",
+      "category": "Performance",
+      "title": "draw_polygon (added v0.0.14) shares #196's missing loop-bound intersection AND has an unbounded per-scanline O(vertices) factor + per-scanline sort; parse_clip_polygon caps neither vertex count nor coordinate magnitude",
+      "primary_file": "crates/cerberus-text/src/lib.rs",
+      "issue_number": 196,
+      "fingerprint": "cerberus|crates/cerberus-text/src/lib.rs|for y in min_y..max_y {"
+    },
+    {
+      "id": "CERBERUS-20260803-003",
+      "disposition": "ENRICHMENT",
+      "severity": "medium",
+      "category": "Performance",
+      "title": "GlyphCache::insert has no per-item ceiling: one CachedGlyph (up to 16 MiB under MAX_GLYPH_RASTER=4096) above the 4 MiB cap makes every insert wholesale-clear — page-wide cache hit rate ~0 per frame, reverting the v0.0.16 scroll win; #205's font-size clamp alone does not remove it",
+      "primary_file": "crates/cerberus-text/src/hinted.rs",
+      "issue_number": 205,
+      "fingerprint": "cerberus|crates/cerberus-text/src/hinted.rs|if self.bytes + sz > GLYPH_CACHE_CAP_BYTES {"
     }
   ],
-  "fixed_this_run": [
-    { "issue": 62, "summary": "combine_pos same-axis keyword pairs now return None instead of misparsing to a bogus 2-D point" },
-    { "issue": 35, "summary": "select_srcset now tokenizes per the WHATWG srcset grammar; commas inside candidate URLs no longer shear candidates" },
-    { "issue": 37, "summary": "background shorthand now resets background-position/background-size to their initial values before applying parsed geometry" },
-    { "issue": 17, "summary": "ProfileFillProvider's decrypted profile map is now clearable, and MirrorShell::lock_vault() clears it together with locking the underlying vault, so no live structure holds decrypted secrets past a lock" },
-    { "issue": 30, "summary": "vault_input and the CLI passphrase String are now actually zeroize()d (not just .clear()ed) on every reset path" }
-  ],
-  "closed_stale": [
-    { "issue": 9, "reason": "CSPRNG fail-closed fix (abc9360) already on main; fallback removed" },
-    { "issue": 12, "reason": "origin-bound autofill fix (abc9360) already on main" },
-    { "issue": 13, "reason": "HTTP response size cap (22e5465) already on main" },
-    { "issue": 15, "reason": "atomic_write unique-tmp-name fix (abc9360) already on main" }
-  ],
-  "stale_prs_reconciled": [
-    { "pr": 33, "action": "closed", "reason": "head commit is an ancestor of PR #53's branch; fully superseded, no changes lost" },
-    { "pr": 63, "action": "merged", "reason": "bookkeeping-only (.reviews/STATE.json), zero code changes, no CI gate on this repo" },
-    { "pr": 53, "action": "left open", "reason": "large in-progress draft (17.7k+ additions, 129 files); out of scope for this pass, needs dedicated review" }
-  ],
   "duplicates_skipped": [
-    "web-platform epic phases #40-#48 (roadmap, not bugs)",
-    "#49 eTLD+1 OnceLock fail-open (distinct from #70's is_public_suffix precedence bug)",
-    "#50 deeply nested HTML stack-overflow (distinct from #68's QuickJS runtime limits)",
-    "#29 vault passphrase env var (distinct egress-channel issue from #30's in-memory zeroize gap, left open — not in this session's fix scope)"
+    "paint_vspan glyph-run span reads GlyphBox.h (always 0) → exact match of #204, skipped",
+    "DisplayList::scaled(1.0) full deep clone per frame + render_frame's clone of cached display/links/fields/elements → covered by #207 ('deep-cloned twice, translated, rescanned'), skipped",
+    "collect_computed + set_computed_styles pushed into JS every frame → covered by #22, skipped",
+    "synchronous subresource image decode in poll → #211, skipped",
+    "table-nesting cap bypass via Ctx::sub → #220, skipped",
+    "HintingInstance map unbounded / font-size unclamped → #205 body, skipped (only the GlyphCache degenerate mode was new → enrichment)",
+    "draw_image/gradient/shadow/round_rect full-rect iteration → #196 body, skipped (only draw_polygon was new → enrichment)"
+  ],
+  "not_filed_below_bar": [
+    "extract_font_face_families allocates a full to_ascii_lowercase() copy of all author CSS inside every parse_stylesheet call — additive detail on #172 (author CSS re-parsed per restyle); #172's fix (cache the parsed sheet) removes it automatically",
+    "finish_positioned negative-z prepend (v0.0.17) is an O(items) Vec prepend per context — bounded, once per layout, not per frame; below bar",
+    "build_tree per-text-token stack.iter().any(pre check) and close_element rposition — O(depth<=512) per token, bounded; below bar",
+    "shape_in_styled/itemize per-call Vec allocations — same churn family as existing #26/#178/#183/#187; nothing distinct enough to add",
+    "draw_line iterates the segment bounding box — chrome/icon-only emitters found, not author-reachable at scale; below bar"
   ],
   "no_findings_areas": [
-    "cerberus-crypto / cerberus-crypto-rustcrypto: correct AEAD/KDF usage, proper zeroize + redacted Debug",
-    "cerberus-tls-rustls: correct rustls + bundled roots, no type leaks",
-    "cerberus-js-dom JSON/storage/cookie shims: careful parsing, run-scoped, isolation holds for the single-window path",
-    "cerberus-shell / cerberus-shell-winit / cerberus-headless / cerberus-sysmem: plumbing is sound, single Windows unsafe FFI is bounded and documented"
+    "cerberus-image: decode caps present and tested (DEFAULT_MAX_DECODE_PIXELS 6M, 1600px longest side, 4 MiB SVG byte ceiling)",
+    "cerberus-shell-winit scroll path: wheel deltas go through request_redraw() (winit-coalesced), no per-event relayout",
+    "cerberus-js-dom Worker/WebSocket/Blob shims (v0.0.14): same-thread, timer-queue-scheduled, no thread spawn; WebSocket is a stub — no new P0 surface beyond filed issues",
+    "cerberus-ui toolbar/panel painting: fixed small control count, not a hot path",
+    "hinted.rs cache-key correctness verified: baseline is integer (origin.y + ascent().round()) so the missing y-phase in the glyph-cache key is sound; sub-pixel bucket keying is translation-invariant"
   ],
-  "overall_health": "Good and improving. This run reconciled 4 stale-but-fixed issues and 2 stale/superseded PRs, fixed 5 open low/medium correctness and secret-hygiene issues with tests, and surfaced one critical (JS sandboxing) and one high (mirror farbling gap) finding that should be prioritized next — both concrete, verified bugs rather than roadmap items."
+  "overall_health": "Good code trajectory, exceptionally well-audited backlog. The tree through v0.0.19 was swept exhaustively by the 2026-08-02 run (#204-#227), so this rotation's yield is honest and small: one new genuine O(n²) parse hot path (#229, same class as the fixed #23) and two material scope enrichments on open perf issues (#196 draw_polygon, #205 GlyphCache thrash mode). The dominant open risks remain the previously-filed HIGH perf items (#170 exponential layout, #175 O(N²) display list, #195 full-DOM serialize per event, #210 no connection reuse, #213 JS budget gaps, #220 table-cap bypass) — fixing capacity, not finding capacity, is the bottleneck."
 }
